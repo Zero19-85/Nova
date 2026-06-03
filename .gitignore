@@ -1,0 +1,26 @@
+﻿# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build artifacts
+*.pdb
+*.exe
+*.lib
+*.dll
+*.exp
+*.o
+*.a
+
+# Test output files
+nova_test_output.h264
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
