@@ -4,27 +4,36 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# === Async Runtime + Web Server (RTSP + Pairing) ===
 tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
+mdns-sd = "0.13"
+rcgen = "0.14"
+ring = "0.17"
+aes = "0.8"
+sha2 = "0.10"
+rand = "0.8"
+cipher = "0.4"
+hex = "0.4"
+url = "2"
+clap = { version = "4", features = ["derive"] }
 
-# === Windows APIs (DXGI Desktop Duplication + D3D11) ===
-windows = { version = "0.59", features = [
+# Windows DXGI + NVENC
+windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Foundation",
-    "Win32_System_Com"
-]}
-
-# === CLI ===
-clap = { version = "4.5", features = ["derive"] }
-mdns-sd = "0.20.0"
-url = "2.5.8"
-rcgen = "0.14.8"
-hex = "0.4.3"
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+rsa = "0.9.10"
+rustls = "0.23.40"
+tokio-rustls = "0.26.4"
+rustls-pki-types = "1.14.1"
 
 [build-dependencies]
-cc = "1.2"
+cc = "1.0"
