@@ -47,7 +47,7 @@ pub struct ServerCrypto {
     pub cert_hex: String,
     pub cert_sig: Vec<u8>,
     pub private_key_der: Vec<u8>,
-    pub cert_der: Vec<u8>,
+    pub cert_der: Vec<u8>, 
 }
 
 impl ServerCrypto {
@@ -175,10 +175,12 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
             let pin = pin_https.clone();
 
             tokio::task::spawn(async move {
-                // Wrap the TCP stream in TLS
                 let tls_stream = match tls_acceptor_inner.accept(stream).await {
                     Ok(s) => s,
-                    Err(_) => return, // Ignore random network scans
+                    Err(e) => {
+                        eprintln!("⚠️ TLS Handshake Failed on 47984 (Moonlight dropped connection): {}", e);
+                        return; 
+                    }, 
                 };
                 let io = TokioIo::new(tls_stream);
 
@@ -300,10 +302,6 @@ async fn handle_request(
                     session.salt.clone().unwrap_or_default()
                 };
 
-                println!("\n=======================================================");
-                println!("🚨 QUICK! TYPE THE 4-DIGIT PIN AND PRESS ENTER! 🚨");
-                println!("=======================================================\n");
-
                 let mut attempts = 0;
                 let mut pin = String::new();
                 while attempts < 20 { 
@@ -392,6 +390,12 @@ async fn handle_request(
                 println!("🎉 Phase 4: Handshake Complete! Device is officially paired.");
                 let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
                 Ok(make_xml_response(body))
+
+            } else if phrase == "pairchallenge" {
+                println!("🔄 Phase 5: pairchallenge | Moonlight verifying pairing state...");
+                let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
+                Ok(make_xml_response(body))
+
             } else {
                 Ok(make_error_response("Unknown pairing request"))
             }
@@ -404,17 +408,55 @@ async fn handle_request(
             Ok(make_xml_response(body))
         }
 
-        // 🌟 APP LIST IS NOW PROPERLY ROUTED THROUGH SECURE HTTPS!
         "/applist" => {
             println!("📋 Moonlight requested /applist");
+            // 🛠️ THE FIX: <UniqueId> tags added so Moonlight actually renders the buttons!
             let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
-    <App><IsMediaApp>0</IsMediaApp><AppTitle>Desktop</AppTitle><ID>1</ID></App>
-    <App><IsMediaApp>0</IsMediaApp><AppTitle>Steam</AppTitle><ID>2</ID></App>
-    <App><IsMediaApp>0</IsMediaApp><AppTitle>Xbox App</AppTitle><ID>3</ID></App>
-    <App><IsMediaApp>0</IsMediaApp><AppTitle>Virtual Desktop</AppTitle><ID>4</ID></App>
+    <App>
+        <IsMediaApp>0</IsMediaApp>
+        <AppTitle>Desktop</AppTitle>
+        <UniqueId>1</UniqueId>
+        <ID>1</ID>
+    </App>
+    <App>
+        <IsMediaApp>0</IsMediaApp>
+        <AppTitle>Steam</AppTitle>
+        <UniqueId>2</UniqueId>
+        <ID>2</ID>
+    </App>
+    <App>
+        <IsMediaApp>0</IsMediaApp>
+        <AppTitle>Xbox App</AppTitle>
+        <UniqueId>3</UniqueId>
+        <ID>3</ID>
+    </App>
+    <App>
+        <IsMediaApp>0</IsMediaApp>
+        <AppTitle>Virtual Desktop</AppTitle>
+        <UniqueId>4</UniqueId>
+        <ID>4</ID>
+    </App>
 </root>"#;
             Ok(make_xml_response(body))
+        }
+
+        "/appasset" => {
+            println!("🖼️ Moonlight requested /appasset (Box Art). Serving blank PNG.");
+            // 🛠️ THE FIX: 1x1 Transparent PNG so Moonlight doesn't hang waiting for an image
+            let png_1x1: [u8; 67] = [
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+                0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+                0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+                0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+                0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ];
+            let mut res = Response::new(Full::new(Bytes::from(png_1x1.to_vec())));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+            res.headers_mut().insert(header::CONTENT_LENGTH, png_1x1.len().to_string().parse().unwrap());
+            Ok(res)
         }
 
         "/launch" => {
@@ -437,6 +479,7 @@ async fn handle_request(
     }
 }
 
+// Helpers
 fn make_xml_response(body: &str) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(Bytes::from(body.to_string())));
     *res.status_mut() = StatusCode::OK;
