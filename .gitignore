@@ -14,6 +14,15 @@ Cargo.lock
 
 # Test output files
 nova_test_output.h264
+test.h264
+
+# Runtime-generated / sensitive — never commit
+nova_cert.der
+nova_cert.pem
+nova_key.der
+nova_cert.version
+nova_paired.txt
+nova_debug.log
 
 # IDE / Editor
 .vscode/

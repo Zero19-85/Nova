@@ -10,6 +10,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 mdns-sd = "0.13"
 rcgen = "0.14"
+time = "0.3"
 ring = "0.17"
 aes = "0.8"
 sha2 = "0.10"

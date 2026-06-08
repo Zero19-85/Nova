@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use url::Url;
 use std::sync::Mutex;
-use std::io::Write; 
+use std::io::Write as IoWrite;
 
 // TLS/HTTPS Imports
 use tokio_rustls::TlsAcceptor;
@@ -28,9 +28,48 @@ use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 
 // RSA Generation Imports 
 use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
 type PairSessions = Arc<Mutex<HashMap<String, PairSession>>>;
+
+const PAIRED_PATH:        &str = "nova_paired.txt";
+const CERT_VERSION_PATH: &str = "nova_cert.version";
+const CERT_VERSION:       u8  = 4;
+
+/// Append a client ID to the persist file (one ID per line).
+fn persist_paired_client(client_id: &str) {
+    use std::fs::OpenOptions;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(PAIRED_PATH) {
+        let _ = writeln!(f, "{}", client_id);
+    }
+}
+
+/// Remove a client ID from the persist file.
+fn remove_paired_client(client_id: &str) {
+    if let Ok(contents) = std::fs::read_to_string(PAIRED_PATH) {
+        let updated: String = contents
+            .lines()
+            .filter(|l| l.trim() != client_id)
+            .map(|l| format!("{}\n", l))
+            .collect();
+        let _ = std::fs::write(PAIRED_PATH, updated);
+    }
+}
+
+/// Load all persisted client IDs and mark them as paired in the sessions map.
+fn load_paired_clients(sessions: &PairSessions) {
+    let contents = match std::fs::read_to_string(PAIRED_PATH) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut lock = sessions.lock().unwrap();
+    for id in contents.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let entry = lock.entry(id.to_string()).or_default();
+        entry.last_phase = "CLIENTPAIRINGSECRET".to_string();
+    }
+    println!("📂 Loaded {} paired client(s) from disk", lock.len());
+}
 
 #[derive(Default)]
 struct PairSession {
@@ -44,36 +83,166 @@ struct PairSession {
 }
 
 pub struct ServerCrypto {
+    /// Hex-encoded DER — this is what goes in `plaincert`.
+    /// moonlight-qt parses `plaincert` with OpenSSL d2i_X509() (DER-only).
+    /// Moonlight Android uses CertificateFactory which accepts both, but
+    /// hex-DER is the canonical format Sunshine uses and works everywhere.
+    /// Note: Moonlight sends its *own* clientcert as hex-PEM — asymmetric but correct.
     pub cert_hex: String,
+    /// Last 256 bytes of the DER cert — used as the signature blob in Phase 2.
     pub cert_sig: Vec<u8>,
     pub private_key_der: Vec<u8>,
-    pub cert_der: Vec<u8>, 
+    pub cert_der: Vec<u8>,
+}
+
+const CERT_PATH:     &str = "nova_cert.der";
+const CERT_PEM_PATH: &str = "nova_cert.pem";
+const KEY_PATH:      &str = "nova_key.der";
+
+/// Encode DER bytes as a standard PEM certificate string (no extra dependencies).
+fn der_to_pem(der: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::with_capacity((der.len() + 2) / 3 * 4);
+    for chunk in der.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        b64.push(CHARS[b0 >> 2] as char);
+        b64.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        b64.push(if chunk.len() > 1 { CHARS[((b1 & 15) << 2) | (b2 >> 6)] as char } else { '=' });
+        b64.push(if chunk.len() > 2 { CHARS[b2 & 63] as char } else { '=' });
+    }
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+fn sha256_fingerprint(der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(der);
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
 }
 
 impl ServerCrypto {
+    /// Load from disk if all three files exist; generate and persist otherwise.
+    /// The cert identity must be stable across restarts — Moonlight pins the
+    /// exact cert bytes seen during pairing.
     pub fn new() -> Self {
-        println!("🔑 Generating Nova RSA Security Certificate...");
-        
+        if let Some(crypto) = Self::try_load_from_disk() {
+            return crypto;
+        }
+
+        println!("🔑 Generating Nova RSA certificate (first run)...");
+
         let mut rng = rand::thread_rng();
         let rsa_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate RSA key");
-            
-        let pkcs8_pem = rsa_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).expect("Failed to encode RSA key to PEM");
-        let key_pair = KeyPair::from_pem(&pkcs8_pem.to_string()).expect("Failed to load KeyPair into rcgen");
+
+        let pkcs8_pem = rsa_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("Failed to encode RSA key to PEM");
+        let key_pair = KeyPair::from_pem(&pkcs8_pem.to_string())
+            .expect("Failed to load KeyPair into rcgen");
 
         let pkcs8_der = rsa_key.to_pkcs8_der().expect("Failed to encode RSA key to DER");
         let private_key_der = pkcs8_der.as_bytes().to_vec();
 
-        let params = CertificateParams::new(vec!["NovaServer".into()]).expect("Failed to create certificate params");
-        let cert = params.self_signed(&key_pair).expect("Failed to generate Certificate");
-            
+        // SAN must be a valid DNS label (no spaces). "NVIDIA GameStream Server" goes
+        // only in the CN — putting it in the SAN makes OpenSSL consider the cert
+        // structurally malformed and drop the TLS handshake before VerifyNone runs.
+        let mut params = CertificateParams::new(vec!["localhost".to_string()])
+            .expect("Failed to create certificate params");
+        // CA:TRUE — moonlight-qt's OpenSSL adds plaincert to its trusted-CA store and
+        // runs full chain validation. A self-signed cert must be CA:TRUE to validate as
+        // its own issuer, otherwise OpenSSL returns CertificateUnknown.
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // KeyCertSign required: modern OpenSSL strict mode rejects CA certs that lack
+        // keyCertSign in KeyUsage even when BasicConstraints: CA:TRUE is present.
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+            KeyUsagePurpose::KeyCertSign,
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "NVIDIA GameStream Server");
+        params.distinguished_name = dn;
+        // Backdate by 1 year so clients whose clocks are slightly behind ours never
+        // see CertificateNotYetValid. Moonlight whitelists SelfSignedCertificate and
+        // HostNameMismatch but NOT CertificateNotYetValid — any clock skew (even
+        // sub-second) would cause an unwhitelisted error and a fatal CertificateUnknown
+        // alert. Sunshine uses the same backdate approach in crypto.cpp.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(365);
+        params.not_after  = now + time::Duration::days(3650);
+        let cert     = params.self_signed(&key_pair).expect("Failed to self-sign certificate");
         let cert_der = cert.der().to_vec();
-        let cert_hex = hex::encode(&cert_der);
+        let cert_pem = der_to_pem(&cert_der);
 
-        let sig_len = 256;
+        if let Err(e) = std::fs::write(CERT_PATH, &cert_der) {
+            eprintln!("⚠️ Could not save {}: {}", CERT_PATH, e);
+        }
+        if let Err(e) = std::fs::write(CERT_PEM_PATH, &cert_pem) {
+            eprintln!("⚠️ Could not save {}: {}", CERT_PEM_PATH, e);
+        }
+        if let Err(e) = std::fs::write(KEY_PATH, &private_key_der) {
+            eprintln!("⚠️ Could not save {}: {}", KEY_PATH, e);
+        }
+        if let Err(e) = std::fs::write(CERT_VERSION_PATH, &[CERT_VERSION]) {
+            eprintln!("⚠️ Could not save {}: {}", CERT_VERSION_PATH, e);
+        }
+
+        let cert_hex = hex::encode_upper(&cert_der);
+        let sig_len  = 256;
         let cert_sig = cert_der[cert_der.len() - sig_len..].to_vec();
 
-        println!("✅ RSA Certificate Generated and Ready!");
+        let fp = sha256_fingerprint(&cert_der);
+        println!("✅ RSA certificate generated — SHA-256: {}", fp);
+        println!("   plaincert = hex-DER, {} bytes", cert_der.len());
         Self { cert_hex, cert_sig, private_key_der, cert_der }
+    }
+
+    fn try_load_from_disk() -> Option<Self> {
+        // Version gate: certs generated before CERT_VERSION lack KeyCertSign/EKU/DN.
+        // Delete stale files so new() regenerates with the correct extensions.
+        let stored_version = std::fs::read(CERT_VERSION_PATH)
+            .ok()
+            .and_then(|b| b.first().copied());
+        if stored_version.unwrap_or(0) < CERT_VERSION {
+            println!("🔄 Nova cert is outdated (v{} < v{}) — deleting to regenerate.",
+                stored_version.unwrap_or(0), CERT_VERSION);
+            println!("   ⚠️  Delete nova_paired.txt and re-pair Moonlight after restart.");
+            let _ = std::fs::remove_file(CERT_PATH);
+            let _ = std::fs::remove_file(CERT_PEM_PATH);
+            let _ = std::fs::remove_file(KEY_PATH);
+            let _ = std::fs::remove_file(CERT_VERSION_PATH);
+            return None;
+        }
+
+        let cert_der        = std::fs::read(CERT_PATH).ok()?;
+        let private_key_der = std::fs::read(KEY_PATH).ok()?;
+        if cert_der.is_empty() || private_key_der.is_empty() {
+            return None;
+        }
+        // PEM file might not exist on older installs — derive it from DER.
+        let _cert_pem = std::fs::read_to_string(CERT_PEM_PATH)
+            .unwrap_or_else(|_| {
+                let pem = der_to_pem(&cert_der);
+                let _ = std::fs::write(CERT_PEM_PATH, &pem);
+                pem
+            });
+        let cert_hex = hex::encode_upper(&cert_der);
+        let sig_len  = 256;
+        let cert_sig = cert_der[cert_der.len() - sig_len..].to_vec();
+        let fp = sha256_fingerprint(&cert_der);
+        println!("🔑 Loaded existing Nova certificate from disk — SHA-256: {}", fp);
+        Some(Self { cert_hex, cert_sig, private_key_der, cert_der })
     }
 }
 
@@ -115,27 +284,38 @@ fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
 }
 
 pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String, server_mac: String) {
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], port)); // 47989
-    let https_addr = SocketAddr::from(([0, 0, 0, 0], 47984)); // HTTPS Port
-
-    let http_listener = TcpListener::bind(http_addr).await.expect("Failed to bind HTTP port");
-    let https_listener = TcpListener::bind(https_addr).await.expect("Failed to bind HTTPS port");
-
-    println!("🔐 NVIDIA HTTP server listening on port {}", port);
-    println!("🔒 NVIDIA HTTPS server listening on port 47984");
-
+    // ── Phase 1: Crypto ───────────────────────────────────────────────────────
+    // Must run first. try_load_from_disk() may delete stale cert files and
+    // regenerate. No port is open yet — Moonlight cannot connect to a cert that
+    // isn't built yet.
     let crypto = Arc::new(ServerCrypto::new());
     let sessions: PairSessions = Arc::new(Mutex::new(HashMap::new()));
+    load_paired_clients(&sessions);
 
-    // --- SETUP TLS ---
+    // ── Phase 2: TLS config ───────────────────────────────────────────────────
+    // Build from the cert that was just loaded/generated above. plaincert (sent
+    // during HTTP pairing) and the TLS identity are guaranteed to be the same
+    // bytes because both come from the same crypto.cert_der.
     let cert = CertificateDer::from(crypto.cert_der.clone());
     let key = PrivateKeyDer::Pkcs8(crypto.private_key_der.clone().into());
-    let mut tls_config = ServerConfig::builder()
+    let tls_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .expect("Failed to build TLS config");
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    println!("🔒 TLS cert identity (SHA-256): {}", sha256_fingerprint(&crypto.cert_der));
+
+    // ── Phase 3: Bind listeners ───────────────────────────────────────────────
+    // Ports open only after TLS is fully configured — no window where a
+    // connection could arrive before the correct cert is loaded.
+    let http_addr  = SocketAddr::from(([0, 0, 0, 0], port));
+    let https_addr = SocketAddr::from(([0, 0, 0, 0], 47984));
+
+    let http_listener  = TcpListener::bind(http_addr).await.expect("Failed to bind HTTP port");
+    let https_listener = TcpListener::bind(https_addr).await.expect("Failed to bind HTTPS port");
+
+    println!("🔐 Nova HTTP  server listening on port {}", port);
+    println!("🔒 Nova HTTPS server listening on port 47984");
 
     // --- PIN CHANNEL ---
     let global_pin = Arc::new(Mutex::new(String::new()));
@@ -178,7 +358,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
                 let tls_stream = match tls_acceptor_inner.accept(stream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("⚠️ TLS Handshake Failed on 47984 (Moonlight dropped connection): {}", e);
+                        eprintln!("⚠️ TLS Handshake Failed on 47984: {}", e);
                         return; 
                     }, 
                 };
@@ -265,7 +445,7 @@ async fn handle_request(
     <ExternalPort>47989</ExternalPort>
     <mac>00:11:22:33:44:55</mac>
     <LocalIP>{}</LocalIP>
-    <ServerCodecModeSupport>259</ServerCodecModeSupport>
+    <ServerCodecModeSupport>3</ServerCodecModeSupport>
     <PairStatus>{}</PairStatus>
     <currentgame>0</currentgame>
     <state>SUNSHINE_SERVER_FREE</state>
@@ -306,23 +486,21 @@ async fn handle_request(
                 let mut attempts = 0;
                 let mut pin = String::new();
                 
-                // THE DETOX: Wait up to 5 minutes (600 attempts * 500ms) instead of 10 seconds!
                 while attempts < 600 { 
                     {
                         let mut p_guard = global_pin.lock().unwrap();
                         if p_guard.len() == 4 {
                             pin = p_guard.clone();
-                            *p_guard = String::new(); // Clear it out for the future
+                            *p_guard = String::new();
                             break;
                         }
                     }
-                    // Wait patiently without blocking the async runtime
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     attempts += 1;
                 }
 
                 if pin.is_empty() {
-                    println!("⏳ PIN input timed out after 5 minutes. Please restart the pairing process.");
+                    println!("⏳ PIN input timed out. Please restart the pairing process.");
                     return Ok(make_error_response("Timeout waiting for PIN"));
                 }
 
@@ -363,7 +541,7 @@ async fn handle_request(
                     session.server_challenge = Some(server_challenge);
                 }
 
-                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>{}</challengeresponse></root>"#, hex::encode(encrypted_response));
+                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>{}</challengeresponse></root>"#, hex::encode_upper(encrypted_response));
                 Ok(make_xml_response(&body))
 
             } else if phrase == "serverchallengeresp" || server_challenge_resp.is_some() {
@@ -382,7 +560,7 @@ async fn handle_request(
                 let mut pairing_secret = server_secret.clone();
                 pairing_secret.extend_from_slice(&sig_buf);
                 
-                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><pairingsecret>{}</pairingsecret></root>"#, hex::encode(pairing_secret));
+                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><pairingsecret>{}</pairingsecret></root>"#, hex::encode_upper(pairing_secret));
                 Ok(make_xml_response(&body))
 
             } else if phrase == "clientpairingsecret" || client_pairing_secret.is_some() {
@@ -391,7 +569,8 @@ async fn handle_request(
                     let session = lock.entry(client_id.clone()).or_default();
                     session.last_phase = "CLIENTPAIRINGSECRET".to_string();
                 }
-                println!("🎉 Phase 4: Handshake Complete! Device is officially paired.");
+                persist_paired_client(&client_id);
+                println!("🎉 Phase 4: Handshake Complete! Device is officially paired (saved to disk).");
                 let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
                 Ok(make_xml_response(body))
 
@@ -406,48 +585,30 @@ async fn handle_request(
         }
 
         "/unpair" => {
-            println!("🧹 Moonlight requested /unpair");
+            println!("🧹 Moonlight requested /unpair for {}", client_id);
             sessions.lock().unwrap().remove(&client_id);
+            remove_paired_client(&client_id);
             let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
             Ok(make_xml_response(body))
         }
 
         "/applist" => {
             println!("📋 Moonlight requested /applist");
-            // 🛠️ THE FIX: <UniqueId> tags added so Moonlight actually renders the buttons!
             let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
     <App>
-        <IsMediaApp>0</IsMediaApp>
         <AppTitle>Desktop</AppTitle>
-        <UniqueId>1</UniqueId>
         <ID>1</ID>
-    </App>
-    <App>
-        <IsMediaApp>0</IsMediaApp>
-        <AppTitle>Steam</AppTitle>
-        <UniqueId>2</UniqueId>
-        <ID>2</ID>
-    </App>
-    <App>
-        <IsMediaApp>0</IsMediaApp>
-        <AppTitle>Xbox App</AppTitle>
-        <UniqueId>3</UniqueId>
-        <ID>3</ID>
-    </App>
-    <App>
-        <IsMediaApp>0</IsMediaApp>
-        <AppTitle>Virtual Desktop</AppTitle>
-        <UniqueId>4</UniqueId>
-        <ID>4</ID>
+        <IsRunning>0</IsRunning>
+        <MaxControllersCount>4</MaxControllersCount>
+        <HDRSupported>0</HDRSupported>
     </App>
 </root>"#;
             Ok(make_xml_response(body))
         }
 
         "/appasset" => {
-            println!("🖼️ Moonlight requested /appasset (Box Art). Serving blank PNG.");
-            // 🛠️ THE FIX: 1x1 Transparent PNG so Moonlight doesn't hang waiting for an image
+            println!("🖼️ Moonlight requested Box Art. Serving blank PNG.");
             let png_1x1: [u8; 67] = [
                 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
                 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,

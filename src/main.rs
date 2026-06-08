@@ -1,14 +1,18 @@
+mod audio;
 mod capture;
-mod rtsp;
-mod rtp;
+mod debug;
+mod encoder;
 mod pairing;
+mod rtp;
+mod rtsp;
 
 use clap::Parser;
-use windows::core::Result;
-use std::ffi::{c_void, CString};
+use encoder::{Encoder, EncoderConfig};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use windows::core::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use tokio::signal;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Nova Server")]
@@ -23,166 +27,181 @@ struct Args {
     codec: String,
     #[arg(long, default_value_t = 60)]
     fps: u32,
-    #[arg(long, default_value_t = 300)]
-    seconds: u32,
-}
-
-extern "C" {
-    fn OpenNvEncSession(d3d11_device: *mut c_void, out_encoder: *mut *mut c_void) -> i32;
-    fn InitEncoder(encoder: *mut c_void, width: i32, height: i32, codec: *const std::ffi::c_char) -> i32;
-    fn InitColorConversion(device: *mut c_void, width: i32, height: i32) -> i32;
-    fn EncodeFrame(encoder: *mut c_void, d3d11_texture: *mut c_void, width: i32, height: i32, out_buffer: *mut u8, max_size: i32) -> i32;
-    fn CleanupEncoder(encoder: *mut c_void) -> i32;
 }
 
 fn get_local_ip() -> String {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP for IP discovery");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind UDP for IP discovery");
     socket.connect("8.8.8.8:80").ok();
-    socket.local_addr().map(|addr| addr.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
+    socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    debug::init_debug_logger();
     let args = Args::parse();
     let local_ip = get_local_ip();
     println!("=== Nova Server ===\n🌐 LAN IP: {}\n", local_ip);
+    debug::debug_log(&format!("Nova started — {}x{} {} {} Kbps {} fps",
+        args.width, args.height, args.codec, args.bitrate, args.fps));
 
-    // 🌟 NOVA'S PERMANENT IDENTITY
-    let server_id = "0123456789ABCDEF";
+    let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
 
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
-    let total_frames = (args.fps as f64 * args.seconds as f64) as u32;
 
-    let capturer = capture::DesktopCapturer::new().expect("Failed to start capture");
+    let capturer = capture::DesktopCapturer::new().expect("Failed to start DXGI capture");
 
-    unsafe {
-        let d3d_device_ptr: *mut c_void = std::mem::transmute(capturer.device.clone());
-        let mut h_encoder: *mut c_void = std::ptr::null_mut();
+    let enc = Encoder::new(
+        &capturer.device,
+        EncoderConfig {
+            width:        args.width,
+            height:       args.height,
+            fps:          args.fps as i32,
+            bitrate_kbps: args.bitrate,
+            codec:        encoder::Codec::from_str(&args.codec),
+        },
+    )
+    .expect("Failed to initialize NVENC encoder");
 
-        OpenNvEncSession(d3d_device_ptr, &mut h_encoder);
-        let codec_cstr = CString::new(args.codec.as_str()).unwrap();
-        InitEncoder(h_encoder, args.width, args.height, codec_cstr.as_ptr());
-        InitColorConversion(d3d_device_ptr, args.width, args.height);
+    let client_info = Arc::new(Mutex::new(None::<rtsp::ClientInfo>));
 
-        let client_info = Arc::new(Mutex::new(None));
+    // RTSP server (blocking thread — owns the TCP listener)
+    std::thread::spawn({
+        let info = client_info.clone();
+        move || rtsp::start_rtsp_server(48010, info)
+    });
 
-        // Start RTSP server in background thread
-        std::thread::spawn({
-            let info = client_info.clone();
-            move || rtsp::start_rtsp_server(48010, info)
-        });
+    // Pairing HTTP/HTTPS server (tokio task)
+    tokio::spawn(crate::pairing::start_pairing_server(
+        47989,
+        local_ip.clone(),
+        server_id.to_string(),
+        server_mac.to_string(),
+    ));
 
-        // Start pairing HTTP/HTTPS server (tokio task)
-        tokio::spawn(crate::pairing::start_pairing_server(
-            47989,
-            local_ip.clone(),
-            server_id.to_string(),
-            server_mac.to_string()
-        ));
+    // mDNS — Sunshine-compatible service record
+    let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
+    let svc = ServiceInfo::new(
+        "_nvstream._tcp.local.",
+        "Nova",
+        "nova.local.",
+        local_ip.as_str(),
+        47989,
+        &[
+            ("txtvers", "1"),
+            ("port",     "47989"),
+            ("mac",      server_mac),
+            ("uniqueid", server_id),
+        ][..],
+    )
+    .unwrap();
+    let _ = mdns.register(svc);
+    println!("📡 mDNS broadcaster started for Nova");
 
-        // mDNS Discovery (Sunshine-compatible)
-        let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
-        let info = ServiceInfo::new(
-            "_nvstream._tcp.local.",
-            "Nova",
-            "nova.local.",
-            local_ip.as_str(),
-            47989,
-            &[
-                ("txtvers", "1"),
-                ("port", "47989"),
-                ("mac", server_mac),
-                ("uniqueid", server_id)
-            ][..],
-        ).unwrap();
-        let _ = mdns.register(info);
+    // Bind to the GameStream video port (47998) so RTP packets arrive from the
+    // port advertised in the RTSP SETUP response — Moonlight validates the source port.
+    let mut rtp_sender = crate::rtp::RtpSender::new(47998, "127.0.0.1", 50002)
+        .expect("Failed to bind RTP socket on 47998");
 
-        println!("📡 mDNS broadcaster started for Nova");
+    let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
+    let mut client_connected = false;
+    let mut next_frame_time  = Instant::now();
+    let mut frames_encoded   = 0u64;
 
-        // RTP Sender setup
-        let mut rtp_sender = crate::rtp::RtpSender::new(50000, "127.0.0.1", 50002)
-            .expect("Failed to create RTP sender");
+    println!("▶️  Capture loop running — press Ctrl+C to stop");
 
-        let mut next_frame_time = Instant::now();
-        let mut out_buffer = vec![0u8; 8 * 1024 * 1024];
-        let mut client_connected = false;
-
-        for _ in 0..total_frames {
-            let now = Instant::now();
-            if now < next_frame_time {
-                tokio::time::sleep(next_frame_time - now).await;
+    loop {
+        // Frame pacing: sleep until the next frame slot, but also watch for Ctrl+C.
+        let now = Instant::now();
+        if now < next_frame_time {
+            let wait = next_frame_time - now;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = signal::ctrl_c() => {
+                    println!("\n🛑 Ctrl+C — shutting down ({} frames encoded)", frames_encoded);
+                    break;
+                }
             }
-            next_frame_time += frame_interval;
+        }
+        next_frame_time += frame_interval;
 
-            // Poll the shared ClientInfo that rtsp.rs updates on SETUP/PLAY
+        // Latch Moonlight client address the moment RTSP PLAY arrives.
+        if !client_connected {
             if let Ok(guard) = client_info.lock() {
                 if let Some(client) = guard.as_ref() {
-                    // Only start streaming if Moonlight explicitly sent the PLAY command
-                    if !client_connected && client.streaming_active {
-                        println!("🎮 Moonlight client connected: {}:{} (streaming_active={})",
-                                 client.ip, client.rtp_port, client.streaming_active);
+                    if client.streaming_active {
+                        println!("🎮 Moonlight connected: {}:{}", client.ip, client.rtp_port);
+                        debug::debug_log(&format!("Client connected {}:{}", client.ip, client.rtp_port));
                         let _ = rtp_sender.update_target_if_changed(&client.ip, client.rtp_port);
                         client_connected = true;
                     }
                 }
             }
+        }
 
-            match capturer.acquire_frame() {
-                Ok((resource, _)) => {
-                    if let Ok(texture) = capturer.get_texture(&resource) {
-                        let tex_ptr = std::mem::transmute_copy(&texture);
-                        // Catch the returned packet size from C++
-                        let packet_size = EncodeFrame(h_encoder, tex_ptr, args.width, args.height, out_buffer.as_mut_ptr(), out_buffer.len() as i32);
-                        
-                        // If we have video data and Moonlight is ready...
-                        if packet_size > 0 && client_connected {
-                            let encoded_data = &out_buffer[..packet_size as usize];
-                            
-                            // Annex B Parser: Find all 0x00 0x00 0x00 0x01 start codes
-                            let mut nal_starts = Vec::new();
-                            for i in 0..encoded_data.len().saturating_sub(3) {
-                                if encoded_data[i] == 0 && encoded_data[i+1] == 0 && encoded_data[i+2] == 0 && encoded_data[i+3] == 1 {
-                                    nal_starts.push(i + 4); // Push the index just after the start code
-                                }
-                            }
+        match capturer.acquire_frame() {
+            Ok((resource, _)) => {
+                if let Ok(texture) = capturer.get_texture(&resource) {
+                    let packet_size = enc.encode_frame(&texture, &mut out_buffer);
 
-                            // Send each isolated NAL unit
-                            for (idx, &start) in nal_starts.iter().enumerate() {
-                                let end = if idx + 1 < nal_starts.len() {
-                                    nal_starts[idx + 1] - 4 // End right before the next start code
-                                } else {
-                                    encoded_data.len() // End of the whole buffer
-                                };
+                    if packet_size > 0 {
+                        frames_encoded += 1;
+                        if frames_encoded == 1 {
+                            println!("🎬 First encoded frame: {} bytes", packet_size);
+                            debug::debug_log(&format!("First frame {} bytes", packet_size));
+                        }
 
-                                let nal_slice = &encoded_data[start..end];
-                                
-                                // Clean up trailing zeros that sometimes exist before the next start code
-                                let clean_nal = match nal_slice.iter().rposition(|&x| x != 0) {
-                                    Some(last_non_zero) => &nal_slice[..=last_non_zero],
-                                    None => nal_slice, // Edge case: all zeros
-                                };
-
-                                // The last NAL unit in this frame gets the Marker Bit = true
-                                let is_last_nal = idx == nal_starts.len() - 1;
-                                rtp_sender.send_nal(clean_nal, is_last_nal);
-                            }
+                        if client_connected {
+                            let data = &out_buffer[..packet_size as usize];
+                            send_nal_units(data, &mut rtp_sender);
                         }
                     }
-                    capturer.release_frame().ok();
                 }
-                Err(e) if e.code().0 == 0x887A0027_u32 as i32 => {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-                Err(e) => {
-                    eprintln!("Capture error: {:?}", e);
-                    break;
-                }
+                capturer.release_frame().ok();
             }
-        } // End of the frame loop
-
-        CleanupEncoder(h_encoder);
+            // DXGI_ERROR_WAIT_TIMEOUT — desktop unchanged this interval, skip frame.
+            Err(e) if e.code().0 == 0x887A0027_u32 as i32 => {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(e) => {
+                eprintln!("❌ Capture error: {:?}", e);
+                debug::debug_log(&format!("Capture error: {:?}", e));
+                break;
+            }
+        }
     }
 
+    println!("✅ Capture loop done — {} frames encoded", frames_encoded);
+    // `enc` drops here → CleanupEncoder flushes + closes test.h264
     Ok(())
+}
+
+/// Parse Annex-B start codes and send each NAL unit as an RTP packet.
+fn send_nal_units(data: &[u8], sender: &mut rtp::RtpSender) {
+    let mut nal_starts: Vec<usize> = Vec::new();
+    for i in 0..data.len().saturating_sub(3) {
+        if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+            nal_starts.push(i + 4);
+        }
+    }
+    if nal_starts.is_empty() {
+        return;
+    }
+
+    for (idx, &start) in nal_starts.iter().enumerate() {
+        let end = if idx + 1 < nal_starts.len() {
+            nal_starts[idx + 1] - 4
+        } else {
+            data.len()
+        };
+
+        let nal_slice = &data[start..end];
+        let clean_nal = match nal_slice.iter().rposition(|&x| x != 0) {
+            Some(last) => &nal_slice[..=last],
+            None       => nal_slice,
+        };
+
+        let is_last = idx == nal_starts.len() - 1;
+        sender.send_nal(clean_nal, is_last);
+    }
 }

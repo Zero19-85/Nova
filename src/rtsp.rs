@@ -32,94 +32,114 @@ pub fn start_rtsp_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>>>)
 }
 
 fn handle_client(mut stream: TcpStream, client_info: Arc<Mutex<Option<ClientInfo>>>) -> std::io::Result<()> {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    let peer       = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    let client_ip  = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string());
     println!("🎥 New RTSP connection from {}", peer);
 
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request = String::new();
+    let mut reader     = BufReader::new(stream.try_clone()?);
+    let mut session_id = "12345678".to_string();
 
-    // Robust read: accumulate until we see the end of headers (\r\n\r\n)
+    // Persistent-connection loop — handles OPTIONS → DESCRIBE → SETUP → PLAY on the same TCP stream.
     loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break; // connection closed
+        let mut request = String::new();
+
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                return Ok(()); // client closed connection
+            }
+            request.push_str(&line);
+            if line.trim().is_empty() {
+                break; // end of RTSP headers
+            }
         }
-        request.push_str(&line);
-        if line.trim().is_empty() {
-            break; // end of RTSP headers
+
+        if request.trim().is_empty() {
+            return Ok(());
         }
-    }
 
-    if request.trim().is_empty() {
-        return Ok(());
-    }
+        println!("📥 RTSP from {}:\n{}", peer, request.trim());
 
-    println!("📥 RTSP raw request from {}:\n{}", peer, request.trim());
+        let cseq                    = extract_cseq(&request).unwrap_or(1);
+        let req_session             = extract_session_id(&request);
+        let (client_rtp, client_rtcp) = extract_client_ports(&request);
 
-    let cseq = extract_cseq(&request).unwrap_or(1);
-    let session_id = extract_session_id(&request).unwrap_or_else(|| "12345678".to_string());
-    let (client_rtp, client_rtcp) = extract_client_ports(&request);
-    let client_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string());
+        // Keep session_id stable across SETUP/PLAY/TEARDOWN on this connection.
+        if let Some(s) = req_session {
+            if !s.is_empty() { session_id = s; }
+        }
 
-    // Update shared client info on SETUP or PLAY (your main loop polls this)
-    if request.contains("SETUP") || request.contains("PLAY") {
-        let mut guard = client_info.lock().unwrap();
-        let mut info = guard.take().unwrap_or_default();
-        info.ip = client_ip.clone();
-        info.rtp_port = client_rtp;
-        info.rtcp_port = client_rtcp;
-        info.session_id = session_id.clone();
-        info.server_rtp_port = 47998; // standard GameStream video port (adjust if you negotiate differently)
+        if request.contains("SETUP") {
+            let mut guard = client_info.lock().unwrap();
+            let mut info  = guard.take().unwrap_or_default();
+            info.ip              = client_ip.clone();
+            info.rtp_port        = client_rtp;
+            info.rtcp_port       = client_rtcp;
+            info.session_id      = session_id.clone();
+            info.server_rtp_port = 47998;
+            *guard = Some(info);
+        }
+
         if request.contains("PLAY") {
+            let mut guard = client_info.lock().unwrap();
+            let mut info  = guard.take().unwrap_or_default();
+            info.ip              = client_ip.clone();
+            info.rtp_port        = client_rtp.max(info.rtp_port); // keep port from SETUP if PLAY has 0
             info.streaming_active = true;
-            println!("🚀 PLAY received — streaming_active = true (main loop should start RTP now)");
+            *guard = Some(info);
+            println!("🚀 PLAY received — streaming_active = true");
         }
-        *guard = Some(info);
-    }
 
-    if request.contains("TEARDOWN") {
-        let mut guard = client_info.lock().unwrap();
-        *guard = None;
-        println!("🛑 TEARDOWN — client_info cleared");
-    }
+        if request.contains("TEARDOWN") {
+            let mut guard = client_info.lock().unwrap();
+            if let Some(ref mut info) = *guard {
+                info.streaming_active = false;
+            }
+            println!("🛑 TEARDOWN — streaming stopped");
+        }
 
-    // Build response (always echo CSeq; Moonlight is strict)
-    let response = if request.contains("OPTIONS") {
-        format!(
-            "RTSP/1.0 200 OK\r\nCSeq: {}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n",
-            cseq
-        )
-    } else if request.contains("DESCRIBE") {
-        let sdp = "v=0\r\n\
+        let response = if request.contains("OPTIONS") {
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n",
+                cseq
+            )
+        } else if request.contains("DESCRIBE") {
+            // profile-level-id 42001e = Baseline 3.0, widely compatible.
+            // sprop-parameter-sets carries a placeholder SPS/PPS; Moonlight will use
+            // the in-band SPS/PPS from the first IDR (NVENC repeatSPSPPS=1).
+            let sdp = "v=0\r\n\
 o=- 0 0 IN IP4 0.0.0.0\r\n\
 s=Nova Server\r\n\
 t=0 0\r\n\
 a=control:*\r\n\
 m=video 47998 RTP/AVP 96\r\n\
 a=rtpmap:96 H264/90000\r\n\
-a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;sprop-parameter-sets=Z0LAH4sBABhpBQA=,aM4G4g==\r\n\
+a=fmtp:96 packetization-mode=1;profile-level-id=42001e\r\n\
 a=control:streamid=0\r\n";
-        format!(
-            "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Base: rtsp://0.0.0.0:48010/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
-            cseq, sdp.len(), sdp
-        )
-    } else if request.contains("SETUP") {
-        format!(
-            "RTSP/1.0 200 OK\r\nCSeq: {}\r\nTransport: RTP/AVP;unicast;client_port={}-{};server_port=47998-47999\r\nSession: {};timeout=60\r\n\r\n",
-            cseq, client_rtp, client_rtcp, session_id
-        )
-    } else if request.contains("PLAY") {
-        format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nSession: {}\r\n\r\n", cseq, session_id)
-    } else if request.contains("TEARDOWN") {
-        format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nSession: {}\r\n\r\n", cseq, session_id)
-    } else {
-        format!("RTSP/1.0 404 Not Found\r\nCSeq: {}\r\n\r\n", cseq)
-    };
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Base: rtsp://0.0.0.0:48010/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+                cseq, sdp.len(), sdp
+            )
+        } else if request.contains("SETUP") {
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nTransport: RTP/AVP;unicast;client_port={}-{};server_port=47998-47999\r\nSession: {};timeout=60\r\n\r\n",
+                cseq, client_rtp, client_rtcp, session_id
+            )
+        } else if request.contains("PLAY") {
+            format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nSession: {}\r\n\r\n", cseq, session_id)
+        } else if request.contains("TEARDOWN") {
+            stream.write_all(
+                format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nSession: {}\r\n\r\n", cseq, session_id).as_bytes()
+            )?;
+            return Ok(()); // connection intentionally closed after TEARDOWN
+        } else {
+            format!("RTSP/1.0 404 Not Found\r\nCSeq: {}\r\n\r\n", cseq)
+        };
 
-    stream.write_all(response.as_bytes())?;
-    println!("📤 RTSP response sent (CSeq={})", cseq);
-    Ok(())
+        stream.write_all(response.as_bytes())?;
+        println!("📤 RTSP → {} (CSeq={})", peer, cseq);
+    }
 }
 
 // === Helpers (robust extraction) ===
