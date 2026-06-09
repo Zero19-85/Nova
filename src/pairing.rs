@@ -15,8 +15,10 @@ use std::io::Write as IoWrite;
 
 // TLS/HTTPS Imports
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{self, ServerConfig};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::{self, ServerConfig, DigitallySignedStruct, SignatureScheme};
+use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 
 // Crypto imports
 use aes::Aes128;
@@ -279,6 +281,59 @@ fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     output
 }
 
+/// Sunshine sends CertificateRequest during TLS — Moonlight always presents its client cert in
+/// response.  Moonlight Android's TrustManager likely gates on mutual-auth being offered (it
+/// expects the GameStream protocol's mutual-TLS dance).  This verifier sends CertificateRequest
+/// but accepts any client cert, matching Sunshine's behaviour without requiring cert pinning yet.
+#[derive(Debug)]
+struct AcceptAnyClientCert;
+
+impl ClientCertVerifier for AcceptAnyClientCert {
+    fn offer_client_auth(&self) -> bool { true }
+    fn client_auth_mandatory(&self) -> bool { false }
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] { &[] }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+        ]
+    }
+}
+
 pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String, server_mac: String) {
     // ── Phase 1: Crypto ───────────────────────────────────────────────────────
     // Must run first. try_load_from_disk() may delete stale cert files and
@@ -301,7 +356,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
     // server ALPN response the HTTP/2 negotiation can silently abort the connection before
     // the cert is evaluated.
     let mut tls_config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AcceptAnyClientCert))
         .with_single_cert(vec![cert], key)
         .expect("Failed to build TLS config");
     tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
