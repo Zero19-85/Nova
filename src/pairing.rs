@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 
 // TLS/HTTPS Imports
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::{self, ServerConfig};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 // Crypto imports
@@ -28,14 +28,13 @@ use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 
 // RSA Generation Imports 
 use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType,
-            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_RSA_SHA256};
 
 type PairSessions = Arc<Mutex<HashMap<String, PairSession>>>;
 
 const PAIRED_PATH:        &str = "nova_paired.txt";
 const CERT_VERSION_PATH: &str = "nova_cert.version";
-const CERT_VERSION:       u8  = 4;
+const CERT_VERSION:       u8  = 8;
 
 /// Append a client ID to the persist file (one ID per line).
 fn persist_paired_client(client_id: &str) {
@@ -132,55 +131,52 @@ impl ServerCrypto {
     /// Load from disk if all three files exist; generate and persist otherwise.
     /// The cert identity must be stable across restarts — Moonlight pins the
     /// exact cert bytes seen during pairing.
-    pub fn new() -> Self {
+    pub fn new(host_ip: Option<&str>) -> Self {
         if let Some(crypto) = Self::try_load_from_disk() {
+            println!("🔒 Cert SHA-256: {}", sha256_fingerprint(&crypto.cert_der));
             return crypto;
         }
 
-        println!("🔑 Generating Nova RSA certificate (first run)...");
+        println!("🔑 Generating Nova RSA-2048 certificate (v{})...", CERT_VERSION);
 
         let mut rng = rand::thread_rng();
         let rsa_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate RSA key");
 
-        let pkcs8_pem = rsa_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .expect("Failed to encode RSA key to PEM");
-        let key_pair = KeyPair::from_pem(&pkcs8_pem.to_string())
-            .expect("Failed to load KeyPair into rcgen");
-
+        // PKCS#8 DER — no PEM round-trip. Same bytes go to rcgen and the TLS acceptor.
         let pkcs8_der = rsa_key.to_pkcs8_der().expect("Failed to encode RSA key to DER");
         let private_key_der = pkcs8_der.as_bytes().to_vec();
 
-        // SAN must be a valid DNS label (no spaces). "NVIDIA GameStream Server" goes
-        // only in the CN — putting it in the SAN makes OpenSSL consider the cert
-        // structurally malformed and drop the TLS handshake before VerifyNone runs.
-        let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        // Algorithm comes from KeyPair in rcgen 0.14 — there is no params.alg field.
+        let key_for_rcgen = PrivateKeyDer::Pkcs8(private_key_der.clone().into());
+        let key_pair = KeyPair::from_der_and_sign_algo(&key_for_rcgen, &PKCS_RSA_SHA256)
+            .expect("Failed to load RSA-2048 key into rcgen");
+
+        // Cert design: CN + IP SAN, no CA extensions.
+        //
+        // Sunshine's cert has no SAN and works because Moonlight's handleSslErrors()
+        // suppresses all errors when error.certificate() == m_ServerCert (the pinned
+        // plaincert DER).  Adding an IP SAN for the host's LAN address means OpenSSL
+        // hostname verification PASSES outright — no errors to suppress at all.
+        // This is strictly safer and makes us work even if m_ServerCert is null in Qt.
+        //
+        // CA:TRUE is intentionally absent — it triggers extra OpenSSL chain-validation
+        // errors with error.certificate() == null that bypass the suppression check.
+        let mut params = CertificateParams::new(Vec::<String>::new())
             .expect("Failed to create certificate params");
-        // CA:TRUE — moonlight-qt's OpenSSL adds plaincert to its trusted-CA store and
-        // runs full chain validation. A self-signed cert must be CA:TRUE to validate as
-        // its own issuer, otherwise OpenSSL returns CertificateUnknown.
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        // KeyCertSign required: modern OpenSSL strict mode rejects CA certs that lack
-        // keyCertSign in KeyUsage even when BasicConstraints: CA:TRUE is present.
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-            KeyUsagePurpose::KeyCertSign,
-        ];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "NVIDIA GameStream Server");
         params.distinguished_name = dn;
-        // Backdate by 1 year so clients whose clocks are slightly behind ours never
-        // see CertificateNotYetValid. Moonlight whitelists SelfSignedCertificate and
-        // HostNameMismatch but NOT CertificateNotYetValid — any clock skew (even
-        // sub-second) would cause an unwhitelisted error and a fatal CertificateUnknown
-        // alert. Sunshine uses the same backdate approach in crypto.cpp.
+        // LAN IP SAN so OpenSSL hostname check passes without needing error suppression.
+        if let Some(ip_str) = host_ip {
+            if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                params.subject_alt_names.push(SanType::IpAddress(ip));
+                println!("   🌐 SAN IP: {}", ip);
+            }
+        }
+        // Backdate 1 day to absorb clock skew; 20-year validity matches Sunshine.
         let now = time::OffsetDateTime::now_utc();
-        params.not_before = now - time::Duration::days(365);
-        params.not_after  = now + time::Duration::days(3650);
+        params.not_before = now - time::Duration::days(1);
+        params.not_after  = now + time::Duration::days(365 * 20);
         let cert     = params.self_signed(&key_pair).expect("Failed to self-sign certificate");
         let cert_der = cert.der().to_vec();
         let cert_pem = der_to_pem(&cert_der);
@@ -204,7 +200,7 @@ impl ServerCrypto {
 
         let fp = sha256_fingerprint(&cert_der);
         println!("✅ RSA certificate generated — SHA-256: {}", fp);
-        println!("   plaincert = hex-DER, {} bytes", cert_der.len());
+        println!("   DER size: {} bytes  |  plaincert is hex-DER (uppercase)", cert_der.len());
         Self { cert_hex, cert_sig, private_key_der, cert_der }
     }
 
@@ -288,7 +284,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
     // Must run first. try_load_from_disk() may delete stale cert files and
     // regenerate. No port is open yet — Moonlight cannot connect to a cert that
     // isn't built yet.
-    let crypto = Arc::new(ServerCrypto::new());
+    let crypto = Arc::new(ServerCrypto::new(Some(host_ip.as_str())));
     let sessions: PairSessions = Arc::new(Mutex::new(HashMap::new()));
     load_paired_clients(&sessions);
 
@@ -298,12 +294,18 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
     // bytes because both come from the same crypto.cert_der.
     let cert = CertificateDer::from(crypto.cert_der.clone());
     let key = PrivateKeyDer::Pkcs8(crypto.private_key_der.clone().into());
-    let tls_config = ServerConfig::builder()
+    // Restrict to TLS 1.2: Sunshine negotiates TLS 1.2 via OpenSSL.  Some Qt/OpenSSL
+    // Moonlight builds emit a spurious certificate_unknown fatal alert on TLS 1.3 even
+    // when cert bytes are byte-perfect.  TLS 1.2 bypasses that code path entirely.
+    // ALPN http/1.1: Qt 5.x sends ALPN ["h2","http/1.1"] by default; without an explicit
+    // server ALPN response the HTTP/2 negotiation can silently abort the connection before
+    // the cert is evaluated.
+    let mut tls_config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .expect("Failed to build TLS config");
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    println!("🔒 TLS cert identity (SHA-256): {}", sha256_fingerprint(&crypto.cert_der));
 
     // ── Phase 3: Bind listeners ───────────────────────────────────────────────
     // Ports open only after TLS is fully configured — no window where a
