@@ -81,13 +81,19 @@ A hyper-optimized, lightweight background service that runs effortlessly with ze
 
 ---
 
-## Current Status (June 1, 2026)
-**Phase 2 Complete**  
-✅ DXGI Desktop Duplication working  
-✅ Stable NVENC session on RTX 50-series via C++ shim  
-✅ Hybrid Rust + C++ architecture locked in
+## Current Status (June 10, 2026)
+**Phase 3 Complete — Phase 4 (Networking & Packetization) in progress**
+✅ DXGI Desktop Duplication + NVENC zero-copy pipeline (H.264, NV12)
+✅ HTTPS pairing server (TLS handshake, GameStream PIN pairing)
+✅ RTSP control channel (port 48010) — OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY,
+   rebuilt to mirror Sunshine's `rtsp.cpp` wire behavior
+✅ ENet reliable-UDP control stream (port 47999) via `rusty_enet`
+✅ RTP video packetizer (port 47998) — NV_VIDEO_PACKET framing, MTU slicing,
+   client address-learning, IDR/keyframe detection, force-IDR on connect
+🔜 Audio RTP packetization (WASAPI capture done, Opus + RTP send pending)
+🔜 Control-stream input event handling (gamepad/mouse/keyboard)
 
-**Next Step**: Phase 3 bitstream generation and zero-copy encoding loop.
+**Next Step**: Validate end-to-end video rendering in Moonlight, then wire up audio RTP.
 
 ---
 

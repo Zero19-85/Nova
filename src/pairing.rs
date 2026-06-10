@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use url::Url;
 use std::sync::Mutex;
 use std::io::Write as IoWrite;
+use crate::rtsp;
 
 // TLS/HTTPS Imports
 use tokio_rustls::TlsAcceptor;
@@ -279,7 +280,13 @@ fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     output
 }
 
-pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String, server_mac: String) {
+pub async fn start_pairing_server(
+    port: u16,
+    host_ip: String,
+    server_id: String,
+    server_mac: String,
+    client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
+) {
     // ── Phase 1: Crypto ───────────────────────────────────────────────────────
     // Must run first. try_load_from_disk() may delete stale cert files and
     // regenerate. No port is open yet — Moonlight cannot connect to a cert that
@@ -343,6 +350,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
     let id_https = server_id.clone();
     let mac_https = server_mac.clone();
     let pin_https = global_pin.clone();
+    let ci_https = client_info.clone();
     let tls_acceptor_clone = tls_acceptor.clone();
 
     tokio::task::spawn(async move {
@@ -355,6 +363,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
             let crypt = crypto_https.clone();
             let sess = sessions_https.clone();
             let pin = pin_https.clone();
+            let ci = ci_https.clone();
 
             tokio::task::spawn(async move {
                 println!("🔒 [47984] TLS attempt from {}", peer);
@@ -378,7 +387,8 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
                         let crypt = crypt.clone();
                         let sess = sess.clone();
                         let pin = pin.clone();
-                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, pin).await }
+                        let ci = ci.clone();
+                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, pin, ci).await }
                     }))
                     .await;
             });
@@ -395,6 +405,7 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
         let crypto_clone = crypto.clone();
         let sessions_clone = sessions.clone();
         let pin_clone = global_pin.clone();
+        let ci_clone = client_info.clone();
 
         tokio::task::spawn(async move {
             let _ = http1::Builder::new()
@@ -405,7 +416,8 @@ pub async fn start_pairing_server(port: u16, host_ip: String, server_id: String,
                     let crypt = crypto_clone.clone();
                     let sess = sessions_clone.clone();
                     let pin = pin_clone.clone();
-                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, pin).await }
+                    let ci = ci_clone.clone();
+                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, pin, ci).await }
                 }))
                 .await;
         });
@@ -421,6 +433,7 @@ async fn handle_request(
     crypto: Arc<ServerCrypto>,
     sessions: PairSessions,
     global_pin: Arc<Mutex<String>>,
+    client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let full_uri = req.uri().to_string();
     if !full_uri.contains("/serverinfo") {
@@ -442,22 +455,44 @@ async fn handle_request(
 
     match path {
         "/serverinfo" => {
-            let body = format!(r#"<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <hostname>Nova</hostname>
-    <appversion>7.1.431.0</appversion>
-    <GfeVersion>3.23.0.74</GfeVersion>
-    <uniqueid>{}</uniqueid>
-    <HttpsPort>47984</HttpsPort>
-    <ExternalPort>47989</ExternalPort>
-    <mac>00:11:22:33:44:55</mac>
-    <LocalIP>{}</LocalIP>
-    <ServerCodecModeSupport>3</ServerCodecModeSupport>
-    <PairStatus>{}</PairStatus>
-    <currentgame>0</currentgame>
-    <state>SUNSHINE_SERVER_FREE</state>
-    <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
-</root>"#, server_id, _host_ip, pair_status);
+            let (current_game, server_state) = {
+                let guard = client_info.lock().unwrap();
+                if let Some(ref info) = *guard {
+                    if info.app_id != 0 {
+                        (info.app_id, "SUNSHINE_SERVER_BUSY")
+                    } else {
+                        (0u32, "SUNSHINE_SERVER_FREE")
+                    }
+                } else {
+                    (0u32, "SUNSHINE_SERVER_FREE")
+                }
+            };
+            println!("📊 {} /serverinfo — id={} pair={} game={}", port_tag,
+                if client_id.is_empty() { "anon" } else { &client_id },
+                pair_status, current_game);
+            let body = format!(
+                concat!(
+                    r#"<?xml version="1.0" encoding="utf-8"?>"#,
+                    r#"<root status_code="200">"#,
+                    r#"<hostname>Nova</hostname>"#,
+                    r#"<appversion>7.1.431.0</appversion>"#,
+                    r#"<GfeVersion>3.23.0.74</GfeVersion>"#,
+                    r#"<uniqueid>{}</uniqueid>"#,
+                    r#"<HttpsPort>47984</HttpsPort>"#,
+                    r#"<ExternalPort>47989</ExternalPort>"#,
+                    r#"<mac>00:11:22:33:44:55</mac>"#,
+                    r#"<LocalIP>{}</LocalIP>"#,
+                    r#"<ExternalIP>{}</ExternalIP>"#,
+                    r#"<ServerCodecModeSupport>3</ServerCodecModeSupport>"#,
+                    r#"<PairStatus>{}</PairStatus>"#,
+                    r#"<currentgame>{}</currentgame>"#,
+                    r#"<state>{}</state>"#,
+                    r#"<MaxLumaPixelsH264>1869449984</MaxLumaPixelsH264>"#,
+                    r#"<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"#,
+                    r#"</root>"#,
+                ),
+                server_id, _host_ip, _host_ip, pair_status, current_game, server_state,
+            );
             Ok(make_xml_response(&body))
         }
 
@@ -601,45 +636,76 @@ async fn handle_request(
 
         "/applist" => {
             println!("📋 Moonlight requested /applist");
-            let body = r#"<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <App>
-        <AppTitle>Desktop</AppTitle>
-        <ID>1</ID>
-        <IsRunning>0</IsRunning>
-        <MaxControllersCount>4</MaxControllersCount>
-        <HDRSupported>0</HDRSupported>
-    </App>
-</root>"#;
+            let body = concat!(
+                r#"<?xml version="1.0" encoding="utf-8"?>"#,
+                r#"<root status_code="200">"#,
+                r#"<App><AppTitle>Desktop</AppTitle><ID>1</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>Steam</AppTitle><ID>2</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"</root>"#,
+            );
             Ok(make_xml_response(body))
         }
 
         "/appasset" => {
-            println!("🖼️ Moonlight requested Box Art. Serving blank PNG.");
-            let png_1x1: [u8; 67] = [
-                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-                0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-                0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-                0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-                0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-                0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-            ];
-            let mut res = Response::new(Full::new(Bytes::from(png_1x1.to_vec())));
+            let app_id = params.get("appid").map(|s| s.as_str()).unwrap_or("?");
+            println!("🖼️  Box art requested — appid={}", app_id);
+            // Bright orange so tiles are unmistakably visible on any background.
+            // no-store so Android's Glide never caches the old transparent PNG.
+            let png = make_solid_png(64, 36, 0xFF, 0x66, 0x00);
+            let len = png.len();
+            let mut res = Response::new(Full::new(Bytes::from(png)));
             *res.status_mut() = StatusCode::OK;
             res.headers_mut().insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
-            res.headers_mut().insert(header::CONTENT_LENGTH, png_1x1.len().to_string().parse().unwrap());
+            res.headers_mut().insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+            res.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
             Ok(res)
         }
 
-        "/launch" => {
-            println!("🚀 Moonlight requested /launch for app!");
-            let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><gamesession>1</gamesession></root>"#;
-            Ok(make_xml_response(body))
-        }
+        "/launch" | "/resume" => {
+            // Parse mode string "WxHxFPS" (e.g. "1920x1080x60")
+            let mode_str = params.get("mode").map(|s| s.as_str()).unwrap_or("1280x720x60");
+            let mut mode_parts = mode_str.split('x');
+            let width  = mode_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1280);
+            let height = mode_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(720);
+            let fps    = mode_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(60);
 
-        "/resume" => {
-            println!("▶️ Moonlight requested /resume");
-            let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><resume>1</resume></root>"#;
+            let rikey: [u8; 16] = {
+                let hex_str = params.get("rikey").map(|s| s.as_str()).unwrap_or("");
+                let bytes = hex::decode(hex_str).unwrap_or_else(|_| vec![0u8; 16]);
+                let mut key = [0u8; 16];
+                let n = bytes.len().min(16);
+                key[..n].copy_from_slice(&bytes[..n]);
+                key
+            };
+            // rikeyid is signed on the wire (can be negative) — parse as i32, store as u32 bits.
+            let rikeyid = params.get("rikeyid")
+                .and_then(|s| s.parse::<i32>().ok())
+                .map(|v| v as u32)
+                .unwrap_or(0);
+
+            let app_id_str = params.get("appid").map(|s| s.as_str()).unwrap_or("1");
+            let app_id_num = app_id_str.parse::<u32>().unwrap_or(1);
+            println!("🚀 {} app={} mode={}x{}@{}fps rikeyid={}", path, app_id_str, width, height, fps, rikeyid);
+
+            // Store session info — RTSP DESCRIBE reads width/height/fps from here.
+            // Setting app_id causes /serverinfo to return currentgame=N (BUSY state),
+            // which is what Moonlight checks before proceeding with the RTSP handshake.
+            if let Ok(mut guard) = client_info.lock() {
+                let mut info = guard.take().unwrap_or_default();
+                info.rikey   = rikey;
+                info.rikeyid = rikeyid;
+                info.width   = width;
+                info.height  = height;
+                info.fps     = fps;
+                info.app_id  = app_id_num;
+                *guard = Some(info);
+            }
+
+            let body = if path == "/resume" {
+                r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><resume>1</resume></root>"#
+            } else {
+                r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><gamesession>1</gamesession></root>"#
+            };
             Ok(make_xml_response(body))
         }
 
@@ -649,6 +715,82 @@ async fn handle_request(
             Ok(res)
         }
     }
+}
+
+// ── Minimal PNG encoder (no external dependency) ─────────────────────────
+// Generates a solid-color RGB PNG using DEFLATE "store" (no compression).
+// Used for box art placeholders so Moonlight app tiles are visible.
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        let mut v = crc ^ (b as u32);
+        for _ in 0..8 {
+            v = if v & 1 != 0 { 0xEDB8_8320 ^ (v >> 1) } else { v >> 1 };
+        }
+        crc = v;
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn png_adler32(data: &[u8]) -> u32 {
+    const M: u32 = 65521;
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % M;
+        b = (b + a) % M;
+    }
+    (b << 16) | a
+}
+
+fn png_write_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(tag);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&png_crc32(&crc_input).to_be_bytes());
+}
+
+fn make_solid_png(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // signature
+
+    // IHDR: 8-bit RGB, no interlace
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    png_write_chunk(&mut out, b"IHDR", &ihdr);
+
+    // Raw scanlines: filter(0) + R G B per pixel
+    let row_len = 1 + 3 * width as usize;
+    let mut raw = vec![0u8; height as usize * row_len];
+    for row in 0..height as usize {
+        // filter byte is already 0
+        for col in 0..width as usize {
+            let base = row * row_len + 1 + col * 3;
+            raw[base]     = r;
+            raw[base + 1] = g;
+            raw[base + 2] = b;
+        }
+    }
+
+    // IDAT: zlib "store" wrapper (DEFLATE BTYPE=00, no compression)
+    let adler = png_adler32(&raw);
+    let data_len = raw.len() as u16;
+    let mut idat = Vec::new();
+    idat.extend_from_slice(&[0x78, 0x01]);          // zlib CMF + FLG
+    idat.push(0x01);                                 // BFINAL=1, BTYPE=00
+    idat.extend_from_slice(&data_len.to_le_bytes()); // LEN
+    idat.extend_from_slice(&(!data_len).to_le_bytes()); // NLEN (one's complement)
+    idat.extend_from_slice(&raw);
+    idat.extend_from_slice(&adler.to_be_bytes());
+    png_write_chunk(&mut out, b"IDAT", &idat);
+
+    png_write_chunk(&mut out, b"IEND", &[]);
+    out
 }
 
 // Helpers

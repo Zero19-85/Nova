@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <fstream>
 #include <vector>
+#include <atomic>
 
 #include "nvEncodeAPI.h"
 #include "NvEncoderD3D11.h"
@@ -20,6 +21,7 @@ static ID3D11Device*        g_device    = nullptr;
 static ID3D11DeviceContext* g_context   = nullptr;
 static NvEncoderD3D11*      g_nvEncoder = nullptr;
 static std::ofstream        g_h264File;
+static std::atomic<bool>    g_force_idr{false};
 
 // ==================== INIT COLOR CONVERSION ====================
 extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height) {
@@ -197,7 +199,13 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         (ID3D11Texture2D*)encoderInputFrame->inputPtr, g_nv12Texture);
 
     std::vector<NvEncOutputFrame> vPacket;
-    g_nvEncoder->EncodeFrame(vPacket);
+    if (g_force_idr.exchange(false)) {
+        NV_ENC_PIC_PARAMS picParams = {};
+        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        g_nvEncoder->EncodeFrame(vPacket, &picParams);
+    } else {
+        g_nvEncoder->EncodeFrame(vPacket);
+    }
 
     int total_size = 0;
     for (const auto& packet : vPacket) {
@@ -214,6 +222,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     }
 
     return total_size;
+}
+
+// ==================== FORCE IDR ====================
+// Sets a flag picked up by the next EncodeFrame() call, which passes
+// NV_ENC_PIC_FLAG_FORCEIDR to NVENC. Used to guarantee the first frame sent
+// to a newly-connected Moonlight client is a keyframe (with inline SPS/PPS).
+extern "C" __declspec(dllexport) void RequestIdrFrame(void* /*encoder*/) {
+    g_force_idr.store(true);
 }
 
 // ==================== CLEANUP ====================

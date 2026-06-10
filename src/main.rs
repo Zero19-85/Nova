@@ -1,5 +1,6 @@
 mod audio;
 mod capture;
+mod control;
 mod debug;
 mod encoder;
 mod pairing;
@@ -71,12 +72,19 @@ async fn main() -> Result<()> {
         move || rtsp::start_rtsp_server(48010, info)
     });
 
+    // Control stream (ENet/reliable-UDP) on port 47999.
+    std::thread::spawn({
+        let info = client_info.clone();
+        move || control::start_control_server(47999, info)
+    });
+
     // Pairing HTTP/HTTPS server (tokio task)
     tokio::spawn(crate::pairing::start_pairing_server(
         47989,
         local_ip.clone(),
         server_id.to_string(),
         server_mac.to_string(),
+        client_info.clone(),
     ));
 
     // mDNS — Sunshine-compatible service record
@@ -100,11 +108,19 @@ async fn main() -> Result<()> {
 
     // Bind to the GameStream video port (47998) so RTP packets arrive from the
     // port advertised in the RTSP SETUP response — Moonlight validates the source port.
-    let mut rtp_sender = crate::rtp::RtpSender::new(47998, "127.0.0.1", 50002)
+    let mut rtp_sender = crate::rtp::RtpSender::new(47998)
         .expect("Failed to bind RTP socket on 47998");
+
+    // Audio port (48000) — bind so the client's address-learning "ping" packets
+    // land somewhere instead of an ICMP port-unreachable. Opus encoding and
+    // audio RTP packetization land in a later phase.
+    let audio_probe = std::net::UdpSocket::bind("0.0.0.0:48000")
+        .expect("Failed to bind audio probe socket on 48000");
+    audio_probe.set_nonblocking(true).expect("set_nonblocking on audio probe");
 
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
+    let mut video_learned    = false;
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
 
@@ -125,19 +141,37 @@ async fn main() -> Result<()> {
         }
         next_frame_time += frame_interval;
 
-        // Latch Moonlight client address the moment RTSP PLAY arrives.
+        // Latch Moonlight client info the moment RTSP PLAY arrives.
         if !client_connected {
             if let Ok(guard) = client_info.lock() {
                 if let Some(client) = guard.as_ref() {
                     if client.streaming_active {
-                        println!("🎮 Moonlight connected: {}:{}", client.ip, client.rtp_port);
-                        debug::debug_log(&format!("Client connected {}:{}", client.ip, client.rtp_port));
-                        let _ = rtp_sender.update_target_if_changed(&client.ip, client.rtp_port);
+                        println!("🎮 Moonlight connected: {} ({}x{}@{}fps)",
+                            client.ip, client.width, client.height, client.fps);
+                        debug::debug_log(&format!("Client connected {}", client.ip));
+                        rtp_sender.set_fps(client.fps.max(1));
                         client_connected = true;
+                        // Force a fresh IDR (with inline SPS/PPS) so the client's
+                        // decoder can initialize on the very first frame it sees.
+                        enc.request_idr();
                     }
                 }
             }
         }
+
+        // Learn the client's real video UDP address from its first "ping" packet
+        // (its source port is ephemeral and wasn't known at SETUP time).
+        if client_connected && !video_learned {
+            if let Some(addr) = rtp_sender.try_learn_target() {
+                println!("🎥 Learned client video address: {}", addr);
+                debug::debug_log(&format!("Video target {}", addr));
+                video_learned = true;
+            }
+        }
+
+        // Drain audio "ping" packets — no audio RTP yet.
+        let mut audio_buf = [0u8; 64];
+        let _ = audio_probe.recv_from(&mut audio_buf);
 
         match capturer.acquire_frame() {
             Ok((resource, _)) => {
@@ -151,9 +185,9 @@ async fn main() -> Result<()> {
                             debug::debug_log(&format!("First frame {} bytes", packet_size));
                         }
 
-                        if client_connected {
+                        if video_learned {
                             let data = &out_buffer[..packet_size as usize];
-                            send_nal_units(data, &mut rtp_sender);
+                            rtp_sender.send_frame(data);
                         }
                     }
                 }
@@ -176,32 +210,3 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse Annex-B start codes and send each NAL unit as an RTP packet.
-fn send_nal_units(data: &[u8], sender: &mut rtp::RtpSender) {
-    let mut nal_starts: Vec<usize> = Vec::new();
-    for i in 0..data.len().saturating_sub(3) {
-        if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
-            nal_starts.push(i + 4);
-        }
-    }
-    if nal_starts.is_empty() {
-        return;
-    }
-
-    for (idx, &start) in nal_starts.iter().enumerate() {
-        let end = if idx + 1 < nal_starts.len() {
-            nal_starts[idx + 1] - 4
-        } else {
-            data.len()
-        };
-
-        let nal_slice = &data[start..end];
-        let clean_nal = match nal_slice.iter().rposition(|&x| x != 0) {
-            Some(last) => &nal_slice[..=last],
-            None       => nal_slice,
-        };
-
-        let is_last = idx == nal_starts.len() - 1;
-        sender.send_nal(clean_nal, is_last);
-    }
-}

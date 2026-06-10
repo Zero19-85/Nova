@@ -18,6 +18,7 @@ rand = "0.8"
 cipher = "0.4"
 hex = "0.4"
 url = "2"
+rusty_enet = "0.4"
 clap = { version = "4", features = ["derive"] }
 
 # Windows DXGI + NVENC

@@ -21,6 +21,7 @@ extern "C" {
         max_size: i32,
     ) -> i32;
     fn CleanupEncoder(encoder: *mut c_void) -> i32;
+    fn RequestIdrFrame(encoder: *mut c_void);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +139,13 @@ impl Encoder {
     /// Raw device pointer — needed by InitColorConversion and passed back to C++.
     pub fn device_ptr(&self) -> *mut c_void {
         self.device_ptr
+    }
+
+    /// Force the next encoded frame to be an IDR keyframe with inline SPS/PPS.
+    /// Call this when a Moonlight client connects so it doesn't have to wait
+    /// up to `idrPeriod` frames for a decodable frame.
+    pub fn request_idr(&self) {
+        unsafe { RequestIdrFrame(self.handle) };
     }
 }
 
