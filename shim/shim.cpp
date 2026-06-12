@@ -86,6 +86,31 @@ static int  g_cursorX       = 0;
 static int  g_cursorY       = 0;
 static bool g_cursorVisible = false;
 
+// Bumped by UpdateCursorShape() on every shape upload — used to detect a
+// cursor shape change (e.g. arrow -> text-select caret) for IDR purposes.
+static uint32_t g_cursorShapeGeneration = 0;
+
+// ==================== CURSOR-MOTION IDR ====================
+// P-frame motion compensation leaves faint residual copies of the composited
+// cursor at its old on-screen positions for several frames ("ghost trails")
+// — they only fully disappear at an IDR. Forcing an IDR whenever the cursor
+// moves/changes "significantly" clears them almost immediately. A cooldown
+// caps how often this can fire so continuous mouse movement doesn't turn
+// into an IDR storm: at 10 frames (~6 IDR/s @ 60fps) the rate controller
+// couldn't recover its VBV budget between IDRs and crept QP up over the
+// session, eventually making even the "IDR" frames too lossy to fully clear
+// ghosts ("looks perfect, then returns after a while"). 30 frames (~2 IDR/s)
+// + the wider VBV above gives the controller room to recover.
+static const int kCursorIdrMoveThreshold  = 2;  // pixels
+static const int kCursorIdrCooldownFrames = 30; // ~2 forced IDR/s @ 60fps
+static int      g_lastIdrCursorX          = -1000000;
+static int      g_lastIdrCursorY          = -1000000;
+static bool     g_lastIdrCursorVisible    = false;
+static uint32_t g_lastIdrShapeGeneration  = 0;
+static int      g_framesSinceCursorIdr    = kCursorIdrCooldownFrames;
+
+static inline int iabs(int v) { return v < 0 ? -v : v; }
+
 // ==================== CURSOR COMPOSITING HELPERS ====================
 
 // Compiles the cursor VS/PS, blend state and sampler once. Called from
@@ -319,6 +344,7 @@ extern "C" __declspec(dllexport) int UpdateCursorShape(
     if (g_cursorTex) { g_cursorTex->Release(); g_cursorTex = nullptr; }
     g_cursorTexW = 0;
     g_cursorTexH = 0;
+    g_cursorShapeGeneration++;
 
     if (img.empty() || out_w == 0 || out_h == 0) {
         // Unsupported/empty shape — cursor stays hidden until the next shape update.
@@ -494,14 +520,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
         initializeParams.frameRateDen = 1;
         initializeParams.enablePTD    = 1; // driver picks P/I picture types
 
-        // No periodic GOP-based IDR — replaced by continuous intra refresh
-        // (see intraRefreshPeriod/intraRefreshCnt below), which self-heals
-        // every macroblock roughly once per second WITHOUT the bitrate spike
-        // of a full IDR frame. NVENC requires gopLength ==
-        // NVENC_INFINITE_GOPLENGTH for intraRefreshPeriod to take effect.
-        // frameIntervalP = 1 (no B-frames; required when gopLength is
-        // infinite, and B-frames add reorder latency anyway).
-        encodeConfig.gopLength       = NVENC_INFINITE_GOPLENGTH;
+        // GOP: IDR every 1 s, no B-frames (B-frames add reorder latency).
+        // Was 2 s — halved so any transient reference-frame corruption
+        // (packet loss, FEC shortfall) self-heals roughly twice as fast.
+        encodeConfig.gopLength       = fps * 1;
         encodeConfig.frameIntervalP  = 1;
 
         // VBR with a target average well below the cap, but the VBV/HRD
@@ -557,32 +579,14 @@ extern "C" __declspec(dllexport) int InitEncoder(
         vuiParams.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         vuiParams.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 
-        // Continuous intra refresh: every macroblock gets re-coded as intra
-        // roughly once every `intraRefreshPeriod` frames, spread evenly over
-        // `intraRefreshCnt` of those frames (must be < intraRefreshPeriod).
-        // fps/(fps-1) -> ~1s cycle, ~continuous coverage with one frame of
-        // slack. This self-heals cursor-ghost/prediction-residual artifacts
-        // everywhere on screen within ~1s, WITHOUT the bitrate spike of a
-        // full IDR — replaces the earlier per-cursor-movement forced-IDR
-        // approach, which caused the rate controller to ratchet QP up over
-        // time under repeated IDR overshoot. idrPeriod = infinite means no
-        // automatic IDR at all now; connect-time (RequestIdrFrame on first
-        // learn) and Moonlight's on-demand control-stream IDR requests
-        // (request_idr_global) remain via the g_force_idr/FORCEIDR path.
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
-            encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = NVENC_INFINITE_GOPLENGTH;
-            encodeConfig.encodeCodecConfig.h264Config.enableIntraRefresh  = 1;
-            encodeConfig.encodeCodecConfig.h264Config.intraRefreshPeriod  = (uint32_t)fps;
-            encodeConfig.encodeCodecConfig.h264Config.intraRefreshCnt     = (uint32_t)fps - 1;
+            encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = fps * 1;
             encodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
             encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 0;
             encodeConfig.encodeCodecConfig.h264Config.h264VUIParameters = vuiParams;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
-            encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = NVENC_INFINITE_GOPLENGTH;
-            encodeConfig.encodeCodecConfig.hevcConfig.enableIntraRefresh  = 1;
-            encodeConfig.encodeCodecConfig.hevcConfig.intraRefreshPeriod  = (uint32_t)fps;
-            encodeConfig.encodeCodecConfig.hevcConfig.intraRefreshCnt     = (uint32_t)fps - 1;
+            encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = fps * 1;
             encodeConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
             encodeConfig.encodeCodecConfig.hevcConfig.enableFillerDataInsertion = 0;
@@ -648,6 +652,26 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // surface, since the DXGI duplication texture may not support that bind).
     if (g_cursorVisible && g_cursorSRV && g_cursorTexW > 0 && g_cursorTexH > 0) {
         DrawCursorOverlay();
+    }
+
+    // Cursor-motion IDR: see kCursorIdrMoveThreshold/kCursorIdrCooldownFrames
+    // above. Detect a "significant" cursor change since the last
+    // cursor-triggered IDR and force one (subject to the cooldown) so any
+    // residual ghost from old cursor positions/shapes is fully cleared.
+    g_framesSinceCursorIdr++;
+    bool cursorChanged =
+        (g_cursorVisible != g_lastIdrCursorVisible) ||
+        (g_cursorShapeGeneration != g_lastIdrShapeGeneration) ||
+        (g_cursorVisible &&
+         (iabs(g_cursorX - g_lastIdrCursorX) >= kCursorIdrMoveThreshold ||
+          iabs(g_cursorY - g_lastIdrCursorY) >= kCursorIdrMoveThreshold));
+    if (cursorChanged && g_framesSinceCursorIdr >= kCursorIdrCooldownFrames) {
+        g_force_idr.store(true);
+        g_lastIdrCursorX         = g_cursorX;
+        g_lastIdrCursorY         = g_cursorY;
+        g_lastIdrCursorVisible   = g_cursorVisible;
+        g_lastIdrShapeGeneration = g_cursorShapeGeneration;
+        g_framesSinceCursorIdr   = 0;
     }
 
     // BGRA → NV12 via D3D11 Video Processor
