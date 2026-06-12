@@ -72,4 +72,23 @@ impl DesktopCapturer {
     pub fn get_texture(&self, resource: &IDXGIResource) -> Result<ID3D11Texture2D> {
         resource.cast()
     }
+
+    /// Fetches the new cursor shape after `acquire_frame()` reports
+    /// `frame_info.PointerShapeBufferSize > 0`. Returns the raw shape bytes
+    /// (MONOCHROME AND/XOR masks, or a BGRA bitmap for COLOR/MASKED_COLOR)
+    /// plus the accompanying `DXGI_OUTDUPL_POINTER_SHAPE_INFO`.
+    pub fn get_pointer_shape(&self, buffer_size: u32) -> Result<(Vec<u8>, DXGI_OUTDUPL_POINTER_SHAPE_INFO)> {
+        unsafe {
+            let mut buffer = vec![0u8; buffer_size as usize];
+            let mut required_size = 0u32;
+            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            self.dupl.GetFramePointerShape(
+                buffer_size,
+                buffer.as_mut_ptr() as *mut _,
+                &mut required_size,
+                &mut shape_info,
+            )?;
+            Ok((buffer, shape_info))
+        }
+    }
 }

@@ -22,6 +22,32 @@ extern "C" {
     ) -> i32;
     fn CleanupEncoder(encoder: *mut c_void) -> i32;
     fn RequestIdrFrame(encoder: *mut c_void);
+
+    fn UpdateCursorShape(
+        data: *const u8,
+        data_len: i32,
+        shape_type: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> i32;
+    fn UpdateCursorPosition(x: i32, y: i32, visible: i32);
+}
+
+/// Upload a new cursor shape (DXGI MONOCHROME/COLOR/MASKED_COLOR raw shape
+/// data) — call only when `DXGI_OUTDUPL_FRAME_INFO.PointerShapeBufferSize > 0`.
+pub fn update_cursor_shape(data: &[u8], shape_type: u32, width: u32, height: u32, pitch: u32) {
+    unsafe {
+        UpdateCursorShape(data.as_ptr(), data.len() as i32, shape_type, width, height, pitch);
+    }
+}
+
+/// Update the cursor's on-screen position/visibility — call every frame from
+/// `DXGI_OUTDUPL_FRAME_INFO.PointerPosition`.
+pub fn update_cursor_position(x: i32, y: i32, visible: bool) {
+    unsafe {
+        UpdateCursorPosition(x, y, if visible { 1 } else { 0 });
+    }
 }
 
 /// Thread-safe IDR trigger callable from any thread (e.g. the control-stream

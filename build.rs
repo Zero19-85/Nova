@@ -26,6 +26,10 @@ fn main() {
     // ole32: CoCreateInstance, CoInitializeEx, CoTaskMemFree (WASAPI shim)
     println!("cargo:rustc-link-lib=ole32");
 
+    // d3dcompiler: D3DCompile, used at runtime to build the cursor-overlay
+    // shaders. d3dcompiler_47.dll ships with Windows itself — no redist needed.
+    println!("cargo:rustc-link-lib=d3dcompiler");
+
     // Tell Cargo to re-compile automatically if any of these files change
     println!("cargo:rerun-if-changed=shim/audio_shim.cpp");
     println!("cargo:rerun-if-changed=shim/shim.cpp");

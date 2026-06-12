@@ -279,7 +279,26 @@ async fn main() -> Result<()> {
         }
 
         match capturer.acquire_frame() {
-            Ok((resource, _)) => {
+            Ok((resource, frame_info)) => {
+                // Cursor position/visibility is updated every frame; the
+                // shape is only re-uploaded when DXGI reports it changed.
+                encoder::update_cursor_position(
+                    frame_info.PointerPosition.Position.x,
+                    frame_info.PointerPosition.Position.y,
+                    frame_info.PointerPosition.Visible.as_bool(),
+                );
+                if frame_info.PointerShapeBufferSize > 0 {
+                    if let Ok((shape_data, shape_info)) = capturer.get_pointer_shape(frame_info.PointerShapeBufferSize) {
+                        encoder::update_cursor_shape(
+                            &shape_data,
+                            shape_info.Type,
+                            shape_info.Width,
+                            shape_info.Height,
+                            shape_info.Pitch,
+                        );
+                    }
+                }
+
                 if let Ok(texture) = capturer.get_texture(&resource) {
                     // No periodic forced IDR here: FEC handles packet loss,
                     // Moonlight requests IDRs via the control stream when it

@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <stdio.h>
 #include <vector>
 #include <atomic>
@@ -20,6 +21,330 @@ static ID3D11Device*        g_device    = nullptr;
 static ID3D11DeviceContext* g_context   = nullptr;
 static NvEncoderD3D11*      g_nvEncoder = nullptr;
 static std::atomic<bool>    g_force_idr{false};
+
+// ==================== CURSOR COMPOSITING GLOBALS ====================
+// DXGI_OUTDUPL_POINTER_SHAPE_TYPE values (avoids pulling in dxgi1_2.h).
+static const uint32_t kPointerShapeMonochrome  = 1;
+static const uint32_t kPointerShapeColor       = 2;
+static const uint32_t kPointerShapeMaskedColor = 4;
+
+// Tiny fullscreen-triangle shader pair: the vertex shader emits a triangle
+// that covers the whole viewport, and the pixel shader just samples the
+// cursor texture. The cursor is positioned/sized purely via RSSetViewports
+// (Sunshine's approach) — no per-vertex transform math needed.
+static const char* kCursorShaderSrc = R"(
+struct VS_OUT {
+    float4 pos : SV_POSITION;
+    float2 tex : TEXCOORD0;
+};
+
+VS_OUT main_vs(uint vid : SV_VertexID) {
+    VS_OUT o;
+    float2 t;
+    if (vid == 0)      { o.pos = float4(-1, -1, 0, 1); t = float2(0, 1); }
+    else if (vid == 1) { o.pos = float4(-1,  3, 0, 1); t = float2(0, -1); }
+    else               { o.pos = float4( 3, -1, 0, 1); t = float2(2, 1); }
+    o.tex = t;
+    return o;
+}
+
+Texture2D cursorTex : register(t0);
+SamplerState cursorSamp : register(s0);
+
+float4 main_ps(VS_OUT input) : SV_TARGET {
+    return cursorTex.Sample(cursorSamp, input.tex);
+}
+)";
+
+static ID3D11VertexShader*       g_cursorVS      = nullptr;
+static ID3D11PixelShader*        g_cursorPS      = nullptr;
+static ID3D11BlendState*         g_cursorBlend   = nullptr;
+static ID3D11SamplerState*       g_cursorSampler = nullptr;
+
+// Current cursor shape, uploaded as a small BGRA texture whenever DXGI
+// reports a shape change (PointerShapeBufferSize > 0).
+static ID3D11Texture2D*          g_cursorTex     = nullptr;
+static ID3D11ShaderResourceView* g_cursorSRV     = nullptr;
+static UINT                      g_cursorTexW    = 0;
+static UINT                      g_cursorTexH    = 0;
+
+// Intermediate render-targetable copy of the captured frame — the DXGI
+// duplication texture isn't guaranteed to support D3D11_BIND_RENDER_TARGET,
+// so the cursor is drawn onto this copy before NV12 conversion.
+static ID3D11Texture2D*          g_compositeTex  = nullptr;
+static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
+
+// Updated every frame from DXGI_OUTDUPL_FRAME_INFO.PointerPosition. Only
+// touched from the single capture/encode thread, so no locking needed.
+static int  g_cursorX       = 0;
+static int  g_cursorY       = 0;
+static bool g_cursorVisible = false;
+
+// ==================== CURSOR COMPOSITING HELPERS ====================
+
+// Compiles the cursor VS/PS, blend state and sampler once. Called from
+// InitColorConversion since that's where we first have a device.
+static bool InitCursorPipeline(ID3D11Device* device) {
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* errBlob = nullptr;
+
+    HRESULT hr = D3DCompile(kCursorShaderSrc, strlen(kCursorShaderSrc), nullptr, nullptr, nullptr,
+                             "main_vs", "vs_5_0", 0, 0, &vsBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob) {
+            printf("❌ Cursor VS compile error: %s\n", (char*)errBlob->GetBufferPointer());
+            errBlob->Release();
+        }
+        return false;
+    }
+    hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_cursorVS);
+    vsBlob->Release();
+    if (FAILED(hr)) return false;
+
+    hr = D3DCompile(kCursorShaderSrc, strlen(kCursorShaderSrc), nullptr, nullptr, nullptr,
+                     "main_ps", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob) {
+            printf("❌ Cursor PS compile error: %s\n", (char*)errBlob->GetBufferPointer());
+            errBlob->Release();
+        }
+        return false;
+    }
+    hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_cursorPS);
+    psBlob->Release();
+    if (FAILED(hr)) return false;
+
+    // Standard alpha blending (Sunshine's blend_alpha): out.rgb = src.rgb*srcA + dst.rgb*(1-srcA).
+    D3D11_BLEND_DESC bdesc = {};
+    D3D11_RENDER_TARGET_BLEND_DESC& rt = bdesc.RenderTarget[0];
+    rt.BlendEnable           = TRUE;
+    rt.SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    rt.DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    rt.BlendOp               = D3D11_BLEND_OP_ADD;
+    rt.SrcBlendAlpha         = D3D11_BLEND_ZERO;
+    rt.DestBlendAlpha        = D3D11_BLEND_ZERO;
+    rt.BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = device->CreateBlendState(&bdesc, &g_cursorBlend);
+    if (FAILED(hr)) return false;
+
+    D3D11_SAMPLER_DESC sdesc = {};
+    sdesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sdesc.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sdesc.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sdesc.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sdesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sdesc.MaxLOD         = D3D11_FLOAT32_MAX;
+    hr = device->CreateSamplerState(&sdesc, &g_cursorSampler);
+    if (FAILED(hr)) return false;
+
+    printf("✅ Cursor compositing pipeline initialized\n");
+    return true;
+}
+
+// Ports Sunshine's make_cursor_alpha_image (display_vram.cpp) for the
+// MONOCHROME / COLOR / MASKED_COLOR pointer shape types. The XOR-blended
+// "inverse of screen" pass (make_cursor_xor_image) is intentionally omitted
+// for this first working version — affected pixels are simply left
+// transparent, which only affects rare invert-style cursors.
+static std::vector<uint8_t> build_cursor_alpha_image(
+    const uint8_t* data, size_t data_len,
+    uint32_t type, uint32_t width, uint32_t height, uint32_t pitch,
+    uint32_t& out_width, uint32_t& out_height)
+{
+    constexpr uint32_t black       = 0xFF000000;
+    constexpr uint32_t white       = 0xFFFFFFFF;
+    constexpr uint32_t transparent = 0x00000000;
+
+    out_width  = 0;
+    out_height = 0;
+
+    if (type == kPointerShapeColor || type == kPointerShapeMaskedColor) {
+        if (pitch == 0 || width == 0 || height == 0) return {};
+        if ((size_t)pitch * height > data_len) return {};
+
+        std::vector<uint8_t> img((size_t)width * height * 4);
+        for (uint32_t y = 0; y < height; ++y) {
+            memcpy(img.data() + (size_t)y * width * 4, data + (size_t)y * pitch, (size_t)width * 4);
+        }
+
+        if (type == kPointerShapeMaskedColor) {
+            uint32_t* pixels = (uint32_t*)img.data();
+            for (size_t i = 0; i < (size_t)width * height; ++i) {
+                uint8_t alpha = (uint8_t)((pixels[i] >> 24) & 0xFF);
+                if (alpha == 0xFF) {
+                    // XOR-blended pixel (inverse of screen) — not implemented, leave transparent.
+                    pixels[i] = transparent;
+                } else if (alpha == 0x00) {
+                    // Fully opaque in the alpha-blended image.
+                    pixels[i] |= 0xFF000000;
+                }
+            }
+        }
+
+        out_width  = width;
+        out_height = height;
+        return img;
+    }
+
+    if (type == kPointerShapeMonochrome) {
+        if (pitch == 0 || width == 0 || height < 2) return {};
+        uint32_t out_h = height / 2;
+        size_t bytes = (size_t)pitch * out_h;
+        if (bytes * 2 > data_len) return {};
+
+        std::vector<uint8_t> img((size_t)width * out_h * 4);
+        uint32_t* pixel_data = (uint32_t*)img.data();
+        const uint8_t* and_mask = data;
+        const uint8_t* xor_mask = data + bytes;
+
+        size_t total_pixels = (size_t)width * out_h;
+        size_t pixel_index = 0;
+        for (size_t b = 0; b < bytes && pixel_index < total_pixels; ++b) {
+            uint8_t and_byte = and_mask[b];
+            uint8_t xor_byte = xor_mask[b];
+            for (int bit = 7; bit >= 0 && pixel_index < total_pixels; --bit) {
+                uint32_t mask = 1u << bit;
+                int color_type = ((and_byte & mask) ? 1 : 0) + ((xor_byte & mask) ? 2 : 0);
+                uint32_t pixel;
+                switch (color_type) {
+                    case 0:  pixel = black;       break; // opaque black
+                    case 2:  pixel = white;       break; // opaque white
+                    default: pixel = transparent; break; // screen color / inverse (XOR-only)
+                }
+                pixel_data[pixel_index++] = pixel;
+            }
+        }
+
+        out_width  = width;
+        out_height = out_h;
+        return img;
+    }
+
+    return {};
+}
+
+// Lazily creates a render-target+shader-resource copy of the captured frame,
+// sized to match. Created once and reused for the lifetime of the session
+// (capture resolution doesn't change mid-stream).
+static bool EnsureCompositeTexture(int width, int height) {
+    if (g_compositeTex) return true;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width            = width;
+    desc.Height           = height;
+    desc.MipLevels        = 1;
+    desc.ArraySize        = 1;
+    desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage            = D3D11_USAGE_DEFAULT;
+    desc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    HRESULT hr = g_device->CreateTexture2D(&desc, nullptr, &g_compositeTex);
+    if (FAILED(hr)) return false;
+
+    hr = g_device->CreateRenderTargetView(g_compositeTex, nullptr, &g_compositeRTV);
+    if (FAILED(hr)) {
+        g_compositeTex->Release();
+        g_compositeTex = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Draws the current cursor texture onto g_compositeTex at (g_cursorX, g_cursorY),
+// alpha-blended. The viewport — not a per-vertex transform — positions and
+// sizes the draw, matching Sunshine's blend_cursor approach.
+static void DrawCursorOverlay() {
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->IASetInputLayout(nullptr);
+    g_context->VSSetShader(g_cursorVS, nullptr, 0);
+    g_context->PSSetShader(g_cursorPS, nullptr, 0);
+    g_context->PSSetShaderResources(0, 1, &g_cursorSRV);
+    g_context->PSSetSamplers(0, 1, &g_cursorSampler);
+
+    float blendFactor[4] = {0, 0, 0, 0};
+    g_context->OMSetBlendState(g_cursorBlend, blendFactor, 0xFFFFFFFF);
+    g_context->OMSetRenderTargets(1, &g_compositeRTV, nullptr);
+
+    D3D11_VIEWPORT vp = {};
+    vp.TopLeftX = (float)g_cursorX;
+    vp.TopLeftY = (float)g_cursorY;
+    vp.Width    = (float)g_cursorTexW;
+    vp.Height   = (float)g_cursorTexH;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    g_context->RSSetViewports(1, &vp);
+
+    g_context->Draw(3, 0);
+
+    // Unbind so the Video Processor (and next frame's draw) start clean.
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    g_context->PSSetShaderResources(0, 1, &nullSRV);
+    ID3D11RenderTargetView* nullRTV = nullptr;
+    g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
+    g_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_context->RSSetViewports(0, nullptr);
+}
+
+// ==================== CURSOR SHAPE / POSITION UPDATES ====================
+// Called from the capture loop when DXGI_OUTDUPL_FRAME_INFO.PointerShapeBufferSize > 0
+// — i.e. only when the cursor's shape actually changed, not every frame.
+extern "C" __declspec(dllexport) int UpdateCursorShape(
+    const uint8_t* data, int data_len,
+    uint32_t type, uint32_t width, uint32_t height, uint32_t pitch)
+{
+    if (!g_device) return -1;
+
+    uint32_t out_w = 0, out_h = 0;
+    std::vector<uint8_t> img = build_cursor_alpha_image(data, (size_t)data_len, type, width, height, pitch, out_w, out_h);
+
+    if (g_cursorSRV) { g_cursorSRV->Release(); g_cursorSRV = nullptr; }
+    if (g_cursorTex) { g_cursorTex->Release(); g_cursorTex = nullptr; }
+    g_cursorTexW = 0;
+    g_cursorTexH = 0;
+
+    if (img.empty() || out_w == 0 || out_h == 0) {
+        // Unsupported/empty shape — cursor stays hidden until the next shape update.
+        return 0;
+    }
+
+    D3D11_TEXTURE2D_DESC tdesc = {};
+    tdesc.Width            = out_w;
+    tdesc.Height           = out_h;
+    tdesc.MipLevels        = 1;
+    tdesc.ArraySize        = 1;
+    tdesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tdesc.SampleDesc.Count = 1;
+    tdesc.Usage            = D3D11_USAGE_IMMUTABLE;
+    tdesc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA sub = {};
+    sub.pSysMem     = img.data();
+    sub.SysMemPitch = out_w * 4;
+
+    HRESULT hr = g_device->CreateTexture2D(&tdesc, &sub, &g_cursorTex);
+    if (FAILED(hr)) return -2;
+
+    hr = g_device->CreateShaderResourceView(g_cursorTex, nullptr, &g_cursorSRV);
+    if (FAILED(hr)) {
+        g_cursorTex->Release();
+        g_cursorTex = nullptr;
+        return -3;
+    }
+
+    g_cursorTexW = out_w;
+    g_cursorTexH = out_h;
+    return 0;
+}
+
+// Called every frame with DXGI_OUTDUPL_FRAME_INFO.PointerPosition.
+extern "C" __declspec(dllexport) void UpdateCursorPosition(int x, int y, int visible) {
+    g_cursorX       = x;
+    g_cursorY       = y;
+    g_cursorVisible = visible != 0;
+}
 
 // ==================== INIT COLOR CONVERSION ====================
 extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height) {
@@ -98,6 +423,11 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     g_videoContext->VideoProcessorSetOutputColorSpace(g_vp, &outputColorSpace);
 
     printf("✅ Video Processor (BGRA → NV12) initialized\n");
+
+    if (!InitCursorPipeline(device)) {
+        printf("⚠️  Cursor compositing pipeline failed to initialize — stream will have no cursor\n");
+    }
+
     return 0;
 }
 
@@ -240,6 +570,20 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     if (!g_nvEncoder || !d3d11_texture) return -1;
 
     ID3D11Texture2D* dxgiFrame = (ID3D11Texture2D*)d3d11_texture;
+    ID3D11Texture2D* vpSourceTexture = dxgiFrame;
+
+    // Composite the cursor onto a copy of the captured frame before NV12
+    // conversion (Sunshine's approach: blend into an intermediate surface,
+    // since the DXGI duplication texture may not be render-targetable).
+    if (g_cursorVisible && g_cursorSRV && g_cursorTexW > 0 && g_cursorTexH > 0) {
+        D3D11_TEXTURE2D_DESC frameDesc = {};
+        dxgiFrame->GetDesc(&frameDesc);
+        if (EnsureCompositeTexture((int)frameDesc.Width, (int)frameDesc.Height)) {
+            g_context->CopyResource(g_compositeTex, dxgiFrame);
+            DrawCursorOverlay();
+            vpSourceTexture = g_compositeTex;
+        }
+    }
 
     // BGRA → NV12 via D3D11 Video Processor
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
@@ -247,7 +591,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
 
     ID3D11VideoProcessorInputView* vpInputView = nullptr;
     HRESULT hr = g_videoDevice->CreateVideoProcessorInputView(
-        dxgiFrame, g_vpEnum, &ivDesc, &vpInputView);
+        vpSourceTexture, g_vpEnum, &ivDesc, &vpInputView);
 
     if (SUCCEEDED(hr)) {
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
@@ -295,6 +639,17 @@ extern "C" __declspec(dllexport) void RequestIdrFrame(void* /*encoder*/) {
 
 // ==================== CLEANUP ====================
 extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
+    if (g_cursorSRV)     { g_cursorSRV->Release();     g_cursorSRV     = nullptr; }
+    if (g_cursorTex)     { g_cursorTex->Release();     g_cursorTex     = nullptr; }
+    if (g_compositeRTV)  { g_compositeRTV->Release();  g_compositeRTV  = nullptr; }
+    if (g_compositeTex)  { g_compositeTex->Release();  g_compositeTex  = nullptr; }
+    if (g_cursorSampler) { g_cursorSampler->Release();  g_cursorSampler = nullptr; }
+    if (g_cursorBlend)   { g_cursorBlend->Release();   g_cursorBlend   = nullptr; }
+    if (g_cursorPS)      { g_cursorPS->Release();      g_cursorPS      = nullptr; }
+    if (g_cursorVS)      { g_cursorVS->Release();      g_cursorVS      = nullptr; }
+    g_cursorTexW = 0;
+    g_cursorTexH = 0;
+
     if (g_vpOutView)    { g_vpOutView->Release();    g_vpOutView    = nullptr; }
     if (g_nv12Texture)  { g_nv12Texture->Release();  g_nv12Texture  = nullptr; }
     if (g_vp)           { g_vp->Release();           g_vp           = nullptr; }
