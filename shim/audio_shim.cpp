@@ -174,15 +174,25 @@ int GetDefaultAudioDeviceId(WCHAR* out_id, int cch)
 // device with no physical output). Matches the endpoint friendly name, e.g.
 // "Speakers (Steam Streaming Speakers)". Returns 0 + id on success, 1 if no
 // virtual sink is present, <0 on error.
-extern "C" __declspec(dllexport)
-int FindVirtualAudioSink(WCHAR* out_id, int cch)
-{
-    static const WCHAR* kVirtualSinkNames[] = {
-        L"Steam Streaming Speakers",   // installed by Steam; Sunshine's default
-        L"CABLE Input",                // VB-Audio Virtual Cable
-        L"Virtual Audio Cable",
-    };
+static const WCHAR* kVirtualSinkNames[] = {
+    L"Steam Streaming Speakers",   // installed by Steam; Sunshine's default
+    L"CABLE Input",                // VB-Audio Virtual Cable
+    L"Virtual Audio Cable",
+};
 
+static bool is_virtual_sink_name(const WCHAR* name)
+{
+    for (const WCHAR* match : kVirtualSinkNames) {
+        if (wcsstr(name, match)) return true;
+    }
+    return false;
+}
+
+// Enumerates active render endpoints, returning the id of the first one for
+// which `want_virtual` matches `is_virtual_sink_name(friendly_name)`.
+// Returns 0 + id on success, 1 if none matched, <0 on error.
+static int find_render_device(WCHAR* out_id, int cch, bool want_virtual)
+{
     ComScope com;
     if (FAILED(com.hr)) return -1;
 
@@ -207,19 +217,17 @@ int FindVirtualAudioSink(WCHAR* out_id, int cch)
             PROPVARIANT name;
             PropVariantInit(&name);
             if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) &&
-                name.vt == VT_LPWSTR && name.pwszVal) {
-                for (const WCHAR* match : kVirtualSinkNames) {
-                    if (wcsstr(name.pwszVal, match)) {
-                        LPWSTR id = nullptr;
-                        if (SUCCEEDED(dev->GetId(&id)) && id && (int)wcslen(id) < cch) {
-                            wcscpy_s(out_id, cch, id);
-                            printf("\xF0\x9F\x8E\xA7 Virtual audio sink: %ls\n", name.pwszVal);
-                            ret = 0;
-                        }
-                        if (id) CoTaskMemFree(id);
-                        break;
-                    }
+                name.vt == VT_LPWSTR && name.pwszVal &&
+                is_virtual_sink_name(name.pwszVal) == want_virtual) {
+                LPWSTR id = nullptr;
+                if (SUCCEEDED(dev->GetId(&id)) && id && (int)wcslen(id) < cch) {
+                    wcscpy_s(out_id, cch, id);
+                    printf(want_virtual ? "\xF0\x9F\x8E\xA7 Virtual audio sink: %ls\n"
+                                         : "\xF0\x9F\x94\x8A Real audio device: %ls\n",
+                           name.pwszVal);
+                    ret = 0;
                 }
+                if (id) CoTaskMemFree(id);
             }
             PropVariantClear(&name);
             props->Release();
@@ -230,6 +238,22 @@ int FindVirtualAudioSink(WCHAR* out_id, int cch)
     if (coll) coll->Release();
     if (en)   en->Release();
     return ret;
+}
+
+extern "C" __declspec(dllexport)
+int FindVirtualAudioSink(WCHAR* out_id, int cch)
+{
+    return find_render_device(out_id, cch, true);
+}
+
+// Finds the first ACTIVE render endpoint that is NOT a known virtual sink —
+// used for crash recovery: if Nova exited without restoring the default
+// device (killed/closed rather than a clean shutdown), startup can detect
+// the default is still the virtual sink and switch back to a real output.
+extern "C" __declspec(dllexport)
+int FindRealAudioDevice(WCHAR* out_id, int cch)
+{
+    return find_render_device(out_id, cch, false);
 }
 
 // Makes device_id the default render endpoint for all roles (console,

@@ -43,6 +43,10 @@ fn get_local_ip() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     debug::init_debug_logger();
+    // If a previous run was killed/closed without restoring the default audio
+    // device, fix that up before anything else (host would otherwise stay
+    // silent with no client connected).
+    audio::recover_stuck_sink();
     let args = Args::parse();
     let local_ip = get_local_ip();
     println!("=== Nova Server ===\n🌐 LAN IP: {}\n", local_ip);
@@ -139,10 +143,21 @@ async fn main() -> Result<()> {
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
 
+    // `signal::ctrl_c()` only ever fires for CTRL_C_EVENT. Closing the console
+    // window, logging off, or a shutdown sends CTRL_CLOSE/LOGOFF/SHUTDOWN
+    // instead — without these handlers the process is torn down without
+    // running Rust destructors, so AudioStreamer's Drop (which restores the
+    // default audio device away from the virtual sink) never runs and the
+    // host is left silent. recover_stuck_sink() at startup is the last-resort
+    // backstop for paths even these handlers can't catch (e.g. taskkill /F).
+    let mut ctrl_close = signal::windows::ctrl_close().expect("register ctrl_close handler");
+    let mut ctrl_shutdown = signal::windows::ctrl_shutdown().expect("register ctrl_shutdown handler");
+    let mut ctrl_logoff = signal::windows::ctrl_logoff().expect("register ctrl_logoff handler");
+
     println!("▶️  Capture loop running — press Ctrl+C to stop");
 
     loop {
-        // Frame pacing: sleep until the next frame slot, but also watch for Ctrl+C.
+        // Frame pacing: sleep until the next frame slot, but also watch for shutdown signals.
         let now = Instant::now();
         if now < next_frame_time {
             let wait = next_frame_time - now;
@@ -150,6 +165,18 @@ async fn main() -> Result<()> {
                 _ = tokio::time::sleep(wait) => {}
                 _ = signal::ctrl_c() => {
                     println!("\n🛑 Ctrl+C — shutting down ({} frames encoded)", frames_encoded);
+                    break;
+                }
+                _ = ctrl_close.recv() => {
+                    println!("\n🛑 Console closed — shutting down ({} frames encoded)", frames_encoded);
+                    break;
+                }
+                _ = ctrl_shutdown.recv() => {
+                    println!("\n🛑 System shutdown — shutting down ({} frames encoded)", frames_encoded);
+                    break;
+                }
+                _ = ctrl_logoff.recv() => {
+                    println!("\n🛑 User logoff — shutting down ({} frames encoded)", frames_encoded);
                     break;
                 }
             }
@@ -287,6 +314,13 @@ async fn main() -> Result<()> {
                 break;
             }
         }
+    }
+
+    // Explicit stop (rather than relying on drop at function exit) so the
+    // restore-default-audio-device log line is visible before we report done.
+    if let Some(streamer) = audio_streamer.take() {
+        println!("🔊 Restoring host audio output before exit...");
+        streamer.stop();
     }
 
     println!("✅ Capture loop done — {} frames encoded", frames_encoded);

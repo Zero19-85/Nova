@@ -30,7 +30,38 @@ extern "C" {
     fn CleanupAudio();
     fn GetDefaultAudioDeviceId(out_id: *mut u16, cch: i32) -> i32;
     fn FindVirtualAudioSink(out_id: *mut u16, cch: i32) -> i32;
+    fn FindRealAudioDevice(out_id: *mut u16, cch: i32) -> i32;
     fn SetDefaultAudioDevice(device_id: *const u16) -> i32;
+}
+
+/// Crash recovery: if Nova exited without restoring the default audio device
+/// (process killed, console window closed, or any path that skips Rust
+/// destructors), the virtual sink is left as the system default and the host
+/// stays silent even with no client connected. Call once at startup — if the
+/// default is currently the virtual sink, switch back to a real output device.
+pub fn recover_stuck_sink() {
+    let mut sink = [0u16; DEVICE_ID_CCH];
+    if unsafe { FindVirtualAudioSink(sink.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
+        return; // no virtual sink installed — nothing to recover
+    }
+    let mut cur = [0u16; DEVICE_ID_CCH];
+    if unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
+        return;
+    }
+    if wide_id(&cur) != wide_id(&sink) {
+        return; // default is already a real device
+    }
+
+    let mut real = [0u16; DEVICE_ID_CCH];
+    if unsafe { FindRealAudioDevice(real.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
+        eprintln!("⚠️  Audio: default output is the virtual sink (from a previous unclean exit) and no real device was found to restore — check Windows sound settings");
+        return;
+    }
+    if unsafe { SetDefaultAudioDevice(wide_id(&real).as_ptr()) } == 0 {
+        println!("🔊 Audio: recovered from a previous unclean exit — default output restored to host speakers");
+    } else {
+        eprintln!("⚠️  Audio: found a real output device but failed to restore it as default — check Windows sound settings");
+    }
 }
 
 const DEVICE_ID_CCH: usize = 512;
