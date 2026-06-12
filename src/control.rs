@@ -104,6 +104,18 @@ fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<Cl
         enet::Event::Disconnect { peer, .. } => {
             let addr = peer.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string());
             println!("🎮 Control stream: peer {} disconnected", addr);
+            // The control stream dying means the client is gone, whether or not
+            // an RTSP TEARDOWN ever arrived (abrupt exit, network drop). End the
+            // session so the main loop resets video/audio state — otherwise a
+            // reconnect inherits the dead session's target/keys (black screen).
+            if let Ok(mut guard) = client_info.lock() {
+                if let Some(info) = guard.as_mut() {
+                    if info.streaming_active {
+                        info.streaming_active = false;
+                        println!("🎮 Control stream lost → ending session (resetting stream state)");
+                    }
+                }
+            }
         }
         enet::Event::Receive { channel_id, packet, .. } => {
             handle_control_message(channel_id, packet.data());

@@ -232,9 +232,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Learn the client's real video UDP address from its first "ping" packet
-        // (its source port is ephemeral and wasn't known at SETUP time).
-        if client_connected && !video_learned {
+        // Learn (and keep refreshed) the client's real video UDP address from
+        // its "ping" packets — the source port is ephemeral, wasn't known at
+        // SETUP time, and CHANGES on reconnect. This must run every iteration,
+        // not just until first learn: it drains the ping backlog (a stale
+        // buffered ping from the old session would otherwise become the next
+        // session's target → black screen) and follows mid-stream port changes.
+        if client_connected {
             if let Some(addr) = rtp_sender.try_learn_target() {
                 println!("🎥 Learned client video address: {}", addr);
                 debug::debug_log(&format!("Video target {}", addr));

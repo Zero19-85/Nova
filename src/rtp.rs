@@ -104,22 +104,25 @@ impl RtpSender {
         })
     }
 
-    /// Non-blocking poll for an incoming "ping" packet from the client. GameStream
-    /// clients send these to the video/audio ports right after PLAY so the server
-    /// can learn the client's NAT-mapped source port. Returns the learned address
-    /// the first time it changes.
+    /// Non-blocking drain of all queued "ping" packets, keeping the most recent
+    /// sender. GameStream clients ping the video port every ~500ms for the WHOLE
+    /// session (not just after PLAY), so this must be called every loop iteration
+    /// — if the socket goes unread after the first learn, stale pings from a
+    /// previous session pile up in the receive buffer and the next session
+    /// latches onto a dead source port (black screen on reconnect).
+    /// Returns the address only when it changes.
     pub fn try_learn_target(&mut self) -> Option<SocketAddr> {
         let mut buf = [0u8; 64];
-        match self.socket.recv_from(&mut buf) {
-            Ok((_n, addr)) => {
-                if self.target != Some(addr) {
-                    self.target = Some(addr);
-                    return Some(addr);
-                }
-                None
-            }
-            Err(_) => None,
+        let mut latest = None;
+        while let Ok((_n, addr)) = self.socket.recv_from(&mut buf) {
+            latest = Some(addr);
         }
+        let addr = latest?;
+        if self.target != Some(addr) {
+            self.target = Some(addr);
+            return Some(addr);
+        }
+        None
     }
 
     pub fn set_fps(&mut self, fps: u32) {
@@ -141,6 +144,10 @@ impl RtpSender {
     /// (fresh sequence numbers/timestamps, and re-learn the client's
     /// ephemeral video source port via `try_learn_target`).
     pub fn reset(&mut self) {
+        // Flush pings buffered from the ending session so the next learn
+        // can't latch onto a stale source port.
+        let mut buf = [0u8; 64];
+        while self.socket.recv_from(&mut buf).is_ok() {}
         self.target          = None;
         self.sequence_number = 0;
         self.timestamp       = 0;
@@ -371,4 +378,73 @@ pub(crate) fn detect_frame_type(data: &[u8]) -> u8 {
         }
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ping(sock: &UdpSocket, dst: std::net::SocketAddr, n: usize) {
+        for _ in 0..n {
+            sock.send_to(b"PING", dst).unwrap();
+        }
+        // Let loopback delivery land in the receiver buffer.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    /// Reproduces the reconnect black-screen: session 1 leaves a backlog of
+    /// pings in the receive buffer; after reset(), session 2 (new source port)
+    /// must be learned — not a stale session-1 ping.
+    fn loopback_addr(sender: &RtpSender) -> std::net::SocketAddr {
+        // The sender binds 0.0.0.0 — rewrite to a sendable loopback address.
+        let port = sender.socket.local_addr().unwrap().port();
+        format!("127.0.0.1:{}", port).parse().unwrap()
+    }
+
+    #[test]
+    fn reconnect_learns_new_port_not_stale_backlog() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let old = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let new = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        ping(&old, dst, 20);
+        assert_eq!(
+            sender.try_learn_target().expect("learn session 1").port(),
+            old.local_addr().unwrap().port()
+        );
+
+        // Pings keep arriving during the stream (these went unread pre-fix).
+        ping(&old, dst, 20);
+
+        sender.reset();
+        assert!(sender.target.is_none());
+
+        ping(&new, dst, 3);
+        assert_eq!(
+            sender.try_learn_target().expect("learn session 2").port(),
+            new.local_addr().unwrap().port(),
+            "reconnect must latch the NEW client port, not a stale buffered ping"
+        );
+    }
+
+    /// Draining must keep the most recent sender when pings from an old and a
+    /// new source port are interleaved in the buffer.
+    #[test]
+    fn learn_target_keeps_latest_sender() {
+        let mut sender = RtpSender::new(0).unwrap();
+        let dst = loopback_addr(&sender);
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        ping(&a, dst, 1);
+        assert_eq!(sender.try_learn_target().unwrap().port(), a.local_addr().unwrap().port());
+
+        a.send_to(b"PING", dst).unwrap();
+        ping(&b, dst, 1);
+        assert_eq!(
+            sender.try_learn_target().unwrap().port(),
+            b.local_addr().unwrap().port()
+        );
+    }
 }
