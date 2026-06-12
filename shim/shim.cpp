@@ -96,9 +96,13 @@ static uint32_t g_cursorShapeGeneration = 0;
 // — they only fully disappear at an IDR. Forcing an IDR whenever the cursor
 // moves/changes "significantly" clears them almost immediately. A cooldown
 // caps how often this can fire so continuous mouse movement doesn't turn
-// into an IDR-every-frame storm.
+// into an IDR storm: at 10 frames (~6 IDR/s @ 60fps) the rate controller
+// couldn't recover its VBV budget between IDRs and crept QP up over the
+// session, eventually making even the "IDR" frames too lossy to fully clear
+// ghosts ("looks perfect, then returns after a while"). 30 frames (~2 IDR/s)
+// + the wider VBV above gives the controller room to recover.
 static const int kCursorIdrMoveThreshold  = 2;  // pixels
-static const int kCursorIdrCooldownFrames = 10; // ~6 forced IDR/s @ 60fps
+static const int kCursorIdrCooldownFrames = 30; // ~2 forced IDR/s @ 60fps
 static int      g_lastIdrCursorX          = -1000000;
 static int      g_lastIdrCursorY          = -1000000;
 static bool     g_lastIdrCursorVisible    = false;
@@ -539,8 +543,16 @@ extern "C" __declspec(dllexport) int InitEncoder(
         encodeConfig.rcParams.averageBitRate  = avgBitRateVal;
         encodeConfig.rcParams.maxBitRate      = maxBitRateVal;
         // 1x maxBitRate/fps (~31.25KB @ 15Mbps/60fps) is smaller than the ~36KB
-        // IDRs we're seeing — give the VBV a 2-frame window so IDRs fit.
-        encodeConfig.rcParams.vbvBufferSize   = (maxBitRateVal / (uint32_t)fps) * 2;
+        // IDRs we're seeing — give the VBV a window so IDRs fit. Widened from
+        // 2 to 4 frames: with cursor-motion-triggered IDRs (see
+        // kCursorIdrCooldownFrames) firing every ~0.5s on top of the 1s GOP,
+        // a 2-frame VBV was too small to absorb each IDR's overshoot, so the
+        // rate controller raised QP on the following frames to "pay it back"
+        // — and with IDRs arriving faster than it could recover, average QP
+        // crept up over the session (ghosts/cursor "painting" returning after
+        // looking clean initially). 4 frames (~66ms @ 60fps) is still
+        // low-latency and gives the controller room to recover between IDRs.
+        encodeConfig.rcParams.vbvBufferSize   = (maxBitRateVal / (uint32_t)fps) * 4;
         encodeConfig.rcParams.vbvInitialDelay = encodeConfig.rcParams.vbvBufferSize;
         encodeConfig.rcParams.zeroReorderDelay = 1;
         // Two-pass (quarter-res first pass) — Sunshine's default. The
