@@ -70,9 +70,15 @@ static UINT                      g_cursorTexH    = 0;
 
 // Intermediate render-targetable copy of the captured frame — the DXGI
 // duplication texture isn't guaranteed to support D3D11_BIND_RENDER_TARGET,
-// so the cursor is drawn onto this copy before NV12 conversion.
+// so the cursor is drawn onto this copy before NV12 conversion. Also serves
+// as the synchronization boundary for dxgiFrame (see g_copyFence below).
 static ID3D11Texture2D*          g_compositeTex  = nullptr;
 static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
+
+// GPU fence used to block EncodeFrame() until the CopyResource of the DXGI
+// duplication surface into g_compositeTex has actually finished on the GPU
+// (see EncodeFrame for why this matters).
+static ID3D11Query*              g_copyFence     = nullptr;
 
 // Updated every frame from DXGI_OUTDUPL_FRAME_INFO.PointerPosition. Only
 // touched from the single capture/encode thread, so no locking needed.
@@ -248,6 +254,15 @@ static bool EnsureCompositeTexture(int width, int height) {
     if (FAILED(hr)) {
         g_compositeTex->Release();
         g_compositeTex = nullptr;
+        return false;
+    }
+
+    D3D11_QUERY_DESC qdesc = {};
+    qdesc.Query = D3D11_QUERY_EVENT;
+    hr = g_device->CreateQuery(&qdesc, &g_copyFence);
+    if (FAILED(hr)) {
+        g_compositeRTV->Release(); g_compositeRTV = nullptr;
+        g_compositeTex->Release(); g_compositeTex = nullptr;
         return false;
     }
     return true;
@@ -572,19 +587,37 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     if (!g_nvEncoder || !d3d11_texture) return -1;
 
     ID3D11Texture2D* dxgiFrame = (ID3D11Texture2D*)d3d11_texture;
-    ID3D11Texture2D* vpSourceTexture = dxgiFrame;
 
-    // Composite the cursor onto a copy of the captured frame before NV12
-    // conversion (Sunshine's approach: blend into an intermediate surface,
-    // since the DXGI duplication texture may not be render-targetable).
+    // Copy the DXGI duplication surface into our own texture and block until
+    // the GPU has actually finished that copy before returning. The Rust
+    // capture loop calls IDXGIOutputDuplication::ReleaseFrame() immediately
+    // after this function returns, which lets DWM start writing the NEXT
+    // frame into this same recycled surface. Without this fence, the
+    // CopyResource below is only *queued*, not executed — so the GPU could
+    // still be reading dxgiFrame (for this copy, or the VPBlt that used to
+    // read it directly) while DWM is already overwriting it, tearing the
+    // captured image. A static desktop hides this (old/new pixels match);
+    // moving content (cursor, text, scrolling) doesn't — visible as the
+    // smearing/ghosting that only self-heals at the next IDR.
+    D3D11_TEXTURE2D_DESC frameDesc = {};
+    dxgiFrame->GetDesc(&frameDesc);
+    if (!EnsureCompositeTexture((int)frameDesc.Width, (int)frameDesc.Height)) {
+        return 0;
+    }
+    g_context->CopyResource(g_compositeTex, dxgiFrame);
+    g_context->End(g_copyFence);
+    while (g_context->GetData(g_copyFence, nullptr, 0, 0) == S_FALSE) {
+        // Spin: this copy is a few hundred microseconds at most, and we must
+        // not return (letting Rust call ReleaseFrame) before it completes.
+    }
+
+    ID3D11Texture2D* vpSourceTexture = g_compositeTex;
+
+    // Composite the cursor onto g_compositeTex before NV12 conversion
+    // (Sunshine's approach: blend into an intermediate render-targetable
+    // surface, since the DXGI duplication texture may not support that bind).
     if (g_cursorVisible && g_cursorSRV && g_cursorTexW > 0 && g_cursorTexH > 0) {
-        D3D11_TEXTURE2D_DESC frameDesc = {};
-        dxgiFrame->GetDesc(&frameDesc);
-        if (EnsureCompositeTexture((int)frameDesc.Width, (int)frameDesc.Height)) {
-            g_context->CopyResource(g_compositeTex, dxgiFrame);
-            DrawCursorOverlay();
-            vpSourceTexture = g_compositeTex;
-        }
+        DrawCursorOverlay();
     }
 
     // BGRA → NV12 via D3D11 Video Processor
@@ -645,6 +678,7 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_cursorTex)     { g_cursorTex->Release();     g_cursorTex     = nullptr; }
     if (g_compositeRTV)  { g_compositeRTV->Release();  g_compositeRTV  = nullptr; }
     if (g_compositeTex)  { g_compositeTex->Release();  g_compositeTex  = nullptr; }
+    if (g_copyFence)     { g_copyFence->Release();     g_copyFence     = nullptr; }
     if (g_cursorSampler) { g_cursorSampler->Release();  g_cursorSampler = nullptr; }
     if (g_cursorBlend)   { g_cursorBlend->Release();   g_cursorBlend   = nullptr; }
     if (g_cursorPS)      { g_cursorPS->Release();      g_cursorPS      = nullptr; }
