@@ -280,13 +280,20 @@ async fn main() -> Result<()> {
 
         match capturer.acquire_frame() {
             Ok((resource, frame_info)) => {
-                // Cursor position/visibility is updated every frame; the
-                // shape is only re-uploaded when DXGI reports it changed.
-                encoder::update_cursor_position(
-                    frame_info.PointerPosition.Position.x,
-                    frame_info.PointerPosition.Position.y,
-                    frame_info.PointerPosition.Visible.as_bool(),
-                );
+                // PointerPosition is only valid when LastMouseUpdateTime != 0
+                // (DXGI docs) — on frames without a mouse update it can be
+                // stale/zeroed. Updating the shim from a zeroed struct made
+                // the cursor flicker to (0,0)/invisible and back on alternate
+                // frames while the mouse moved, leaving P-frame remnants
+                // along the path (visible as "ghost cursors" until the next
+                // IDR). Only push position when DXGI actually reports a move.
+                if frame_info.LastMouseUpdateTime != 0 {
+                    encoder::update_cursor_position(
+                        frame_info.PointerPosition.Position.x,
+                        frame_info.PointerPosition.Position.y,
+                        frame_info.PointerPosition.Visible.as_bool(),
+                    );
+                }
                 if frame_info.PointerShapeBufferSize > 0 {
                     if let Ok((shape_data, shape_info)) = capturer.get_pointer_shape(frame_info.PointerShapeBufferSize) {
                         encoder::update_cursor_shape(
@@ -302,7 +309,7 @@ async fn main() -> Result<()> {
                 if let Ok(texture) = capturer.get_texture(&resource) {
                     // No periodic forced IDR here: FEC handles packet loss,
                     // Moonlight requests IDRs via the control stream when it
-                    // can't recover, and NVENC's idrPeriod (2s GOP) is the
+                    // can't recover, and NVENC's idrPeriod (1s GOP) is the
                     // final backstop.
                     let packet_size = enc.encode_frame(&texture, &mut out_buffer);
 

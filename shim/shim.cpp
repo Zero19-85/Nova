@@ -479,8 +479,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
         initializeParams.frameRateDen = 1;
         initializeParams.enablePTD    = 1; // driver picks P/I picture types
 
-        // GOP: IDR every 2 s, no B-frames (B-frames add reorder latency)
-        encodeConfig.gopLength       = fps * 2;
+        // GOP: IDR every 1 s, no B-frames (B-frames add reorder latency).
+        // Was 2 s — halved so any transient reference-frame corruption
+        // (packet loss, FEC shortfall) self-heals roughly twice as fast.
+        encodeConfig.gopLength       = fps * 1;
         encodeConfig.frameIntervalP  = 1;
 
         // VBR with a target average well below the cap, but the VBV/HRD
@@ -529,13 +531,13 @@ extern "C" __declspec(dllexport) int InitEncoder(
         vuiParams.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
-            encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = fps * 2;
+            encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = fps * 1;
             encodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
             encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 0;
             encodeConfig.encodeCodecConfig.h264Config.h264VUIParameters = vuiParams;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
-            encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = fps * 2;
+            encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = fps * 1;
             encodeConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
             encodeConfig.encodeCodecConfig.hevcConfig.enableFillerDataInsertion = 0;
