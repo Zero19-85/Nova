@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <stdio.h>
-#include <fstream>
 #include <vector>
 #include <atomic>
 
@@ -20,7 +19,6 @@ static ID3D11VideoProcessorOutputView* g_vpOutView     = nullptr;
 static ID3D11Device*        g_device    = nullptr;
 static ID3D11DeviceContext* g_context   = nullptr;
 static NvEncoderD3D11*      g_nvEncoder = nullptr;
-static std::ofstream        g_h264File;
 static std::atomic<bool>    g_force_idr{false};
 
 // ==================== INIT COLOR CONVERSION ====================
@@ -71,6 +69,34 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     hr = g_videoDevice->CreateVideoProcessorOutputView(g_nv12Texture, g_vpEnum, &ovDesc, &g_vpOutView);
     if (FAILED(hr)) return -7;
 
+    // Pin source/dest/output rects to the full dynamic surface. Without this,
+    // VideoProcessorBlt on NVIDIA drivers can default to a stale/partial
+    // rectangle, leaving everything below it black — exactly the "bottom of
+    // frame black" symptom.
+    RECT fullRect = {0, 0, (LONG)width, (LONG)height};
+    g_videoContext->VideoProcessorSetStreamSourceRect(g_vp, 0, TRUE, &fullRect);
+    g_videoContext->VideoProcessorSetStreamDestRect(g_vp, 0, TRUE, &fullRect);
+    g_videoContext->VideoProcessorSetOutputTargetRect(g_vp, TRUE, &fullRect);
+
+    // Pin the RGB->NV12 color-space conversion to BT.709 limited range,
+    // matching the H264 VUI parameters set in InitEncoder. A mismatch here
+    // between what the VP writes into the NV12 surface and what the decoder
+    // assumes from the SPS produces a structurally-correct but blocky,
+    // wrong-color picture (each 2x2 luma block shares one off chroma sample).
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace = {};
+    inputColorSpace.Usage         = 0;
+    inputColorSpace.RGB_Range     = 0; // full range 0-255 (desktop BGRA)
+    inputColorSpace.YCbCr_Matrix  = 1; // BT.709
+    inputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+    g_videoContext->VideoProcessorSetStreamColorSpace(g_vp, 0, &inputColorSpace);
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace = {};
+    outputColorSpace.Usage         = 0;
+    outputColorSpace.RGB_Range     = 0;
+    outputColorSpace.YCbCr_Matrix  = 1; // BT.709
+    outputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    g_videoContext->VideoProcessorSetOutputColorSpace(g_vp, &outputColorSpace);
+
     printf("✅ Video Processor (BGRA → NV12) initialized\n");
     return 0;
 }
@@ -110,10 +136,13 @@ extern "C" __declspec(dllexport) int InitEncoder(
         NV_ENC_CONFIG encodeConfig               = { NV_ENC_CONFIG_VER };
         initializeParams.encodeConfig            = &encodeConfig;
 
+        // P1+ULTRA_LOW_LATENCY is NVENC's fastest *and lowest-quality* preset —
+        // it was crushing every frame into heavy macroblocking. P4+LOW_LATENCY
+        // gives a large quality jump for a small (sub-frame) latency cost.
         g_nvEncoder->CreateDefaultEncoderParams(
             &initializeParams, codecGuid,
-            NV_ENC_PRESET_P1_GUID,          // lowest latency preset
-            NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
+            NV_ENC_PRESET_P4_GUID,
+            NV_ENC_TUNING_INFO_LOW_LATENCY);
 
         // Framerate
         initializeParams.frameRateNum = fps;
@@ -124,35 +153,73 @@ extern "C" __declspec(dllexport) int InitEncoder(
         encodeConfig.gopLength       = fps * 2;
         encodeConfig.frameIntervalP  = 1;
 
-        // CBR — mandatory for real-time streaming; VBR causes buffer underruns
-        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        encodeConfig.rcParams.averageBitRate  = (uint32_t)bitrate_kbps * 1000;
-        encodeConfig.rcParams.maxBitRate      = (uint32_t)bitrate_kbps * 1000;
-        // 1-frame VBV keeps the encoder from buffering ahead at all
-        encodeConfig.rcParams.vbvBufferSize   = (uint32_t)bitrate_kbps * 1000 / fps;
-        encodeConfig.rcParams.vbvInitialDelay = (uint32_t)bitrate_kbps * 1000 / fps;
+        // VBR with a target average well below the cap, but the VBV/HRD
+        // buffer must still be sized for the *biggest* frame (IDR), not the
+        // average — IDRs measured up to ~27KB while a VBV sized off the
+        // 5Mbps average (~20.8KB) was smaller than that. A bitstream that
+        // overshoots its declared HRD buffer is non-conformant and corrupts
+        // decode right at/after the IDR (matches "bottom of frame black").
+        // So: average drives P-frame sizing, vbv (sized off maxBitRate, as
+        // before) gives IDR frames room to fit within the declared buffer.
+        // avgBitRate at maxBitRate/3 was starving P-frames of detail (heavy
+        // macroblocking). The 2-frame VBV window below already gives IDRs
+        // room to spike, so let average ride much closer to the cap.
+        uint32_t maxBitRateVal     = (uint32_t)bitrate_kbps * 1000;
+        uint32_t avgBitRateVal     = (maxBitRateVal * 3) / 4;
+        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+        encodeConfig.rcParams.averageBitRate  = avgBitRateVal;
+        encodeConfig.rcParams.maxBitRate      = maxBitRateVal;
+        // 1x maxBitRate/fps (~31.25KB @ 15Mbps/60fps) is smaller than the ~36KB
+        // IDRs we're seeing — give the VBV a 2-frame window so IDRs fit.
+        encodeConfig.rcParams.vbvBufferSize   = (maxBitRateVal / (uint32_t)fps) * 2;
+        encodeConfig.rcParams.vbvInitialDelay = encodeConfig.rcParams.vbvBufferSize;
         encodeConfig.rcParams.zeroReorderDelay = 1;
+        // Two-pass (quarter-res first pass) — Sunshine's default. The
+        // preliminary pass catches large motion vectors and distributes bits
+        // far better on full-screen motion (window dragging was producing
+        // severe blocking with single-pass).
+        encodeConfig.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+        // Spatial AQ: shifts bits toward flat/low-detail regions where
+        // quantization noise is most visible — targets the static-desktop
+        // shimmer on text/UI edges.
+        encodeConfig.rcParams.enableAQ = 1;
 
         // Codec-specific: inline SPS/PPS on every IDR so Moonlight can recover
+        // VUI color description must match the BT.709 limited-range NV12
+        // surface produced by the D3D11 Video Processor (InitColorConversion)
+        // — otherwise the decoder applies the wrong YUV->RGB matrix/range and
+        // the picture comes out blocky/wrong-colored despite decoding fine.
+        NV_ENC_CONFIG_H264_VUI_PARAMETERS vuiParams = {};
+        vuiParams.videoSignalTypePresentFlag   = 1;
+        vuiParams.videoFormat                  = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+        vuiParams.videoFullRangeFlag           = 0; // limited (16-235), matches VP output
+        vuiParams.colourDescriptionPresentFlag = 1;
+        vuiParams.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        vuiParams.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        vuiParams.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
             encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = fps * 2;
             encodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+            encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 0;
+            encodeConfig.encodeCodecConfig.h264Config.h264VUIParameters = vuiParams;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
             encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = fps * 2;
             encodeConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
             encodeConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
+            encodeConfig.encodeCodecConfig.hevcConfig.enableFillerDataInsertion = 0;
+            encodeConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters = vuiParams;
         }
+
+        printf("📊 NVENC RC config: mode=%s avgBitRate=%u maxBitRate=%u vbvBufferSize=%u fillerData(h264)=%u\n",
+               encodeConfig.rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR ? "VBR" : "CBR",
+               encodeConfig.rcParams.averageBitRate,
+               encodeConfig.rcParams.maxBitRate,
+               encodeConfig.rcParams.vbvBufferSize,
+               encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion);
 
         g_nvEncoder->CreateEncoder(&initializeParams);
-
-        // Milestone 3.2: capture raw bitstream to disk for VLC verification
-        g_h264File.open("test.h264", std::ios::binary | std::ios::trunc);
-        if (!g_h264File.is_open()) {
-            printf("⚠️ Could not open test.h264 — disk output disabled\n");
-        } else {
-            printf("📼 Bitstream mirror → test.h264\n");
-        }
 
         printf("✅ NVENC READY (%s @ %dx%d, %d Kbps, %d fps)\n",
                codec, width, height, bitrate_kbps, fps);
@@ -215,12 +282,6 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         total_size += chunk;
     }
 
-    // Mirror to test.h264 for VLC verification (Milestone 3.2)
-    if (g_h264File.is_open() && total_size > 0) {
-        g_h264File.write(reinterpret_cast<const char*>(out_buffer), total_size);
-        g_h264File.flush();
-    }
-
     return total_size;
 }
 
@@ -250,7 +311,6 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     }
     if (g_context) { g_context->Release(); g_context = nullptr; }
     if (g_device)  { g_device->Release();  g_device  = nullptr; }
-    if (g_h264File.is_open()) g_h264File.close();
 
     printf("✅ Cleanup complete.\n");
     return 0;

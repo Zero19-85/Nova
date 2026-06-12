@@ -24,6 +24,14 @@ extern "C" {
     fn RequestIdrFrame(encoder: *mut c_void);
 }
 
+/// Thread-safe IDR trigger callable from any thread (e.g. the control-stream
+/// thread when Moonlight requests a keyframe). The shim's `g_force_idr` is a
+/// C++ `std::atomic<bool>` and `RequestIdrFrame` ignores its argument, so no
+/// handle is needed.
+pub fn request_idr_global() {
+    unsafe { RequestIdrFrame(std::ptr::null_mut()) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,

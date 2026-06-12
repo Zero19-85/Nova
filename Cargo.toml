@@ -19,11 +19,16 @@ cipher = "0.4"
 hex = "0.4"
 url = "2"
 rusty_enet = "0.4"
+socket2 = "0.5"
+reed-solomon-erasure = "6"
+# Opus encoder for the GameStream audio stream (builds bundled libopus via cmake)
+audiopus = "0.2"
 clap = { version = "4", features = ["derive"] }
 
 # Windows DXGI + NVENC
 windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common",

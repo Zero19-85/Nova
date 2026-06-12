@@ -7,6 +7,14 @@ use windows::Win32::Foundation::HMODULE;
 pub struct DesktopCapturer {
     pub dupl: IDXGIOutputDuplication,
     pub device: ID3D11Device,
+    /// Native resolution of the duplicated output (DXGI_OUTPUT_DESC.DesktopCoordinates).
+    /// The encoder/color-conversion pipeline must be initialized with these
+    /// dimensions — anything else leaves the video processor's input size
+    /// mismatched with the captured texture, which blits only the overlapping
+    /// region and leaves the rest of the NV12 surface (typically the bottom)
+    /// black/uninitialized.
+    pub width: u32,
+    pub height: u32,
 }
 
 impl DesktopCapturer {
@@ -32,12 +40,18 @@ impl DesktopCapturer {
             let dxgi_device: IDXGIDevice = device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
             let output = adapter.EnumOutputs(0)?;
+
+            let desc = output.GetDesc()?;
+            let rect = desc.DesktopCoordinates;
+            let width  = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+
             let output1: IDXGIOutput1 = output.cast()?;
             let dupl = output1.DuplicateOutput(&dxgi_device)?;
 
-            println!("✅ DXGI Desktop Duplication READY!");
+            println!("✅ DXGI Desktop Duplication READY! ({}x{})", width, height);
 
-            Ok(Self { dupl, device })
+            Ok(Self { dupl, device, width, height })
         }
     }
 

@@ -661,6 +661,18 @@ async fn handle_request(
             Ok(res)
         }
 
+        "/cancel" => {
+            println!("🛑 Moonlight requested /cancel — stopping stream");
+            if let Ok(mut guard) = client_info.lock() {
+                if let Some(ref mut info) = *guard {
+                    info.streaming_active = false;
+                    info.app_id = 0;
+                }
+            }
+            let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><cancel>1</cancel></root>"#;
+            Ok(make_xml_response(body))
+        }
+
         "/launch" | "/resume" => {
             // Parse mode string "WxHxFPS" (e.g. "1920x1080x60")
             let mode_str = params.get("mode").map(|s| s.as_str()).unwrap_or("1280x720x60");
@@ -685,19 +697,26 @@ async fn handle_request(
 
             let app_id_str = params.get("appid").map(|s| s.as_str()).unwrap_or("1");
             let app_id_num = app_id_str.parse::<u32>().unwrap_or(1);
-            println!("🚀 {} app={} mode={}x{}@{}fps rikeyid={}", path, app_id_str, width, height, fps, rikeyid);
+            // Moonlight's "Play audio on PC" setting → localAudioPlayMode=1.
+            // Default 0 = audio goes to the client only (routed via virtual sink).
+            let host_audio = params.get("localAudioPlayMode")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0) != 0;
+            println!("🚀 {} app={} mode={}x{}@{}fps rikeyid={} hostAudio={}",
+                path, app_id_str, width, height, fps, rikeyid, host_audio);
 
             // Store session info — RTSP DESCRIBE reads width/height/fps from here.
             // Setting app_id causes /serverinfo to return currentgame=N (BUSY state),
             // which is what Moonlight checks before proceeding with the RTSP handshake.
             if let Ok(mut guard) = client_info.lock() {
                 let mut info = guard.take().unwrap_or_default();
-                info.rikey   = rikey;
-                info.rikeyid = rikeyid;
-                info.width   = width;
-                info.height  = height;
-                info.fps     = fps;
-                info.app_id  = app_id_num;
+                info.rikey      = rikey;
+                info.rikeyid    = rikeyid;
+                info.width      = width;
+                info.height     = height;
+                info.fps        = fps;
+                info.app_id     = app_id_num;
+                info.host_audio = host_audio;
                 *guard = Some(info);
             }
 

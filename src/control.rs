@@ -50,6 +50,50 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
     }
 }
 
+// Control message types (Sunshine stream.cpp packetTypes[]).
+const PT_INVALIDATE_REF_FRAMES: u16 = 0x0301;
+const PT_LOSS_STATS:            u16 = 0x0201;
+const PT_PERIODIC_PING:         u16 = 0x0200;
+const PT_REQUEST_IDR_FRAME:     u16 = 0x0302;
+
+/// Parse a control-stream message: [u16 LE type][u16 LE payload length][payload].
+/// The periodic 36-byte messages are loss stats (4B header + 32B payload).
+fn handle_control_message(channel_id: u8, data: &[u8]) {
+    if data.len() < 4 {
+        return;
+    }
+    let msg_type = u16::from_le_bytes([data[0], data[1]]);
+    match msg_type {
+        PT_REQUEST_IDR_FRAME => {
+            println!("🎮 Control: client requested IDR frame");
+            crate::encoder::request_idr_global();
+        }
+        // We don't do reference frame invalidation — recover with an IDR
+        // instead (valid per protocol; Sunshine does this when the encoder
+        // lacks ref-invalidation support).
+        PT_INVALIDATE_REF_FRAMES => {
+            println!("🎮 Control: reference frames invalidated → forcing IDR");
+            crate::encoder::request_idr_global();
+        }
+        // Loss stats arrive every ~50ms; payload[0] (i32 LE) is the loss count
+        // since the last report. Only log when the client actually lost
+        // something — this is the live signal that FEC is being exercised.
+        PT_LOSS_STATS => {
+            if data.len() >= 8 {
+                let lost = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                if lost > 0 {
+                    println!("🎮 Loss stats: client lost {} packet(s) since last report", lost);
+                }
+            }
+        }
+        PT_PERIODIC_PING => {}
+        _ => {
+            println!("🎮 Control rx type 0x{:04x} ({} bytes) on channel {}",
+                msg_type, data.len(), channel_id);
+        }
+    }
+}
+
 fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<ClientInfo>>>) {
     match event {
         enet::Event::Connect { peer, .. } => {
@@ -62,7 +106,7 @@ fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<Cl
             println!("🎮 Control stream: peer {} disconnected", addr);
         }
         enet::Event::Receive { channel_id, packet, .. } => {
-            println!("🎮 Control rx {} bytes on channel {}", packet.data().len(), channel_id);
+            handle_control_message(channel_id, packet.data());
         }
     }
 }

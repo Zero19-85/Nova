@@ -20,6 +20,23 @@ pub struct ClientInfo {
     pub fps: u32,
     /// App ID currently streaming (0 = none); mirrored in /serverinfo currentgame
     pub app_id: u32,
+    /// Negotiated video packet size from ANNOUNCE SDP (x-nv-video[0].packetSize).
+    /// Moonlight uses 1392 on LAN, 1024 for remote. 0 = not announced yet.
+    /// The RTP/FEC shard size MUST match this — the client reconstructs lost
+    /// packets over shards of exactly this size.
+    pub packet_size: u32,
+    /// Client's x-nv-vqos[0].fec.minRequiredFecPackets (0 = not announced).
+    pub min_fec_packets: u32,
+    /// Client requested audio encryption (x-nv-general.featureFlags bit 0x20,
+    /// or x-ss-general.encryptionEnabled bit 0x1). Audio payloads must then be
+    /// AES-128-CBC encrypted with the /launch rikey.
+    pub audio_encryption: bool,
+    /// x-nv-aqos.packetDuration in ms (0 = not announced; default 5).
+    pub audio_packet_duration: u32,
+    /// /launch localAudioPlayMode=1 — keep playing audio on the host speakers
+    /// while streaming. Default false = client-only: audio is routed through a
+    /// virtual sink so the host speakers stay silent (never muted).
+    pub host_audio: bool,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".
@@ -215,6 +232,40 @@ fn handle_message(
             }
             println!("🛑 TEARDOWN — streaming stopped");
         }
+        "ANNOUNCE" => {
+            // The ANNOUNCE SDP carries the client's negotiated stream params.
+            let sdp = String::from_utf8_lossy(&body);
+            let packet_size = parse_sdp_u32(&sdp, "x-nv-video[0].packetSize");
+            let fps         = parse_sdp_u32(&sdp, "x-nv-video[0].maxFPS");
+            let width       = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportWd");
+            let height      = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportHt");
+            let min_fec     = parse_sdp_u32(&sdp, "x-nv-vqos[0].fec.minRequiredFecPackets");
+            let feat_flags  = parse_sdp_u32(&sdp, "x-nv-general.featureFlags").unwrap_or(0);
+            let enc_enabled = parse_sdp_u32(&sdp, "x-ss-general.encryptionEnabled").unwrap_or(0);
+            let pkt_dur     = parse_sdp_u32(&sdp, "x-nv-aqos.packetDuration");
+
+            let mut guard = client_info.lock().unwrap();
+            let mut info  = guard.take().unwrap_or_default();
+            if let Some(v) = packet_size { info.packet_size = v; }
+            if let Some(v) = fps         { info.fps = v; }
+            if let Some(v) = width       { info.width = v; }
+            if let Some(v) = height      { info.height = v; }
+            if let Some(v) = min_fec     { info.min_fec_packets = v; }
+            if let Some(v) = pkt_dur     { info.audio_packet_duration = v; }
+            // Sunshine rtsp.cpp:982-987 — legacy nv flag 0x20 or Sunshine
+            // extension bit 0x1 both mean "encrypt audio".
+            info.audio_encryption = (feat_flags & 0x20) != 0 || (enc_enabled & 0x1) != 0;
+            println!("   ↳ ANNOUNCE audio: encryption={} packetDuration={:?}ms",
+                info.audio_encryption, pkt_dur);
+            println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?}",
+                packet_size, fps, width, height, min_fec);
+            if packet_size.is_none() {
+                // Parse failure would silently leave the 1024 fallback active —
+                // dump the SDP so the actual attribute names are visible.
+                println!("   ⚠️ packetSize missing from ANNOUNCE SDP — raw body:\n{}", sdp);
+            }
+            *guard = Some(info);
+        }
         _ => {}
     }
 
@@ -247,6 +298,14 @@ fn handle_message(
     println!("🔌 RTSP {} — closed after {}", peer, method);
 
     Ok(())
+}
+
+/// Extract a numeric SDP attribute value, e.g. "a=x-nv-video[0].packetSize:1392".
+fn parse_sdp_u32(sdp: &str, key: &str) -> Option<u32> {
+    let pos  = sdp.find(key)?;
+    let rest = sdp[pos + key.len()..].strip_prefix(':')?;
+    let end  = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 // ── Header extraction helpers ─────────────────────────────────────────────────

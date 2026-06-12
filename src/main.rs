@@ -28,6 +28,10 @@ struct Args {
     codec: String,
     #[arg(long, default_value_t = 60)]
     fps: u32,
+    /// FEC parity percentage (0 disables FEC — A/B test knob for RS
+    /// matrix-compatibility debugging). Default 20, matching Sunshine.
+    #[arg(long, default_value_t = 20)]
+    fec: u32,
 }
 
 fn get_local_ip() -> String {
@@ -52,11 +56,22 @@ async fn main() -> Result<()> {
 
     let capturer = capture::DesktopCapturer::new().expect("Failed to start DXGI capture");
 
+    // The DXGI duplication captures at the monitor's native resolution, which
+    // may not match --width/--height (CLI defaults 1920x1080). The encoder and
+    // the D3D11 video processor's NV12 conversion surface must be sized to the
+    // ACTUAL captured texture — a mismatch leaves the video processor blitting
+    // into a differently-sized output, which can leave the bottom portion of
+    // the NV12 surface (and therefore the encoded frame) black/garbage.
+    if capturer.width as i32 != args.width || capturer.height as i32 != args.height {
+        println!("⚠️  Monitor native resolution ({}x{}) differs from --width/--height ({}x{}) — using native resolution for capture/encoder pipeline.",
+            capturer.width, capturer.height, args.width, args.height);
+    }
+
     let enc = Encoder::new(
         &capturer.device,
         EncoderConfig {
-            width:        args.width,
-            height:       args.height,
+            width:        capturer.width as i32,
+            height:       capturer.height as i32,
             fps:          args.fps as i32,
             bitrate_kbps: args.bitrate,
             codec:        encoder::Codec::from_str(&args.codec),
@@ -111,12 +126,12 @@ async fn main() -> Result<()> {
     let mut rtp_sender = crate::rtp::RtpSender::new(47998)
         .expect("Failed to bind RTP socket on 47998");
 
-    // Audio port (48000) — bind so the client's address-learning "ping" packets
-    // land somewhere instead of an ICMP port-unreachable. Opus encoding and
-    // audio RTP packetization land in a later phase.
-    let audio_probe = std::net::UdpSocket::bind("0.0.0.0:48000")
-        .expect("Failed to bind audio probe socket on 48000");
-    audio_probe.set_nonblocking(true).expect("set_nonblocking on audio probe");
+    // Audio port (48000) — the AudioStreamer thread learns the client's
+    // address from its pings and sends Opus RTP back on this socket.
+    let audio_socket = std::net::UdpSocket::bind("0.0.0.0:48000")
+        .expect("Failed to bind audio socket on 48000");
+    audio_socket.set_nonblocking(true).expect("set_nonblocking on audio socket");
+    let mut audio_streamer: Option<audio::AudioStreamer> = None;
 
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
@@ -150,12 +165,70 @@ async fn main() -> Result<()> {
                             client.ip, client.width, client.height, client.fps);
                         debug::debug_log(&format!("Client connected {}", client.ip));
                         rtp_sender.set_fps(client.fps.max(1));
+                        // Shard size MUST match the client's negotiated
+                        // packetSize (1392 LAN / 1024 remote) or its FEC
+                        // reconstruction runs over the wrong block size.
+                        let pkt_size = if client.packet_size >= 512 {
+                            client.packet_size as usize
+                        } else {
+                            1024
+                        };
+                        let min_fec = if client.min_fec_packets > 0 {
+                            client.min_fec_packets as usize
+                        } else {
+                            2
+                        };
+                        println!("📡 Client negotiated packetSize={} (announced: {}), fps={}, fec.minRequired={}",
+                            pkt_size, client.packet_size, client.fps, min_fec);
+                        // We encode at the monitor's NATIVE resolution, but the
+                        // client chose its bitrate for the mode it requested. If
+                        // native is larger, every bit is stretched over more
+                        // pixels — shows up as uniform shimmer/soft blocking.
+                        let native_px = capturer.width as u64 * capturer.height as u64;
+                        let client_px = client.width as u64 * client.height as u64;
+                        if client_px > 0 && native_px > client_px {
+                            println!("⚠️  Encoding {}x{} (native) but client requested {}x{} — bitrate is stretched {:.1}x thinner per pixel. Raise Moonlight's bitrate or match resolutions.",
+                                capturer.width, capturer.height, client.width, client.height,
+                                native_px as f64 / client_px as f64);
+                        }
+                        rtp_sender.configure(pkt_size, args.fec as usize, min_fec);
+
+                        // Start the audio pipeline (WASAPI → Opus → RTP 48000).
+                        let pkt_dur = if client.audio_packet_duration > 0 {
+                            client.audio_packet_duration
+                        } else {
+                            5
+                        };
+                        audio_streamer = Some(audio::AudioStreamer::start(
+                            audio_socket.try_clone().expect("clone audio socket"),
+                            client.rikey,
+                            client.rikeyid,
+                            client.audio_encryption,
+                            pkt_dur,
+                            // localAudioPlayMode: false = client-only (route
+                            // audio through a virtual sink, host speakers stay
+                            // silent), true = also play on the host speakers.
+                            client.host_audio,
+                        ));
                         client_connected = true;
-                        // Force a fresh IDR (with inline SPS/PPS) so the client's
-                        // decoder can initialize on the very first frame it sees.
-                        enc.request_idr();
                     }
                 }
+            }
+        } else {
+            // /cancel or TEARDOWN flips streaming_active back to false —
+            // reset to idle so the next PLAY starts a clean session.
+            let still_active = client_info.lock()
+                .map(|g| g.as_ref().is_some_and(|c| c.streaming_active))
+                .unwrap_or(false);
+            if !still_active {
+                println!("⏹️  Stream ended — resetting to idle");
+                debug::debug_log("Stream ended, resetting to idle");
+                rtp_sender.reset();
+                if let Some(streamer) = audio_streamer.take() {
+                    streamer.stop();
+                }
+                client_connected = false;
+                video_learned    = false;
             }
         }
 
@@ -166,16 +239,21 @@ async fn main() -> Result<()> {
                 println!("🎥 Learned client video address: {}", addr);
                 debug::debug_log(&format!("Video target {}", addr));
                 video_learned = true;
+                // Force a fresh IDR (with inline SPS/PPS) on the very next encoded
+                // frame — the first one we'll actually transmit — so the client's
+                // decoder can initialize immediately.
+                enc.request_idr();
+                println!("🎯 Force-IDR requested for first transmitted frame");
             }
         }
-
-        // Drain audio "ping" packets — no audio RTP yet.
-        let mut audio_buf = [0u8; 64];
-        let _ = audio_probe.recv_from(&mut audio_buf);
 
         match capturer.acquire_frame() {
             Ok((resource, _)) => {
                 if let Ok(texture) = capturer.get_texture(&resource) {
+                    // No periodic forced IDR here: FEC handles packet loss,
+                    // Moonlight requests IDRs via the control stream when it
+                    // can't recover, and NVENC's idrPeriod (2s GOP) is the
+                    // final backstop.
                     let packet_size = enc.encode_frame(&texture, &mut out_buffer);
 
                     if packet_size > 0 {
@@ -187,6 +265,8 @@ async fn main() -> Result<()> {
 
                         if video_learned {
                             let data = &out_buffer[..packet_size as usize];
+                            let kind = if rtp::detect_frame_type(data) == 2 { "IDR" } else { "P" };
+                            println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, kind);
                             rtp_sender.send_frame(data);
                         }
                     }

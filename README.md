@@ -1,113 +1,112 @@
-# 🚀 Nova Server — Ultra-Low Footprint Game Streaming Host
 
-**Moonlight / GameStream compatible • Rust + C++ • <15MB single-exe target**
+| 🟢 NOVA CORE (FREE / OPEN SOURCE) | 🟣 NOVA PRO (DONATION TIER) |
+| :--- | :--- |
+| **Zero-Copy Pipelines** (DXGI Desktop Dup. → HW Encoder) | **Windows Service Mode** (Pre-login, hidden, boot-level) |
+| **Intelligent Codec Tiering** (H.265 baseline, AV1, H.264 fallback) | **Native Echo Mic Passthrough** (UMDF Virtual Audio Driver) |
+| **Token-Bucket Network Pacer** (Eliminates wireless micro-stutter) | **Virtual Monitor / IDD Sandbox** (Headless HDR/10-bit) |
+| **Full Controller Support** (XInput + ViGEmBus virtual injection) | **Advanced Orchestration & Routing** |
 
-An ambitious next-generation replacement for Sunshine. Built for **maximum performance with minimum resource usage**.
 
----
-
-### Why Nova?
-- True **zero-copy** DXGI → NVENC/AMF GPU pipelines
-- Extremely lightweight (<15MB executable goal)
-- Leaves 99.9% of system resources for your games
-- Native RTX 50-series support out of the box
-- Open-Core model: Powerful free core + optional Pro/donation features
-- Moonlight compatible (works with existing clients)
-
-**Nova** = the host (server)  
-**Echo** = companion client (coming later)
-
----
-
-## 🎯 Master Blueprint
-
-This project follows a clear **Master Pattern Blueprint** to become an unstoppable market disruptor in game streaming.
-
-### Core Vision
-A hyper-optimized, lightweight background service that runs effortlessly with zero-copy memory transfers entirely on the GPU.
-
-### Open-Core Model
-
-**Nova Core (Free / Open Source)**
-- Zero-Copy Pipelines (DXGI Desktop Duplication → hardware encoder buffers)
-- Intelligent Codec Tiering (H.265 baseline, AV1 on modern GPUs, H.264 fallback)
-- Token-Bucket Network Pacer (eliminates wireless micro-stutter)
-- Full Controller Support (XInput + ViGEmBus virtual injection)
-
-**Nova Pro / Donation Tier**
-- Windows Service Mode (runs at boot, pre-login, hidden)
-- Native Echo Mic Passthrough (UMDF Virtual Audio Driver)
-- Virtual Monitor / Indirect Display Driver (IDD) Sandbox (headless HDR/10-bit)
-- Advanced orchestration & routing
 
 ---
 
 ## 🗺️ Master Roadmap
 
-### Phase 3: The Pipeline Finish Line (Current Focus)
-- Bind acquire_frame pointer stream into C++ EncodeFrame shim
-- Generate test `.h264` file output (verifiable in VLC)
-- Basic RTSP network handling for Moonlight client pairing
+### 🏁 Phase 3: The Pipeline Finish Line `[✅ COMPLETE]`
+*   **Zero-copy DXGI Desktop Duplication → NVENC** *(H.264/NV12, CBR, IDR every 2s, Annex-B, repeatSPSPPS=1)*
+*   **Exact Sunshine RTSP wire protocol** on TCP 48010 *(per-connection messages, immediate shutdown after response, DEADBEEFCAFE session token, correct X-SS-Ping-Payload / X-SS-Connect-Data headers on SETUP)*
+*   **ENet reliable UDP control stream** on 47999 via `rusty_enet`
+*   **RTP video packetizer** on UDP 47998 *(NV_VIDEO_PACKET 8-byte header, MTU slicing, client address learning from post-PLAY ping packet, full NAL keyframe detection + force-IDR-on-connect shim)*
+*   **HTTPS pairing server** with hardened TLS 1.2 + mutual-auth compatibility *(LAN IP SAN, proper CA/KeyCertSign chain, ALPN http/1.1, clock-skew & hostname verification fixes)*
 
-### Phase 4: Brainstorm & Refinement
-- Low-Latency WASAPI Audio Loopback
-- AV Sync Engine with hardware timing
-- mDNS Zero-Config Discovery
-- Dynamic Bitrate Adjustment via UDP feedback
-- Mouse Lock & Virtual Absolute Input
-- Auto-Game Presets (based on foreground window)
-- Headless Display Emulation (no HDMI dummies needed)
+> **Result:** Video bitstream generation + complete control plane is live and Moonlight-compatible! 🎉
 
-### Phase 5: Single-Exe Release Engineering
-- Asset embedding with `include_bytes!`
-- Full LTO + panic=abort + symbol stripping
-- Portable executable with no installer required
+### 🚧 Phase 4: Core Streaming MVP `[IN PROGRESS]`
+*Prioritized for the fastest path to a usable Alpha:*
+1.  **End-to-End Video Validation:** Real Moonlight client testing (decoder init, no black screen, flawless frame delivery).
+2.  **Low-Latency Audio:** WASAPI audio capture → Opus → RTP packetization + hardware-timed AV sync engine.
+3.  **Input Event Handling:** Gamepad via ViGEmBus/XInput, mouse lock + absolute positioning, keyboard injection.
+4.  **Zero-Config & Bitrate:** mDNS discovery + dynamic bitrate adjustment via UDP feedback.
+5.  **Quality of Life:** Auto-game presets (foreground window detection) + Headless Display Emulation.
+
+### 📦 Phase 5: Single-Exe Release Engineering
+*   Asset embedding with `include_bytes!`
+*   Full LTO + `panic=abort` + symbol stripping.
+*   100% Portable executable—**zero installer required**.
+
+---
+
+## 📡 Current Status *(Updated: June 10, 2026)*
+
+**Phase 3 Complete ✅ | Phase 4 In Progress (Video pipeline + control plane live)**
+
+### 🟢 Working Right Now:
+*   ✅ **DXGI → NVENC** zero-copy encode path (Live RTP capable).
+*   ✅ **RTSP + ENet + RTP channels** mirroring Sunshine/Moonlight semantics.
+*   ✅ **HTTPS Pairing** hardened for desktop and beta Android clients.
+*   ✅ **Force-IDR on connect** + proper keyframe signaling.
+
+### 🟡 Next Immediate Actions:
+*   Validate live video stream in Moonlight over LAN.
+*   Wire the remaining audio RTP leg (WASAPI capture shim is ready).
+*   Input injection on the control stream.
+*   *Alpha MVP ships once video + audio render cleanly!*
 
 ---
 
 ## 🔥 Community Most-Wanted Features
-- Mouse lock & virtual absolute input handling
-- Headless display emulation (zero hardware dummies)
-- Auto game presets based on running titles
-- Native microphone passthrough (Echo)
+
+We are listening. Here is what is on the high-priority radar:
+- [ ] **Mouse lock** & virtual absolute input handling.
+- [ ] **Headless display emulation** (Kill the HDMI dummy plugs for good).
+- [ ] **Auto game presets** based on running titles (WoW, FPS, etc.).
+- [ ] **Native microphone passthrough** via Echo.
 
 ---
 
-## 🛠️ Tech Stack
-- **Core**: 100% Rust for safety and performance
-- **Hardware Shims**: Thin C++ layer via `cc` builder (NVENC today, AMF/QuickSync tomorrow)
-- **Capture**: DXGI Desktop Duplication
-- **Encoding**: Direct hardware access (NVIDIA/AMD/Intel)
+## 🛠️ The Tech Stack
+
+Nova is forged from modern, uncompromising tools:
+
+*   🦀 **Core:** 100% Rust for memory safety, concurrency, and raw speed.
+*   ⚙️ **Hardware Shims:** Thin C++ layer via `cc` builder (NVENC active; AMF/QuickSync incoming).
+*   📸 **Capture:** DXGI Desktop Duplication.
+*   🎥 **Encoding:** Direct bare-metal hardware access.
+*   🌐 **Networking:** RTSP (TCP), ENet (reliable UDP), RTP (video/audio UDP).
 
 ---
 
-## Current Status (June 10, 2026)
-**Phase 3 Complete — Phase 4 (Networking & Packetization) in progress**
-✅ DXGI Desktop Duplication + NVENC zero-copy pipeline (H.264, NV12)
-✅ HTTPS pairing server (TLS handshake, GameStream PIN pairing)
-✅ RTSP control channel (port 48010) — OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY,
-   rebuilt to mirror Sunshine's `rtsp.cpp` wire behavior
-✅ ENet reliable-UDP control stream (port 47999) via `rusty_enet`
-✅ RTP video packetizer (port 47998) — NV_VIDEO_PACKET framing, MTU slicing,
-   client address-learning, IDR/keyframe detection, force-IDR on connect
-🔜 Audio RTP packetization (WASAPI capture done, Opus + RTP send pending)
-🔜 Control-stream input event handling (gamepad/mouse/keyboard)
+## 🚀 Quick Start *(Alpha Coming Soon)*
 
-**Next Step**: Validate end-to-end video rendering in Moonlight, then wire up audio RTP.
-
----
-
-## Quick Start (Alpha coming soon)
+Ready to compile from source? 
 
 ```bash
-git clone https://github.com/Zero19-85/nova-server.git
-cd nova-server
+# Clone the repository
+git clone [https://github.com/Zero19-85/Nova.git](https://github.com/Zero19-85/Nova.git)
+
+# Enter the directory
+cd Nova
+
+# Build and run the optimized release binary
 cargo run --release
 
-Requirements: Windows 10/11 + Modern GPU (NVIDIA recommended)
+---
 
-Contributing & Donations
-We welcome contributions! See BLUEPRINT.md for the full vision and open issues for tasks.
-If you want to support faster development of Pro features (Windows Service, Virtual Audio, IDD), consider sponsoring the project on GitHub.
+### 💻 System Requirements
+* **OS:** Windows 10 / Windows 11
+* **Hardware:** Modern GPU (*NVIDIA RTX series highly recommended to leverage the current bare-metal NVENC path*)
 
-Star this repo if you want lower-latency, lighter game streaming! ⭐
+> ⚠️ **NOTE:** Previous documentation referenced `nova-server` — this has been officially corrected to the actual **Nova** repository.
+
+---
+
+
+
+### 🤝 Contributing & Donations
+
+We welcome pull requests from fellow optimizers! Check out [`BLUEPRINT.md`](#) for the full architectural vision and browse open issues for active tasks. 
+
+If you want to support the blistering-fast development of **Nova Pro** features *(Windows Service mode, Virtual Audio, IDD)*, consider sponsoring the project on GitHub.
+
+**If you want lower-latency, lighter game streaming... drop a ⭐ on this repo!**
+
