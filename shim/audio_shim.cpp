@@ -248,12 +248,18 @@ int SetDefaultAudioDevice(const WCHAR* device_id)
 
     int failures = 0;
     for (int role = 0; role < ERole_enum_count; ++role) {
-        if (FAILED(policy->SetDefaultEndpoint(device_id, (ERole)role)))
+        HRESULT r = policy->SetDefaultEndpoint(device_id, (ERole)role);
+        if (FAILED(r)) {
             ++failures;
+            printf("\xE2\x9A\xA0 SetDefaultEndpoint role %d failed: 0x%08lx\n", role, (unsigned long)r);
+        }
     }
 
     policy->Release();
-    return failures ? -3 : 0;
+    // Playback follows eConsole/eMultimedia; some devices reject the
+    // communications role. Only report failure if NO role could be set —
+    // a partial success must not abort client-only routing.
+    return (failures == ERole_enum_count) ? -3 : 0;
 }
 
 extern "C" __declspec(dllexport)

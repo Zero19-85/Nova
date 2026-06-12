@@ -88,6 +88,14 @@ impl SinkGuard {
             return Self { restore_id: None, capture_id: None };
         }
 
+        // Verify the switch actually landed — diagnoses "plays on both" cases.
+        let mut now = [0u16; DEVICE_ID_CCH];
+        if unsafe { GetDefaultAudioDeviceId(now.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0
+            && wide_id(&now) != sink_id
+        {
+            eprintln!("⚠️  Audio: default-device readback does not match virtual sink — host speakers may still play");
+        }
+
         println!("🎧 Audio: client-only — default output switched to virtual sink (host speakers silent, not muted)");
         Self {
             restore_id: if have_cur { Some(cur_id) } else { None },
@@ -119,8 +127,9 @@ pub struct AudioFormat {
 /// when None) and return a channel that yields raw PCM chunks (interleaved,
 /// format described by the returned AudioFormat).
 fn start_capture_thread(
+    stop: Arc<AtomicBool>,
     device_id: Option<&[u16]>,
-) -> Result<(mpsc::Receiver<Vec<u8>>, AudioFormat), String> {
+) -> Result<(mpsc::Receiver<Vec<u8>>, AudioFormat, thread::JoinHandle<()>), String> {
     let mut sample_rate: u32 = 0;
     let mut channels: u16 = 0;
     let mut bps: u16 = 0;
@@ -136,18 +145,21 @@ fn start_capture_thread(
 
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
 
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         // ~1 s of audio at worst-case 48 kHz, 2 ch, 32-bit float
         let mut buf = vec![0u8; 48_000 * 2 * 4];
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             let mut frames: u32 = 0;
             let bytes = unsafe {
                 CaptureAudioFrame(buf.as_mut_ptr(), buf.len() as i32, &mut frames)
             };
             if bytes > 0 {
-                // Send fails when the receiver is gone (streaming stopped)
-                if tx.try_send(buf[..bytes as usize].to_vec()).is_err() {
-                    break;
+                match tx.try_send(buf[..bytes as usize].to_vec()) {
+                    // Receiver gone — streaming stopped.
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    // Channel full — drop this chunk instead of killing the
+                    // session; the consumer will catch up.
+                    _ => {}
                 }
             } else if bytes < 0 {
                 eprintln!("❌ CaptureAudioFrame error: {}", bytes);
@@ -159,7 +171,7 @@ fn start_capture_thread(
         unsafe { CleanupAudio(); }
     });
 
-    Ok((rx, fmt))
+    Ok((rx, fmt, handle))
 }
 
 /// AES-128-CBC with PKCS7 padding — GameStream audio encryption
@@ -238,10 +250,10 @@ fn audio_send_loop(
 ) {
     // Routing must be decided before capture starts: client-only mode captures
     // the virtual sink by id, so the loopback never touches the host speakers.
-    // The guard restores the original default device on every exit path below.
+    // The guard restores the original default device on every exit path.
     let sink_guard = SinkGuard::engage(host_audio);
 
-    let (rx, fmt) = match start_capture_thread(sink_guard.capture_id.as_deref()) {
+    let (rx, fmt, cap_handle) = match start_capture_thread(stop.clone(), sink_guard.capture_id.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("🎵 Audio disabled: {}", e);
@@ -249,6 +261,31 @@ fn audio_send_loop(
         }
     };
 
+    send_pcm_loop(&socket, rikey, rikeyid, encrypt, packet_duration_ms, &stop, &rx, fmt);
+
+    // Tear capture down COMPLETELY before this function returns: CleanupAudio
+    // releases the shim's GLOBAL WASAPI state, so a reconnect's InitAudioCapture
+    // must never overlap it — a lingering capture thread from the old session
+    // would otherwise null out the new session's capture client mid-stream.
+    // Joining also guarantees teardown precedes the SinkGuard drop below that
+    // restores the default output device.
+    stop.store(true, Ordering::Relaxed);
+    drop(rx); // also unblocks the capture thread's channel sends
+    let _ = cap_handle.join();
+    drop(sink_guard);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_pcm_loop(
+    socket: &UdpSocket,
+    rikey: [u8; 16],
+    rikeyid: u32,
+    encrypt: bool,
+    packet_duration_ms: u32,
+    stop: &AtomicBool,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    fmt: AudioFormat,
+) {
     // Opus only accepts 48/24/16/12/8 kHz; the Windows shared-mode mix format
     // is essentially always 48 kHz. Resampling is out of scope for v1.
     if fmt.sample_rate != 48_000 {
@@ -352,5 +389,4 @@ fn audio_send_loop(
             timestamp = timestamp.wrapping_add(packet_duration_ms);
         }
     }
-    // rx drops here → capture thread sees the closed channel and cleans up.
 }
