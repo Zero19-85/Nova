@@ -86,6 +86,27 @@ static int  g_cursorX       = 0;
 static int  g_cursorY       = 0;
 static bool g_cursorVisible = false;
 
+// Bumped by UpdateCursorShape() on every shape upload — used to detect a
+// cursor shape change (e.g. arrow -> text-select caret) for IDR purposes.
+static uint32_t g_cursorShapeGeneration = 0;
+
+// ==================== CURSOR-MOTION IDR ====================
+// P-frame motion compensation leaves faint residual copies of the composited
+// cursor at its old on-screen positions for several frames ("ghost trails")
+// — they only fully disappear at an IDR. Forcing an IDR whenever the cursor
+// moves/changes "significantly" clears them almost immediately. A cooldown
+// caps how often this can fire so continuous mouse movement doesn't turn
+// into an IDR-every-frame storm.
+static const int kCursorIdrMoveThreshold  = 2;  // pixels
+static const int kCursorIdrCooldownFrames = 10; // ~6 forced IDR/s @ 60fps
+static int      g_lastIdrCursorX          = -1000000;
+static int      g_lastIdrCursorY          = -1000000;
+static bool     g_lastIdrCursorVisible    = false;
+static uint32_t g_lastIdrShapeGeneration  = 0;
+static int      g_framesSinceCursorIdr    = kCursorIdrCooldownFrames;
+
+static inline int iabs(int v) { return v < 0 ? -v : v; }
+
 // ==================== CURSOR COMPOSITING HELPERS ====================
 
 // Compiles the cursor VS/PS, blend state and sampler once. Called from
@@ -319,6 +340,7 @@ extern "C" __declspec(dllexport) int UpdateCursorShape(
     if (g_cursorTex) { g_cursorTex->Release(); g_cursorTex = nullptr; }
     g_cursorTexW = 0;
     g_cursorTexH = 0;
+    g_cursorShapeGeneration++;
 
     if (img.empty() || out_w == 0 || out_h == 0) {
         // Unsupported/empty shape — cursor stays hidden until the next shape update.
@@ -618,6 +640,26 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // surface, since the DXGI duplication texture may not support that bind).
     if (g_cursorVisible && g_cursorSRV && g_cursorTexW > 0 && g_cursorTexH > 0) {
         DrawCursorOverlay();
+    }
+
+    // Cursor-motion IDR: see kCursorIdrMoveThreshold/kCursorIdrCooldownFrames
+    // above. Detect a "significant" cursor change since the last
+    // cursor-triggered IDR and force one (subject to the cooldown) so any
+    // residual ghost from old cursor positions/shapes is fully cleared.
+    g_framesSinceCursorIdr++;
+    bool cursorChanged =
+        (g_cursorVisible != g_lastIdrCursorVisible) ||
+        (g_cursorShapeGeneration != g_lastIdrShapeGeneration) ||
+        (g_cursorVisible &&
+         (iabs(g_cursorX - g_lastIdrCursorX) >= kCursorIdrMoveThreshold ||
+          iabs(g_cursorY - g_lastIdrCursorY) >= kCursorIdrMoveThreshold));
+    if (cursorChanged && g_framesSinceCursorIdr >= kCursorIdrCooldownFrames) {
+        g_force_idr.store(true);
+        g_lastIdrCursorX         = g_cursorX;
+        g_lastIdrCursorY         = g_cursorY;
+        g_lastIdrCursorVisible   = g_cursorVisible;
+        g_lastIdrShapeGeneration = g_cursorShapeGeneration;
+        g_framesSinceCursorIdr   = 0;
     }
 
     // BGRA → NV12 via D3D11 Video Processor
