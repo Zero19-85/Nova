@@ -50,6 +50,11 @@ fn get_local_ip() -> String {
 /// for following the capture target onto/off of the virtual display as
 /// streams start and stop.
 ///
+/// `expected_size`, when `Some((width, height))`, is forwarded to
+/// `capturer.rebind` to guard against `GetDesc()` transiently reporting the
+/// virtual display's 800x600 failsafe mode right after a CCD topology change
+/// — see `capture::DesktopCapturer::rebind`'s doc comment.
+///
 /// A failed `rebind` is treated as transient (DXGI needs a moment to settle
 /// after a topology change) and retried on the next call. A failed `Encoder`
 /// recreation is not recoverable — the caller should `break` the capture loop.
@@ -62,8 +67,9 @@ fn rebind_capture_and_encoder(
     capturer: &mut capture::DesktopCapturer,
     enc: &mut Encoder,
     target: Option<&str>,
+    expected_size: Option<(u32, u32)>,
 ) -> std::result::Result<(), String> {
-    match capturer.rebind(target) {
+    match capturer.rebind(target, expected_size) {
         Ok(needs_new_encoder) => {
             if needs_new_encoder {
                 println!("🔁 Capture resolution/device changed — recreating NVENC encoder ({}x{})", capturer.width, capturer.height);
@@ -88,6 +94,13 @@ fn rebind_capture_and_encoder(
                     }
                 }
             }
+            // Keep input.rs's mouse-mapping rect in sync even when the
+            // resolution didn't change — rebind() can move the captured
+            // output to a different position in the virtual screen (e.g.
+            // the Virtual Desktop output becoming primary at (0,0) while a
+            // physical monitor that used to be primary shifts to a non-zero
+            // origin).
+            input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
             Ok(())
         }
         Err(e) => {
@@ -115,7 +128,27 @@ pub async fn run() -> Result<()> {
 
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
 
-    let mut capturer = capture::DesktopCapturer::new().expect("Failed to start DXGI capture");
+    // Owns the virtual-display lifecycle for the whole process.
+    // activate_for_stream/deactivate_after_stream cache/restore the host's
+    // audio endpoint, so there's no separate audio bookkeeping elsewhere.
+    //
+    // Enable Root\MttVDD ONCE, here, at boot, and leave it enabled for the
+    // server's entire lifetime. The old code disabled/re-enabled the devnode
+    // inside activate_for_stream on every session start, which raced the
+    // IDD's transient 800x600 default mode against the client's requested
+    // resolution. Bringing it up once at boot means the devnode has long
+    // since settled at the configured mode by the time any client connects.
+    let mut vd = virtual_display::VirtualDisplay::new();
+    let virtual_device_name = match vd.ensure_enabled_at_boot(args.width as u32, args.height as u32, args.fps) {
+        Ok(name) => name,
+        Err(e) => {
+            println!("⚠️  Failed to enable Root\\MttVDD at boot: {e} — Virtual Desktop sessions will be unavailable");
+            None
+        }
+    };
+
+    let mut capturer = capture::DesktopCapturer::new_excluding(virtual_device_name.as_deref()).expect("Failed to start DXGI capture");
+    input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
 
     // The DXGI duplication captures at the monitor's native resolution, which
     // may not match --width/--height (CLI defaults 1920x1080). The encoder and
@@ -194,11 +227,6 @@ pub async fn run() -> Result<()> {
     audio_socket.set_nonblocking(true).expect("set_nonblocking on audio socket");
     let mut audio_streamer: Option<audio::AudioStreamer> = None;
 
-    // Owns the virtual-display lifecycle across connect/disconnect cycles —
-    // activate_for_stream/deactivate_after_stream also cache/restore the
-    // host's audio endpoint, so there's no separate audio bookkeeping here.
-    let mut vd = virtual_display::VirtualDisplay::new();
-
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
     let mut video_learned    = false;
@@ -272,17 +300,20 @@ pub async fn run() -> Result<()> {
             if let Ok(mut guard) = client_info.lock() {
                 let pending = guard.as_ref()
                     .filter(|c| c.app_id != 0 && !c.activated && !c.streaming_active)
-                    .map(|c| (c.width, c.height, c.fps));
-                if let Some((width, height, fps)) = pending {
-                    println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps)");
-                    match vd.activate_for_stream(width, height, fps) {
-                        Ok(()) => {
-                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name()).is_err() {
-                                break;
+                    .map(|c| (c.app_id, c.width, c.height, c.fps));
+                if let Some((app_id, width, height, fps)) = pending {
+                    if app_launcher::uses_virtual_display(app_id) {
+                        println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps)");
+                        match vd.activate_for_stream(width, height, fps) {
+                            Ok(()) => {
+                                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((width, height))).is_err() {
+                                    break;
+                                }
                             }
-                            app_launcher::sleep_displays();
+                            Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
                         }
-                        Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
+                    } else {
+                        println!("🖥️  App {app_id} targets the physical display — virtual display not used");
                     }
                     if let Some(info) = guard.as_mut() {
                         info.activated = true;
@@ -317,25 +348,24 @@ pub async fn run() -> Result<()> {
                         if client.activated {
                             println!("🖥️  Virtual display already active for this session");
                         } else {
-                            match vd.activate_for_stream(client.width, client.height, client.fps) {
-                                Ok(()) => {
-                                    if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name()).is_err() {
-                                        break;
+                            if app_launcher::uses_virtual_display(client.app_id) {
+                                match vd.activate_for_stream(client.width, client.height, client.fps) {
+                                    Ok(()) => {
+                                        if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                            break;
+                                        }
                                     }
-                                    // Put the physical displays to sleep now that
-                                    // the virtual display is the desktop primary
-                                    // and capture has moved over to it.
-                                    app_launcher::sleep_displays();
+                                    Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
                                 }
-                                Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
+                            } else {
+                                println!("🖥️  App {} streaming from the physical display — virtual display not used", client.app_id);
                             }
                             // Mirror the pre-activation pass: mark this session
                             // activated so that once the control stream
                             // disconnects, the idle-loop pre-activation check
                             // (app_id != 0 && !activated && !streaming_active)
                             // doesn't see a stale "not yet activated" session
-                            // and re-activate the virtual display (and re-sleep
-                            // the physical monitors) with no client connected.
+                            // and re-run this block with no client connected.
                             if let Ok(mut guard) = client_info.lock() {
                                 if let Some(info) = guard.as_mut() {
                                     info.activated = true;
@@ -428,10 +458,8 @@ pub async fn run() -> Result<()> {
                 if let Err(e) = vd.deactivate_after_stream() {
                     println!("⚠️  Virtual display deactivation failed: {e}");
                 }
-                // Wake the host displays if "Virtual Desktop" put them to sleep.
-                app_launcher::wake_displays();
                 // Follow capture back onto the restored physical display.
-                if rebind_capture_and_encoder(&mut capturer, &mut enc, None).is_err() {
+                if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
                     break;
                 }
                 client_connected = false;
@@ -539,7 +567,7 @@ pub async fn run() -> Result<()> {
                         println!("⚠️  DXGI duplication lost (display change) — rebinding capture (attempt {access_lost_streak})");
                     }
                 }
-                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name()).is_err() {
+                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), vd.active_resolution()).is_err() {
                     break;
                 }
                 // Back off instead of spinning at full frame rate once the

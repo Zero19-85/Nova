@@ -16,6 +16,16 @@ pub struct DesktopCapturer {
     /// black/uninitialized.
     pub width: u32,
     pub height: u32,
+    /// Top-left corner of this output's `DesktopCoordinates`, i.e. its
+    /// position within the Win32 virtual screen
+    /// (`SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`..+`SM_CXVIRTUALSCREEN`/
+    /// `SM_CYVIRTUALSCREEN`). The GDI primary monitor sits at `(0, 0)`, but
+    /// the captured output isn't always the primary — `input.rs` uses this
+    /// (via `input::set_active_capture_rect`) to map Moonlight's
+    /// client-relative mouse coordinates onto the right monitor instead of
+    /// assuming `(0, 0)`/`GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`.
+    pub origin_x: i32,
+    pub origin_y: i32,
     /// Copy of the last successfully captured frame, kept on `device` so it
     /// can be re-submitted to the encoder when `AcquireNextFrame` reports
     /// `DXGI_ERROR_WAIT_TIMEOUT` (desktop unchanged). A fully idle/static
@@ -31,15 +41,38 @@ impl DesktopCapturer {
         Self::for_output(None)
     }
 
+    /// Like [`new`](Self::new), but the startup "first output" fallback skips
+    /// any output whose GDI device name matches `exclude`.
+    ///
+    /// `run()` uses this to keep the boot-time capturer off the virtual
+    /// display. `ensure_enabled_at_boot` cycles `Root\MttVDD`'s devnode,
+    /// which can change WDDM adapter-registration order and make the virtual
+    /// display's adapter enumerate as DXGI adapter 0 — so the "first output"
+    /// fallback would bind the idle boot-time capturer to the *virtual*
+    /// display. A later `activate_for_stream` then [`rebind`](Self::rebind)s
+    /// *the same* capturer to *the same* output (just a different mode): a
+    /// same-output re-`DuplicateOutput`, whose `AcquireNextFrame` never
+    /// produces a frame (perpetual `DXGI_ERROR_ACCESS_LOST`/`INVALIDCALL`),
+    /// leaving the stream black. Excluding the virtual display here
+    /// guarantees that first rebind is a cross-output switch instead.
+    pub fn new_excluding(exclude: Option<&str>) -> Result<Self> {
+        Self::for_output_excluding(None, exclude)
+    }
+
     /// Binds to the output whose GDI device name (`DXGI_OUTPUT_DESC::DeviceName`,
     /// e.g. `\\.\DISPLAY28`) matches `gdi_device_name`. When `gdi_device_name`
     /// is `None`, or no output matches, falls back to the first output of the
     /// first adapter — today's default behavior, used at startup before any
     /// virtual-display activation has happened.
     pub fn for_output(gdi_device_name: Option<&str>) -> Result<Self> {
+        Self::for_output_excluding(gdi_device_name, None)
+    }
+
+    /// See [`new_excluding`](Self::new_excluding) for `exclude`'s meaning.
+    pub fn for_output_excluding(gdi_device_name: Option<&str>, exclude: Option<&str>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let (adapter, output) = Self::find_output(&factory, gdi_device_name)?;
+            let (adapter, output) = Self::find_output(&factory, gdi_device_name, exclude)?;
             let adapter: IDXGIAdapter = adapter.cast()?;
 
             let mut device = None;
@@ -70,7 +103,7 @@ impl DesktopCapturer {
 
             println!("✅ DXGI Desktop Duplication READY! ({}x{})", width, height);
 
-            Ok(Self { dupl, device, width, height, last_frame: None })
+            Ok(Self { dupl, device, width, height, origin_x: rect.left, origin_y: rect.top, last_frame: None })
         }
     }
 
@@ -86,19 +119,31 @@ impl DesktopCapturer {
     /// for a frame or two right after a topology change settles, so this
     /// retries briefly before giving up.
     ///
+    /// `expected_size`, when `Some((width, height))`, additionally guards
+    /// against `GetDesc().DesktopCoordinates` itself being transiently wrong:
+    /// `set_primary_display`/`deactivate_other_paths`/`force_resolution`
+    /// (virtual_display.rs) can each cause Windows to momentarily report the
+    /// IDD's 800x600 failsafe mode before its `vdd_settings.xml` mode takes
+    /// effect (see `wait_for_display_resolution`'s doc comment — that covers
+    /// the GDI-level view of this transient; DXGI's view can lag
+    /// independently). Each retry attempt re-queries `GetDesc()` on the same
+    /// `IDXGIOutput` (which reflects live state), and if the reported size
+    /// doesn't match `expected_size`, sleeps and retries without spending a
+    /// `DuplicateOutput` call — except on the final attempt, which is
+    /// accepted regardless (with a warning if still mismatched) so `rebind`
+    /// never fails outright just because the expected size never arrived.
+    /// `None` skips this check entirely, preserving the prior behavior
+    /// (accept whatever `GetDesc()` reports on the first successful
+    /// `DuplicateOutput`).
+    ///
     /// Returns `Ok(true)` if the caller must recreate its `Encoder`: either
     /// the resolution changed, or the new output lives on a different
     /// adapter and `device` was recreated (the old `Encoder`'s device pointer
     /// would otherwise dangle).
-    pub fn rebind(&mut self, gdi_device_name: Option<&str>) -> Result<bool> {
+    pub fn rebind(&mut self, gdi_device_name: Option<&str>, expected_size: Option<(u32, u32)>) -> Result<bool> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let (adapter, output) = Self::find_output(&factory, gdi_device_name)?;
-
-            let desc = output.GetDesc()?;
-            let rect = desc.DesktopCoordinates;
-            let new_width  = (rect.right - rect.left) as u32;
-            let new_height = (rect.bottom - rect.top) as u32;
+            let (adapter, output) = Self::find_output(&factory, gdi_device_name, None)?;
 
             let current_dxgi_device: IDXGIDevice = self.device.cast()?;
             let current_adapter: IDXGIAdapter1 = current_dxgi_device.GetAdapter()?.cast()?;
@@ -109,8 +154,20 @@ impl DesktopCapturer {
             };
 
             let mut last_err = None;
-            for _ in 0..20 {
-                let attempt: Result<(IDXGIOutputDuplication, ID3D11Device)> = if same_adapter {
+            for attempt in 0..20 {
+                let desc = output.GetDesc()?;
+                let rect = desc.DesktopCoordinates;
+                let new_width  = (rect.right - rect.left) as u32;
+                let new_height = (rect.bottom - rect.top) as u32;
+
+                let last_attempt = attempt == 19;
+                let size_mismatch = expected_size.is_some_and(|(w, h)| w != new_width || h != new_height);
+                if size_mismatch && !last_attempt {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+
+                let result: Result<(IDXGIOutputDuplication, ID3D11Device)> = if same_adapter {
                     let output1: IDXGIOutput1 = output.cast()?;
                     output1.DuplicateOutput(&current_dxgi_device).map(|d| (d, self.device.clone()))
                 } else {
@@ -135,13 +192,21 @@ impl DesktopCapturer {
                     })
                 };
 
-                match attempt {
+                match result {
                     Ok((dupl, device)) => {
+                        if size_mismatch {
+                            if let Some((w, h)) = expected_size {
+                                println!("⚠️  DXGI still reports {new_width}x{new_height} after 20 attempts (wanted {w}x{h}) — binding anyway");
+                            }
+                        }
+
                         let resized = new_width != self.width || new_height != self.height || !same_adapter;
                         self.dupl   = dupl;
                         self.device = device;
                         self.width  = new_width;
                         self.height = new_height;
+                        self.origin_x = rect.left;
+                        self.origin_y = rect.top;
                         self.last_frame = None;
                         println!("✅ DXGI Desktop Duplication re-bound ({}x{})", new_width, new_height);
                         return Ok(resized);
@@ -158,10 +223,10 @@ impl DesktopCapturer {
 
     /// Walks every output of every adapter looking for one whose
     /// `DXGI_OUTPUT_DESC::DeviceName` matches `gdi_device_name`. Always also
-    /// records the first output it sees as a fallback, returned when
-    /// `gdi_device_name` is `None` or doesn't match anything (e.g. the
+    /// records the first non-`exclude` output it sees as a fallback, returned
+    /// when `gdi_device_name` is `None` or doesn't match anything (e.g. the
     /// virtual display hasn't appeared in DXGI's enumeration yet).
-    fn find_output(factory: &IDXGIFactory1, gdi_device_name: Option<&str>) -> Result<(IDXGIAdapter1, IDXGIOutput)> {
+    fn find_output(factory: &IDXGIFactory1, gdi_device_name: Option<&str>, exclude: Option<&str>) -> Result<(IDXGIAdapter1, IDXGIOutput)> {
         let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput)> = None;
 
         let mut i = 0;
@@ -177,7 +242,7 @@ impl DesktopCapturer {
                         return Ok((adapter, output));
                     }
                 }
-                if fallback.is_none() {
+                if fallback.is_none() && !exclude.is_some_and(|ex| ex.eq_ignore_ascii_case(name)) {
                     fallback = Some((adapter.clone(), output.clone()));
                 }
                 j += 1;

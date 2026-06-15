@@ -20,16 +20,16 @@
 //! ## Big picture
 //!
 //! Module owns one [`VirtualDisplay`] instance, created once at startup and
-//! held for the lifetime of the process (alongside `app_launcher`'s
-//! sleep/wake state). When the Moonlight client launches App 5:
+//! held for the lifetime of the process. `Root\MttVDD` is enabled once, at
+//! boot, via [`VirtualDisplay::ensure_enabled_at_boot`], and stays enabled
+//! for the whole process lifetime. When the Moonlight client launches App 5:
 //!
-//!   1. [`VirtualDisplay::ensure_installed`] — make sure the driver exists.
-//!   2. [`VirtualDisplay::configure_mode`] — make the driver advertise a mode
-//!      matching the client's negotiated resolution/fps.
-//!   3. [`VirtualDisplay::activate_for_stream`] — enable the virtual monitor,
-//!      make it the new desktop primary, and put the physical monitors to
-//!      sleep.
-//!   4. main.rs's capture loop is re-pointed at the new primary (see "DXGI
+//!   1. [`VirtualDisplay::configure_mode`] — make the already-enabled driver
+//!      advertise a mode matching the client's negotiated resolution/fps.
+//!   2. [`VirtualDisplay::activate_for_stream`] — make the virtual monitor
+//!      the new desktop primary, and fully detach the physical display
+//!      path(s) from the CCD topology (true headless).
+//!   3. main.rs's capture loop is re-pointed at the new primary (see "DXGI
 //!      Handoff Strategy" below — this is the part that touches capture.rs /
 //!      shim.cpp and is intentionally NOT scaffolded here yet).
 //!
@@ -48,7 +48,7 @@
 //!
 //! Planned sequence for `App 5` start:
 //!
-//!   1. `activate_for_stream()` runs steps 1-3 above. At this point Windows
+//!   1. `activate_for_stream()` runs steps 1-2 above. At this point Windows
 //!      has a NEW primary display whose GDI device name (e.g. `\\.\DISPLAY3`)
 //!      we capture in `VirtualDisplay::active_device_name()`.
 //!   2. main.rs's capture loop must be told to tear down its current
@@ -69,21 +69,20 @@
 //!          `activate_for_stream`/`deactivate_after_stream`) that causes it to
 //!          drop + recreate `DesktopCapturer` and call `ReinitEncoder` before
 //!          the next `AcquireNextFrame`.
-//!   3. `app_launcher::sleep_displays()` (existing SC_MONITORPOWER broadcast)
-//!      powers off the PHYSICAL panels. OPEN QUESTION to verify on hardware:
-//!      the original bug ("SC_MONITORPOWER breaks DXGI duplication") was
-//!      observed while duplicating a PHYSICAL output that then lost power.
-//!      The virtual display has no backlight/power state, so its IddCx
-//!      swapchain *should* be unaffected by the same broadcast — but this
-//!      needs to be confirmed empirically before relying on it. If it turns
-//!      out the broadcast still kills the virtual duplication too, the fix is
-//!      to reorder: do the DXGI re-hook (step 2) AFTER `sleep_displays()`
-//!      rather than before, so any transient ACCESS_LOST is absorbed by the
-//!      rebuild anyway.
+//!   3. [`VirtualDisplay::deactivate_other_paths`] clears
+//!      `DISPLAYCONFIG_PATH_ACTIVE` on every CCD path except the virtual
+//!      display's, via `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)`.
+//!      This is the "true headless" mechanism and replaces the earlier
+//!      `SC_MONITORPOWER`/`sleep_displays()` approach: monitor standby risked
+//!      breaking DXGI duplication of a physical output that then lost power,
+//!      whereas detaching the path entirely is safe since capture has
+//!      already moved to the virtual output by this point.
 //!
-//! Reverse sequence for stream stop is `deactivate_after_stream()` (restores
-//! primary + saved mode) followed by `wake_displays()` (existing) and the
-//! mirror-image capture/encoder rebuild back to the physical output.
+//! Reverse sequence for stream stop is `deactivate_after_stream()` —
+//! [`VirtualDisplay::restore_topology`] re-applies the topology snapshot
+//! taken before activation (forcing the virtual display's path inactive) —
+//! followed by the mirror-image capture/encoder rebind back to the physical
+//! output.
 //!
 //! ## Cargo.toml audit note
 //!
@@ -118,15 +117,20 @@ use std::process::Command;
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND, LUID, POINTL};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW,
-    DISPLAY_DEVICE_PRIMARY_DEVICE, ENUM_CURRENT_SETTINGS,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL, CDS_NORESET,
+    CDS_RESET, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL,
+    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
 };
+#[cfg(test)]
+use windows::Win32::Graphics::Gdi::DISPLAY_DEVICE_PRIMARY_DEVICE;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
-    SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
+    QDC_DATABASE_CURRENT, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES,
+    SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CM_PROB_DISABLED, CR_SUCCESS,
@@ -192,9 +196,18 @@ const VDD_REGISTRY_KEY: &str = r"SOFTWARE\MikeTheTech\VirtualDisplayDriver";
 /// directory path.
 const VDD_REGISTRY_VALUE: &str = "VDDPATH";
 
+/// `DISPLAYCONFIG_PATH_INFO::flags` bit marking a path as part of the active
+/// desktop topology. Documented in `wingdi.h` but not exported by
+/// `windows-rs` 0.58's `Win32_Devices_Display` — defined locally at its
+/// standard value. Used by [`VirtualDisplay::deactivate_other_paths`] and
+/// [`VirtualDisplay::restore_topology`] to flip paths active/inactive.
+const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+
 /// Snapshot of the physical display that was primary before Nova switched to
-/// the virtual one, so [`VirtualDisplay::deactivate_after_stream`] can put
-/// things back exactly as they were.
+/// the virtual one. Used only by the `#[ignore]`d CCD/GDI diagnostics below —
+/// [`VirtualDisplay::activate_for_stream`]/[`VirtualDisplay::deactivate_after_stream`]
+/// now save/restore the full CCD topology instead (see `saved_topology`).
+#[cfg(test)]
 struct DisplaySnapshot {
     /// GDI device name, e.g. `\\.\DISPLAY1` (from `EnumDisplayDevicesW`).
     device_name: String,
@@ -222,15 +235,33 @@ pub struct VirtualDisplay {
     /// re-querying the device tree.
     active: bool,
 
-    /// Captured by `activate_for_stream`, consumed by
-    /// `deactivate_after_stream`. `None` when inactive.
-    saved_primary: Option<DisplaySnapshot>,
+    /// CCD topology as persisted in the database (`QDC_DATABASE_CURRENT`),
+    /// captured by `activate_for_stream` before any mutation. `None` when
+    /// inactive.
+    ///
+    /// NOT re-applied to `SetDisplayConfig` directly — every variant tried
+    /// (`QDC_ALL_PATHS`, `QDC_ONLY_ACTIVE_PATHS`, `QDC_DATABASE_CURRENT`) hits
+    /// `ERROR_INVALID_PARAMETER`/87 as a direct
+    /// `SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY` payload. Instead
+    /// [`Self::restore_topology`] takes a FRESH [`Self::query_all_topology`]
+    /// snapshot as its apply payload and consults this saved snapshot only as
+    /// a "what was active, where, and with what mode" reference for
+    /// reactivating the physical path(s) — see its doc comment.
+    saved_topology: Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)>,
 
     /// GDI device name of the virtual monitor once it's enabled and Windows
     /// has assigned it a `\\.\DISPLAYn` slot. Filled in by
     /// `activate_for_stream`, used by capture re-hook (see module docs) and
     /// by `deactivate_after_stream`.
     active_device_name: Option<String>,
+
+    /// `(width, height)` requested by [`activate_for_stream`], cleared by
+    /// [`deactivate_after_stream`]. Lets the steady-state DXGI rebind (in
+    /// lib.rs's `run()`) pass an `expected_size` to
+    /// [`crate::capture::DesktopCapturer::rebind`] while a stream is active,
+    /// so a transient post-CCD-apply 800x600 dip (see
+    /// [`wait_for_display_resolution`]) gets retried instead of latched onto.
+    active_resolution: Option<(u32, u32)>,
 
     /// Default audio render endpoint (device id string, NUL-terminated
     /// UTF-16), cached by `activate_for_stream` via `IMMDeviceEnumerator`
@@ -251,8 +282,9 @@ impl VirtualDisplay {
         Self {
             install_dir,
             active: false,
-            saved_primary: None,
+            saved_topology: None,
             active_device_name: None,
+            active_resolution: None,
             saved_audio_endpoint: None,
         }
     }
@@ -952,6 +984,144 @@ impl VirtualDisplay {
         }
     }
 
+    /// Brings `Root\MttVDD` up once, at process startup, and leaves it
+    /// enabled for the server's entire lifetime.
+    ///
+    /// [`ensure_installed`] + [`configure_mode`]`(width, height, refresh_hz)`,
+    /// then [`set_enabled`]`(true)` only if [`is_enabled`] currently reports
+    /// `false`. Unlike the old `activate_for_stream`, this never disables an
+    /// already-enabled devnode: toggling MttVDD off and back on while a
+    /// session is starting is what produced a transient 800x600 mode that
+    /// raced the client's requested resolution (the "800x600 race
+    /// condition"). Bringing the devnode up once, here, before any client can
+    /// connect, means it has long since settled at the configured mode by the
+    /// time [`activate_for_stream`] runs.
+    ///
+    /// Finally, [`isolate_virtual_display_at_boot`] snaps the virtual
+    /// display's mode to 0x0 so it sits dormant — disconnected from the
+    /// desktop, not an enumerable DXGI output, not visible in Display
+    /// Settings — until a stream activates it.
+    ///
+    /// Returns the virtual display's GDI device name (e.g. `\\.\DISPLAY29`),
+    /// if [`wait_for_virtual_display_device_name`] found one. `run()` passes
+    /// this to `capture::DesktopCapturer::new_excluding` so the boot-time
+    /// capturer's "first output" fallback can't bind to the virtual display.
+    pub fn ensure_enabled_at_boot(&mut self, width: u32, height: u32, refresh_hz: u32) -> Result<Option<String>, String> {
+        self.ensure_installed()?;
+        self.configure_mode(width, height, refresh_hz)?;
+
+        if self.is_enabled() {
+            // configure_mode only edits vdd_settings.xml/VDDPATH; MttVDD's
+            // IddCx adapter re-reads those only on devnode (re)start (see
+            // configure_mode's doc comment). An instance left enabled since a
+            // previous run may be advertising a stale mode/refresh-rate
+            // table, which makes force_resolution fail with
+            // DISP_CHANGE_BADMODE later when a stream requests a resolution
+            // that was only just added to the file. Cycle once, here, before
+            // capture::DesktopCapturer::new() (called by run(), after this
+            // returns) binds to anything — settling now, with no client
+            // connected and no capture pipeline yet, avoids the rebind race
+            // that ruled out cycling inside activate_for_stream on every
+            // session start (see run()'s "Enable Root\\MttVDD ONCE" comment).
+            println!("✅ Root\\MttVDD already enabled — cycling to refresh its mode table");
+            self.set_enabled(false)?;
+            self.set_enabled(true)?;
+        } else {
+            self.set_enabled(true)?;
+        }
+
+        let virtual_device = Self::wait_for_virtual_display_device_name();
+        Self::isolate_virtual_display_at_boot(virtual_device.as_deref());
+
+        Ok(virtual_device)
+    }
+
+    /// Phase 5.3: immediately after enabling `Root\MttVDD`, detaches the
+    /// virtual display by snapping its mode to 0x0 via the legacy
+    /// `ChangeDisplaySettingsExW`/`DEVMODEW` API — not CCD.
+    ///
+    /// Phase 5.2 did this via `SetDisplayConfig` (clearing
+    /// `DISPLAYCONFIG_PATH_ACTIVE` on just the virtual display's CCD path),
+    /// but that left the IDD part of an extended desktop at 800x600: it could
+    /// still become DXGI output 0, so `DesktopCapturer::new()`'s startup
+    /// default bound to the dummy monitor instead of the physical primary for
+    /// App 1/Desktop. Setting the resolution to 0x0 is the documented way to
+    /// fully disconnect a display from the desktop while keeping its
+    /// driver/devnode enabled and enumerable — [`activate_for_stream`]'s
+    /// later [`force_resolution`] call (a real width/height with
+    /// `CDS_RESET`) is what brings it back for a stream.
+    ///
+    /// Takes the virtual display's GDI device name (`\\.\DISPLAYn`), already
+    /// resolved by [`ensure_enabled_at_boot`] via
+    /// [`wait_for_virtual_display_device_name`] — `None` if it never appeared
+    /// in GDI enumeration.
+    ///
+    /// Steps:
+    ///   1. `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` — if it succeeds and
+    ///      already reports 0x0, no-op (steady state on later boots).
+    ///   2. Overwrite `dmFields = DM_PELSWIDTH | DM_PELSHEIGHT`,
+    ///      `dmPelsWidth = dmPelsHeight = 0`, apply via
+    ///      `ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)` —
+    ///      `CDS_NORESET` stages the change in the registry without
+    ///      immediately repainting the desktop.
+    ///   3. A second, global `ChangeDisplaySettingsExW(NULL, NULL, NULL, 0,
+    ///      NULL)` commits every pending `CDS_NORESET` change at once — the
+    ///      same two-call apply idiom as `set_primary_noop_diagnostic`.
+    ///
+    /// Best-effort: logs success or failure either way and never blocks
+    /// [`ensure_enabled_at_boot`]'s return.
+    fn isolate_virtual_display_at_boot(virtual_device: Option<&str>) {
+        let Some(virtual_device) = virtual_device else {
+            println!("⚠️  Root\\MttVDD enabled but never appeared in GDI enumeration — cannot isolate it at boot");
+            return;
+        };
+
+        let name_w: Vec<u16> = virtual_device.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let enum_ok = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() };
+
+        if enum_ok && mode.dmPelsWidth == 0 && mode.dmPelsHeight == 0 {
+            println!("✅ {virtual_device} already dormant (0x0) at boot");
+            return;
+        }
+
+        mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+        mode.dmPelsWidth = 0;
+        mode.dmPelsHeight = 0;
+        // Defensive: IddCx virtual displays can report a nonzero
+        // dmDriverExtra from EnumDisplaySettingsW, which would need a
+        // matching trailing private-data buffer if echoed back as-is.
+        // NOTE: -2 below is DISP_CHANGE_BADMODE ("mode not supported"), not
+        // DISP_CHANGE_BADPARAM (-5) — dmDriverExtra isn't the cause of that
+        // failure; 0x0 simply isn't in this driver's enumerated mode list.
+        mode.dmDriverExtra = 0;
+
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(name_w.as_ptr()),
+                Some(&mode),
+                HWND(std::ptr::null_mut()),
+                CDS_UPDATEREGISTRY | CDS_NORESET,
+                None,
+            )
+        };
+        if result != DISP_CHANGE_SUCCESSFUL {
+            println!("⚠️  Failed to stage {virtual_device} detach at boot (DISP_CHANGE {})", result.0);
+            return;
+        }
+
+        let apply = unsafe { ChangeDisplaySettingsExW(PCWSTR::null(), None, HWND(std::ptr::null_mut()), CDS_TYPE(0), None) };
+        if apply == DISP_CHANGE_SUCCESSFUL {
+            println!("🕶️  {virtual_device} detached at boot (0x0) — dormant until a stream activates it");
+        } else {
+            println!("⚠️  {virtual_device} staged for detach but the global apply failed (DISP_CHANGE {})", apply.0);
+        }
+    }
+
     // -------------------------------------------------------------
     // Stream start/stop orchestration (Task 2)
     // -------------------------------------------------------------
@@ -965,21 +1135,46 @@ impl VirtualDisplay {
     ///      done FIRST, before any display or audio mutation, so the cached
     ///      id is the *real* host speaker regardless of what the topology
     ///      swap below does to the default-device guess.
-    ///   1. [`ensure_installed`]
-    ///   2. [`configure_mode`]`(width, height, refresh_hz)`
-    ///   3. [`snapshot_current_primary`] → `self.saved_primary`
-    ///   4. [`set_enabled`]`(true)` → `self.active_device_name`
-    ///   5. [`set_primary_display`]`(active_device_name)` — repositions the
+    ///   1. [`query_database_topology`] → local `saved_topology` — a snapshot
+    ///      of the CCD database's full current paths/modes (including
+    ///      inactive ones, e.g. the dormant virtual-display path left by
+    ///      [`isolate_virtual_display_at_boot`]), before anything is mutated.
+    ///      `Root\MttVDD` is already enabled ([`ensure_enabled_at_boot`] ran
+    ///      at startup), so this is the "how do I put everything back"
+    ///      baseline. `QDC_DATABASE_CURRENT`, not `QDC_ONLY_ACTIVE_PATHS`/
+    ///      `QDC_ALL_PATHS` — see [`Self::saved_topology`] for why.
+    ///   2. [`configure_mode`]`(width, height, refresh_hz)` — usually a
+    ///      no-op at this point: [`ensure_enabled_at_boot`] already cycled
+    ///      `Root\MttVDD` once at startup (before
+    ///      [`crate::capture::DesktopCapturer::new`] bound to anything)
+    ///      specifically so the driver's mode table is current. No devnode
+    ///      cycle here — doing it per-stream raced the DXGI rebind that
+    ///      follows this call against the IDD's transient post-cycle mode
+    ///      (see `run()`'s "Enable Root\\MttVDD ONCE" comment). If
+    ///      `width`x`height`@`refresh_hz` truly isn't in the driver's table
+    ///      yet (first time this resolution has ever been requested),
+    ///      [`force_resolution`] below fails with `DISP_CHANGE_BADMODE` (-2)
+    ///      — but `configure_mode` has by then persisted it to
+    ///      `vdd_settings.xml`, so the next boot's cycle picks it up.
+    ///   3. [`set_primary_display`]`(virtual_device)` — repositions the
     ///      virtual monitor's CCD source to the (0,0) desktop origin (the new
     ///      primary), shifting whatever was there beside it. Uses
     ///      `QueryDisplayConfig`/`SetDisplayConfig` (CCD), not the legacy
     ///      `ChangeDisplaySettingsExW`/`CDS_SET_PRIMARY` path — the latter is
     ///      rejected outright (`DISP_CHANGE_FAILED`) on this driver stack even
     ///      as a no-op (see diagnostics in the test module).
-    ///   6. `app_launcher::sleep_displays()` — existing SC_MONITORPOWER call,
-    ///      reused as-is (see module docs for the open question about
-    ///      ordering relative to step 5/the capture re-hook).
-    ///   7. `self.active = true`.
+    ///   4. [`deactivate_other_paths`]`(virtual_device)` — clears
+    ///      `DISPLAYCONFIG_PATH_ACTIVE` on every other active path, so the
+    ///      virtual display becomes the ONLY active output ("true headless").
+    ///   5. [`force_resolution`]`(&virtual_device, width, height, refresh_hz)`
+    ///      — explicitly snaps the virtual monitor's active mode to the
+    ///      Moonlight-requested resolution/refresh via
+    ///      `ChangeDisplaySettingsExW`. Steps 3-4 (CCD) only route/activate
+    ///      paths; they never change which advertised mode is current, so
+    ///      without this the virtual display stays at whatever mode it booted
+    ///      into (typically the 800x600 failsafe).
+    ///   6. [`wait_for_display_resolution`], then `self.saved_topology` /
+    ///      `self.active_device_name` / `self.active = true`.
     pub fn activate_for_stream(&mut self, width: u32, height: u32, refresh_hz: u32) -> Result<(), String> {
         self.saved_audio_endpoint = Self::cache_default_audio_endpoint();
         match &self.saved_audio_endpoint {
@@ -987,22 +1182,10 @@ impl VirtualDisplay {
             None => println!("⚠️  Could not query the current default audio endpoint — restore-on-disconnect will be skipped"),
         }
 
-        self.ensure_installed()?;
+        let saved_topology = Self::query_database_topology()?;
+        println!("📸 Saved current display topology from the CCD database ({} path(s))", saved_topology.0.len());
+
         self.configure_mode(width, height, refresh_hz)?;
-
-        if self.is_enabled() {
-            println!("🔁 Root\\MttVDD already active — cycling devnode to reload {width}x{height}@{refresh_hz}Hz");
-            self.set_enabled(false)?;
-            self.set_enabled(true)?;
-        } else {
-            self.set_enabled(true)?;
-        }
-
-        let saved_primary = Self::snapshot_current_primary()?;
-        println!(
-            "📸 Saved current primary: {} ({}x{}@{}Hz at {:?})",
-            saved_primary.device_name, saved_primary.width, saved_primary.height, saved_primary.refresh_hz, saved_primary.position
-        );
 
         let virtual_device = Self::wait_for_virtual_display_device_name()
             .ok_or_else(|| "timed out waiting for the virtual display to appear in GDI enumeration".to_string())?;
@@ -1010,16 +1193,30 @@ impl VirtualDisplay {
         Self::set_primary_display(&virtual_device)?;
         println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) is now the desktop primary");
 
-        // The IDD briefly reports a default 800x600 surface before it picks
-        // up the vdd_settings.xml mode we just configured. Wait for
-        // EnumDisplaySettingsW to report the requested resolution before
+        match Self::deactivate_other_paths(&virtual_device) {
+            Ok(()) => println!("🕶️  Physical display path(s) detached — {virtual_device} is now the only active display"),
+            Err(e) => println!("⚠️  Failed to fully detach the physical display path(s): {e} — continuing with {virtual_device} as primary"),
+        }
+
+        // CCD (SetDisplayConfig, just above) only routes/activates display
+        // paths — it never changes which of a path's advertised modes is
+        // current. Without an explicit resize, the virtual display stays at
+        // whatever mode it was last showing (typically the 800x600 failsafe
+        // from boot), independent of the width/height/refresh_hz that
+        // configure_mode already wrote into vdd_settings.xml.
+        Self::force_resolution(&virtual_device, width, height, refresh_hz);
+
+        // ChangeDisplaySettingsExW above can apply asynchronously, and
+        // EnumDisplaySettingsW may briefly still report the old mode for a
+        // frame or two. Wait for it to report the requested resolution before
         // returning, so the DXGI rebind in lib.rs binds to the final mode
-        // instead of the transient one (which would otherwise force an
+        // instead of a transient one (which would otherwise force an
         // immediate second encoder recreation).
         Self::wait_for_display_resolution(&virtual_device, width, height);
 
-        self.saved_primary = Some(saved_primary);
+        self.saved_topology = Some(saved_topology);
         self.active_device_name = Some(virtual_device);
+        self.active_resolution = Some((width, height));
         self.active = true;
 
         Ok(())
@@ -1030,18 +1227,18 @@ impl VirtualDisplay {
     /// no-ops if its corresponding setup step didn't happen).
     ///
     /// Steps:
-    ///   1. [`set_primary_display`]`(self.saved_primary.device_name)` —
-    ///      restore the original display as the CCD (0,0) primary.
-    ///   2. `app_launcher::wake_displays()` — existing call, made from the
-    ///      same teardown path in lib.rs's capture loop.
-    ///   3. [`set_enabled`]`(false)` — unplug the virtual monitor entirely,
-    ///      returning the host to its pre-stream device topology.
-    ///   4. Force the default audio playback device back to
+    ///   1. [`restore_topology`]`(self.saved_topology, self.active_device_name)`
+    ///      — re-applies the exact pre-activation path/mode array, forcing
+    ///      the virtual display's path inactive regardless of what it was
+    ///      doing beforehand (see [`restore_topology`] doc comment).
+    ///      `Root\MttVDD` itself stays enabled — [`ensure_enabled_at_boot`]
+    ///      made enable/disable a boot-time-only operation.
+    ///   2. Force the default audio playback device back to
     ///      `self.saved_audio_endpoint` via `SetDefaultAudioDevice` —
     ///      explicit restore to the speaker GUID cached *before* launch,
     ///      rather than letting Windows guess (which lands on the NVIDIA HDMI
     ///      endpoint once the virtual display's audio device has appeared).
-    ///   5. Clear `saved_primary` / `active_device_name` /
+    ///   3. Clear `saved_topology` / `active_device_name` /
     ///      `saved_audio_endpoint`, `self.active = false`.
     pub fn deactivate_after_stream(&mut self) -> Result<(), String> {
         if !self.active {
@@ -1050,19 +1247,14 @@ impl VirtualDisplay {
 
         let mut error: Option<String> = None;
 
-        if let Some(saved) = self.saved_primary.take() {
-            match Self::set_primary_display(&saved.device_name) {
-                Ok(()) => println!("🖥️  Restored {} as the desktop primary", saved.device_name),
+        if let Some(saved) = self.saved_topology.take() {
+            match Self::restore_topology(&saved, self.active_device_name.as_deref()) {
+                Ok(()) => println!("🖥️  Restored the original display topology — virtual display detached"),
                 Err(e) => {
-                    println!("⚠️  Failed to restore {} as primary display: {e}", saved.device_name);
+                    println!("⚠️  Failed to restore the original display topology: {e}");
                     error = Some(e);
                 }
             }
-        }
-
-        if let Err(e) = self.set_enabled(false) {
-            println!("⚠️  Failed to disable Root\\MttVDD virtual monitor: {e}");
-            error.get_or_insert(e);
         }
 
         if let Some(endpoint) = self.saved_audio_endpoint.take() {
@@ -1076,6 +1268,7 @@ impl VirtualDisplay {
         }
 
         self.active_device_name = None;
+        self.active_resolution = None;
         self.active = false;
 
         match error {
@@ -1092,28 +1285,142 @@ impl VirtualDisplay {
         self.active_device_name.as_deref()
     }
 
+    /// `(width, height)` of the mode [`activate_for_stream`] requested, once
+    /// it has run. Used by the steady-state DXGI rebind in lib.rs's `run()`
+    /// to pass `expected_size` to
+    /// [`crate::capture::DesktopCapturer::rebind`].
+    pub fn active_resolution(&self) -> Option<(u32, u32)> {
+        self.active_resolution
+    }
+
     /// Polls [`find_virtual_display_device_name`] for up to ~2 seconds,
     /// since GDI's display enumeration can lag the devnode-arrival event
     /// (`WM_DISPLAYCHANGE`) by a frame or two right after [`set_enabled`]
     /// returns.
+    /// Blocking poll: re-applying the CCD topology
+    /// ([`set_primary_display`]/[`deactivate_other_paths`], just above) makes
+    /// Windows momentarily drop the IDD to a failsafe 800x600 mode before it
+    /// picks up the `vdd_settings.xml` mode [`configure_mode`] wrote — the
+    /// DXGI rebind that follows `activate_for_stream`'s return would
+    /// otherwise see `DesktopCoordinates` for 800x600 and lock the encoder at
+    /// the wrong resolution until the next topology change.
+    ///
     /// Polls `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` for `device_name`
-    /// until its mode reports `width`x`height` or ~1s elapses. Best-effort —
-    /// callers proceed regardless, this just gives the IDD a moment to move
-    /// past its transient default mode (see [`activate_for_stream`]).
+    /// every 100ms for up to 3 seconds, returning as soon as it reports
+    /// `width`x`height`. Does NOT return early on timeout-without-match —
+    /// logs the last-seen mode and proceeds anyway, so a stuck IDD is visible
+    /// in the log instead of silently producing a wrong-sized stream.
     fn wait_for_display_resolution(device_name: &str, width: u32, height: u32) {
         let name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
-        for attempt in 0..10 {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3000);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut last_seen = (0u32, 0u32);
+        loop {
             let mut mode = DEVMODEW {
                 dmSize: std::mem::size_of::<DEVMODEW>() as u16,
                 ..Default::default()
             };
             let ok = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() };
-            if ok && mode.dmPelsWidth == width && mode.dmPelsHeight == height {
+            if ok {
+                last_seen = (mode.dmPelsWidth, mode.dmPelsHeight);
+                if last_seen == (width, height) {
+                    println!("✅ {device_name} stabilized at {width}x{height} — proceeding with DXGI rebind");
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                println!(
+                    "⚠️  {device_name} still reporting {}x{} after {}ms (wanted {width}x{height}) — proceeding anyway, DXGI rebind may need another pass",
+                    last_seen.0, last_seen.1, TIMEOUT.as_millis()
+                );
                 return;
             }
-            if attempt < 9 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Phase 5.2, directive 2: explicitly snaps `device_name`'s active mode
+    /// to `width`x`height`@`refresh_hz` via the legacy
+    /// `ChangeDisplaySettingsExW`/`DEVMODEW` API.
+    ///
+    /// CCD's `SetDisplayConfig` (used by [`set_primary_display`] and
+    /// [`deactivate_other_paths`], called just before this in
+    /// [`activate_for_stream`]) only routes which paths are active and where
+    /// their sources sit on the desktop — it has no effect on which of a
+    /// target's advertised modes is "current". Left alone, the virtual
+    /// display can stay parked on its 800x600 failsafe mode indefinitely
+    /// while CCD-wise it's already the active primary.
+    ///
+    /// This doesn't invent a new mode: [`configure_mode`] already wrote
+    /// `width`x`height`@`refresh_hz` into `vdd_settings.xml` and the devnode
+    /// has been enabled since boot, so the driver already advertises this
+    /// exact mode as one `ChangeDisplaySettingsExW` can select — this call
+    /// just picks it.
+    ///
+    /// Reads the current `DEVMODEW` via `EnumDisplaySettingsW
+    /// (ENUM_CURRENT_SETTINGS)` first and overwrites only
+    /// `dmPelsWidth`/`dmPelsHeight`/`dmDisplayFrequency` (via `dmFields =
+    /// DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY`), leaving every
+    /// other field (color depth, position, orientation, ...) as Windows
+    /// reported it.
+    ///
+    /// Uses `CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_RESET`. `CDS_UPDATEREGISTRY`
+    /// persists the mode to the registry as well as applying it.
+    /// `CDS_GLOBAL` writes that registry change for all users rather than
+    /// just the current session — relevant since Nova runs headless/as a
+    /// service, not an interactive user session. `CDS_RESET` is the critical
+    /// addition for the "stuck at 800x600" symptom: without it, Windows can
+    /// decide the requested mode is "equivalent enough" to the current one
+    /// and silently skip applying it, even though `ChangeDisplaySettingsExW`
+    /// still returns `DISP_CHANGE_SUCCESSFUL`. `CDS_RESET` forces the mode
+    /// change to be applied immediately and unconditionally. Elsewhere in
+    /// this module, `CDS_SET_PRIMARY`-class calls are documented as returning
+    /// `DISP_CHANGE_FAILED` outright on this driver stack even as a true
+    /// no-op (see `set_primary_noop_diagnostic`); this call's `dmFields`
+    /// (size/refresh, not position/primary) differ enough that it may not hit
+    /// the same rejection, but the `DISP_CHANGE` result is logged either way
+    /// so a rejection is visible. [`wait_for_display_resolution`], called
+    /// right after this, is the other signal — if it times out without ever
+    /// seeing `width`x`height`, this call was rejected or ineffective.
+    ///
+    /// Best-effort: logs success or failure and never returns an error;
+    /// [`activate_for_stream`] proceeds to [`wait_for_display_resolution`]
+    /// regardless.
+    fn force_resolution(device_name: &str, width: u32, height: u32, refresh_hz: u32) {
+        let name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let _ = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) };
+
+        mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        mode.dmPelsWidth = width;
+        mode.dmPelsHeight = height;
+        mode.dmDisplayFrequency = refresh_hz;
+        // Defensive, see isolate_virtual_display_at_boot. NOTE: -2 below is
+        // DISP_CHANGE_BADMODE ("mode not supported"), not BADPARAM — if this
+        // still fails, width x height @ refresh_hz isn't in the driver's
+        // currently-loaded mode table (see activate_for_stream step 2).
+        mode.dmDriverExtra = 0;
+
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(name_w.as_ptr()),
+                Some(&mode),
+                HWND(std::ptr::null_mut()),
+                CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_RESET,
+                None,
+            )
+        };
+
+        if result == DISP_CHANGE_SUCCESSFUL {
+            println!("🔧 {device_name} resolution snapped to {width}x{height}@{refresh_hz}Hz (DISP_CHANGE_SUCCESSFUL)");
+        } else {
+            println!("⚠️  ChangeDisplaySettingsExW failed to snap {device_name} to {width}x{height}@{refresh_hz}Hz (DISP_CHANGE {})", result.0);
         }
     }
 
@@ -1161,13 +1468,11 @@ impl VirtualDisplay {
     // -------------------------------------------------------------
 
     /// Records the current primary display's GDI device name, resolution,
-    /// refresh rate, and position — everything needed to restore it later.
-    ///
-    /// Planned impl: `EnumDisplayDevicesW(None, i, &mut DISPLAY_DEVICEW, 0)`
-    /// for `i in 0..`, find the one with `StateFlags &
-    /// DISPLAY_DEVICE_PRIMARY_DEVICE != 0`, then `EnumDisplaySettingsW(name,
-    /// ENUM_CURRENT_SETTINGS, &mut DEVMODEW)` for its `dmPelsWidth` /
-    /// `dmPelsHeight` / `dmDisplayFrequency` / `dmPosition`.
+    /// refresh rate, and position. Used only by the `#[ignore]`d CCD/GDI
+    /// diagnostics below — [`activate_for_stream`]/[`deactivate_after_stream`]
+    /// save/restore the full CCD topology instead (see `saved_topology`,
+    /// [`Self::query_all_topology`], [`Self::restore_topology`]).
+    #[cfg(test)]
     fn snapshot_current_primary() -> Result<DisplaySnapshot, String> {
         unsafe {
             let mut index = 0u32;
@@ -1208,18 +1513,28 @@ impl VirtualDisplay {
         }
     }
 
-    /// Queries the active CCD display topology: one [`DISPLAYCONFIG_PATH_INFO`]
-    /// per active path plus the backing source/target mode info array.
+    /// Shared `GetDisplayConfigBufferSizes`/`QueryDisplayConfig` loop backing
+    /// [`query_active_topology`] (`QDC_ONLY_ACTIVE_PATHS`),
+    /// [`query_all_topology`] (`QDC_ALL_PATHS`), and
+    /// [`query_database_topology`] (`QDC_DATABASE_CURRENT`).
     ///
     /// Loops on `ERROR_INSUFFICIENT_BUFFER` since the topology can change
     /// between [`GetDisplayConfigBufferSizes`] and [`QueryDisplayConfig`]
     /// (e.g. a monitor is plugged/unplugged concurrently).
-    fn query_active_topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+    ///
+    /// `QueryDisplayConfig`'s `currentTopologyId` out-param is documented as
+    /// **required (non-null) when `flags == QDC_DATABASE_CURRENT`, and
+    /// required to be null for every other flag** — passing the wrong one
+    /// either way is `ERROR_INVALID_PARAMETER`/87. [`query_database_topology`]
+    /// hitting exactly this (always passing `None`) was the cause of App 5's
+    /// pre-activation Error 87, even though `GetDisplayConfigBufferSizes` and
+    /// `QueryDisplayConfig` were already called with the same `flags`.
+    fn query_topology(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
         unsafe {
             loop {
                 let mut num_paths = 0u32;
                 let mut num_modes = 0u32;
-                let err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut num_paths, &mut num_modes);
+                let err = GetDisplayConfigBufferSizes(flags, &mut num_paths, &mut num_modes);
                 if err.0 != 0 {
                     return Err(format!("GetDisplayConfigBufferSizes failed (error {})", err.0));
                 }
@@ -1228,13 +1543,21 @@ impl VirtualDisplay {
                 let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); num_modes as usize];
                 let mut out_paths = num_paths;
                 let mut out_modes = num_modes;
+
+                let mut topology_id = DISPLAYCONFIG_TOPOLOGY_ID::default();
+                let topology_id_ptr: Option<*mut DISPLAYCONFIG_TOPOLOGY_ID> = if flags == QDC_DATABASE_CURRENT {
+                    Some(&mut topology_id as *mut DISPLAYCONFIG_TOPOLOGY_ID)
+                } else {
+                    None
+                };
+
                 let err = QueryDisplayConfig(
-                    QDC_ONLY_ACTIVE_PATHS,
+                    flags,
                     &mut out_paths,
                     paths.as_mut_ptr(),
                     &mut out_modes,
                     modes.as_mut_ptr(),
-                    None,
+                    topology_id_ptr,
                 );
                 if err == ERROR_INSUFFICIENT_BUFFER {
                     continue;
@@ -1248,6 +1571,43 @@ impl VirtualDisplay {
                 return Ok((paths, modes));
             }
         }
+    }
+
+    /// Queries the active CCD display topology: one [`DISPLAYCONFIG_PATH_INFO`]
+    /// per active path plus the backing source/target mode info array.
+    fn query_active_topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+        Self::query_topology(QDC_ONLY_ACTIVE_PATHS)
+    }
+
+    /// Queries the full CCD display topology, including paths that are
+    /// currently inactive (e.g. a physical monitor about to be detached, or
+    /// the virtual display's path before it's activated). Used by
+    /// [`deactivate_other_paths`], which needs the about-to-be-deactivated
+    /// physical path(s) present in the array (with `DISPLAYCONFIG_PATH_ACTIVE`
+    /// cleared) — `SDC_USE_SUPPLIED_DISPLAY_CONFIG` with an all-paths array is
+    /// the documented way to flip individual paths active/inactive without
+    /// disturbing the rest of the topology.
+    ///
+    /// Used by [`deactivate_other_paths`] to toggle individual paths
+    /// active/inactive in place, and by [`restore_topology`] (a fresh call,
+    /// not [`VirtualDisplay::saved_topology`] itself) as the apply payload
+    /// when reverting that toggle.
+    fn query_all_topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+        Self::query_topology(QDC_ALL_PATHS)
+    }
+
+    /// Queries the CCD database's current topology — every path/mode the
+    /// database knows about (active or not), including inactive paths (e.g.
+    /// the dormant virtual display before activation).
+    ///
+    /// Used by [`activate_for_stream`] for `self.saved_topology`, which
+    /// [`restore_topology`] consults as a "what was active and where"
+    /// reference. NOT a valid `SetDisplayConfig
+    /// (SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY)` payload — that
+    /// combination returns `ERROR_INVALID_PARAMETER`/87 for
+    /// `QDC_DATABASE_CURRENT`-sourced arrays (see [`restore_topology`]).
+    fn query_database_topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+        Self::query_topology(QDC_DATABASE_CURRENT)
     }
 
     /// Resolves a CCD path source (`adapterId`/`id`) to its GDI device name
@@ -1342,6 +1702,149 @@ impl VirtualDisplay {
         let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
         if status != 0 {
             return Err(format!("SetDisplayConfig failed to make {device_name} the CCD primary (error {status})"));
+        }
+
+        Ok(())
+    }
+
+    /// "True headless": clears `DISPLAYCONFIG_PATH_ACTIVE` on every currently
+    /// active CCD path except the one whose source resolves to
+    /// `virtual_device`, then commits via `SetDisplayConfig`.
+    ///
+    /// Re-queries [`query_all_topology`] (not just the active subset) so the
+    /// physical path(s) being deactivated stay present in the supplied array
+    /// — `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)` with an all-paths
+    /// array is the documented mechanism for toggling individual paths
+    /// active/inactive in place, leaving the rest of the topology (source
+    /// positions, modes, etc.) untouched. After this call, `virtual_device`
+    /// is the only active display — equivalent to physically unplugging every
+    /// other monitor, without touching `Root\MttVDD`'s devnode-enabled state.
+    ///
+    /// Returns `Err` if `virtual_device` isn't found among the currently
+    /// active paths (it should always be, since [`activate_for_stream`] calls
+    /// [`set_primary_display`]`(virtual_device)` first) or if
+    /// `SetDisplayConfig` rejects the change.
+    fn deactivate_other_paths(virtual_device: &str) -> Result<(), String> {
+        let (mut paths, modes) = Self::query_all_topology()?;
+
+        let mut found_virtual = false;
+        for path in &mut paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+
+            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            let is_virtual = idx < modes.len()
+                && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                && Self::gdi_device_name_for_source(path.sourceInfo.adapterId, path.sourceInfo.id)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(virtual_device));
+
+            if is_virtual {
+                found_virtual = true;
+            } else {
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+            }
+        }
+
+        if !found_virtual {
+            return Err(format!("{virtual_device} not found among active CCD display paths"));
+        }
+
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if status != 0 {
+            return Err(format!("SetDisplayConfig failed to deactivate other display paths (error {status})"));
+        }
+
+        Ok(())
+    }
+
+    /// Reverses [`deactivate_other_paths`]/[`set_primary_display`] by cloning
+    /// `saved` itself — the [`query_database_topology`] snapshot
+    /// [`activate_for_stream`] captures into `self.saved_topology` before it
+    /// touches anything — instead of starting from a fresh
+    /// [`query_all_topology`].
+    ///
+    /// `QDC_ALL_PATHS` returns one path entry per (source × every target the
+    /// adapter could possibly drive that source to). On this system the
+    /// physical source (`\\.\DISPLAY1`, one `(adapterId, sourceId)` pair)
+    /// alone appears in 7 of its 29 entries — all resolving to the same GDI
+    /// name via [`gdi_device_name_for_source`], which depends only on
+    /// `sourceInfo.adapterId`/`id`, not `targetInfo`. The old approach
+    /// matched `saved`'s single `\\.\DISPLAY1` entry against a fresh
+    /// `QDC_ALL_PATHS` snapshot by GDI name, matched all 7 of those, and
+    /// setting `DISPLAYCONFIG_PATH_ACTIVE` on all 7 asked `SetDisplayConfig`
+    /// for one source driving 7 simultaneously-active targets —
+    /// `ERROR_INVALID_PARAMETER`/87.
+    ///
+    /// `saved.0`/`saved.1` don't have this ambiguity: `QDC_DATABASE_CURRENT`
+    /// returns one entry per *actually configured* path — on this system
+    /// exactly two, `\\.\DISPLAY1` and `virtual_device`, both active (the
+    /// extended-desktop state [`activate_for_stream`] started from) — each
+    /// already pointing at its own valid
+    /// `DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE`/`_TARGET` entries in `saved.1`.
+    /// Cloning both vectors and:
+    ///
+    ///   1. clearing `DISPLAYCONFIG_PATH_ACTIVE` on the path whose source
+    ///      resolves (via [`gdi_device_name_for_source`]) to `virtual_device`
+    ///      — leaving its mode-info entries exactly as cloned, the same
+    ///      "clear ACTIVE, leave modeInfoIdx pointing at still-valid
+    ///      entries" pattern [`deactivate_other_paths`] uses (proven to
+    ///      round-trip), and
+    ///   2. zeroing each remaining active path's source-mode `position` to
+    ///      `(0, 0)` — undoing [`set_primary_display`]'s swap so the lone
+    ///      remaining display sits at the desktop origin/primary even if
+    ///      `saved` itself reflects a topology where `virtual_device` was
+    ///      primary,
+    ///
+    /// yields a minimal, internally-consistent array for
+    /// `SetDisplayConfig(SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+    /// SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES)` — same flags as
+    /// [`deactivate_other_paths`].
+    fn restore_topology(
+        saved: &(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>),
+        virtual_device: Option<&str>,
+    ) -> Result<(), String> {
+        let mut paths = saved.0.clone();
+        let mut modes = saved.1.clone();
+
+        for path in &mut paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+
+            let is_virtual = virtual_device.is_some_and(|vd| {
+                Self::gdi_device_name_for_source(path.sourceInfo.adapterId, path.sourceInfo.id)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(vd))
+            });
+
+            if is_virtual {
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+                continue;
+            }
+
+            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if idx < modes.len() && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                modes[idx].Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
+            }
+        }
+
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if status != 0 {
+            println!("🔎 restore_topology failed (error {status}) — dumping path state:");
+            for (i, p) in paths.iter().enumerate() {
+                let name = Self::gdi_device_name_for_source(p.sourceInfo.adapterId, p.sourceInfo.id);
+                let (src_idx, tgt_idx) = unsafe { (p.sourceInfo.Anonymous.modeInfoIdx, p.targetInfo.Anonymous.modeInfoIdx) };
+                let src_valid = (src_idx as usize) < modes.len() && modes[src_idx as usize].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+                let pos = src_valid.then(|| unsafe { modes[src_idx as usize].Anonymous.sourceMode.position });
+                println!(
+                    "🔎   path[{i}]: gdi={name:?} adapterId={:#x}:{:#x} sourceId={} active={} src_idx={src_idx} tgt_idx={tgt_idx} pos={pos:?} (modes.len()={})",
+                    p.sourceInfo.adapterId.HighPart, p.sourceInfo.adapterId.LowPart, p.sourceInfo.id,
+                    p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0, modes.len()
+                );
+            }
+            return Err(format!("SetDisplayConfig failed to restore the saved display topology (error {status})"));
         }
 
         Ok(())

@@ -8,14 +8,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, PostMessageW, HWND_BROADCAST, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND,
-    MB_TOPMOST, MB_YESNO, SC_MONITORPOWER, WM_SYSCOMMAND,
+    MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
 };
 
 pub const APP_ID_DESKTOP: u32 = 1;
@@ -23,6 +21,17 @@ pub const APP_ID_STEAM: u32 = 2;
 pub const APP_ID_XBOX: u32 = 3;
 pub const APP_ID_RETROARCH: u32 = 4;
 pub const APP_ID_VIRTUAL_DESKTOP: u32 = 5;
+
+/// Does `app_id` correspond to the "Virtual Desktop" app — the only app
+/// allowed to drive [`crate::virtual_display::VirtualDisplay`]?
+///
+/// App 1 ("Desktop") streams the host's existing physical display(s)
+/// untouched (mirror mode) and must never enable, configure, or reposition
+/// the virtual display driver. `lib.rs`'s connect handler gates every
+/// `activate_for_stream`/`deactivate_after_stream` call on this check.
+pub fn uses_virtual_display(app_id: u32) -> bool {
+    app_id == APP_ID_VIRTUAL_DESKTOP
+}
 
 const BOX_ART_DESKTOP: &[u8] = include_bytes!("../assets/desktop.jpg");
 const BOX_ART_STEAM: &[u8] = include_bytes!("../assets/steam.jpg");
@@ -44,13 +53,10 @@ pub fn get_box_art(app_id: u32) -> &'static [u8] {
 /// Launch (or apply) the action backing `app_id`, as selected from the
 /// Moonlight app list. Desktop, Virtual Desktop, and any unrecognized id are
 /// a no-op here — the client just lands on the live desktop (already what's
-/// streamed), and for Virtual Desktop the actual display-topology switch +
-/// [`sleep_displays`] happen later, from `lib.rs`'s connect handler, only
-/// once `VirtualDisplay::activate_for_stream` has succeeded and capture has
-/// moved onto the virtual output. Calling `sleep_displays()` here — before
-/// RTSP PLAY, while DXGI is still duplicating the physical display — powered
-/// the physical panel down out from under the live capture (the "screen
-/// blinks, no video" symptom).
+/// streamed). For Virtual Desktop, the actual display-topology switch
+/// happens later, from `lib.rs`'s connect handler, via
+/// `VirtualDisplay::activate_for_stream` (gated on [`uses_virtual_display`])
+/// once capture has moved onto the virtual output.
 pub fn launch_app(app_id: u32) {
     match app_id {
         APP_ID_STEAM => launch_steam_big_picture(),
@@ -293,47 +299,4 @@ fn extract_7z(archive: &Path, dir: &Path) -> bool {
         dir.display()
     );
     false
-}
-
-// ---------------------------------------------------------------------
-// "Virtual Desktop" host blackout — the GPU/NVENC pipeline keeps capturing
-// and streaming as normal, but the physical monitors are told to power off
-// so the host doesn't light up a room while someone streams.
-// ---------------------------------------------------------------------
-
-static MONITORS_ASLEEP: AtomicBool = AtomicBool::new(false);
-
-/// Put the physical displays to sleep via an `SC_MONITORPOWER` broadcast.
-/// Called once the virtual display has become the desktop primary
-/// ([`crate::virtual_display::VirtualDisplay::activate_for_stream`]) so the
-/// stream continues uninterrupted while the physical panel goes dark.
-/// [`wake_displays`] reverses this on stream teardown.
-pub fn sleep_displays() {
-    println!("🌙 Virtual Desktop: putting physical displays to sleep (stream continues)");
-    unsafe {
-        let _ = PostMessageW(
-            HWND_BROADCAST,
-            WM_SYSCOMMAND,
-            WPARAM(SC_MONITORPOWER as usize),
-            LPARAM(2), // 2 = off / low power
-        );
-    }
-    MONITORS_ASLEEP.store(true, Ordering::SeqCst);
-}
-
-/// Wake the physical displays if [`sleep_displays`] put them to sleep.
-/// Safe to call unconditionally on every stream teardown — a no-op if the
-/// displays were never put to sleep.
-pub fn wake_displays() {
-    if MONITORS_ASLEEP.swap(false, Ordering::SeqCst) {
-        println!("☀️  Virtual Desktop: waking physical displays");
-        unsafe {
-            let _ = PostMessageW(
-                HWND_BROADCAST,
-                WM_SYSCOMMAND,
-                WPARAM(SC_MONITORPOWER as usize),
-                LPARAM(-1), // -1 = on
-            );
-        }
-    }
 }
