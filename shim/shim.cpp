@@ -81,15 +81,24 @@ static ID3D11ShaderResourceView* g_cursorXorSRV  = nullptr;
 static UINT                      g_cursorTexW    = 0;
 static UINT                      g_cursorTexH    = 0;
 
-// Intermediate render-targetable copy of the captured frame — the DXGI
-// duplication texture isn't guaranteed to support D3D11_BIND_RENDER_TARGET,
-// so the cursor is drawn onto this copy before NV12 conversion. Also serves
-// as the synchronization boundary for dxgiFrame (see g_copyFence below).
+// "Clean background" — a copy of the captured frame (dxgiFrame), refreshed
+// every EncodeFrame call BEFORE the cursor overlay is drawn anywhere. Source
+// for g_compositeTex below, so a DXGI_ERROR_WAIT_TIMEOUT replay (the same
+// dxgiFrame re-submitted by Rust while the desktop is static) never
+// re-composites onto an already cursor-stamped buffer.
+static ID3D11Texture2D*          g_cleanBgTex    = nullptr;
+
+// Render-targetable copy of g_cleanBgTex with the cursor overlay drawn on
+// top — the VideoProcessorBlt source for NV12 conversion. Re-copied from
+// g_cleanBgTex every EncodeFrame call (see EncodeFrame), so cursor pixels
+// from a previous frame never persist into this one. The DXGI duplication
+// texture isn't guaranteed to support D3D11_BIND_RENDER_TARGET, which is why
+// the cursor is drawn onto this copy rather than dxgiFrame directly.
 static ID3D11Texture2D*          g_compositeTex  = nullptr;
 static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
 
 // GPU fence used to block EncodeFrame() until the CopyResource of the DXGI
-// duplication surface into g_compositeTex has actually finished on the GPU
+// duplication surface into g_cleanBgTex has actually finished on the GPU
 // (see EncodeFrame for why this matters).
 static ID3D11Query*              g_copyFence     = nullptr;
 
@@ -325,11 +334,22 @@ static std::vector<uint8_t> build_cursor_xor_image(
     return {};
 }
 
-// Lazily creates a render-target+shader-resource copy of the captured frame,
-// sized to match. Created once and reused for the lifetime of the session
-// (capture resolution doesn't change mid-stream).
-static bool EnsureCompositeTexture(int width, int height) {
-    if (g_compositeTex) return true;
+// Lazily (re)creates a Texture2D sized to width x height, optionally with a
+// render-target view, releasing and recreating it if it already exists at a
+// different size. A topology/resolution change mid-session (e.g. the Phase 5
+// virtual-display swap) would otherwise leave a texture created at the old
+// size: CopyResource into it silently no-ops on a size mismatch, so it keeps
+// whatever stale (possibly cursor-stamped) content it last held.
+static bool EnsureSizedTexture(ID3D11Texture2D** tex, ID3D11RenderTargetView** rtv, int width, int height, UINT bindFlags) {
+    if (*tex) {
+        D3D11_TEXTURE2D_DESC existing = {};
+        (*tex)->GetDesc(&existing);
+        if ((int)existing.Width == width && (int)existing.Height == height) return true;
+
+        if (rtv && *rtv) { (*rtv)->Release(); *rtv = nullptr; }
+        (*tex)->Release();
+        *tex = nullptr;
+    }
 
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width            = width;
@@ -339,25 +359,18 @@ static bool EnsureCompositeTexture(int width, int height) {
     desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Usage            = D3D11_USAGE_DEFAULT;
-    desc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.BindFlags        = bindFlags;
 
-    HRESULT hr = g_device->CreateTexture2D(&desc, nullptr, &g_compositeTex);
+    HRESULT hr = g_device->CreateTexture2D(&desc, nullptr, tex);
     if (FAILED(hr)) return false;
 
-    hr = g_device->CreateRenderTargetView(g_compositeTex, nullptr, &g_compositeRTV);
-    if (FAILED(hr)) {
-        g_compositeTex->Release();
-        g_compositeTex = nullptr;
-        return false;
-    }
-
-    D3D11_QUERY_DESC qdesc = {};
-    qdesc.Query = D3D11_QUERY_EVENT;
-    hr = g_device->CreateQuery(&qdesc, &g_copyFence);
-    if (FAILED(hr)) {
-        g_compositeRTV->Release(); g_compositeRTV = nullptr;
-        g_compositeTex->Release(); g_compositeTex = nullptr;
-        return false;
+    if (rtv) {
+        hr = g_device->CreateRenderTargetView(*tex, nullptr, rtv);
+        if (FAILED(hr)) {
+            (*tex)->Release();
+            *tex = nullptr;
+            return false;
+        }
     }
     return true;
 }
@@ -673,6 +686,16 @@ extern "C" __declspec(dllexport) int InitEncoder(
             h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_1;
             h264.enableFillerDataInsertion = 0;
             h264.h264VUIParameters = vuiParams;
+            // Continuous intra refresh: with CBR + infinite GOP (no periodic
+            // IDR — see above), this is what actually self-heals dropped or
+            // corrupted reference data. Every intraRefreshPeriod frames, NVENC
+            // starts cycling the whole frame through intra-coded macroblocks,
+            // completing the cycle over the next intraRefreshCnt frames — an
+            // IDR-less "rolling keyframe" that fits the single-frame VBV
+            // instead of spiking it like a full IDR would.
+            h264.enableIntraRefresh = 1;
+            h264.intraRefreshPeriod = 30;
+            h264.intraRefreshCnt    = 10;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
             auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
             hevc.repeatSPSPPS         = 1;
@@ -683,6 +706,9 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
             hevc.enableFillerDataInsertion = 0;
             hevc.hevcVUIParameters    = vuiParams;
+            hevc.enableIntraRefresh = 1;
+            hevc.intraRefreshPeriod = 30;
+            hevc.intraRefreshCnt    = 10;
         }
 
         printf("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
@@ -711,28 +737,46 @@ extern "C" __declspec(dllexport) int EncodeFrame(
 
     ID3D11Texture2D* dxgiFrame = (ID3D11Texture2D*)d3d11_texture;
 
-    // Copy the DXGI duplication surface into our own texture and block until
-    // the GPU has actually finished that copy before returning. The Rust
-    // capture loop calls IDXGIOutputDuplication::ReleaseFrame() immediately
-    // after this function returns, which lets DWM start writing the NEXT
-    // frame into this same recycled surface. Without this fence, the
-    // CopyResource below is only *queued*, not executed — so the GPU could
-    // still be reading dxgiFrame (for this copy, or the VPBlt that used to
-    // read it directly) while DWM is already overwriting it, tearing the
-    // captured image. A static desktop hides this (old/new pixels match);
-    // moving content (cursor, text, scrolling) doesn't — visible as the
-    // smearing/ghosting that only self-heals at the next IDR.
+    // Copy the DXGI duplication surface into the clean-background texture
+    // and block until the GPU has actually finished that copy before
+    // returning. The Rust capture loop calls
+    // IDXGIOutputDuplication::ReleaseFrame() immediately after this function
+    // returns, which lets DWM start writing the NEXT frame into this same
+    // recycled surface. Without this fence, the CopyResource below is only
+    // *queued*, not executed — so the GPU could still be reading dxgiFrame
+    // while DWM is already overwriting it, tearing the captured image. A
+    // static desktop hides this (old/new pixels match); moving content
+    // (cursor, text, scrolling) doesn't — visible as the smearing/ghosting
+    // that only self-heals at the next IDR.
     D3D11_TEXTURE2D_DESC frameDesc = {};
     dxgiFrame->GetDesc(&frameDesc);
-    if (!EnsureCompositeTexture((int)frameDesc.Width, (int)frameDesc.Height)) {
+    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_SHADER_RESOURCE)) {
         return 0;
     }
-    g_context->CopyResource(g_compositeTex, dxgiFrame);
+    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) {
+        return 0;
+    }
+    if (!g_copyFence) {
+        D3D11_QUERY_DESC qdesc = {};
+        qdesc.Query = D3D11_QUERY_EVENT;
+        if (FAILED(g_device->CreateQuery(&qdesc, &g_copyFence))) return 0;
+    }
+
+    g_context->CopyResource(g_cleanBgTex, dxgiFrame);
     g_context->End(g_copyFence);
     while (g_context->GetData(g_copyFence, nullptr, 0, 0) == S_FALSE) {
         // Spin: this copy is a few hundred microseconds at most, and we must
         // not return (letting Rust call ReleaseFrame) before it completes.
     }
+
+    // Refresh the encode buffer from the clean background on EVERY call —
+    // including a DXGI_ERROR_WAIT_TIMEOUT replay of the same dxgiFrame while
+    // the desktop is static — so the cursor drawn below never persists into
+    // the next iteration's source. Previously g_compositeTex was copied
+    // directly from dxgiFrame and cursor-overlaid in place: a static desktop
+    // kept re-copying the same source frame onto a buffer that still had the
+    // last cursor draw on it, "stamping" a permanent trail of cursor images.
+    g_context->CopyResource(g_compositeTex, g_cleanBgTex);
 
     ID3D11Texture2D* vpSourceTexture = g_compositeTex;
 
@@ -835,6 +879,7 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_cursorTex)         { g_cursorTex->Release();         g_cursorTex         = nullptr; }
     if (g_cursorXorSRV)      { g_cursorXorSRV->Release();      g_cursorXorSRV      = nullptr; }
     if (g_cursorXorTex)      { g_cursorXorTex->Release();      g_cursorXorTex      = nullptr; }
+    if (g_cleanBgTex)        { g_cleanBgTex->Release();        g_cleanBgTex        = nullptr; }
     if (g_compositeRTV)      { g_compositeRTV->Release();      g_compositeRTV      = nullptr; }
     if (g_compositeTex)      { g_compositeTex->Release();      g_compositeTex      = nullptr; }
     if (g_copyFence)         { g_copyFence->Release();         g_copyFence         = nullptr; }
