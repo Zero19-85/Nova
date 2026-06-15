@@ -39,7 +39,7 @@
 //! Mouse/keyboard packet magics and layouts are documented above the
 //! relevant `inject_*` functions further down in this file.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
 use windows::Win32::Foundation::POINT;
@@ -48,12 +48,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY, VK_CONTROL, VK_F11, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
-    VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY, VK_CONTROL, VK_F11, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, XBUTTON1, XBUTTON2,
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 const MULTI_CONTROLLER_MAGIC_GEN5: u32 = 0x0000_000C;
@@ -306,12 +307,80 @@ pub fn handle_input_packet(payload: &[u8]) {
 // Mouse & keyboard injection via SendInput.
 //
 // Per project requirements, mouse positioning is ALWAYS injected as an
-// absolute SendInput move (MOUSEEVENTF_ABSOLUTE, 0-65535 normalized to the
-// primary monitor). Even client-relative deltas (NV_REL_MOUSE_MOVE_PACKET)
-// are resolved against the host's current cursor position and re-injected
-// absolutely — true relative SendInput moves would let the client's and
-// host's notions of cursor position drift apart (desync).
+// absolute SendInput move (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+// 0-65535 normalized to the Win32 virtual screen — SM_XVIRTUALSCREEN/
+// SM_YVIRTUALSCREEN/SM_CXVIRTUALSCREEN/SM_CYVIRTUALSCREEN). Even
+// client-relative deltas (NV_REL_MOUSE_MOVE_PACKET) are resolved against the
+// host's current cursor position and re-injected absolutely — true relative
+// SendInput moves would let the client's and host's notions of cursor
+// position drift apart (desync).
+//
+// Plain MOUSEEVENTF_ABSOLUTE (without VIRTUALDESK) maps 0-65535 onto the GDI
+// *primary* monitor's bounds, which is NOT necessarily the display
+// `capture::DesktopCapturer` is duplicating — on a multi-monitor host, DXGI
+// output 0 of adapter 0 isn't guaranteed to be the primary, and during a
+// Virtual Desktop session the virtual display becomes primary while other
+// physical paths are detached rather than removed. So every absolute move
+// below is computed in desktop coordinates (the same top-left-origin,
+// Y-increases-downward space as DXGI's DesktopCoordinates / GetCursorPos —
+// matching the wire format, so no axis is ever flipped) against the ACTIVE
+// CAPTURE RECT (see `set_active_capture_rect`), then converted to the
+// VIRTUALDESK 0-65535 space via `virtual_desktop_to_absolute`.
 // ---------------------------------------------------------------------
+
+/// Position (`origin_x`/`origin_y`, desktop coordinates — i.e.
+/// `DXGI_OUTPUT_DESC::DesktopCoordinates.left/top`) and size (`width`/
+/// `height`) of the display `capture::DesktopCapturer` is currently
+/// duplicating. `lib.rs` calls [`set_active_capture_rect`] after creating or
+/// rebinding the capturer — including following the Virtual Desktop
+/// activate/deactivate handoff — so this always reflects what's actually
+/// being streamed. Mouse-move injection maps onto THIS rect, not onto
+/// `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` (the GDI primary monitor,
+/// which may be a different display).
+static CAPTURE_ORIGIN_X: AtomicI32 = AtomicI32::new(0);
+static CAPTURE_ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
+static CAPTURE_WIDTH: AtomicI32 = AtomicI32::new(0);
+static CAPTURE_HEIGHT: AtomicI32 = AtomicI32::new(0);
+
+/// Records the desktop-coordinate rect of the display currently being
+/// captured. See [`CAPTURE_ORIGIN_X`] and friends.
+pub fn set_active_capture_rect(origin_x: i32, origin_y: i32, width: u32, height: u32) {
+    CAPTURE_ORIGIN_X.store(origin_x, Ordering::Relaxed);
+    CAPTURE_ORIGIN_Y.store(origin_y, Ordering::Relaxed);
+    CAPTURE_WIDTH.store(width as i32, Ordering::Relaxed);
+    CAPTURE_HEIGHT.store(height as i32, Ordering::Relaxed);
+}
+
+fn active_capture_rect() -> (i32, i32, i32, i32) {
+    (
+        CAPTURE_ORIGIN_X.load(Ordering::Relaxed),
+        CAPTURE_ORIGIN_Y.load(Ordering::Relaxed),
+        CAPTURE_WIDTH.load(Ordering::Relaxed),
+        CAPTURE_HEIGHT.load(Ordering::Relaxed),
+    )
+}
+
+/// Converts a point in desktop coordinates (top-left origin, Y increasing
+/// downward — the same space as [`active_capture_rect`], DXGI's
+/// `DesktopCoordinates`, and `GetCursorPos`) into the
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` 0-65535 space, which
+/// SendInput maps onto the identical rect (`SM_XVIRTUALSCREEN`/
+/// `SM_YVIRTUALSCREEN`, sized `SM_CXVIRTUALSCREEN`/`SM_CYVIRTUALSCREEN`).
+/// Same origin and axis direction on both sides, so neither axis is flipped
+/// here.
+fn virtual_desktop_to_absolute(x: f64, y: f64) -> Option<(i32, i32)> {
+    let vs_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
+    let vs_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f64;
+    let vs_w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f64;
+    let vs_h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f64;
+    if vs_w <= 0.0 || vs_h <= 0.0 {
+        return None;
+    }
+
+    let nx = (((x - vs_x) / vs_w) * 65535.0).clamp(0.0, 65535.0) as i32;
+    let ny = (((y - vs_y) / vs_h) * 65535.0).clamp(0.0, 65535.0) as i32;
+    Some((nx, ny))
+}
 
 fn send_mouse_input(mi: MOUSEINPUT) {
     let input = INPUT {
@@ -342,10 +411,13 @@ fn send_key_input(ki: KEYBDINPUT) {
 ///   width  : i16 BE  @len-4  client's reference width for `x`
 ///   height : i16 BE  @len-2  client's reference height for `y`
 ///
-/// SendInput's MOUSEEVENTF_ABSOLUTE maps [0, 65535] onto the primary
-/// monitor's full extent (no MOUSEEVENTF_VIRTUALDESK), and the client's
-/// stream resolution corresponds 1:1 to the host's capture (primary
-/// monitor) resolution — so a straight proportional remap is correct.
+/// `x/width` and `y/height` give the cursor's fractional position within the
+/// client's view (top-left origin, Y increasing downward — both ends of the
+/// wire format agree, so this fraction is applied directly with no flip).
+/// That fraction is applied to the active capture rect (see
+/// [`active_capture_rect`]) to get a desktop-coordinate point, which
+/// [`virtual_desktop_to_absolute`] converts to SendInput's 0-65535
+/// VIRTUALDESK space.
 fn inject_mouse_move_abs(payload: &[u8]) {
     if payload.len() < 16 {
         return;
@@ -353,20 +425,31 @@ fn inject_mouse_move_abs(payload: &[u8]) {
     let len = payload.len();
     let x = i16::from_be_bytes([payload[8], payload[9]]) as f64;
     let y = i16::from_be_bytes([payload[10], payload[11]]) as f64;
-    let width = i16::from_be_bytes([payload[len - 4], payload[len - 3]]) as f64;
-    let height = i16::from_be_bytes([payload[len - 2], payload[len - 1]]) as f64;
-    if width <= 0.0 || height <= 0.0 {
+    let client_width = i16::from_be_bytes([payload[len - 4], payload[len - 3]]) as f64;
+    let client_height = i16::from_be_bytes([payload[len - 2], payload[len - 1]]) as f64;
+    if client_width <= 0.0 || client_height <= 0.0 {
         return;
     }
 
-    let nx = ((x / width) * 65535.0).clamp(0.0, 65535.0) as i32;
-    let ny = ((y / height) * 65535.0).clamp(0.0, 65535.0) as i32;
+    let (origin_x, origin_y, capture_w, capture_h) = active_capture_rect();
+    if capture_w <= 0 || capture_h <= 0 {
+        return;
+    }
+
+    let frac_x = (x / client_width).clamp(0.0, 1.0);
+    let frac_y = (y / client_height).clamp(0.0, 1.0);
+    let target_x = origin_x as f64 + frac_x * capture_w as f64;
+    let target_y = origin_y as f64 + frac_y * capture_h as f64;
+
+    let Some((nx, ny)) = virtual_desktop_to_absolute(target_x, target_y) else {
+        return;
+    };
 
     send_mouse_input(MOUSEINPUT {
         dx: nx,
         dy: ny,
         mouseData: 0,
-        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         time: 0,
         dwExtraInfo: 0,
     });
@@ -377,8 +460,9 @@ fn inject_mouse_move_abs(payload: &[u8]) {
 ///   deltaY : i16 BE @10
 ///
 /// Resolved against the host's current cursor position (GetCursorPos),
-/// clamped to the primary monitor, and re-injected as an absolute move —
-/// see the module-level note on why relative SendInput moves aren't used.
+/// clamped to the active capture rect (see [`active_capture_rect`]), and
+/// re-injected as an absolute move — see the module-level note on why
+/// relative SendInput moves aren't used.
 fn inject_mouse_move_rel(payload: &[u8]) {
     if payload.len() < 12 {
         return;
@@ -391,23 +475,23 @@ fn inject_mouse_move_rel(payload: &[u8]) {
         return;
     }
 
-    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    if screen_w <= 0 || screen_h <= 0 {
+    let (origin_x, origin_y, capture_w, capture_h) = active_capture_rect();
+    if capture_w <= 0 || capture_h <= 0 {
         return;
     }
 
-    let new_x = (pos.x + dx).clamp(0, screen_w - 1);
-    let new_y = (pos.y + dy).clamp(0, screen_h - 1);
+    let new_x = (pos.x + dx).clamp(origin_x, origin_x + capture_w - 1);
+    let new_y = (pos.y + dy).clamp(origin_y, origin_y + capture_h - 1);
 
-    let nx = (new_x as f64 / screen_w as f64 * 65535.0) as i32;
-    let ny = (new_y as f64 / screen_h as f64 * 65535.0) as i32;
+    let Some((nx, ny)) = virtual_desktop_to_absolute(new_x as f64, new_y as f64) else {
+        return;
+    };
 
     send_mouse_input(MOUSEINPUT {
         dx: nx,
         dy: ny,
         mouseData: 0,
-        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         time: 0,
         dwExtraInfo: 0,
     });
