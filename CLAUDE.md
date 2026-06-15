@@ -15,6 +15,6 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
    - If a build fails, analyze the compiler output, identify the specific missing library or header, and fix the `build.rs` or shim pathing.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 
-## Current Phase: Phase 4 (Networking & Packetization)
-We have successfully completed Phase 3 (Hardware Handshake & Pairing). 
-- **Next steps:** Finalize the RTSP control channel (port 48010) and package H.264 NAL units into RTP packets for UDP transmission.
+## Current Phase: Phase 5 (HDR10 / Color Pipeline)
+Phase 4 (Networking & Packetization) is complete and user-confirmed over live Moonlight sessions: RTSP control channel (port 48010), ENet control stream (UDP 47999), H.264 NAL units packaged into RTP with Reed-Solomon FEC, audio (WASAPI loopback -> Opus over RTP), input passthrough (mouse/keyboard/gamepad), cursor compositing, and virtual-display (App 5 "Virtual Desktop") activate/restore are all working end-to-end.
+- **Next steps:** Implement HDR10 — NVENC HDR metadata / HEVC Main10 10-bit profile (encoder.rs, shim.cpp), HDR-capable DXGI capture format (capture.rs), and RTSP/SDP HDR signaling (rtsp.rs). See memory/project_nova_state.md ("Next up: HDR10") for history and standing conventions.
