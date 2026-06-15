@@ -13,7 +13,8 @@ static ID3D11VideoDevice*              g_videoDevice   = nullptr;
 static ID3D11VideoContext*             g_videoContext  = nullptr;
 static ID3D11VideoProcessorEnumerator* g_vpEnum        = nullptr;
 static ID3D11VideoProcessor*           g_vp            = nullptr;
-static ID3D11Texture2D*                g_nv12Texture   = nullptr;
+// g_vpOutView targets NVENC's own input texture directly (see
+// InitColorConversion) — there is no separate intermediate NV12 texture.
 static ID3D11VideoProcessorOutputView* g_vpOutView     = nullptr;
 
 // ==================== ENCODER GLOBALS ====================
@@ -21,6 +22,13 @@ static ID3D11Device*        g_device    = nullptr;
 static ID3D11DeviceContext* g_context   = nullptr;
 static NvEncoderD3D11*      g_nvEncoder = nullptr;
 static std::atomic<bool>    g_force_idr{false};
+
+// Persisted encoder configuration so ReconfigureBitrate() can rebuild
+// NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
+// with (only rate-control fields changed).
+static NV_ENC_INITIALIZE_PARAMS g_initParams = {};
+static NV_ENC_CONFIG            g_encConfig  = {};
+static int                      g_encoderFps = 60;
 
 // ==================== CURSOR COMPOSITING GLOBALS ====================
 // DXGI_OUTDUPL_POINTER_SHAPE_TYPE values (avoids pulling in dxgi1_2.h).
@@ -56,15 +64,20 @@ float4 main_ps(VS_OUT input) : SV_TARGET {
 }
 )";
 
-static ID3D11VertexShader*       g_cursorVS      = nullptr;
-static ID3D11PixelShader*        g_cursorPS      = nullptr;
-static ID3D11BlendState*         g_cursorBlend   = nullptr;
-static ID3D11SamplerState*       g_cursorSampler = nullptr;
+static ID3D11VertexShader*       g_cursorVS          = nullptr;
+static ID3D11PixelShader*        g_cursorPS          = nullptr;
+static ID3D11BlendState*         g_cursorBlend       = nullptr;
+static ID3D11BlendState*         g_cursorBlendInvert = nullptr;
+static ID3D11SamplerState*       g_cursorSampler     = nullptr;
 
-// Current cursor shape, uploaded as a small BGRA texture whenever DXGI
-// reports a shape change (PointerShapeBufferSize > 0).
+// Current cursor shape, uploaded as two small BGRA textures whenever DXGI
+// reports a shape change (PointerShapeBufferSize > 0). Sunshine splits every
+// cursor into an alpha-blended image and an XOR(invert)-blended image so
+// monochrome/masked cursors (text I-beam etc.) render correctly.
 static ID3D11Texture2D*          g_cursorTex     = nullptr;
 static ID3D11ShaderResourceView* g_cursorSRV     = nullptr;
+static ID3D11Texture2D*          g_cursorXorTex  = nullptr;
+static ID3D11ShaderResourceView* g_cursorXorSRV  = nullptr;
 static UINT                      g_cursorTexW    = 0;
 static UINT                      g_cursorTexH    = 0;
 
@@ -85,31 +98,6 @@ static ID3D11Query*              g_copyFence     = nullptr;
 static int  g_cursorX       = 0;
 static int  g_cursorY       = 0;
 static bool g_cursorVisible = false;
-
-// Bumped by UpdateCursorShape() on every shape upload — used to detect a
-// cursor shape change (e.g. arrow -> text-select caret) for IDR purposes.
-static uint32_t g_cursorShapeGeneration = 0;
-
-// ==================== CURSOR-MOTION IDR ====================
-// P-frame motion compensation leaves faint residual copies of the composited
-// cursor at its old on-screen positions for several frames ("ghost trails")
-// — they only fully disappear at an IDR. Forcing an IDR whenever the cursor
-// moves/changes "significantly" clears them almost immediately. A cooldown
-// caps how often this can fire so continuous mouse movement doesn't turn
-// into an IDR storm: at 10 frames (~6 IDR/s @ 60fps) the rate controller
-// couldn't recover its VBV budget between IDRs and crept QP up over the
-// session, eventually making even the "IDR" frames too lossy to fully clear
-// ghosts ("looks perfect, then returns after a while"). 30 frames (~2 IDR/s)
-// + the wider VBV above gives the controller room to recover.
-static const int kCursorIdrMoveThreshold  = 2;  // pixels
-static const int kCursorIdrCooldownFrames = 30; // ~2 forced IDR/s @ 60fps
-static int      g_lastIdrCursorX          = -1000000;
-static int      g_lastIdrCursorY          = -1000000;
-static bool     g_lastIdrCursorVisible    = false;
-static uint32_t g_lastIdrShapeGeneration  = 0;
-static int      g_framesSinceCursorIdr    = kCursorIdrCooldownFrames;
-
-static inline int iabs(int v) { return v < 0 ? -v : v; }
 
 // ==================== CURSOR COMPOSITING HELPERS ====================
 
@@ -160,6 +148,14 @@ static bool InitCursorPipeline(ID3D11Device* device) {
     hr = device->CreateBlendState(&bdesc, &g_cursorBlend);
     if (FAILED(hr)) return false;
 
+    // Invert blending (Sunshine's blend_invert): out.rgb = src.rgb*(1-dst.rgb) + dst.rgb*(1-src.rgb).
+    // Where the XOR image is white this inverts the screen; where it's
+    // transparent (black) the screen passes through unchanged.
+    rt.SrcBlend  = D3D11_BLEND_INV_DEST_COLOR;
+    rt.DestBlend = D3D11_BLEND_INV_SRC_COLOR;
+    hr = device->CreateBlendState(&bdesc, &g_cursorBlendInvert);
+    if (FAILED(hr)) return false;
+
     D3D11_SAMPLER_DESC sdesc = {};
     sdesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sdesc.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -175,10 +171,9 @@ static bool InitCursorPipeline(ID3D11Device* device) {
 }
 
 // Ports Sunshine's make_cursor_alpha_image (display_vram.cpp) for the
-// MONOCHROME / COLOR / MASKED_COLOR pointer shape types. The XOR-blended
-// "inverse of screen" pass (make_cursor_xor_image) is intentionally omitted
-// for this first working version — affected pixels are simply left
-// transparent, which only affects rare invert-style cursors.
+// MONOCHROME / COLOR / MASKED_COLOR pointer shape types. Pixels that need
+// "inverse of screen" treatment are left transparent here and handled by
+// build_cursor_xor_image + invert blending below.
 static std::vector<uint8_t> build_cursor_alpha_image(
     const uint8_t* data, size_t data_len,
     uint32_t type, uint32_t width, uint32_t height, uint32_t pitch,
@@ -205,7 +200,7 @@ static std::vector<uint8_t> build_cursor_alpha_image(
             for (size_t i = 0; i < (size_t)width * height; ++i) {
                 uint8_t alpha = (uint8_t)((pixels[i] >> 24) & 0xFF);
                 if (alpha == 0xFF) {
-                    // XOR-blended pixel (inverse of screen) — not implemented, leave transparent.
+                    // Handled by build_cursor_xor_image — transparent here.
                     pixels[i] = transparent;
                 } else if (alpha == 0x00) {
                     // Fully opaque in the alpha-blended image.
@@ -245,6 +240,80 @@ static std::vector<uint8_t> build_cursor_alpha_image(
                     default: pixel = transparent; break; // screen color / inverse (XOR-only)
                 }
                 pixel_data[pixel_index++] = pixel;
+            }
+        }
+
+        out_width  = width;
+        out_height = out_h;
+        return img;
+    }
+
+    return {};
+}
+
+// Ports Sunshine's make_cursor_xor_image: builds the image drawn with invert
+// blending. White pixels invert the screen underneath ("inverse of screen"
+// regions of monochrome/masked-color cursors); transparent pixels leave it
+// unchanged. COLOR cursors need no XOR pass and return empty.
+static std::vector<uint8_t> build_cursor_xor_image(
+    const uint8_t* data, size_t data_len,
+    uint32_t type, uint32_t width, uint32_t height, uint32_t pitch,
+    uint32_t& out_width, uint32_t& out_height)
+{
+    constexpr uint32_t inverted    = 0xFFFFFFFF;
+    constexpr uint32_t transparent = 0x00000000;
+
+    out_width  = 0;
+    out_height = 0;
+
+    if (type == kPointerShapeColor) return {};
+
+    if (type == kPointerShapeMaskedColor) {
+        if (pitch == 0 || width == 0 || height == 0) return {};
+        if ((size_t)pitch * height > data_len) return {};
+
+        std::vector<uint8_t> img((size_t)width * height * 4);
+        for (uint32_t y = 0; y < height; ++y) {
+            memcpy(img.data() + (size_t)y * width * 4, data + (size_t)y * pitch, (size_t)width * 4);
+        }
+
+        uint32_t* pixels = (uint32_t*)img.data();
+        for (size_t i = 0; i < (size_t)width * height; ++i) {
+            uint8_t alpha = (uint8_t)((pixels[i] >> 24) & 0xFF);
+            if (alpha == 0xFF) {
+                // XOR-blended as is.
+            } else {
+                // Handled by build_cursor_alpha_image — transparent here.
+                pixels[i] = transparent;
+            }
+        }
+
+        out_width  = width;
+        out_height = height;
+        return img;
+    }
+
+    if (type == kPointerShapeMonochrome) {
+        if (pitch == 0 || width == 0 || height < 2) return {};
+        uint32_t out_h = height / 2;
+        size_t bytes = (size_t)pitch * out_h;
+        if (bytes * 2 > data_len) return {};
+
+        std::vector<uint8_t> img((size_t)width * out_h * 4);
+        uint32_t* pixel_data = (uint32_t*)img.data();
+        const uint8_t* and_mask = data;
+        const uint8_t* xor_mask = data + bytes;
+
+        size_t total_pixels = (size_t)width * out_h;
+        size_t pixel_index = 0;
+        for (size_t b = 0; b < bytes && pixel_index < total_pixels; ++b) {
+            uint8_t and_byte = and_mask[b];
+            uint8_t xor_byte = xor_mask[b];
+            for (int bit = 7; bit >= 0 && pixel_index < total_pixels; --bit) {
+                uint32_t mask = 1u << bit;
+                int color_type = ((and_byte & mask) ? 1 : 0) + ((xor_byte & mask) ? 2 : 0);
+                // case 3 = inverse of screen; everything else handled by the alpha image.
+                pixel_data[pixel_index++] = (color_type == 3) ? inverted : transparent;
             }
         }
 
@@ -301,11 +370,7 @@ static void DrawCursorOverlay() {
     g_context->IASetInputLayout(nullptr);
     g_context->VSSetShader(g_cursorVS, nullptr, 0);
     g_context->PSSetShader(g_cursorPS, nullptr, 0);
-    g_context->PSSetShaderResources(0, 1, &g_cursorSRV);
     g_context->PSSetSamplers(0, 1, &g_cursorSampler);
-
-    float blendFactor[4] = {0, 0, 0, 0};
-    g_context->OMSetBlendState(g_cursorBlend, blendFactor, 0xFFFFFFFF);
     g_context->OMSetRenderTargets(1, &g_compositeRTV, nullptr);
 
     D3D11_VIEWPORT vp = {};
@@ -317,7 +382,20 @@ static void DrawCursorOverlay() {
     vp.MaxDepth = 1.0f;
     g_context->RSSetViewports(1, &vp);
 
-    g_context->Draw(3, 0);
+    if (g_cursorSRV) {
+        // Alpha-blended pass.
+        g_context->OMSetBlendState(g_cursorBlend, nullptr, 0xFFFFFFFF);
+        g_context->PSSetShaderResources(0, 1, &g_cursorSRV);
+        g_context->Draw(3, 0);
+    }
+
+    if (g_cursorXorSRV) {
+        // Invert pass for "inverse of screen" pixels, without touching alpha
+        // (Sunshine masks alpha out via the 0x00FFFFFF sample mask).
+        g_context->OMSetBlendState(g_cursorBlendInvert, nullptr, 0x00FFFFFF);
+        g_context->PSSetShaderResources(0, 1, &g_cursorXorSRV);
+        g_context->Draw(3, 0);
+    }
 
     // Unbind so the Video Processor (and next frame's draw) start clean.
     ID3D11ShaderResourceView* nullSRV = nullptr;
@@ -331,29 +409,17 @@ static void DrawCursorOverlay() {
 // ==================== CURSOR SHAPE / POSITION UPDATES ====================
 // Called from the capture loop when DXGI_OUTDUPL_FRAME_INFO.PointerShapeBufferSize > 0
 // — i.e. only when the cursor's shape actually changed, not every frame.
-extern "C" __declspec(dllexport) int UpdateCursorShape(
-    const uint8_t* data, int data_len,
-    uint32_t type, uint32_t width, uint32_t height, uint32_t pitch)
+// Uploads one cursor image as an immutable BGRA texture + SRV. Empty images
+// leave the texture null (that blend pass is skipped).
+static bool UploadCursorImage(
+    const std::vector<uint8_t>& img, uint32_t w, uint32_t h,
+    ID3D11Texture2D** tex, ID3D11ShaderResourceView** srv)
 {
-    if (!g_device) return -1;
-
-    uint32_t out_w = 0, out_h = 0;
-    std::vector<uint8_t> img = build_cursor_alpha_image(data, (size_t)data_len, type, width, height, pitch, out_w, out_h);
-
-    if (g_cursorSRV) { g_cursorSRV->Release(); g_cursorSRV = nullptr; }
-    if (g_cursorTex) { g_cursorTex->Release(); g_cursorTex = nullptr; }
-    g_cursorTexW = 0;
-    g_cursorTexH = 0;
-    g_cursorShapeGeneration++;
-
-    if (img.empty() || out_w == 0 || out_h == 0) {
-        // Unsupported/empty shape — cursor stays hidden until the next shape update.
-        return 0;
-    }
+    if (img.empty() || w == 0 || h == 0) return true;
 
     D3D11_TEXTURE2D_DESC tdesc = {};
-    tdesc.Width            = out_w;
-    tdesc.Height           = out_h;
+    tdesc.Width            = w;
+    tdesc.Height           = h;
     tdesc.MipLevels        = 1;
     tdesc.ArraySize        = 1;
     tdesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -363,20 +429,48 @@ extern "C" __declspec(dllexport) int UpdateCursorShape(
 
     D3D11_SUBRESOURCE_DATA sub = {};
     sub.pSysMem     = img.data();
-    sub.SysMemPitch = out_w * 4;
+    sub.SysMemPitch = w * 4;
 
-    HRESULT hr = g_device->CreateTexture2D(&tdesc, &sub, &g_cursorTex);
-    if (FAILED(hr)) return -2;
+    HRESULT hr = g_device->CreateTexture2D(&tdesc, &sub, tex);
+    if (FAILED(hr)) return false;
 
-    hr = g_device->CreateShaderResourceView(g_cursorTex, nullptr, &g_cursorSRV);
+    hr = g_device->CreateShaderResourceView(*tex, nullptr, srv);
     if (FAILED(hr)) {
-        g_cursorTex->Release();
-        g_cursorTex = nullptr;
-        return -3;
+        (*tex)->Release();
+        *tex = nullptr;
+        return false;
+    }
+    return true;
+}
+
+extern "C" __declspec(dllexport) int UpdateCursorShape(
+    const uint8_t* data, int data_len,
+    uint32_t type, uint32_t width, uint32_t height, uint32_t pitch)
+{
+    if (!g_device) return -1;
+
+    uint32_t alpha_w = 0, alpha_h = 0, xor_w = 0, xor_h = 0;
+    std::vector<uint8_t> alpha_img = build_cursor_alpha_image(data, (size_t)data_len, type, width, height, pitch, alpha_w, alpha_h);
+    std::vector<uint8_t> xor_img   = build_cursor_xor_image(data, (size_t)data_len, type, width, height, pitch, xor_w, xor_h);
+
+    if (g_cursorSRV)    { g_cursorSRV->Release();    g_cursorSRV    = nullptr; }
+    if (g_cursorTex)    { g_cursorTex->Release();    g_cursorTex    = nullptr; }
+    if (g_cursorXorSRV) { g_cursorXorSRV->Release(); g_cursorXorSRV = nullptr; }
+    if (g_cursorXorTex) { g_cursorXorTex->Release(); g_cursorXorTex = nullptr; }
+    g_cursorTexW = 0;
+    g_cursorTexH = 0;
+
+    if (alpha_img.empty() && xor_img.empty()) {
+        // Unsupported/empty shape — cursor stays hidden until the next shape update.
+        return 0;
     }
 
-    g_cursorTexW = out_w;
-    g_cursorTexH = out_h;
+    if (!UploadCursorImage(alpha_img, alpha_w, alpha_h, &g_cursorTex, &g_cursorSRV)) return -2;
+    if (!UploadCursorImage(xor_img, xor_w, xor_h, &g_cursorXorTex, &g_cursorXorSRV)) return -3;
+
+    // Both images (when present) share the shape's dimensions.
+    g_cursorTexW = alpha_img.empty() ? xor_w : alpha_w;
+    g_cursorTexH = alpha_img.empty() ? xor_h : alpha_h;
     return 0;
 }
 
@@ -397,18 +491,19 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     hr = g_context->QueryInterface(__uuidof(ID3D11VideoContext), (void**)&g_videoContext);
     if (FAILED(hr)) return -3;
 
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width            = width;
-    desc.Height           = height;
-    desc.MipLevels        = 1;
-    desc.ArraySize        = 1;
-    desc.Format           = DXGI_FORMAT_NV12;
-    desc.SampleDesc.Count = 1;
-    desc.Usage            = D3D11_USAGE_DEFAULT;
-    desc.BindFlags        = D3D11_BIND_RENDER_TARGET;
-
-    hr = device->CreateTexture2D(&desc, nullptr, &g_nv12Texture);
-    if (FAILED(hr)) return -4;
+    // Zero-copy handoff: rather than converting BGRA -> NV12 into our own
+    // texture and then CopyResource-ing that into NVENC's input buffer, point
+    // the Video Processor's output view directly at the ID3D11Texture2D NVENC
+    // already allocated and registered for encoding. InitEncoder() runs before
+    // this function (see encoder.rs's Encoder::new()) and its CreateEncoder()
+    // call synchronously calls AllocateInputBuffers(), so g_nvEncoder's input
+    // buffer exists by now. With frameIntervalP=1/lookahead=0/no extra output
+    // delay, NVENC uses a single input buffer, so the same texture returned
+    // here is reused for every frame.
+    if (!g_nvEncoder) return -8;
+    const NvEncInputFrame* encoderInputFrame = g_nvEncoder->GetNextInputFrame();
+    if (!encoderInputFrame || !encoderInputFrame->inputPtr) return -9;
+    ID3D11Texture2D* nvencInputTex = (ID3D11Texture2D*)encoderInputFrame->inputPtr;
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
     contentDesc.InputFrameFormat            = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -432,7 +527,7 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     ovDesc.ViewDimension      = D3D11_VPOV_DIMENSION_TEXTURE2D;
     ovDesc.Texture2D.MipSlice = 0;
 
-    hr = g_videoDevice->CreateVideoProcessorOutputView(g_nv12Texture, g_vpEnum, &ovDesc, &g_vpOutView);
+    hr = g_videoDevice->CreateVideoProcessorOutputView(nvencInputTex, g_vpEnum, &ovDesc, &g_vpOutView);
     if (FAILED(hr)) return -7;
 
     // Pin source/dest/output rects to the full dynamic surface. Without this,
@@ -503,67 +598,50 @@ extern "C" __declspec(dllexport) int InitEncoder(
         // nExtraOutputDelay=0 eliminates the 3-frame pipeline buffer — zero-copy latency path.
         g_nvEncoder = new NvEncoderD3D11(g_device, width, height, NV_ENC_BUFFER_FORMAT_NV12, 0);
 
-        NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
-        NV_ENC_CONFIG encodeConfig               = { NV_ENC_CONFIG_VER };
-        initializeParams.encodeConfig            = &encodeConfig;
+        g_initParams = NV_ENC_INITIALIZE_PARAMS{ NV_ENC_INITIALIZE_PARAMS_VER };
+        g_encConfig  = NV_ENC_CONFIG{ NV_ENC_CONFIG_VER };
+        g_encoderFps = fps;
+        NV_ENC_INITIALIZE_PARAMS& initializeParams = g_initParams;
+        NV_ENC_CONFIG&            encodeConfig     = g_encConfig;
+        initializeParams.encodeConfig              = &encodeConfig;
 
-        // P1+ULTRA_LOW_LATENCY is NVENC's fastest *and lowest-quality* preset —
-        // it was crushing every frame into heavy macroblocking. P4+LOW_LATENCY
-        // gives a large quality jump for a small (sub-frame) latency cost.
+        // Sunshine's encoder recipe (src/nvenc/nvenc_base.cpp), ported
+        // verbatim. The combination that keeps the picture artifact-free
+        // WITHOUT any forced IDRs:
+        //   - CBR at the full client bitrate: on a near-static desktop every
+        //     P-frame has a large surplus bit budget, which the encoder
+        //     spends re-encoding/refining blocks — motion-compensation
+        //     residue (cursor ghost trails) is scrubbed within a few frames
+        //     instead of persisting until a keyframe.
+        //   - Infinite GOP: no periodic IDRs to blow the VBV and drag QP up.
+        //     IDRs happen only on demand (new client / decoder request).
+        //   - Single-frame VBV: every frame fits one transmission window —
+        //     consistent frame pacing and no multi-frame quality "payback".
         g_nvEncoder->CreateDefaultEncoderParams(
             &initializeParams, codecGuid,
-            NV_ENC_PRESET_P4_GUID,
-            NV_ENC_TUNING_INFO_LOW_LATENCY);
+            NV_ENC_PRESET_P1_GUID,
+            NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
 
         // Framerate
         initializeParams.frameRateNum = fps;
         initializeParams.frameRateDen = 1;
         initializeParams.enablePTD    = 1; // driver picks P/I picture types
 
-        // GOP: IDR every 1 s, no B-frames (B-frames add reorder latency).
-        // Was 2 s — halved so any transient reference-frame corruption
-        // (packet loss, FEC shortfall) self-heals roughly twice as fast.
-        encodeConfig.gopLength       = fps * 1;
-        encodeConfig.frameIntervalP  = 1;
+        encodeConfig.gopLength       = NVENC_INFINITE_GOPLENGTH;
+        encodeConfig.frameIntervalP  = 1; // no B-frames (reorder latency)
 
-        // VBR with a target average well below the cap, but the VBV/HRD
-        // buffer must still be sized for the *biggest* frame (IDR), not the
-        // average — IDRs measured up to ~27KB while a VBV sized off the
-        // 5Mbps average (~20.8KB) was smaller than that. A bitstream that
-        // overshoots its declared HRD buffer is non-conformant and corrupts
-        // decode right at/after the IDR (matches "bottom of frame black").
-        // So: average drives P-frame sizing, vbv (sized off maxBitRate, as
-        // before) gives IDR frames room to fit within the declared buffer.
-        // avgBitRate at maxBitRate/3 was starving P-frames of detail (heavy
-        // macroblocking). The 2-frame VBV window below already gives IDRs
-        // room to spike, so let average ride much closer to the cap.
-        uint32_t maxBitRateVal     = (uint32_t)bitrate_kbps * 1000;
-        uint32_t avgBitRateVal     = (maxBitRateVal * 3) / 4;
-        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-        encodeConfig.rcParams.averageBitRate  = avgBitRateVal;
-        encodeConfig.rcParams.maxBitRate      = maxBitRateVal;
-        // 1x maxBitRate/fps (~31.25KB @ 15Mbps/60fps) is smaller than the ~36KB
-        // IDRs we're seeing — give the VBV a window so IDRs fit. Widened from
-        // 2 to 4 frames: with cursor-motion-triggered IDRs (see
-        // kCursorIdrCooldownFrames) firing every ~0.5s on top of the 1s GOP,
-        // a 2-frame VBV was too small to absorb each IDR's overshoot, so the
-        // rate controller raised QP on the following frames to "pay it back"
-        // — and with IDRs arriving faster than it could recover, average QP
-        // crept up over the session (ghosts/cursor "painting" returning after
-        // looking clean initially). 4 frames (~66ms @ 60fps) is still
-        // low-latency and gives the controller room to recover between IDRs.
-        encodeConfig.rcParams.vbvBufferSize   = (maxBitRateVal / (uint32_t)fps) * 4;
-        encodeConfig.rcParams.vbvInitialDelay = encodeConfig.rcParams.vbvBufferSize;
-        encodeConfig.rcParams.zeroReorderDelay = 1;
-        // Two-pass (quarter-res first pass) — Sunshine's default. The
-        // preliminary pass catches large motion vectors and distributes bits
-        // far better on full-screen motion (window dragging was producing
-        // severe blocking with single-pass).
-        encodeConfig.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
-        // Spatial AQ: shifts bits toward flat/low-detail regions where
-        // quantization noise is most visible — targets the static-desktop
-        // shimmer on text/UI edges.
-        encodeConfig.rcParams.enableAQ = 1;
+        encodeConfig.rcParams.rateControlMode       = NV_ENC_PARAMS_RC_CBR;
+        encodeConfig.rcParams.averageBitRate        = (uint32_t)bitrate_kbps * 1000;
+        encodeConfig.rcParams.vbvBufferSize         = encodeConfig.rcParams.averageBitRate / (uint32_t)fps;
+        encodeConfig.rcParams.zeroReorderDelay      = 1;
+        encodeConfig.rcParams.enableLookahead       = 0;
+        // Keep on-demand IDR frames the same size as P frames so they fit
+        // the single-frame VBV instead of spiking it.
+        encodeConfig.rcParams.lowDelayKeyFrameScale = 1;
+        // Two-pass (quarter-res first pass): the preliminary pass catches
+        // large motion vectors and enforces the strict single-frame VBV.
+        encodeConfig.rcParams.multiPass             = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+        encodeConfig.rcParams.enableAQ              = 0; // Sunshine default: off
 
         // Codec-specific: inline SPS/PPS on every IDR so Moonlight can recover
         // VUI color description must match the BT.709 limited-range NV12
@@ -578,27 +656,38 @@ extern "C" __declspec(dllexport) int InitEncoder(
         vuiParams.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
         vuiParams.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         vuiParams.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        // Critical for low decoding latency on certain client devices (Sunshine).
+        vuiParams.bitstreamRestrictionFlag     = 1;
 
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
-            encodeConfig.encodeCodecConfig.h264Config.idrPeriod    = fps * 1;
-            encodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-            encodeConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
-            encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 0;
-            encodeConfig.encodeCodecConfig.h264Config.h264VUIParameters = vuiParams;
+            encodeConfig.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+            auto& h264 = encodeConfig.encodeCodecConfig.h264Config;
+            h264.repeatSPSPPS      = 1; // inline SPS/PPS on every IDR
+            h264.idrPeriod         = NVENC_INFINITE_GOPLENGTH;
+            h264.sliceMode         = 3;
+            h264.sliceModeData     = 1; // single slice per frame
+            h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+            // Deep DPB for future reference-frame invalidation; any single
+            // frame still only references one frame back (numRefL0).
+            h264.maxNumRefFrames   = 5;
+            h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_1;
+            h264.enableFillerDataInsertion = 0;
+            h264.h264VUIParameters = vuiParams;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
-            encodeConfig.encodeCodecConfig.hevcConfig.idrPeriod    = fps * 1;
-            encodeConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
-            encodeConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
-            encodeConfig.encodeCodecConfig.hevcConfig.enableFillerDataInsertion = 0;
-            encodeConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters = vuiParams;
+            auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
+            hevc.repeatSPSPPS         = 1;
+            hevc.idrPeriod            = NVENC_INFINITE_GOPLENGTH;
+            hevc.sliceMode            = 3;
+            hevc.sliceModeData        = 1;
+            hevc.maxNumRefFramesInDPB = 5;
+            hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
+            hevc.enableFillerDataInsertion = 0;
+            hevc.hevcVUIParameters    = vuiParams;
         }
 
-        printf("📊 NVENC RC config: mode=%s avgBitRate=%u maxBitRate=%u vbvBufferSize=%u fillerData(h264)=%u\n",
-               encodeConfig.rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR ? "VBR" : "CBR",
+        printf("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
                encodeConfig.rcParams.averageBitRate,
-               encodeConfig.rcParams.maxBitRate,
-               encodeConfig.rcParams.vbvBufferSize,
-               encodeConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion);
+               encodeConfig.rcParams.vbvBufferSize);
 
         g_nvEncoder->CreateEncoder(&initializeParams);
 
@@ -650,28 +739,11 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // Composite the cursor onto g_compositeTex before NV12 conversion
     // (Sunshine's approach: blend into an intermediate render-targetable
     // surface, since the DXGI duplication texture may not support that bind).
-    if (g_cursorVisible && g_cursorSRV && g_cursorTexW > 0 && g_cursorTexH > 0) {
+    // No cursor-motion IDR forcing: with CBR + infinite GOP (see InitEncoder)
+    // the rate controller scrubs any P-frame residue within a few frames on
+    // its own — forcing IDRs only degrades quality (Sunshine never does it).
+    if (g_cursorVisible && (g_cursorSRV || g_cursorXorSRV) && g_cursorTexW > 0 && g_cursorTexH > 0) {
         DrawCursorOverlay();
-    }
-
-    // Cursor-motion IDR: see kCursorIdrMoveThreshold/kCursorIdrCooldownFrames
-    // above. Detect a "significant" cursor change since the last
-    // cursor-triggered IDR and force one (subject to the cooldown) so any
-    // residual ghost from old cursor positions/shapes is fully cleared.
-    g_framesSinceCursorIdr++;
-    bool cursorChanged =
-        (g_cursorVisible != g_lastIdrCursorVisible) ||
-        (g_cursorShapeGeneration != g_lastIdrShapeGeneration) ||
-        (g_cursorVisible &&
-         (iabs(g_cursorX - g_lastIdrCursorX) >= kCursorIdrMoveThreshold ||
-          iabs(g_cursorY - g_lastIdrCursorY) >= kCursorIdrMoveThreshold));
-    if (cursorChanged && g_framesSinceCursorIdr >= kCursorIdrCooldownFrames) {
-        g_force_idr.store(true);
-        g_lastIdrCursorX         = g_cursorX;
-        g_lastIdrCursorY         = g_cursorY;
-        g_lastIdrCursorVisible   = g_cursorVisible;
-        g_lastIdrShapeGeneration = g_cursorShapeGeneration;
-        g_framesSinceCursorIdr   = 0;
     }
 
     // BGRA → NV12 via D3D11 Video Processor
@@ -683,6 +755,9 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         vpSourceTexture, g_vpEnum, &ivDesc, &vpInputView);
 
     if (SUCCEEDED(hr)) {
+        // VideoProcessorBlt writes NV12 directly into NVENC's input texture
+        // via g_vpOutView (see InitColorConversion) — no intermediate texture,
+        // no CopyResource. This is the zero-copy GPU-to-NVENC handoff.
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable        = TRUE;
         stream.pInputSurface = vpInputView;
@@ -692,11 +767,6 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         // VP input view creation failed — this frame is dropped
         return 0;
     }
-
-    // Copy NV12 surface into NVENC's own input buffer
-    const NvEncInputFrame* encoderInputFrame = g_nvEncoder->GetNextInputFrame();
-    g_context->CopyResource(
-        (ID3D11Texture2D*)encoderInputFrame->inputPtr, g_nv12Texture);
 
     std::vector<NvEncOutputFrame> vPacket;
     if (g_force_idr.exchange(false)) {
@@ -718,6 +788,39 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     return total_size;
 }
 
+// ==================== RECONFIGURE BITRATE ====================
+// Retargets CBR rate control to the bitrate the client actually negotiated
+// in its RTSP ANNOUNCE (x-nv-vqos[0].bw.maximumBitrateKbps). The encoder is
+// created at process startup with the CLI default — with CBR the encoder
+// holds that rate constantly, so streaming above what the client asked for
+// saturates the link and Moonlight aborts with bitrate warnings.
+extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fps) {
+    if (!g_nvEncoder || bitrate_kbps <= 0) return -1;
+    if (fps <= 0) fps = g_encoderFps;
+
+    uint32_t newRate = (uint32_t)bitrate_kbps * 1000;
+    if (newRate == g_encConfig.rcParams.averageBitRate) return 0;
+
+    g_encConfig.rcParams.averageBitRate = newRate;
+    g_encConfig.rcParams.vbvBufferSize  = newRate / (uint32_t)fps; // keep single-frame VBV
+
+    NV_ENC_RECONFIGURE_PARAMS rp = { NV_ENC_RECONFIGURE_PARAMS_VER };
+    rp.reInitEncodeParams              = g_initParams;
+    rp.reInitEncodeParams.encodeConfig = &g_encConfig;
+    rp.forceIDR = 1; // rate target changed — start clean at the new budget
+
+    try {
+        g_nvEncoder->Reconfigure(&rp);
+    } catch (const std::exception& e) {
+        printf("❌ ReconfigureBitrate failed: %s\n", e.what());
+        return -2;
+    }
+
+    printf("📊 NVENC reconfigured: CBR bitrate=%u vbvBufferSize=%u (client-negotiated)\n",
+           g_encConfig.rcParams.averageBitRate, g_encConfig.rcParams.vbvBufferSize);
+    return 0;
+}
+
 // ==================== FORCE IDR ====================
 // Sets a flag picked up by the next EncodeFrame() call, which passes
 // NV_ENC_PIC_FLAG_FORCEIDR to NVENC. Used to guarantee the first frame sent
@@ -728,20 +831,25 @@ extern "C" __declspec(dllexport) void RequestIdrFrame(void* /*encoder*/) {
 
 // ==================== CLEANUP ====================
 extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
-    if (g_cursorSRV)     { g_cursorSRV->Release();     g_cursorSRV     = nullptr; }
-    if (g_cursorTex)     { g_cursorTex->Release();     g_cursorTex     = nullptr; }
-    if (g_compositeRTV)  { g_compositeRTV->Release();  g_compositeRTV  = nullptr; }
-    if (g_compositeTex)  { g_compositeTex->Release();  g_compositeTex  = nullptr; }
-    if (g_copyFence)     { g_copyFence->Release();     g_copyFence     = nullptr; }
-    if (g_cursorSampler) { g_cursorSampler->Release();  g_cursorSampler = nullptr; }
-    if (g_cursorBlend)   { g_cursorBlend->Release();   g_cursorBlend   = nullptr; }
-    if (g_cursorPS)      { g_cursorPS->Release();      g_cursorPS      = nullptr; }
-    if (g_cursorVS)      { g_cursorVS->Release();      g_cursorVS      = nullptr; }
+    if (g_cursorSRV)         { g_cursorSRV->Release();         g_cursorSRV         = nullptr; }
+    if (g_cursorTex)         { g_cursorTex->Release();         g_cursorTex         = nullptr; }
+    if (g_cursorXorSRV)      { g_cursorXorSRV->Release();      g_cursorXorSRV      = nullptr; }
+    if (g_cursorXorTex)      { g_cursorXorTex->Release();      g_cursorXorTex      = nullptr; }
+    if (g_compositeRTV)      { g_compositeRTV->Release();      g_compositeRTV      = nullptr; }
+    if (g_compositeTex)      { g_compositeTex->Release();      g_compositeTex      = nullptr; }
+    if (g_copyFence)         { g_copyFence->Release();         g_copyFence         = nullptr; }
+    if (g_cursorSampler)     { g_cursorSampler->Release();     g_cursorSampler     = nullptr; }
+    if (g_cursorBlend)       { g_cursorBlend->Release();       g_cursorBlend       = nullptr; }
+    if (g_cursorBlendInvert) { g_cursorBlendInvert->Release(); g_cursorBlendInvert = nullptr; }
+    if (g_cursorPS)          { g_cursorPS->Release();          g_cursorPS          = nullptr; }
+    if (g_cursorVS)          { g_cursorVS->Release();          g_cursorVS          = nullptr; }
     g_cursorTexW = 0;
     g_cursorTexH = 0;
 
+    // g_vpOutView is our own view object onto NVENC's input texture — releasing
+    // it does not destroy that texture (NvEncoderD3D11::ReleaseD3D11Resources,
+    // called from DestroyEncoder() below, owns and releases it separately).
     if (g_vpOutView)    { g_vpOutView->Release();    g_vpOutView    = nullptr; }
-    if (g_nv12Texture)  { g_nv12Texture->Release();  g_nv12Texture  = nullptr; }
     if (g_vp)           { g_vp->Release();           g_vp           = nullptr; }
     if (g_vpEnum)       { g_vpEnum->Release();       g_vpEnum       = nullptr; }
     if (g_videoContext) { g_videoContext->Release(); g_videoContext = nullptr; }

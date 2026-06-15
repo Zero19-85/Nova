@@ -51,19 +51,169 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
 }
 
 // Control message types (Sunshine stream.cpp packetTypes[]).
+const PT_ENCRYPTED:             u16 = 0x0001;
 const PT_INVALIDATE_REF_FRAMES: u16 = 0x0301;
 const PT_LOSS_STATS:            u16 = 0x0201;
 const PT_PERIODIC_PING:         u16 = 0x0200;
 const PT_REQUEST_IDR_FRAME:     u16 = 0x0302;
+const PT_INPUT_DATA:            u16 = 0x0206;
+
+/// Decrypt a 0x0001 encrypted control envelope (Sunshine stream.cpp
+/// control_encrypted_t + IDX_ENCRYPTED handler):
+///   [u16 LE type=0x0001][u16 LE length][u32 LE seq][16B GCM tag][ciphertext]
+/// where length = 4 (seq) + 16 (tag) + ciphertext len, key = the /launch
+/// rikey, no AAD.
+///
+/// Moonlight's RTSP ANNOUNCE negotiates SS_ENC_CONTROL_V2 (a 12-byte
+/// deterministic IV), but in practice this client falls back to Nvidia's
+/// original ("legacy") control encryption: AES-128-GCM with a 16-byte IV
+/// (byte 0 = low byte of seq, bytes 1-15 = zero), tag(16) || ciphertext.
+/// ring's AES_128_GCM only supports 96-bit (12-byte) nonces and cannot
+/// represent a 16-byte IV at all, so this is decrypted via RustCrypto's
+/// generic aes-gcm instead. Confirmed working end-to-end (60fps video +
+/// low-latency input) — do not reintroduce the SS_ENC_CONTROL_V2 path
+/// without first confirming the client actually negotiates it.
+fn decrypt_control_message(rikey: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+    // 4B outer header + 4B seq + 16B tag is the minimum (empty plaintext).
+    if data.len() < 24 {
+        return None;
+    }
+    let length = u16::from_le_bytes([data[2], data[3]]) as usize;
+    // Sunshine's "Runt packet" check (stream.cpp IDX_ENCRYPTED): length must
+    // cover at least the 4B seq + 16B tag.
+    if length < 20 || 4 + length > data.len() {
+        return None;
+    }
+    let seq_wire = &data[4..8];
+    let payload  = &data[8..4 + length]; // tag(16) || ciphertext
+    let tag = &payload[..16];
+    let cipher = &payload[16..];
+
+    legacy_gcm_decrypt(rikey, seq_wire[0], tag, cipher)
+}
+
+/// Nvidia's legacy control-stream encryption: AES-128-GCM with a 16-byte IV
+/// (byte 0 = low byte of seq, bytes 1-15 = 0), tag(16) || ciphertext.
+fn legacy_gcm_decrypt(rikey: &[u8; 16], seq_lo: u8, tag: &[u8], cipher: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{AeadInPlace, KeyInit, generic_array::GenericArray};
+    use aes_gcm::AesGcm;
+    use cipher::consts::U16;
+
+    type Aes128Gcm16 = AesGcm<aes::Aes128, U16>;
+
+    let mut iv = [0u8; 16];
+    iv[0] = seq_lo;
+
+    let key = Aes128Gcm16::new(GenericArray::from_slice(rikey));
+    let nonce = GenericArray::from_slice(&iv);
+    let tag = GenericArray::from_slice(tag);
+
+    let mut buf = cipher.to_vec();
+    key.decrypt_in_place_detached(nonce, &[], &mut buf, tag).ok()?;
+    Some(buf)
+}
+
+/// Encrypt a plaintext inner control message with the same legacy 16-byte-IV
+/// AES-128-GCM scheme as [`legacy_gcm_decrypt`], using our own outgoing
+/// sequence counter (Sunshine: session->control.outgoing_iv / control.seq).
+/// Returns (tag, ciphertext).
+fn legacy_gcm_encrypt(rikey: &[u8; 16], seq_lo: u8, plaintext: &[u8]) -> ([u8; 16], Vec<u8>) {
+    use aes_gcm::aead::{AeadInPlace, KeyInit, generic_array::GenericArray};
+    use aes_gcm::AesGcm;
+    use cipher::consts::U16;
+
+    type Aes128Gcm16 = AesGcm<aes::Aes128, U16>;
+
+    let mut iv = [0u8; 16];
+    iv[0] = seq_lo;
+
+    let key = Aes128Gcm16::new(GenericArray::from_slice(rikey));
+    let nonce = GenericArray::from_slice(&iv);
+
+    let mut buf = plaintext.to_vec();
+    // AES-GCM encryption of a tiny control payload cannot fail (the only
+    // failure mode is a plaintext exceeding ~64GiB).
+    let tag = key.encrypt_in_place_detached(nonce, &[], &mut buf)
+        .expect("AES-128-GCM encrypt of control reply");
+    let mut tag_arr = [0u8; 16];
+    tag_arr.copy_from_slice(&tag);
+    (tag_arr, buf)
+}
+
+/// Build and send an encrypted 0x0001 control envelope back to the client:
+/// encrypts `[u16 LE msg_type][u16 LE payload.len()][payload]` with
+/// [`legacy_gcm_encrypt`] under `seq`, then wraps it as
+/// `[u16 LE 0x0001][u16 LE length][u32 LE seq][tag(16)][ciphertext]`
+/// (Sunshine stream.cpp encode_control). `seq` is the host's own outgoing
+/// control sequence counter — distinct from the client's incoming `seq`.
+fn send_control_reply(
+    peer: &mut enet::Peer<UdpSocket>,
+    channel_id: u8,
+    rikey: &[u8; 16],
+    seq: u32,
+    msg_type: u16,
+    payload: &[u8],
+) {
+    let mut plain = Vec::with_capacity(4 + payload.len());
+    plain.extend_from_slice(&msg_type.to_le_bytes());
+    plain.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    plain.extend_from_slice(payload);
+
+    let (tag, cipher) = legacy_gcm_encrypt(rikey, seq.to_le_bytes()[0], &plain);
+
+    let length = (cipher.len() + 20) as u16; // seq(4) + tag(16) + cipher
+    let mut envelope = Vec::with_capacity(4 + length as usize);
+    envelope.extend_from_slice(&PT_ENCRYPTED.to_le_bytes());
+    envelope.extend_from_slice(&length.to_le_bytes());
+    envelope.extend_from_slice(&seq.to_le_bytes());
+    envelope.extend_from_slice(&tag);
+    envelope.extend_from_slice(&cipher);
+
+    if let Err(e) = peer.send(channel_id, &enet::Packet::reliable(envelope)) {
+        println!("🎮 Control: failed to send reply: {:?}", e);
+    }
+}
 
 /// Parse a control-stream message: [u16 LE type][u16 LE payload length][payload].
-/// The periodic 36-byte messages are loss stats (4B header + 32B payload).
-fn handle_control_message(channel_id: u8, data: &[u8]) {
+/// Modern Moonlight negotiates control encryption (SS_ENC_CONTROL_V2) and
+/// wraps EVERYTHING — including IDR requests — in 0x0001 envelopes. Ignoring
+/// those means the client can never request recovery, which is fatal with an
+/// infinite GOP (one missed IDR = black screen forever).
+fn handle_control_message(
+    channel_id: u8,
+    data: &[u8],
+    client_info: &Arc<Mutex<Option<ClientInfo>>>,
+    peer: &mut enet::Peer<UdpSocket>,
+) {
     if data.len() < 4 {
         return;
     }
     let msg_type = u16::from_le_bytes([data[0], data[1]]);
     match msg_type {
+        PT_ENCRYPTED => {
+            let rikey = client_info.lock().ok()
+                .and_then(|g| g.as_ref().map(|c| c.rikey));
+            let Some(rikey) = rikey else {
+                println!("🎮 Control: encrypted message but no session rikey — dropping");
+                return;
+            };
+            match decrypt_control_message(&rikey, data) {
+                // Inner message can't be another 0x0001 (would loop) — anything
+                // else dispatches through the same handler.
+                Some(inner) if inner.len() >= 2
+                    && u16::from_le_bytes([inner[0], inner[1]]) != PT_ENCRYPTED =>
+                {
+                    handle_control_message(channel_id, &inner, client_info, peer);
+                }
+                Some(_) => {}
+                None => {
+                    let addr = peer.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string());
+                    println!("🎮 Control: failed to decrypt 0x0001 envelope ({} bytes) from {} — bad tag/format", data.len(), addr);
+                    println!("    rikey={}", hex::encode(rikey));
+                    println!("    raw  ={}", hex::encode(data));
+                }
+            }
+        }
         PT_REQUEST_IDR_FRAME => {
             println!("🎮 Control: client requested IDR frame");
             crate::encoder::request_idr_global();
@@ -86,7 +236,28 @@ fn handle_control_message(channel_id: u8, data: &[u8]) {
                 }
             }
         }
-        PT_PERIODIC_PING => {}
+        // Echo the ping payload straight back as a basic keepalive ACK —
+        // without any reply on the encrypted control channel, long-running
+        // sessions look idle/dead to the client and it tears down the stream.
+        PT_PERIODIC_PING => {
+            let session = client_info.lock().ok().and_then(|mut g| {
+                g.as_mut().map(|c| {
+                    let seq = c.control_out_seq;
+                    c.control_out_seq = c.control_out_seq.wrapping_add(1);
+                    (c.rikey, seq)
+                })
+            });
+            if let Some((rikey, seq)) = session {
+                send_control_reply(peer, channel_id, &rikey, seq, PT_PERIODIC_PING, &data[4..]);
+            }
+        }
+        // Gamepad, mouse, and keyboard input (see input.rs): controller
+        // packets are mirrored onto a virtual Xbox 360 pad via ViGEmBus
+        // (split-seat passthrough), while mouse/keyboard packets are
+        // injected directly into the host session via SendInput.
+        PT_INPUT_DATA => {
+            crate::input::handle_input_packet(&data[4..]);
+        }
         _ => {
             println!("🎮 Control rx type 0x{:04x} ({} bytes) on channel {}",
                 msg_type, data.len(), channel_id);
@@ -117,8 +288,8 @@ fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<Cl
                 }
             }
         }
-        enet::Event::Receive { channel_id, packet, .. } => {
-            handle_control_message(channel_id, packet.data());
+        enet::Event::Receive { peer, channel_id, packet, .. } => {
+            handle_control_message(channel_id, packet.data(), client_info, peer);
         }
     }
 }

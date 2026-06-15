@@ -27,6 +27,12 @@ pub struct ClientInfo {
     pub packet_size: u32,
     /// Client's x-nv-vqos[0].fec.minRequiredFecPackets (0 = not announced).
     pub min_fec_packets: u32,
+    /// Client's requested video bitrate in Kbps (x-nv-vqos[0].bw.maximumBitrateKbps,
+    /// same attribute Sunshine reads — rtsp.cpp:1003). 0 = not announced.
+    /// The encoder MUST be reconfigured to this: with CBR the encoder holds
+    /// its configured rate constantly, so exceeding what the client asked for
+    /// saturates the link/client and Moonlight aborts ("lower your bitrate").
+    pub bitrate_kbps: u32,
     /// Client requested audio encryption (x-nv-general.featureFlags bit 0x20,
     /// or x-ss-general.encryptionEnabled bit 0x1). Audio payloads must then be
     /// AES-128-CBC encrypted with the /launch rikey.
@@ -37,6 +43,16 @@ pub struct ClientInfo {
     /// while streaming. Default false = client-only: audio is routed through a
     /// virtual sink so the host speakers stay silent (never muted).
     pub host_audio: bool,
+    /// Outgoing 0x0001 control envelope sequence counter (control.rs
+    /// send_control_reply). Sunshine: session->control.seq, incremented per
+    /// host->client encrypted control message; used in the legacy 16-byte IV.
+    pub control_out_seq: u32,
+    /// Set once `VirtualDisplay::activate_for_stream` has run for this
+    /// launch/resume cycle — lets the capture loop pre-activate during the
+    /// /launch -> RTSP PLAY gap (see lib.rs) without redoing the slow
+    /// devcon/CCD work again when the control stream actually connects.
+    /// Reset to `false` on every /launch and /resume.
+    pub activated: bool,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".
@@ -94,8 +110,13 @@ fn resp_options(cseq: u32) -> Vec<u8> {
 fn resp_describe(cseq: u32) -> Vec<u8> {
     let mut sdp = Vec::new();
     sdp.extend_from_slice(b"a=x-ss-general.featureFlags:0\n");
-    sdp.extend_from_slice(b"a=x-ss-general.encryptionSupported:0\n");
-    sdp.extend_from_slice(b"a=x-ss-general.encryptionRequested:0\n");
+    // SS_ENC_AUDIO=0x1, SS_ENC_CONTROL_V2=0x4 (Sunshine rtsp.cpp:768-769).
+    // Requesting CONTROL_V2 is required: without it Moonlight encrypts the
+    // 0x0001 control envelopes (IDR requests, etc.) with the legacy 16-byte
+    // IV scheme, which AES-128-GCM (ring, 96-bit nonces only) can't decrypt —
+    // every control message then fails AEAD verification.
+    sdp.extend_from_slice(b"a=x-ss-general.encryptionSupported:5\n");
+    sdp.extend_from_slice(b"a=x-ss-general.encryptionRequested:4\n");
     // stereo: channelCount=2, streams=1, coupledStreams=1, mapping=[0,1]
     sdp.extend_from_slice(b"a=fmtp:97 surround-params=21101\n");
 
@@ -240,6 +261,7 @@ fn handle_message(
             let width       = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportWd");
             let height      = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportHt");
             let min_fec     = parse_sdp_u32(&sdp, "x-nv-vqos[0].fec.minRequiredFecPackets");
+            let bitrate     = parse_sdp_u32(&sdp, "x-nv-vqos[0].bw.maximumBitrateKbps");
             let feat_flags  = parse_sdp_u32(&sdp, "x-nv-general.featureFlags").unwrap_or(0);
             let enc_enabled = parse_sdp_u32(&sdp, "x-ss-general.encryptionEnabled").unwrap_or(0);
             let pkt_dur     = parse_sdp_u32(&sdp, "x-nv-aqos.packetDuration");
@@ -251,14 +273,15 @@ fn handle_message(
             if let Some(v) = width       { info.width = v; }
             if let Some(v) = height      { info.height = v; }
             if let Some(v) = min_fec     { info.min_fec_packets = v; }
+            if let Some(v) = bitrate     { info.bitrate_kbps = v; }
             if let Some(v) = pkt_dur     { info.audio_packet_duration = v; }
             // Sunshine rtsp.cpp:982-987 — legacy nv flag 0x20 or Sunshine
             // extension bit 0x1 both mean "encrypt audio".
             info.audio_encryption = (feat_flags & 0x20) != 0 || (enc_enabled & 0x1) != 0;
             println!("   ↳ ANNOUNCE audio: encryption={} packetDuration={:?}ms",
                 info.audio_encryption, pkt_dur);
-            println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?}",
-                packet_size, fps, width, height, min_fec);
+            println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?} bitrateKbps={:?}",
+                packet_size, fps, width, height, min_fec, bitrate);
             if packet_size.is_none() {
                 // Parse failure would silently leave the 1024 fallback active —
                 // dump the SDP so the actual attribute names are visible.

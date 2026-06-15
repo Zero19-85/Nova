@@ -639,23 +639,31 @@ async fn handle_request(
             let body = concat!(
                 r#"<?xml version="1.0" encoding="utf-8"?>"#,
                 r#"<root status_code="200">"#,
-                r#"<App><AppTitle>Desktop</AppTitle><ID>1</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
-                r#"<App><AppTitle>Steam</AppTitle><ID>2</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                // Titles are prefixed with "N. " so Moonlight's client-side
+                // alphabetical sort of the app grid lands in this fixed order
+                // (the GameStream /applist XML order itself is not honored
+                // by Moonlight's UI).
+                r#"<App><AppTitle>1. Desktop</AppTitle><ID>1</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>2. Steam</AppTitle><ID>2</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>3. Xbox App</AppTitle><ID>3</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>4. RetroArch</AppTitle><ID>4</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>5. Virtual Desktop</AppTitle><ID>5</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
                 r#"</root>"#,
             );
             Ok(make_xml_response(body))
         }
 
         "/appasset" => {
-            let app_id = params.get("appid").map(|s| s.as_str()).unwrap_or("?");
+            let app_id = params.get("appid")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(crate::app_launcher::APP_ID_DESKTOP);
             println!("🖼️  Box art requested — appid={}", app_id);
-            // Bright orange so tiles are unmistakably visible on any background.
-            // no-store so Android's Glide never caches the old transparent PNG.
-            let png = make_solid_png(64, 36, 0xFF, 0x66, 0x00);
-            let len = png.len();
-            let mut res = Response::new(Full::new(Bytes::from(png)));
+            // no-store so Android's Glide never caches a stale tile.
+            let jpeg = crate::app_launcher::get_box_art(app_id);
+            let len = jpeg.len();
+            let mut res = Response::new(Full::new(Bytes::from(jpeg)));
             *res.status_mut() = StatusCode::OK;
-            res.headers_mut().insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+            res.headers_mut().insert(header::CONTENT_TYPE, "image/jpeg".parse().unwrap());
             res.headers_mut().insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
             res.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
             Ok(res)
@@ -681,9 +689,9 @@ async fn handle_request(
             let height = mode_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(720);
             let fps    = mode_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(60);
 
+            let rikey_hex_str = params.get("rikey").cloned().unwrap_or_default();
             let rikey: [u8; 16] = {
-                let hex_str = params.get("rikey").map(|s| s.as_str()).unwrap_or("");
-                let bytes = hex::decode(hex_str).unwrap_or_else(|_| vec![0u8; 16]);
+                let bytes = hex::decode(&rikey_hex_str).unwrap_or_else(|_| vec![0u8; 16]);
                 let mut key = [0u8; 16];
                 let n = bytes.len().min(16);
                 key[..n].copy_from_slice(&bytes[..n]);
@@ -694,6 +702,11 @@ async fn handle_request(
                 .and_then(|s| s.parse::<i32>().ok())
                 .map(|v| v as u32)
                 .unwrap_or(0);
+            // DEBUG: trace the rikey hex-decode end to end — compare this
+            // "decoded" value against control.rs's "🔑 Control session rikey"
+            // line to confirm the same key reaches the UDP control socket.
+            println!("🔑 /launch rikey: raw=\"{}\" ({} chars) decoded={} rikeyid={}",
+                rikey_hex_str, rikey_hex_str.len(), hex::encode(rikey), rikeyid);
 
             let app_id_str = params.get("appid").map(|s| s.as_str()).unwrap_or("1");
             let app_id_num = app_id_str.parse::<u32>().unwrap_or(1);
@@ -717,7 +730,17 @@ async fn handle_request(
                 info.fps        = fps;
                 info.app_id     = app_id_num;
                 info.host_audio = host_audio;
+                // Trigger the capture loop's pre-activation pass (lib.rs) for
+                // this new launch/resume — runs the VDD/CCD switch during the
+                // handshake gap instead of after the control stream connects.
+                info.activated  = false;
                 *guard = Some(info);
+            }
+
+            // /resume reattaches to an already-running session — only /launch
+            // should (re)start the app's process.
+            if path == "/launch" {
+                crate::app_launcher::launch_app(app_id_num);
             }
 
             let body = if path == "/resume" {
@@ -734,82 +757,6 @@ async fn handle_request(
             Ok(res)
         }
     }
-}
-
-// ── Minimal PNG encoder (no external dependency) ─────────────────────────
-// Generates a solid-color RGB PNG using DEFLATE "store" (no compression).
-// Used for box art placeholders so Moonlight app tiles are visible.
-
-fn png_crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        let mut v = crc ^ (b as u32);
-        for _ in 0..8 {
-            v = if v & 1 != 0 { 0xEDB8_8320 ^ (v >> 1) } else { v >> 1 };
-        }
-        crc = v;
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
-fn png_adler32(data: &[u8]) -> u32 {
-    const M: u32 = 65521;
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % M;
-        b = (b + a) % M;
-    }
-    (b << 16) | a
-}
-
-fn png_write_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(tag);
-    out.extend_from_slice(data);
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(tag);
-    crc_input.extend_from_slice(data);
-    out.extend_from_slice(&png_crc32(&crc_input).to_be_bytes());
-}
-
-fn make_solid_png(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // signature
-
-    // IHDR: 8-bit RGB, no interlace
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-    png_write_chunk(&mut out, b"IHDR", &ihdr);
-
-    // Raw scanlines: filter(0) + R G B per pixel
-    let row_len = 1 + 3 * width as usize;
-    let mut raw = vec![0u8; height as usize * row_len];
-    for row in 0..height as usize {
-        // filter byte is already 0
-        for col in 0..width as usize {
-            let base = row * row_len + 1 + col * 3;
-            raw[base]     = r;
-            raw[base + 1] = g;
-            raw[base + 2] = b;
-        }
-    }
-
-    // IDAT: zlib "store" wrapper (DEFLATE BTYPE=00, no compression)
-    let adler = png_adler32(&raw);
-    let data_len = raw.len() as u16;
-    let mut idat = Vec::new();
-    idat.extend_from_slice(&[0x78, 0x01]);          // zlib CMF + FLG
-    idat.push(0x01);                                 // BFINAL=1, BTYPE=00
-    idat.extend_from_slice(&data_len.to_le_bytes()); // LEN
-    idat.extend_from_slice(&(!data_len).to_le_bytes()); // NLEN (one's complement)
-    idat.extend_from_slice(&raw);
-    idat.extend_from_slice(&adler.to_be_bytes());
-    png_write_chunk(&mut out, b"IDAT", &idat);
-
-    png_write_chunk(&mut out, b"IEND", &[]);
-    out
 }
 
 // Helpers

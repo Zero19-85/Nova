@@ -22,6 +22,7 @@ extern "C" {
     ) -> i32;
     fn CleanupEncoder(encoder: *mut c_void) -> i32;
     fn RequestIdrFrame(encoder: *mut c_void);
+    fn ReconfigureBitrate(bitrate_kbps: i32, fps: i32) -> i32;
 
     fn UpdateCursorShape(
         data: *const u8,
@@ -56,6 +57,18 @@ pub fn update_cursor_position(x: i32, y: i32, visible: bool) {
 /// handle is needed.
 pub fn request_idr_global() {
     unsafe { RequestIdrFrame(std::ptr::null_mut()) };
+}
+
+/// Retarget NVENC's CBR rate control to the bitrate the client negotiated in
+/// its RTSP ANNOUNCE. Must be called when a client connects: the encoder is
+/// created at startup with the CLI default, and CBR holds that rate
+/// constantly — exceeding what the client asked for makes Moonlight abort
+/// with "lower your bitrate" warnings. Pass fps <= 0 to keep the current rate.
+pub fn reconfigure_bitrate(bitrate_kbps: u32, fps: u32) {
+    let ret = unsafe { ReconfigureBitrate(bitrate_kbps as i32, fps as i32) };
+    if ret < 0 {
+        eprintln!("❌ ReconfigureBitrate({} Kbps) failed: {}", bitrate_kbps, ret);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,12 +194,30 @@ impl Encoder {
     pub fn request_idr(&self) {
         unsafe { RequestIdrFrame(self.handle) };
     }
+
+    /// Tears down this encoder's shim-global NVENC/D3D state
+    /// (g_nvEncoder/g_device/g_context etc. in shim.cpp) and marks `self` so
+    /// `Drop` becomes a no-op. Idempotent.
+    ///
+    /// Must be called *before* constructing a replacement `Encoder` on a
+    /// capture rebind: `CleanupEncoder` tears down whatever is currently in
+    /// those globals, not specifically what this `Encoder` created. If the
+    /// replacement's `Encoder::new()` ran first, it would overwrite the
+    /// globals with the new encoder's state, and this encoder's `Drop` would
+    /// then destroy the brand-new encoder instead of the old one — leaving
+    /// `g_nvEncoder`/`g_device` null and every subsequent `EncodeFrame`/
+    /// `ReconfigureBitrate` call failing.
+    pub fn cleanup(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { CleanupEncoder(self.handle); }
+            self.handle = std::ptr::null_mut();
+            self.device_ptr = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        unsafe {
-            CleanupEncoder(self.handle);
-        }
+        self.cleanup();
     }
 }

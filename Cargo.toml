@@ -3,6 +3,16 @@ name = "nova-server"
 version = "0.1.0"
 edition = "2021"
 
+# Thin entry point — wires up the lib's run(). Declared explicitly with
+# test = false so `cargo test` doesn't build/run a (test-less) harness for
+# this target, which would inherit the requireAdministrator manifest
+# (rustc-link-arg-bin in build.rs) and fail with "requires elevation" since
+# cargo itself runs unelevated.
+[[bin]]
+name = "nova-server"
+path = "src/bin/nova-server.rs"
+test = false
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
@@ -13,6 +23,10 @@ rcgen = "0.14"
 time = "0.3"
 ring = "0.17"
 aes = "0.8"
+# ring's AES-128-GCM only supports 96-bit nonces. Nvidia's "legacy" control
+# stream encryption (used when SS_ENC_CONTROL_V2 isn't negotiated) uses a
+# 16-byte IV, which only RustCrypto's generic aes-gcm can represent.
+aes-gcm = "0.10"
 sha2 = "0.10"
 rand = "0.8"
 cipher = "0.4"
@@ -24,6 +38,9 @@ reed-solomon-erasure = "6"
 # Opus encoder for the GameStream audio stream (builds bundled libopus via cmake)
 audiopus = "0.2"
 clap = { version = "4", features = ["derive"] }
+# Virtual Xbox 360 controller via ViGEmBus, for split-seat gamepad passthrough
+# (input.rs). Requires the ViGEmBus driver to be installed on the host.
+vigem-client = "0.1"
 
 # Windows DXGI + NVENC
 windows = { version = "0.58", features = [
@@ -36,6 +53,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Devices_Display",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_Media_Audio",
 ] }
 rsa = "0.9.10"
 rustls = "0.23.40"
