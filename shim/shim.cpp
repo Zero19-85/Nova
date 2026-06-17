@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <vector>
@@ -29,6 +30,13 @@ static std::atomic<bool>    g_force_idr{false};
 static NV_ENC_INITIALIZE_PARAMS g_initParams = {};
 static NV_ENC_CONFIG            g_encConfig  = {};
 static int                      g_encoderFps = 60;
+
+// ==================== HDR GLOBALS ====================
+static int                    g_encoderCodec     = 0;    // 0=H264, 1=HEVC, 2=AV1
+static bool                   g_isHdr            = false;
+static MASTERING_DISPLAY_INFO g_masteringDisplay  = {};
+static CONTENT_LIGHT_LEVEL    g_contentLightLevel = {};
+static bool                   g_hdrMetadataReady = false;
 
 // ==================== CURSOR COMPOSITING GLOBALS ====================
 // DXGI_OUTDUPL_POINTER_SHAPE_TYPE values (avoids pulling in dxgi1_2.h).
@@ -340,7 +348,7 @@ static std::vector<uint8_t> build_cursor_xor_image(
 // virtual-display swap) would otherwise leave a texture created at the old
 // size: CopyResource into it silently no-ops on a size mismatch, so it keeps
 // whatever stale (possibly cursor-stamped) content it last held.
-static bool EnsureSizedTexture(ID3D11Texture2D** tex, ID3D11RenderTargetView** rtv, int width, int height, UINT bindFlags) {
+static bool EnsureSizedTexture(ID3D11Texture2D** tex, ID3D11RenderTargetView** rtv, int width, int height, UINT bindFlags, DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM) {
     if (*tex) {
         D3D11_TEXTURE2D_DESC existing = {};
         (*tex)->GetDesc(&existing);
@@ -356,7 +364,7 @@ static bool EnsureSizedTexture(ID3D11Texture2D** tex, ID3D11RenderTargetView** r
     desc.Height           = height;
     desc.MipLevels        = 1;
     desc.ArraySize        = 1;
-    desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format           = format;
     desc.SampleDesc.Count = 1;
     desc.Usage            = D3D11_USAGE_DEFAULT;
     desc.BindFlags        = bindFlags;
@@ -494,8 +502,28 @@ extern "C" __declspec(dllexport) void UpdateCursorPosition(int x, int y, int vis
     g_cursorVisible = visible != 0;
 }
 
+// ==================== HDR METADATA ====================
+// Fills g_masteringDisplay / g_contentLightLevel with session-constant BT.2020 / 1000-nit
+// alpha defaults. Called once at the end of InitEncoder when is_hdr == true. NVENC injects
+// these into the HEVC/AV1 per-frame metadata on every IDR via NV_ENC_PIC_PARAMS_HEVC::
+// pMasteringDisplay / pMaxCll — no manual SEI byte-packing required.
+static void BuildHdrMetadata() {
+    // BT.2020 primaries in units of 1/50000 (HEVC D.2.28, G/B/R order):
+    g_masteringDisplay.g          = { 8500, 39850 }; // G(0.170, 0.797)
+    g_masteringDisplay.b          = { 6550,  2300 }; // B(0.131, 0.046)
+    g_masteringDisplay.r          = { 35400, 14600 }; // R(0.708, 0.292)
+    g_masteringDisplay.whitePoint = { 15635, 16450 }; // D65(0.3127, 0.3290)
+    g_masteringDisplay.maxLuma    = 10000000;          // 1000 nit × 10000
+    g_masteringDisplay.minLuma    = 500;               // 0.05 nit × 10000
+    // Content Light Level (HEVC D.2.35 / AV1 6.7.3):
+    g_contentLightLevel.maxContentLightLevel    = 1000; // MaxCLL  = 1000 nit
+    g_contentLightLevel.maxPicAverageLightLevel = 400;  // MaxFALL = 400 nit
+    g_hdrMetadataReady = true;
+}
+
 // ==================== INIT COLOR CONVERSION ====================
-extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height) {
+extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height, bool is_hdr, int fps) {
+    g_isHdr = is_hdr;
     if (!device || !g_context) return -1;
 
     HRESULT hr = device->QueryInterface(__uuidof(ID3D11VideoDevice), (void**)&g_videoDevice);
@@ -518,15 +546,16 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     if (!encoderInputFrame || !encoderInputFrame->inputPtr) return -9;
     ID3D11Texture2D* nvencInputTex = (ID3D11Texture2D*)encoderInputFrame->inputPtr;
 
+    UINT vp_fps = (fps > 0) ? (UINT)fps : 60;
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
     contentDesc.InputFrameFormat            = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    contentDesc.InputFrameRate.Numerator    = 60;
+    contentDesc.InputFrameRate.Numerator    = vp_fps;
     contentDesc.InputFrameRate.Denominator  = 1;
     contentDesc.InputWidth                  = width;
     contentDesc.InputHeight                 = height;
     contentDesc.OutputWidth                 = width;
     contentDesc.OutputHeight                = height;
-    contentDesc.OutputFrameRate.Numerator   = 60;
+    contentDesc.OutputFrameRate.Numerator   = vp_fps;
     contentDesc.OutputFrameRate.Denominator = 1;
     contentDesc.Usage                       = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
@@ -552,26 +581,41 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     g_videoContext->VideoProcessorSetStreamDestRect(g_vp, 0, TRUE, &fullRect);
     g_videoContext->VideoProcessorSetOutputTargetRect(g_vp, TRUE, &fullRect);
 
-    // Pin the RGB->NV12 color-space conversion to BT.709 limited range,
-    // matching the H264 VUI parameters set in InitEncoder. A mismatch here
-    // between what the VP writes into the NV12 surface and what the decoder
-    // assumes from the SPS produces a structurally-correct but blocky,
-    // wrong-color picture (each 2x2 luma block shares one off chroma sample).
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace = {};
-    inputColorSpace.Usage         = 0;
-    inputColorSpace.RGB_Range     = 0; // full range 0-255 (desktop BGRA)
-    inputColorSpace.YCbCr_Matrix  = 1; // BT.709
-    inputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-    g_videoContext->VideoProcessorSetStreamColorSpace(g_vp, 0, &inputColorSpace);
+    if (is_hdr) {
+        // HDR path: R16G16B16A16_FLOAT (linear scRGB) → P010 (BT.2020 PQ, studio limited).
+        // The legacy D3D11_VIDEO_PROCESSOR_COLOR_SPACE struct cannot express scRGB or
+        // BT.2020 PQ; ID3D11VideoContext1 exposes the extended DXGI_COLOR_SPACE_TYPE API.
+        ID3D11VideoContext1* vc1 = nullptr;
+        HRESULT hr1 = g_videoContext->QueryInterface(__uuidof(ID3D11VideoContext1), (void**)&vc1);
+        if (FAILED(hr1) || !vc1) {
+            printf("❌ ID3D11VideoContext1 unavailable — HDR requires D3D11.1 (hr=0x%08X)\n", (unsigned)hr1);
+            return -10;
+        }
+        // Input:  linear scRGB, full range (R16G16B16A16_FLOAT DXGI HDR desktop)
+        vc1->VideoProcessorSetStreamColorSpace1(g_vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+        // Output: BT.2020 PQ, studio/limited range → P010 in NVENC's 10-bit input texture
+        vc1->VideoProcessorSetOutputColorSpace1(g_vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020);
+        vc1->Release();
+        printf("✅ Video Processor (FP16 scRGB → P010 BT.2020 PQ) initialized\n");
+    } else {
+        // SDR path: BGRA8 desktop full-range → NV12 BT.709 limited-range — UNCHANGED.
+        // A mismatch here vs the VUI parameters set in InitEncoder produces structurally-
+        // correct but wrong-colored output (blocky pixelation from the wrong YUV matrix/range).
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace = {};
+        inputColorSpace.Usage         = 0;
+        inputColorSpace.RGB_Range     = 0; // full range 0-255 (desktop BGRA)
+        inputColorSpace.YCbCr_Matrix  = 1; // BT.709
+        inputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+        g_videoContext->VideoProcessorSetStreamColorSpace(g_vp, 0, &inputColorSpace);
 
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace = {};
-    outputColorSpace.Usage         = 0;
-    outputColorSpace.RGB_Range     = 0;
-    outputColorSpace.YCbCr_Matrix  = 1; // BT.709
-    outputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-    g_videoContext->VideoProcessorSetOutputColorSpace(g_vp, &outputColorSpace);
-
-    printf("✅ Video Processor (BGRA → NV12) initialized\n");
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace = {};
+        outputColorSpace.Usage         = 0;
+        outputColorSpace.RGB_Range     = 0;
+        outputColorSpace.YCbCr_Matrix  = 1; // BT.709
+        outputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        g_videoContext->VideoProcessorSetOutputColorSpace(g_vp, &outputColorSpace);
+        printf("✅ Video Processor (BGRA → NV12 BT.709) initialized\n");
+    }
 
     if (!InitCursorPipeline(device)) {
         printf("⚠️  Cursor compositing pipeline failed to initialize — stream will have no cursor\n");
@@ -593,23 +637,30 @@ extern "C" __declspec(dllexport) int OpenNvEncSession(void* d3d11_device, void**
 
 extern "C" __declspec(dllexport) int InitEncoder(
     void* encoder, int width, int height, const char* codec,
-    int bitrate_kbps, int fps)
+    int bitrate_kbps, int fps, bool is_hdr)
 {
     if (!g_device) return -1;
+    g_hdrMetadataReady = false;
 
     GUID codecGuid = NV_ENC_CODEC_H264_GUID;
+    g_encoderCodec = 0;
     if (strcmp(codec, "hevc") == 0) {
         codecGuid = NV_ENC_CODEC_HEVC_GUID;
+        g_encoderCodec = 1;
     } else if (strcmp(codec, "av1") == 0) {
         codecGuid = NV_ENC_CODEC_AV1_GUID;
+        g_encoderCodec = 2;
     }
+    g_isHdr = is_hdr;
 
-    printf("🔧 Initializing NVENC (%s @ %dx%d, %d Kbps, %d fps)...\n",
-           codec, width, height, bitrate_kbps, fps);
+    printf("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
+           codec, is_hdr ? "/HDR10" : "", width, height, bitrate_kbps, fps);
 
     try {
         // nExtraOutputDelay=0 eliminates the 3-frame pipeline buffer — zero-copy latency path.
-        g_nvEncoder = new NvEncoderD3D11(g_device, width, height, NV_ENC_BUFFER_FORMAT_NV12, 0);
+        NV_ENC_BUFFER_FORMAT bufFmt = is_hdr ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+                                             : NV_ENC_BUFFER_FORMAT_NV12;
+        g_nvEncoder = new NvEncoderD3D11(g_device, width, height, bufFmt, 0);
 
         g_initParams = NV_ENC_INITIALIZE_PARAMS{ NV_ENC_INITIALIZE_PARAMS_VER };
         g_encConfig  = NV_ENC_CONFIG{ NV_ENC_CONFIG_VER };
@@ -664,13 +715,19 @@ extern "C" __declspec(dllexport) int InitEncoder(
         NV_ENC_CONFIG_H264_VUI_PARAMETERS vuiParams = {};
         vuiParams.videoSignalTypePresentFlag   = 1;
         vuiParams.videoFormat                  = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-        vuiParams.videoFullRangeFlag           = 0; // limited (16-235), matches VP output
+        vuiParams.videoFullRangeFlag           = 0; // limited range in both SDR and HDR
         vuiParams.colourDescriptionPresentFlag = 1;
-        vuiParams.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-        vuiParams.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-        vuiParams.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
-        // Critical for low decoding latency on certain client devices (Sunshine).
         vuiParams.bitstreamRestrictionFlag     = 1;
+        if (is_hdr) {
+            // BT.2020 / SMPTE ST 2084 (PQ) / BT.2020 non-constant luminance
+            vuiParams.colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+            vuiParams.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+            vuiParams.colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+        } else {
+            vuiParams.colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+            vuiParams.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+            vuiParams.colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        }
 
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
             encodeConfig.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
@@ -697,7 +754,13 @@ extern "C" __declspec(dllexport) int InitEncoder(
             h264.intraRefreshPeriod = 30;
             h264.intraRefreshCnt    = 10;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
+            encodeConfig.profileGUID = is_hdr ? NV_ENC_HEVC_PROFILE_MAIN10_GUID
+                                              : NV_ENC_HEVC_PROFILE_MAIN_GUID;
             auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
+            hevc.inputBitDepth        = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            hevc.outputBitDepth       = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            hevc.outputMasteringDisplay = is_hdr ? 1 : 0; // emit MDCV SEI on IDR frames
+            hevc.outputMaxCll           = is_hdr ? 1 : 0; // emit CLL SEI on IDR frames
             hevc.repeatSPSPPS         = 1;
             hevc.idrPeriod            = NVENC_INFINITE_GOPLENGTH;
             hevc.sliceMode            = 3;
@@ -717,8 +780,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         g_nvEncoder->CreateEncoder(&initializeParams);
 
-        printf("✅ NVENC READY (%s @ %dx%d, %d Kbps, %d fps)\n",
-               codec, width, height, bitrate_kbps, fps);
+        if (is_hdr) BuildHdrMetadata();
+
+        printf("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
+               codec, is_hdr ? "/HDR10/Main10" : "", width, height, bitrate_kbps, fps);
         return 0;
     }
     catch (const std::exception& e) {
@@ -750,10 +815,12 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // that only self-heals at the next IDR.
     D3D11_TEXTURE2D_DESC frameDesc = {};
     dxgiFrame->GetDesc(&frameDesc);
-    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_SHADER_RESOURCE)) {
+    DXGI_FORMAT captureFmt = g_isHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                     : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
-    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) {
+    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
     if (!g_copyFence) {
@@ -816,6 +883,19 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     if (g_force_idr.exchange(false)) {
         NV_ENC_PIC_PARAMS picParams = {};
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        if (g_isHdr && g_hdrMetadataReady) {
+            // Inject Mastering Display Colour Volume + Content Light Level metadata on
+            // every IDR so the client's HDR tone-mapper has the display capabilities it
+            // needs to activate HDR mode. NVENC packs these into the correct SEI (HEVC)
+            // or OBU metadata (AV1) payloads automatically — no manual byte-packing.
+            if (g_encoderCodec == 1) { // HEVC
+                picParams.codecPicParams.hevcPicParams.pMasteringDisplay = &g_masteringDisplay;
+                picParams.codecPicParams.hevcPicParams.pMaxCll           = &g_contentLightLevel;
+            } else if (g_encoderCodec == 2) { // AV1
+                picParams.codecPicParams.av1PicParams.pMasteringDisplay = &g_masteringDisplay;
+                picParams.codecPicParams.av1PicParams.pMaxCll           = &g_contentLightLevel;
+            }
+        }
         g_nvEncoder->EncodeFrame(vPacket, &picParams);
     } else {
         g_nvEncoder->EncodeFrame(vPacket);
@@ -843,15 +923,23 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
     if (fps <= 0) fps = g_encoderFps;
 
     uint32_t newRate = (uint32_t)bitrate_kbps * 1000;
-    if (newRate == g_encConfig.rcParams.averageBitRate) return 0;
+    bool rateChanged = (newRate != g_encConfig.rcParams.averageBitRate);
+    bool fpsChanged  = ((uint32_t)fps != g_initParams.frameRateNum);
+    if (!rateChanged && !fpsChanged) return 0;
 
     g_encConfig.rcParams.averageBitRate = newRate;
-    g_encConfig.rcParams.vbvBufferSize  = newRate / (uint32_t)fps; // keep single-frame VBV
+    g_encConfig.rcParams.vbvBufferSize  = newRate / (uint32_t)fps; // single-frame VBV at new fps
+
+    if (fpsChanged) {
+        g_initParams.frameRateNum = (uint32_t)fps;
+        g_initParams.frameRateDen = 1;
+        g_encoderFps = fps;
+    }
 
     NV_ENC_RECONFIGURE_PARAMS rp = { NV_ENC_RECONFIGURE_PARAMS_VER };
     rp.reInitEncodeParams              = g_initParams;
     rp.reInitEncodeParams.encodeConfig = &g_encConfig;
-    rp.forceIDR = 1; // rate target changed — start clean at the new budget
+    rp.forceIDR = 1; // rate/fps target changed — start clean at the new budget
 
     try {
         g_nvEncoder->Reconfigure(&rp);
@@ -860,8 +948,8 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
         return -2;
     }
 
-    printf("📊 NVENC reconfigured: CBR bitrate=%u vbvBufferSize=%u (client-negotiated)\n",
-           g_encConfig.rcParams.averageBitRate, g_encConfig.rcParams.vbvBufferSize);
+    printf("📊 NVENC reconfigured: CBR bitrate=%u fps=%u vbvBufferSize=%u (client-negotiated)\n",
+           g_encConfig.rcParams.averageBitRate, (uint32_t)fps, g_encConfig.rcParams.vbvBufferSize);
     return 0;
 }
 

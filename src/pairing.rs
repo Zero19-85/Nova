@@ -195,13 +195,15 @@ impl ServerCrypto {
             eprintln!("⚠️ Could not save {}: {}", CERT_VERSION_PATH, e);
         }
 
-        let cert_hex = hex::encode_upper(&cert_der);
+        // plaincert must be hex-encoded PEM — Moonlight's verifySignature calls
+        // PEM_read_bio_X509, which requires PEM text, not binary DER bytes.
+        let cert_hex = hex::encode_upper(cert_pem.as_bytes());
         let sig_len  = 256;
         let cert_sig = cert_der[cert_der.len() - sig_len..].to_vec();
 
         let fp = sha256_fingerprint(&cert_der);
         println!("✅ RSA certificate generated — SHA-256: {}", fp);
-        println!("   DER size: {} bytes  |  plaincert is hex-DER (uppercase)", cert_der.len());
+        println!("   DER size: {} bytes  |  plaincert is hex-PEM (uppercase)", cert_der.len());
         Self { cert_hex, cert_sig, private_key_der, cert_der }
     }
 
@@ -228,13 +230,13 @@ impl ServerCrypto {
             return None;
         }
         // PEM file might not exist on older installs — derive it from DER.
-        let _cert_pem = std::fs::read_to_string(CERT_PEM_PATH)
+        let cert_pem = std::fs::read_to_string(CERT_PEM_PATH)
             .unwrap_or_else(|_| {
                 let pem = der_to_pem(&cert_der);
                 let _ = std::fs::write(CERT_PEM_PATH, &pem);
                 pem
             });
-        let cert_hex = hex::encode_upper(&cert_der);
+        let cert_hex = hex::encode_upper(cert_pem.as_bytes());
         let sig_len  = 256;
         let cert_sig = cert_der[cert_der.len() - sig_len..].to_vec();
         let fp = sha256_fingerprint(&cert_der);
@@ -286,6 +288,7 @@ pub async fn start_pairing_server(
     server_id: String,
     server_mac: String,
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
+    codec_mode_support: u32,
 ) {
     // ── Phase 1: Crypto ───────────────────────────────────────────────────────
     // Must run first. try_load_from_disk() may delete stale cert files and
@@ -364,6 +367,7 @@ pub async fn start_pairing_server(
             let sess = sessions_https.clone();
             let pin = pin_https.clone();
             let ci = ci_https.clone();
+            let cms = codec_mode_support; // Copy
 
             tokio::task::spawn(async move {
                 println!("🔒 [47984] TLS attempt from {}", peer);
@@ -388,7 +392,7 @@ pub async fn start_pairing_server(
                         let sess = sess.clone();
                         let pin = pin.clone();
                         let ci = ci.clone();
-                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, pin, ci).await }
+                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, pin, ci, cms).await }
                     }))
                     .await;
             });
@@ -397,7 +401,8 @@ pub async fn start_pairing_server(
 
     // --- RUN HTTP LOOP ---
     loop {
-        let (stream, _) = http_listener.accept().await.unwrap();
+        let (stream, peer) = http_listener.accept().await.unwrap();
+        let peer_str = peer.to_string();
         let io = TokioIo::new(stream);
         let ip_clone = host_ip.clone();
         let id_clone = server_id.clone();
@@ -406,8 +411,10 @@ pub async fn start_pairing_server(
         let sessions_clone = sessions.clone();
         let pin_clone = global_pin.clone();
         let ci_clone = client_info.clone();
+        let cms = codec_mode_support; // Copy
 
         tokio::task::spawn(async move {
+            println!("🌐 [47989] HTTP from {}", peer_str);
             let _ = http1::Builder::new()
                 .serve_connection(io, service_fn(move |req| {
                     let ip = ip_clone.clone();
@@ -417,7 +424,7 @@ pub async fn start_pairing_server(
                     let sess = sessions_clone.clone();
                     let pin = pin_clone.clone();
                     let ci = ci_clone.clone();
-                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, pin, ci).await }
+                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, pin, ci, cms).await }
                 }))
                 .await;
         });
@@ -434,6 +441,7 @@ async fn handle_request(
     sessions: PairSessions,
     global_pin: Arc<Mutex<String>>,
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
+    codec_mode_support: u32,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let full_uri = req.uri().to_string();
     if !full_uri.contains("/serverinfo") {
@@ -477,21 +485,39 @@ async fn handle_request(
                     r#"<hostname>Nova</hostname>"#,
                     r#"<appversion>7.1.431.0</appversion>"#,
                     r#"<GfeVersion>3.23.0.74</GfeVersion>"#,
+                    r#"<gputype>NVIDIA GeForce</gputype>"#,
+                    r#"<GsVersion>7.1.431.0</GsVersion>"#,
                     r#"<uniqueid>{}</uniqueid>"#,
                     r#"<HttpsPort>47984</HttpsPort>"#,
                     r#"<ExternalPort>47989</ExternalPort>"#,
                     r#"<mac>00:11:22:33:44:55</mac>"#,
                     r#"<LocalIP>{}</LocalIP>"#,
                     r#"<ExternalIP>{}</ExternalIP>"#,
-                    r#"<ServerCodecModeSupport>3</ServerCodecModeSupport>"#,
+                    // Advertise only the codec the encoder is actually running.
+                    // Clients pick the highest-quality format from (client caps ∩ server caps);
+                    // advertising HEVC here when the encoder is H264 causes a codec mismatch
+                    // and a black screen on strict clients such as Xbox Moonlight UWP.
+                    r#"<ServerCodecModeSupport>{}</ServerCodecModeSupport>"#,
                     r#"<PairStatus>{}</PairStatus>"#,
                     r#"<currentgame>{}</currentgame>"#,
                     r#"<state>{}</state>"#,
                     r#"<MaxLumaPixelsH264>1869449984</MaxLumaPixelsH264>"#,
                     r#"<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"#,
+                    r#"<SupportedDisplayModeList>"#,
+                    r#"<DisplayMode><Width>1280</Width><Height>720</Height><RefreshRate>30</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>1280</Width><Height>720</Height><RefreshRate>60</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>1920</Width><Height>1080</Height><RefreshRate>30</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>1920</Width><Height>1080</Height><RefreshRate>60</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>1920</Width><Height>1080</Height><RefreshRate>120</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>2560</Width><Height>1440</Height><RefreshRate>60</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>2560</Width><Height>1440</Height><RefreshRate>120</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>3840</Width><Height>2160</Height><RefreshRate>30</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>3840</Width><Height>2160</Height><RefreshRate>60</RefreshRate></DisplayMode>"#,
+                    r#"<DisplayMode><Width>3840</Width><Height>2160</Height><RefreshRate>120</RefreshRate></DisplayMode>"#,
+                    r#"</SupportedDisplayModeList>"#,
                     r#"</root>"#,
                 ),
-                server_id, _host_ip, _host_ip, pair_status, current_game, server_state,
+                server_id, _host_ip, _host_ip, codec_mode_support, pair_status, current_game, server_state,
             );
             Ok(make_xml_response(&body))
         }
@@ -647,7 +673,7 @@ async fn handle_request(
                 r#"<App><AppTitle>2. Steam</AppTitle><ID>2</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
                 r#"<App><AppTitle>3. Xbox App</AppTitle><ID>3</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
                 r#"<App><AppTitle>4. RetroArch</AppTitle><ID>4</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
-                r#"<App><AppTitle>5. Virtual Desktop</AppTitle><ID>5</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>5. Virtual Desktop</AppTitle><ID>5</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
                 r#"</root>"#,
             );
             Ok(make_xml_response(body))
@@ -715,21 +741,47 @@ async fn handle_request(
             let host_audio = params.get("localAudioPlayMode")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0) != 0;
+            // videoFormat bitmask: 1=H264, 2=HEVC Main, 0x102=HEVC Main10.
+            // This is the codec Limelight selected from (client caps ∩ ServerCodecModeSupport).
+            // It MUST match the running encoder codec or the client will decode garbage.
+            let video_format = params.get("videoFormat")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            // hdrMode=1 means the client wants an HDR stream (requires HEVC Main10).
+            let hdr_requested = params.get("hdrMode")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0) != 0;
+            let vf_name = if video_format & 0x100 != 0 { "HEVC Main10" }
+                else if video_format & 0x002 != 0 { "HEVC Main" }
+                else { "H264" };
             println!("🚀 {} app={} mode={}x{}@{}fps rikeyid={} hostAudio={}",
                 path, app_id_str, width, height, fps, rikeyid, host_audio);
+            println!("   ↳ videoFormat={:#x} ({})  hdrMode={}  ServerCodecModeSupport={}",
+                video_format, vf_name, hdr_requested as u8, codec_mode_support);
+            // Warn immediately if there's a mismatch so the user knows before trying to stream.
+            let encoder_mode_bit = codec_mode_support;
+            let client_base_codec = video_format & 0x00FF; // strip 10-bit flag for codec ID
+            if video_format != 0 && client_base_codec != encoder_mode_bit {
+                println!("⚠️  CODEC MISMATCH: client selected {} (videoFormat={:#x}) but \
+                    encoder is running codec with ServerCodecModeSupport={}. \
+                    Restart nova-server with the matching --codec flag.",
+                    vf_name, video_format, encoder_mode_bit);
+            }
 
             // Store session info — RTSP DESCRIBE reads width/height/fps from here.
             // Setting app_id causes /serverinfo to return currentgame=N (BUSY state),
             // which is what Moonlight checks before proceeding with the RTSP handshake.
             if let Ok(mut guard) = client_info.lock() {
                 let mut info = guard.take().unwrap_or_default();
-                info.rikey      = rikey;
-                info.rikeyid    = rikeyid;
-                info.width      = width;
-                info.height     = height;
-                info.fps        = fps;
-                info.app_id     = app_id_num;
-                info.host_audio = host_audio;
+                info.rikey         = rikey;
+                info.rikeyid       = rikeyid;
+                info.width         = width;
+                info.height        = height;
+                info.fps           = fps;
+                info.app_id        = app_id_num;
+                info.host_audio    = host_audio;
+                info.video_format  = video_format;
+                info.hdr_requested = hdr_requested;
                 // Trigger the capture loop's pre-activation pass (lib.rs) for
                 // this new launch/resume — runs the VDD/CCD switch during the
                 // handshake gap instead of after the control stream connects.
@@ -743,12 +795,25 @@ async fn handle_request(
                 crate::app_launcher::launch_app(app_id_num);
             }
 
-            let body = if path == "/resume" {
-                r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><resume>1</resume></root>"#
+            let launch_body;
+            let body: &str = if path == "/resume" {
+                launch_body = format!(
+                    r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><resume>1</resume><sessionUrl0>rtsp://{}:48010</sessionUrl0></root>"#,
+                    _host_ip
+                );
+                &launch_body
             } else {
-                r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><gamesession>1</gamesession></root>"#
+                launch_body = format!(
+                    r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><gamesession>1</gamesession><sessionUrl0>rtsp://{}:48010</sessionUrl0></root>"#,
+                    _host_ip
+                );
+                &launch_body
             };
             Ok(make_xml_response(body))
+        }
+
+        "/ping" => {
+            Ok(Response::new(Full::new(Bytes::from("Nova OK"))))
         }
 
         _ => {

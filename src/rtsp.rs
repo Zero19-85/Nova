@@ -53,6 +53,13 @@ pub struct ClientInfo {
     /// devcon/CCD work again when the control stream actually connects.
     /// Reset to `false` on every /launch and /resume.
     pub activated: bool,
+    /// Video format bitmask from /launch `videoFormat` param
+    /// (1=H264, 2=HEVC Main, 0x102=HEVC Main10). 0 = not reported.
+    /// Must match the encoder codec or the client will receive the wrong
+    /// NAL type and display a black screen.
+    pub video_format: u32,
+    /// Client explicitly requested HDR via /launch `hdrMode=1`.
+    pub hdr_requested: bool,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".
@@ -282,10 +289,11 @@ fn handle_message(
                 info.audio_encryption, pkt_dur);
             println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?} bitrateKbps={:?}",
                 packet_size, fps, width, height, min_fec, bitrate);
+            // Always print the full ANNOUNCE SDP so codec/capability issues are
+            // immediately visible in the log during Xbox testing.
+            println!("   📋 ANNOUNCE SDP:\n{}", sdp.trim_end());
             if packet_size.is_none() {
-                // Parse failure would silently leave the 1024 fallback active —
-                // dump the SDP so the actual attribute names are visible.
-                println!("   ⚠️ packetSize missing from ANNOUNCE SDP — raw body:\n{}", sdp);
+                println!("   ⚠️  packetSize missing from ANNOUNCE SDP (see dump above)");
             }
             *guard = Some(info);
         }

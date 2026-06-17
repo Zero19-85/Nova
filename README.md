@@ -1,112 +1,141 @@
 
-| 🟢 NOVA CORE (FREE / OPEN SOURCE) | 🟣 NOVA PRO (DONATION TIER) |
-| :--- | :--- |
-| **Zero-Copy Pipelines** (DXGI Desktop Dup. → HW Encoder) | **Windows Service Mode** (Pre-login, hidden, boot-level) |
-| **Intelligent Codec Tiering** (H.265 baseline, AV1, H.264 fallback) | **Native Echo Mic Passthrough** (UMDF Virtual Audio Driver) |
-| **Token-Bucket Network Pacer** (Eliminates wireless micro-stutter) | **Virtual Monitor / IDD Sandbox** (Headless HDR/10-bit) |
-| **Full Controller Support** (XInput + ViGEmBus virtual injection) | **Advanced Orchestration & Routing** |
+# Nova — Native Rust GameStream Host
 
-
+A zero-copy, native Rust + C++ NVENC game-streaming host that speaks the Moonlight/GameStream protocol. Goal: replace Sunshine with a portable, <15 MB single executable.
 
 ---
 
-## 🗺️ Master Roadmap
+## Current State
 
-### 🏁 Phase 3: The Pipeline Finish Line `[✅ COMPLETE]`
-*   **Zero-copy DXGI Desktop Duplication → NVENC** *(H.264/NV12, CBR, IDR every 2s, Annex-B, repeatSPSPPS=1)*
-*   **Exact Sunshine RTSP wire protocol** on TCP 48010 *(per-connection messages, immediate shutdown after response, DEADBEEFCAFE session token, correct X-SS-Ping-Payload / X-SS-Connect-Data headers on SETUP)*
-*   **ENet reliable UDP control stream** on 47999 via `rusty_enet`
-*   **RTP video packetizer** on UDP 47998 *(NV_VIDEO_PACKET 8-byte header, MTU slicing, client address learning from post-PLAY ping packet, full NAL keyframe detection + force-IDR-on-connect shim)*
-*   **HTTPS pairing server** with hardened TLS 1.2 + mutual-auth compatibility *(LAN IP SAN, proper CA/KeyCertSign chain, ALPN http/1.1, clock-skew & hostname verification fixes)*
+**Phase 5 complete (VDD orchestration + dynamic resolution) — streaming end-to-end on real hardware.**
 
-> **Result:** Video bitstream generation + complete control plane is live and Moonlight-compatible! 🎉
-
-### 🚧 Phase 4: Core Streaming MVP `[IN PROGRESS]`
-*Prioritized for the fastest path to a usable Alpha:*
-1.  **End-to-End Video Validation:** Real Moonlight client testing (decoder init, no black screen, flawless frame delivery).
-2.  **Low-Latency Audio:** WASAPI audio capture → Opus → RTP packetization + hardware-timed AV sync engine.
-3.  **Input Event Handling:** Gamepad via ViGEmBus/XInput, mouse lock + absolute positioning, keyboard injection.
-4.  **Zero-Config & Bitrate:** mDNS discovery + dynamic bitrate adjustment via UDP feedback.
-5.  **Quality of Life:** Auto-game presets (foreground window detection) + Headless Display Emulation.
-
-### 📦 Phase 5: Single-Exe Release Engineering
-*   Asset embedding with `include_bytes!`
-*   Full LTO + `panic=abort` + symbol stripping.
-*   100% Portable executable—**zero installer required**.
+| Layer | Status |
+|---|---|
+| Pairing (RSA/AES-ECB, PEM plaincert) | ✅ Working — Xbox & Android confirmed |
+| RTSP handshake (OPTIONS/DESCRIBE/SETUP×3/ANNOUNCE/PLAY) | ✅ Working |
+| H.264 video (NVENC CBR, infinite GOP, intra refresh) | ✅ Working |
+| RTP packetizer + Reed-Solomon FEC (20% parity) | ✅ Working |
+| ENet control stream (IDR requests, ping, disconnect) | ✅ Working |
+| Audio (WASAPI loopback → Opus → RTP, AES-128-CBC) | ✅ Working |
+| Input (mouse, keyboard, gamepad via ViGEmBus) | ✅ Working |
+| Cursor compositing (alpha + XOR invert pass) | ✅ Working |
+| Virtual Display Driver (App 5 — headless, any resolution) | ✅ Working |
+| Dynamic resolution negotiation (VDD follows client request) | ✅ Working |
+| HEVC Main10 / HDR10 scaffolding | 🔧 Wired, not end-to-end tested |
+| AV1 | 🔧 Advertised, not tested |
 
 ---
 
-## 📡 Current Status *(Updated: June 10, 2026)*
+## Architecture
 
-**Phase 3 Complete ✅ | Phase 4 In Progress (Video pipeline + control plane live)**
-
-### 🟢 Working Right Now:
-*   ✅ **DXGI → NVENC** zero-copy encode path (Live RTP capable).
-*   ✅ **RTSP + ENet + RTP channels** mirroring Sunshine/Moonlight semantics.
-*   ✅ **HTTPS Pairing** hardened for desktop and beta Android clients.
-*   ✅ **Force-IDR on connect** + proper keyframe signaling.
-
-### 🟡 Next Immediate Actions:
-*   Validate live video stream in Moonlight over LAN.
-*   Wire the remaining audio RTP leg (WASAPI capture shim is ready).
-*   Input injection on the control stream.
-*   *Alpha MVP ships once video + audio render cleanly!*
-
----
-
-## 🔥 Community Most-Wanted Features
-
-We are listening. Here is what is on the high-priority radar:
-- [ ] **Mouse lock** & virtual absolute input handling.
-- [ ] **Headless display emulation** (Kill the HDMI dummy plugs for good).
-- [ ] **Auto game presets** based on running titles (WoW, FPS, etc.).
-- [ ] **Native microphone passthrough** via Echo.
-
----
-
-## 🛠️ The Tech Stack
-
-Nova is forged from modern, uncompromising tools:
-
-*   🦀 **Core:** 100% Rust for memory safety, concurrency, and raw speed.
-*   ⚙️ **Hardware Shims:** Thin C++ layer via `cc` builder (NVENC active; AMF/QuickSync incoming).
-*   📸 **Capture:** DXGI Desktop Duplication.
-*   🎥 **Encoding:** Direct bare-metal hardware access.
-*   🌐 **Networking:** RTSP (TCP), ENet (reliable UDP), RTP (video/audio UDP).
+```
+Moonlight client
+      │  HTTPS :47989/:47984  (pairing)
+      │  RTSP  :48010         (session negotiation)
+      │  ENet  :47999 UDP     (control — IDR, ping, input)
+      │  RTP   :47998 UDP     (video frames + FEC)
+      │  RTP   :48000 UDP     (Opus audio)
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  Nova  (nova-server.exe)                            │
+│                                                     │
+│  src/pairing.rs   — HTTP/HTTPS GameStream pairing   │
+│  src/rtsp.rs      — RTSP session + SDP negotiation  │
+│  src/control.rs   — ENet reliable-UDP control       │
+│  src/rtp.rs       — RTP packetizer + RS-FEC         │
+│  src/capture.rs   — DXGI Desktop Duplication        │
+│  src/encoder.rs   — Rust wrapper around C++ shim    │
+│  src/audio.rs     — WASAPI → Opus → RTP             │
+│  src/input.rs     — Mouse/keyboard/gamepad inject   │
+│  src/virtual_display.rs — VDD lifecycle (CCD API)   │
+│                                                     │
+│  shim/shim.cpp    — Zero-copy C++ NVENC FFI shim    │
+│    DXGI texture → D3D11 Video Processor (NV12/P010) │
+│    → NVENC (H.264 / HEVC Main10 / AV1)             │
+└─────────────────────────────────────────────────────┘
+      │
+   Root\MttVDD   (Virtual Display Driver — IddCx)
+   DXGI Desktop Duplication → physical or virtual output
+```
 
 ---
 
-## 🚀 Quick Start *(Alpha Coming Soon)*
+## Media Pipeline
 
-Ready to compile from source? 
+### SDR (default, `--codec h264`)
+DXGI BGRA8 → D3D11 Video Processor (BT.709 full→limited) → NV12 → NVENC H.264
+
+### HEVC / future HDR (`--codec hevc`)
+DXGI BGRA8 (SDR) or R16G16B16A16_FLOAT (HDR desktop) → VP (scRGB→P010 BT.2020 PQ for HDR; BT.709 for SDR) → P010/NV12 → NVENC HEVC Main10 (HDR10 MDCV/CLL SEI) or Main
+
+### AV1 (`--codec av1`)
+Same VP path as HEVC; NVENC AV1. Advertised in ServerCodecModeSupport, not yet end-to-end tested.
+
+---
+
+## Virtual Display Driver (Headless)
+
+Nova manages the [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (Root\MttVDD) lifecycle entirely in-process via SetupAPI + CCD (`SetDisplayConfig`). No HDMI dummy plug needed.
+
+Boot sequence:
+1. Pre-seeds all supported resolutions (720p–4K, 30/60/120 Hz) into `vdd_settings.xml`
+2. Cycles the devnode once so the driver loads the full mode table
+3. Parks VDD at 0×0 (dormant) via `ChangeDisplaySettingsExW`
+
+On App 5 launch:
+1. `SetDisplayConfig(SDC_TOPOLOGY_EXTEND)` — wakes VDD from dormant into the active desktop
+2. `ChangeDisplaySettingsExW` — snaps VDD to client-negotiated resolution/refresh
+3. CCD `SetDisplayConfig` — repositions VDD to desktop origin (new primary), deactivates physical display
+4. DXGI rebinds to VDD; encoder recreates at VDD resolution → SPS matches client exactly
+5. On stream end: full CCD topology restore, host audio endpoint restore
+
+---
+
+## Quick Start
 
 ```bash
-# Clone the repository
-git clone [https://github.com/Zero19-85/Nova.git](https://github.com/Zero19-85/Nova.git)
-
-# Enter the directory
+git clone https://github.com/Zero19-85/Nova.git
 cd Nova
+cargo build --release
+.\target\release\nova-server.exe
+```
 
-# Build and run the optimized release binary
-cargo run --release
+Optional flags:
+```
+--codec h264|hevc|av1    Encoder codec (default: h264)
+--bitrate N              Starting bitrate Kbps — overridden by client ANNOUNCE (default: 15000)
+--fps N                  Idle capture fps (default: 60)
+--fec N                  FEC parity % — 0 disables (default: 20)
+```
+
+The binary self-manages the VDD installation and all encoder lifecycle. Requires an NVIDIA GPU with NVENC support (RTX series recommended).
 
 ---
 
-### 💻 System Requirements
-* **OS:** Windows 10 / Windows 11
-* **Hardware:** Modern GPU (*NVIDIA RTX series highly recommended to leverage the current bare-metal NVENC path*)
+## System Requirements
 
-> ⚠️ **NOTE:** Previous documentation referenced `nova-server` — this has been officially corrected to the actual **Nova** repository.
+- **OS:** Windows 10 / 11
+- **GPU:** NVIDIA (NVENC) — RTX series for HEVC/AV1
+- **Virtual Display:** [VDD Control 25.7.23](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/tag/25.7.23) — Nova downloads and installs automatically on first run
+- **Gamepad passthrough:** [ViGEmBus](https://github.com/ViGEm/ViGEmBus) (optional)
+- **Audio routing:** Steam Streaming Speakers (optional — falls back to host speakers)
 
 ---
 
+## Known Limitations
 
+- **H.264 at 4K@120fps** exceeds Xbox H264 decoder Level 5.2 — use 1080p or 1440p@60fps with H.264. True 4K@120fps requires HEVC (Xbox Moonlight 1.18+ with HEVC enabled).
+- **HDR10** requires `--codec hevc` + a display in HDR mode (DXGI provides R16G16B16A16_FLOAT frames) + a Moonlight client that negotiates `videoFormat=0x102`.
+- **mDNS auto-discovery** may not work across WiFi APs with multicast isolation — add the host IP manually in Moonlight.
 
-### 🤝 Contributing & Donations
+---
 
-We welcome pull requests from fellow optimizers! Check out [`BLUEPRINT.md`](#) for the full architectural vision and browse open issues for active tasks. 
+## Roadmap
 
-If you want to support the blistering-fast development of **Nova Pro** features *(Windows Service mode, Virtual Audio, IDD)*, consider sponsoring the project on GitHub.
-
-**If you want lower-latency, lighter game streaming... drop a ⭐ on this repo!**
-
+| Phase | Description | State |
+|---|---|---|
+| 1–3 | Core pipeline (DXGI→NVENC→RTP, RTSP, pairing) | ✅ Complete |
+| 4 | Audio, input, cursor, reconnect, mDNS | ✅ Complete |
+| 5 | VDD headless orchestration, dynamic resolution, Xbox pairing | ✅ Complete |
+| 6 | HDR10 end-to-end (HEVC Main10, VDD HDR mode, SEI metadata) | 🔧 In progress |
+| 7 | Portable single-exe (LTO, asset embedding, zero installer) | Planned |

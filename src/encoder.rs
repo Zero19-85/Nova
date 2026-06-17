@@ -10,8 +10,9 @@ extern "C" {
         codec: *const std::ffi::c_char,
         bitrate_kbps: i32,
         fps: i32,
+        is_hdr: i32,
     ) -> i32;
-    fn InitColorConversion(device: *mut c_void, width: i32, height: i32) -> i32;
+    fn InitColorConversion(device: *mut c_void, width: i32, height: i32, is_hdr: i32, fps: i32) -> i32;
     fn EncodeFrame(
         encoder: *mut c_void,
         d3d11_texture: *mut c_void,
@@ -112,6 +113,7 @@ pub struct EncoderConfig {
     pub fps: i32,
     pub bitrate_kbps: i32,
     pub codec: Codec,
+    pub is_hdr: bool,
 }
 
 /// Safe handle around the NVENC C++ shim.
@@ -150,12 +152,13 @@ impl Encoder {
                 codec_cstr.as_ptr(),
                 config.bitrate_kbps,
                 config.fps,
+                config.is_hdr as i32,
             );
             if ret != 0 {
                 return Err(format!("InitEncoder returned {}", ret));
             }
 
-            let ret = InitColorConversion(device_ptr, config.width, config.height);
+            let ret = InitColorConversion(device_ptr, config.width, config.height, config.is_hdr as i32, config.fps);
             if ret != 0 {
                 return Err(format!("InitColorConversion returned {}", ret));
             }

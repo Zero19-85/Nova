@@ -86,6 +86,7 @@ fn rebind_capture_and_encoder(
                     fps:          enc.config.fps,
                     bitrate_kbps: enc.config.bitrate_kbps,
                     codec:        enc.config.codec,
+                    is_hdr:       enc.config.is_hdr,
                 }) {
                     Ok(new_enc) => *enc = new_enc,
                     Err(e) => {
@@ -126,7 +127,15 @@ pub async fn run() -> Result<()> {
     let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
 
-    let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
+    // Compute ServerCodecModeSupport from the CLI codec so that clients always
+    // select the codec the encoder is actually running.  Advertising HEVC when
+    // the encoder is H264 causes clients to pick HEVC and send the wrong
+    // decoder format — result: black screen on strict clients (Xbox UWP).
+    let codec_mode_support = encoder::Codec::from_str(&args.codec).mode_bit();
+    println!("🎥 Encoder codec: {} (ServerCodecModeSupport={})", args.codec, codec_mode_support);
+
+    let startup_frame_interval = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
+    let mut frame_interval = startup_frame_interval;
 
     // Owns the virtual-display lifecycle for the whole process.
     // activate_for_stream/deactivate_after_stream cache/restore the host's
@@ -169,6 +178,7 @@ pub async fn run() -> Result<()> {
             fps:          args.fps as i32,
             bitrate_kbps: args.bitrate,
             codec:        encoder::Codec::from_str(&args.codec),
+            is_hdr:       false, // upgraded to true at RTSP session time when client negotiates HDR
         },
     )
     .expect("Failed to initialize NVENC encoder");
@@ -194,6 +204,7 @@ pub async fn run() -> Result<()> {
         server_id.to_string(),
         server_mac.to_string(),
         client_info.clone(),
+        codec_mode_support,
     ));
 
     // mDNS — Sunshine-compatible service record
@@ -302,21 +313,43 @@ pub async fn run() -> Result<()> {
                     .filter(|c| c.app_id != 0 && !c.activated && !c.streaming_active)
                     .map(|c| (c.app_id, c.width, c.height, c.fps));
                 if let Some((app_id, width, height, fps)) = pending {
-                    if app_launcher::uses_virtual_display(app_id) {
-                        println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps)");
+                    // Read HDR flag while we still hold the lock.
+                    let hdr_req = guard.as_ref().map(|c| c.hdr_requested).unwrap_or(false);
+
+                    // Propagate client-negotiated fps (and HDR mode if HEVC) into
+                    // enc.config BEFORE rebind so the new encoder is initialised
+                    // at the right fps/profile rather than the CLI startup default.
+                    enc.config.fps = fps as i32;
+                    if hdr_req && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr {
+                        println!("🎨 HDR requested with HEVC — enabling Main10/HDR10 in pre-activated encoder");
+                        enc.config.is_hdr = true;
+                    }
+
+                    let vdd_ok = if app_launcher::uses_virtual_display(app_id) {
+                        println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
+                            if enc.config.is_hdr { " HDR10" } else { "" });
                         match vd.activate_for_stream(width, height, fps) {
                             Ok(()) => {
                                 if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((width, height))).is_err() {
                                     break;
                                 }
+                                true
                             }
-                            Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
+                            Err(e) => {
+                                println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display");
+                                false
+                            }
                         }
                     } else {
                         println!("🖥️  App {app_id} targets the physical display — virtual display not used");
-                    }
-                    if let Some(info) = guard.as_mut() {
-                        info.activated = true;
+                        true
+                    };
+                    // Only mark activated=true on success; a failure leaves it
+                    // false so the connect-time fallback can retry activate_for_stream.
+                    if vdd_ok {
+                        if let Some(info) = guard.as_mut() {
+                            info.activated = true;
+                        }
                     }
                 }
             }
@@ -337,6 +370,58 @@ pub async fn run() -> Result<()> {
                         println!("🎮 Moonlight connected: {} ({}x{}@{}fps)",
                             client.ip, client.width, client.height, client.fps);
                         debug::debug_log(&format!("Client connected {}", client.ip));
+
+                        // Log the codec that was negotiated vs what the encoder delivers.
+                        let vf_name = if client.video_format & 0x100 != 0 { "HEVC Main10" }
+                            else if client.video_format & 0x002 != 0 { "HEVC Main" }
+                            else { "H264" };
+                        let enc_name = enc.config.codec.as_str();
+                        let hdr_sfx  = if client.hdr_requested { " [HDR requested]" } else { "" };
+                        println!("🔑 Codec negotiation: client={}{} (videoFormat={:#x})  encoder={}{}",
+                            vf_name, hdr_sfx, client.video_format, enc_name,
+                            if enc.config.is_hdr { "/HDR10" } else { "" });
+                        // Belt-and-suspenders mismatch guard: ServerCodecModeSupport
+                        // should prevent this, but warn loudly if it slips through.
+                        let client_base = client.video_format & 0x00FF;
+                        if client.video_format != 0 && client_base != codec_mode_support {
+                            println!("⚠️  CODEC MISMATCH at stream start: client expects {} \
+                                but encoder is {}. Stream will likely fail. \
+                                Restart with --codec {}.",
+                                vf_name, enc_name,
+                                if client_base == 2 { "hevc" } else { "h264" });
+                        }
+
+                        // Wire HDR if the client requested it and the encoder
+                        // hasn't already been armed by the pre-activation pass
+                        // (covers App 1 / physical-display sessions and any race
+                        // where PLAY arrived before the pre-activation tick).
+                        // Requires the display to be in HDR mode so DXGI provides
+                        // R16G16B16A16_FLOAT frames; otherwise the VP's scRGB→P010
+                        // path receives BGRA8 and colours will be wrong — log it.
+                        if client.hdr_requested && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr {
+                            println!("🎨 HDR requested — switching encoder to HEVC Main10/HDR10 \
+                                (display must be in HDR mode for correct colors)");
+                            enc.config.is_hdr = true;
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), None).is_err() {
+                                break;
+                            }
+                        }
+
+                        // Resolution / FPS / HDR summary — the single most
+                        // useful line for diagnosing stream failures.
+                        println!("📐 Encoder: {}x{}@{}fps {}{}  |  Client requested: {}x{}@{}fps{}",
+                            enc.config.width, enc.config.height, enc.config.fps,
+                            enc_name,
+                            if enc.config.is_hdr { "/HDR10" } else { "" },
+                            client.width, client.height, client.fps,
+                            if client.hdr_requested { " HDR" } else { "" });
+                        if enc.config.width as u32 != client.width || enc.config.height as u32 != client.height {
+                            println!("⚠️  RESOLUTION MISMATCH: SPS will declare {}x{} but client \
+                                expects {}x{}. Use App 5 (Virtual Desktop) for dynamic resolution — \
+                                it drives the VDD to exactly the client-requested size.",
+                                enc.config.width, enc.config.height,
+                                client.width, client.height);
+                        }
 
                         // Normally already done by the pre-activation pass
                         // above during the /launch -> PLAY gap. Fall back to
@@ -374,6 +459,13 @@ pub async fn run() -> Result<()> {
                         }
 
                         rtp_sender.set_fps(client.fps.max(1));
+                        let negotiated_interval = Duration::from_secs_f64(1.0 / client.fps.max(1) as f64);
+                        if negotiated_interval != frame_interval {
+                            frame_interval = negotiated_interval;
+                            next_frame_time = Instant::now(); // rebase pacing — prevents burst if interval shrank
+                            println!("⏱️  Frame interval → {:.2}ms ({} fps, client-negotiated)",
+                                frame_interval.as_secs_f64() * 1000.0, client.fps);
+                        }
                         // Shard size MUST match the client's negotiated
                         // packetSize (1392 LAN / 1024 remote) or its FEC
                         // reconstruction runs over the wrong block size.
@@ -408,8 +500,14 @@ pub async fn run() -> Result<()> {
                         // under CBR that's a constant overshoot that makes
                         // Moonlight warn "lower your bitrate" and disconnect.
                         if client.bitrate_kbps > 0 {
-                            println!("📊 Retargeting encoder to client bitrate: {} Kbps", client.bitrate_kbps);
-                            encoder::reconfigure_bitrate(client.bitrate_kbps, args.fps);
+                            println!("📊 Retargeting encoder to client bitrate: {} Kbps @ {} fps",
+                                client.bitrate_kbps, client.fps);
+                            encoder::reconfigure_bitrate(client.bitrate_kbps, client.fps);
+                            // Mirror negotiated values into enc.config so any
+                            // mid-session rebind (resolution/device change) inherits
+                            // the client-negotiated fps and bitrate, not the CLI default.
+                            enc.config.bitrate_kbps = client.bitrate_kbps as i32;
+                            enc.config.fps          = client.fps.max(1) as i32;
                         } else {
                             println!("⚠️  Client did not announce a bitrate — keeping CLI default {} Kbps", args.bitrate);
                         }
@@ -462,6 +560,9 @@ pub async fn run() -> Result<()> {
                 if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
                     break;
                 }
+                // Restore idle capture pacing — don't spin at 120fps between sessions.
+                frame_interval  = startup_frame_interval;
+                next_frame_time = Instant::now();
                 client_connected = false;
                 video_learned    = false;
             }

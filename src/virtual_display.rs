@@ -130,7 +130,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
     QDC_DATABASE_CURRENT, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES,
-    SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CM_PROB_DISABLED, CR_SUCCESS,
@@ -1010,6 +1010,28 @@ impl VirtualDisplay {
         self.ensure_installed()?;
         self.configure_mode(width, height, refresh_hz)?;
 
+        // Pre-seed every resolution/refresh-rate pair from SupportedDisplayModeList
+        // into vdd_settings.xml BEFORE the single devnode cycle below. MttVDD
+        // re-reads the XML only on (re)start — doing this once at boot means
+        // activate_for_stream's force_resolution call always finds the requested
+        // mode in the driver's table, regardless of which resolution the client
+        // asks for, without needing another devcon cycle mid-session (which would
+        // race the DXGI rebind). configure_mode is idempotent for already-present
+        // entries, so this is cheap on repeat boots.
+        let all_modes: &[(u32, u32, u32)] = &[
+            (1280, 720, 30), (1280, 720, 60), (1280, 720, 120),
+            (1920, 1080, 30), (1920, 1080, 60), (1920, 1080, 120),
+            (2560, 1440, 60), (2560, 1440, 120),
+            (3840, 2160, 30), (3840, 2160, 60), (3840, 2160, 120),
+        ];
+        for &(w, h, hz) in all_modes {
+            if let Err(e) = self.configure_mode(w, h, hz) {
+                println!("⚠️  VDD mode pre-seed {w}x{h}@{hz}Hz failed: {e}");
+            }
+        }
+        println!("📋 VDD mode table pre-seeded with {} resolutions (720p/1080p/1440p/4K × 30/60/120Hz)",
+            all_modes.len());
+
         if self.is_enabled() {
             // configure_mode only edits vdd_settings.xml/VDDPATH; MttVDD's
             // IddCx adapter re-reads those only on devnode (re)start (see
@@ -1190,6 +1212,34 @@ impl VirtualDisplay {
         let virtual_device = Self::wait_for_virtual_display_device_name()
             .ok_or_else(|| "timed out waiting for the virtual display to appear in GDI enumeration".to_string())?;
 
+        // isolate_virtual_display_at_boot() parks the VDD at 0×0 by staging
+        // CDS_NORESET and then committing with a global apply. A display
+        // parked at 0×0 is considered disconnected by Windows — it no longer
+        // appears in QDC_ONLY_ACTIVE_PATHS and ChangeDisplaySettingsExW
+        // returns DISP_CHANGE_FAILED (-1) for it, even for modes that ARE in
+        // the driver's table. To bring it back, use SetDisplayConfig(
+        // SDC_TOPOLOGY_EXTEND) first: this asks Windows to extend the desktop
+        // to include all connected outputs (including the VDD), using its
+        // database-stored mode for each. Once the VDD is "live" at its last
+        // valid mode (typically 1080p), force_resolution can retarget it to
+        // the client-requested resolution/refresh.
+        println!("🔌 Re-activating VDD from dormant 0×0 state via SDC_TOPOLOGY_EXTEND...");
+        let ext_status = unsafe {
+            SetDisplayConfig(
+                None::<&[DISPLAYCONFIG_PATH_INFO]>,
+                None::<&[DISPLAYCONFIG_MODE_INFO]>,
+                SDC_APPLY | SDC_TOPOLOGY_EXTEND,
+            )
+        };
+        if ext_status == 0 {
+            println!("✅ VDD re-added to the extended desktop — waiting for topology to settle...");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        } else {
+            println!("⚠️  SDC_TOPOLOGY_EXTEND failed (error {ext_status}) — force_resolution may not work on a disconnected VDD");
+        }
+        Self::force_resolution(&virtual_device, width, height, refresh_hz);
+        Self::wait_for_display_resolution(&virtual_device, width, height);
+
         Self::set_primary_display(&virtual_device)?;
         println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) is now the desktop primary");
 
@@ -1198,20 +1248,14 @@ impl VirtualDisplay {
             Err(e) => println!("⚠️  Failed to fully detach the physical display path(s): {e} — continuing with {virtual_device} as primary"),
         }
 
-        // CCD (SetDisplayConfig, just above) only routes/activates display
-        // paths — it never changes which of a path's advertised modes is
-        // current. Without an explicit resize, the virtual display stays at
-        // whatever mode it was last showing (typically the 800x600 failsafe
-        // from boot), independent of the width/height/refresh_hz that
-        // configure_mode already wrote into vdd_settings.xml.
+        // Re-snap the resolution: SDC_ALLOW_CHANGES in set_primary_display/
+        // deactivate_other_paths can silently select a different mode (often
+        // the 800x600 failsafe) even though configure_mode already wrote the
+        // correct entry into vdd_settings.xml.
         Self::force_resolution(&virtual_device, width, height, refresh_hz);
 
-        // ChangeDisplaySettingsExW above can apply asynchronously, and
-        // EnumDisplaySettingsW may briefly still report the old mode for a
-        // frame or two. Wait for it to report the requested resolution before
-        // returning, so the DXGI rebind in lib.rs binds to the final mode
-        // instead of a transient one (which would otherwise force an
-        // immediate second encoder recreation).
+        // Wait for the mode to stabilise so the DXGI rebind below sees the
+        // correct DesktopCoordinates rather than a transient resolution.
         Self::wait_for_display_resolution(&virtual_device, width, height);
 
         self.saved_topology = Some(saved_topology);
