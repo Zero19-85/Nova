@@ -124,8 +124,10 @@ use windows::Win32::Graphics::Gdi::{
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::DISPLAY_DEVICE_PRIMARY_DEVICE;
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
+    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
+    GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_DEVICE_INFO_TYPE,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
@@ -883,6 +885,48 @@ impl VirtualDisplay {
         Ok(changed)
     }
 
+    /// Ensures `<HDRPlus>true</HDRPlus>` is set in `vdd_settings.xml`.
+    ///
+    /// MttVDD ships with `HDRPlus=false` which means the virtual display does
+    /// not advertise HDR10 capability in its EDID. Without this flag:
+    ///   - Windows reports `advancedColorSupported=true` via the CCD API but
+    ///     cannot actually apply the Advanced Color mode → infinite ACCESS_LOST
+    ///     storm when `SET_ADVANCED_COLOR_STATE` is called.
+    ///   - DXGI stays in BGRA8 (SDR) mode and the FP16→P010 VP blit produces
+    ///     zero-byte frames.
+    ///
+    /// With `HDRPlus=true` the driver advertises proper HDR10 capability, the
+    /// Advanced Color toggle works cleanly, and DXGI switches to
+    /// `R16G16B16A16_FLOAT` (linear scRGB) as expected.
+    ///
+    /// Must be called before the devnode cycle in [`ensure_enabled_at_boot`]
+    /// because MttVDD only re-reads the XML on (re)start.
+    fn ensure_hdr_options(path: &Path) -> Result<bool, String> {
+        let xml = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+
+        // Simple tag-value replacement: swap false→true only when the tag exists.
+        let mut out = xml;
+        let mut changed = false;
+
+        for (old, new) in [
+            ("<HDRPlus>false</HDRPlus>",         "<HDRPlus>true</HDRPlus>"),
+            ("<HDRPlus>False</HDRPlus>",         "<HDRPlus>true</HDRPlus>"),
+        ] {
+            if out.contains(old) {
+                out = out.replace(old, new);
+                changed = true;
+            }
+        }
+
+        if changed {
+            std::fs::write(path, &out)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            println!("📝 vdd_settings.xml: HDRPlus enabled for Advanced Color / HDR10 support");
+        }
+        Ok(changed)
+    }
+
     /// Does the `<resolutions>...</resolutions>` block contain a
     /// `<resolution>` entry with this exact `(width, height)`, regardless of
     /// its `<refresh_rate>` (the global refresh-rate list applies to every
@@ -1031,6 +1075,16 @@ impl VirtualDisplay {
         }
         println!("📋 VDD mode table pre-seeded with {} resolutions (720p/1080p/1440p/4K × 30/60/120Hz)",
             all_modes.len());
+
+        // Enable HDRPlus in vdd_settings.xml so the driver advertises HDR10
+        // capability in its EDID. Required for DisplayConfigSetDeviceInfo
+        // (SET_ADVANCED_COLOR_STATE) to actually work — without it the VDD reports
+        // no HDR in its EDID and Windows triggers an infinite ACCESS_LOST storm.
+        match Self::ensure_hdr_options(&self.vdd_settings_path()) {
+            Ok(true)  => println!("📝 HDRPlus enabled in vdd_settings.xml — driver will advertise HDR10 after devnode cycle"),
+            Ok(false) => println!("✅ HDRPlus already enabled in vdd_settings.xml"),
+            Err(e)    => println!("⚠️  Could not patch HDRPlus in vdd_settings.xml: {e}"),
+        }
 
         if self.is_enabled() {
             // configure_mode only edits vdd_settings.xml/VDDPATH; MttVDD's
@@ -1291,6 +1345,14 @@ impl VirtualDisplay {
 
         let mut error: Option<String> = None;
 
+        // Disable Advanced Color before restoring topology — the VDD is still
+        // the active primary here, so the target id is still valid. After
+        // restore_topology the path is gone and the call would fail.
+        if let Err(e) = self.set_active_display_hdr(false) {
+            // Non-fatal: log and continue; it only matters if HDR was enabled.
+            println!("⚠️  Could not disable Advanced Color on stream end: {e}");
+        }
+
         if let Some(saved) = self.saved_topology.take() {
             match Self::restore_topology(&saved, self.active_device_name.as_deref()) {
                 Ok(()) => println!("🖥️  Restored the original display topology — virtual display detached"),
@@ -1335,6 +1397,204 @@ impl VirtualDisplay {
     /// [`crate::capture::DesktopCapturer::rebind`].
     pub fn active_resolution(&self) -> Option<(u32, u32)> {
         self.active_resolution
+    }
+
+    /// Enables or disables Windows Advanced Color (HDR10 / scRGB rendering) on
+    /// the currently-active VDD output using `DisplayConfigSetDeviceInfo` with
+    /// `DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE` (type value 10).
+    ///
+    /// When enabled, Windows switches the VDD's frame buffer to
+    /// `DXGI_FORMAT_R16G16B16A16_FLOAT` (linear scRGB). The shim's
+    /// `InitColorConversion(is_hdr=true)` VP path (`FP16 scRGB → P010 BT.2020 PQ`)
+    /// then has the correct HDR source data to feed NVENC's P010 input surface.
+    ///
+    /// This triggers `DXGI_ERROR_ACCESS_LOST` on the existing duplication handle —
+    /// the capture loop's ACCESS_LOST handler re-creates the duplication in the new
+    /// (HDR / FP16) color mode automatically, so no explicit rebind is needed here.
+    ///
+    /// Best-effort: logs success or failure and never panics. The VDD may not
+    /// support Advanced Color (e.g. MttVDD versions that don't expose HDR modes);
+    /// in that case the encoder will fall back to encoding BGRA8 as HEVC Main10
+    /// which produces incorrect (over-bright) colors but doesn't crash.
+    /// Returns whether the active VDD output reports `advancedColorSupported` via
+    /// the CCD `GET_ADVANCED_COLOR_INFO` query (type=9).
+    ///
+    /// Requires `HDRPlus=true` in `vdd_settings.xml` (patched at boot by
+    /// [`ensure_hdr_options`]) so the driver advertises HDR10 in its EDID.
+    /// Without it the query returns `advancedColorSupported=false`.
+    ///
+    /// All shipping MttVDD releases (including 25.7.23) use `IddCx0102` (IddCx 1.2),
+    /// which does not implement IddCx Advanced Color callbacks. Calling
+    /// `SET_ADVANCED_COLOR_STATE` on an already-HDR display (Windows may auto-enable
+    /// Advanced Color when the VDD EDID declares HDR10 capability) triggers a
+    /// spurious re-initialization storm. [`set_active_display_hdr`] guards against
+    /// this with an idempotency check — it skips the SET call if the display is
+    /// already in the desired state.
+    pub fn is_advanced_color_supported(&self) -> bool {
+        let Some(device_name) = self.active_device_name.as_deref() else {
+            return false;
+        };
+        let Ok((adapter_id, target_id)) = Self::find_target_for_device_name(device_name) else {
+            return false;
+        };
+        let Some((supported, enabled)) = Self::query_advanced_color_info(adapter_id, target_id) else {
+            return false;
+        };
+        println!("🔍 VDD Advanced Color on {device_name}: supported={supported}, enabled={enabled}");
+        supported
+    }
+
+    /// Queries `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` (type=9) for the given
+    /// CCD target. Returns `(advancedColorSupported, advancedColorEnabled)` from
+    /// the bitfield union, or `None` if the API call fails.
+    ///
+    /// The full `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` struct (wingdi.h) is:
+    ///   header (20 bytes) + value u32 + colorEncoding u32 + bitsPerColorChannel u32
+    /// All fields must be present so the `size` field in the header matches.
+    fn query_advanced_color_info(adapter_id: LUID, target_id: u32) -> Option<(bool, bool)> {
+        #[repr(C)]
+        struct GetAdvancedColorInfo {
+            header:                DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            value:                 u32, // bits: 0=supported, 1=enabled, 2=wideColorEnforced, 3=forceDisabled
+            color_encoding:        u32, // DISPLAYCONFIG_COLOR_ENCODING enum
+            bits_per_color_channel: u32,
+        }
+        let mut info = GetAdvancedColorInfo {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(9i32), // GET_ADVANCED_COLOR_INFO
+                size:   std::mem::size_of::<GetAdvancedColorInfo>() as u32,
+                adapterId: adapter_id,
+                id:        target_id,
+            },
+            value: 0,
+            color_encoding: 0,
+            bits_per_color_channel: 0,
+        };
+        let ret = unsafe {
+            DisplayConfigGetDeviceInfo(
+                &mut info.header as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            )
+        };
+        if ret != 0 {
+            println!("⚠️  GET_ADVANCED_COLOR_INFO failed: error {ret}");
+            return None;
+        }
+        Some(((info.value & 1) != 0, (info.value & 2) != 0))
+    }
+
+    /// Shared helper: walk active CCD paths and return the (adapterId, targetId)
+    /// for the path whose source GDI device name matches `device_name`.
+    fn find_target_for_device_name(device_name: &str) -> Result<(LUID, u32), String> {
+        unsafe {
+            let mut n_paths: u32 = 0;
+            let mut n_modes: u32 = 0;
+            let e = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_paths, &mut n_modes);
+            if e.0 != 0 { return Err(format!("GetDisplayConfigBufferSizes: {}", e.0)); }
+
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); n_paths as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); n_modes as usize];
+            let e = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                &mut n_paths, paths.as_mut_ptr(),
+                &mut n_modes, modes.as_mut_ptr(), None);
+            if e.0 != 0 { return Err(format!("QueryDisplayConfig: {}", e.0)); }
+
+            for path in &paths[..n_paths as usize] {
+                let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
+                src.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                };
+                if DisplayConfigGetDeviceInfo(&mut src.header as *mut _ as *mut _) != 0 { continue; }
+                let name = String::from_utf16_lossy(&src.viewGdiDeviceName);
+                if name.trim_end_matches('\0').eq_ignore_ascii_case(device_name) {
+                    return Ok((path.targetInfo.adapterId, path.targetInfo.id));
+                }
+            }
+            Err(format!("No active path for {device_name}"))
+        }
+    }
+
+    pub fn set_active_display_hdr(&self, enable: bool) -> Result<(), String> {
+        let device_name = self.active_device_name.as_deref()
+            .ok_or_else(|| "VDD not active — cannot set Advanced Color".to_string())?;
+
+        // Walk the active CCD paths to find the one whose source GDI device name
+        // matches our VDD, then grab its target adapterId + id for the set-info call.
+        let (adapter_id, target_id) = Self::find_target_for_device_name(device_name)
+            .map_err(|e| format!("Cannot locate VDD target for Advanced Color: {e}"))?;
+
+        // Idempotency guard: skip SET_ADVANCED_COLOR_STATE if the display is
+        // already in the desired state. On IddCx 1.2 (all shipping MttVDD),
+        // calling SET when the state is already correct triggers a spurious
+        // ACCESS_LOST re-initialization storm (Windows may auto-enable Advanced
+        // Color when the VDD EDID declares HDR10, so this guard fires often).
+        if let Some((_supported, currently_enabled)) =
+            Self::query_advanced_color_info(adapter_id, target_id)
+        {
+            if currently_enabled == enable {
+                println!("✅ Advanced Color on {device_name} already {} — skipping SET",
+                    if enable { "enabled" } else { "disabled" });
+                return Ok(());
+            }
+        }
+
+        // DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE layout (wingdi.h):
+        //   DISPLAYCONFIG_DEVICE_INFO_HEADER  header;
+        //   union { struct { UINT32 enableAdvancedColor:1; UINT32 reserved:31; }; UINT32 value; };
+        // DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE = 10 (not 9 which is the GET variant).
+        #[repr(C)]
+        struct SetAdvancedColorState {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            value:  u32,  // bit 0 = enableAdvancedColor, bits 1-31 = reserved
+        }
+        let req = SetAdvancedColorState {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(10i32),
+                size:   std::mem::size_of::<SetAdvancedColorState>() as u32,
+                adapterId: adapter_id,
+                id:        target_id,
+            },
+            value: if enable { 1 } else { 0 },
+        };
+
+        // DisplayConfigSetDeviceInfo returns LONG (i32) — 0 on success.
+        let ret = unsafe {
+            DisplayConfigSetDeviceInfo(
+                &req.header as *const DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            )
+        };
+
+        if ret == 0 {
+            println!("🎨 Advanced Color (HDR) {} on {device_name}",
+                if enable { "enabled → DXGI will provide FP16 scRGB frames" }
+                else      { "disabled → DXGI back to BGRA8 SDR" });
+            Ok(())
+        } else {
+            let msg = format!(
+                "DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE={}) on {device_name} \
+                 failed: error {ret}",
+                enable as u8
+            );
+            println!("⚠️  {msg}");
+            Err(msg)
+        }
+    }
+
+    /// Re-snaps the already-active VDD to `width`×`height`@`refresh_hz`
+    /// without touching CCD topology. Use when `activate_for_stream`'s
+    /// `force_resolution` + `wait_for_display_resolution` timed out and the
+    /// VDD settled at the wrong mode (e.g. 4K@120fps taking longer than 3 s
+    /// to stabilise, leaving the VDD at 1080p). Calling this at connect time
+    /// gives the VDD a second chance to reach the right mode before the
+    /// capture and encoder are rebound.
+    pub fn re_snap_resolution(&self, width: u32, height: u32, refresh_hz: u32) {
+        if let Some(device) = self.active_device_name.as_deref() {
+            println!("📐 VDD re-snap: forcing {device} → {width}x{height}@{refresh_hz}Hz");
+            Self::force_resolution(device, width, height, refresh_hz);
+            Self::wait_for_display_resolution(device, width, height);
+        }
     }
 
     /// Polls [`find_virtual_display_device_name`] for up to ~2 seconds,

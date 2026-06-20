@@ -1,341 +1,482 @@
-use windows::core::{Result, Interface};
+/// Windows Graphics Capture (WGC) backend — replaces `IDXGIOutputDuplication`.
+///
+/// ## Why WGC instead of DXGI Desktop Duplication
+///
+/// `IDXGIOutputDuplication` exposes the raw OS framebuffer at the DXGI layer.
+/// Any display colour-mode transition — including the FP16 / Advanced Color
+/// switch needed for HDR10 capture from the MttVDD virtual display — invalidates
+/// the duplication handle (`DXGI_ERROR_ACCESS_LOST`) and the caller must
+/// re-duplicate. On IddCx 1.2 (all shipping MttVDD versions) the FP16 mode
+/// transition is NOT stable: it fires 50+ consecutive ACCESS_LOST events during
+/// live streaming, exhausting Moonlight's 7-second connection timeout before any
+/// HDR frame can be delivered.
+///
+/// WGC sits above the DXGI layer at the DWM composition level. Its
+/// `Direct3D11CaptureFramePool` buffers frames on the caller's D3D11 device and
+/// absorbs display mode transitions internally. The caller never sees
+/// ACCESS_LOST — frames simply pause for a moment and then resume in the new
+/// format (FP16 when Advanced Color is active, BGRA8 otherwise).
+///
+/// ## Zero-copy guarantee
+///
+/// The frame pool is created with the same `ID3D11Device` used by the NVENC
+/// encoder. WGC delivers captured textures on that device, so every
+/// `ID3D11Texture2D` returned by `try_get_frame` can be passed directly to the
+/// shim's `ID3D11VideoContext` VP blt without any system-RAM round-trip.
+///
+/// ## HDR pipeline
+///
+/// When `is_hdr = true`, the pool is created with
+/// `DirectXPixelFormat::R16G16B16A16Float`. After the VDD's Advanced Color mode
+/// is enabled via `DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE)`, WGC
+/// delivers true FP16 scRGB frames that the shim converts to P010 BT.2020 PQ
+/// for HEVC Main10 encoding.
+
+use windows::core::{Interface, Result, IInspectable};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool,
+    GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{BOOL, HMODULE, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Direct3D::*;
-use windows::Win32::Foundation::{E_FAIL, HMODULE};
-use std::time::Duration;
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint,
+    HDC, HMONITOR, MONITORINFO, MONITOR_FROM_FLAGS,
+};
+use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
+use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
-pub struct DesktopCapturer {
-    pub dupl: IDXGIOutputDuplication,
-    pub device: ID3D11Device,
-    /// Native resolution of the duplicated output (DXGI_OUTPUT_DESC.DesktopCoordinates).
-    /// The encoder/color-conversion pipeline must be initialized with these
-    /// dimensions — anything else leaves the video processor's input size
-    /// mismatched with the captured texture, which blits only the overlapping
-    /// region and leaves the rest of the NV12 surface (typically the bottom)
-    /// black/uninitialized.
-    pub width: u32,
-    pub height: u32,
-    /// Top-left corner of this output's `DesktopCoordinates`, i.e. its
-    /// position within the Win32 virtual screen
-    /// (`SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`..+`SM_CXVIRTUALSCREEN`/
-    /// `SM_CYVIRTUALSCREEN`). The GDI primary monitor sits at `(0, 0)`, but
-    /// the captured output isn't always the primary — `input.rs` uses this
-    /// (via `input::set_active_capture_rect`) to map Moonlight's
-    /// client-relative mouse coordinates onto the right monitor instead of
-    /// assuming `(0, 0)`/`GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`.
-    pub origin_x: i32,
-    pub origin_y: i32,
-    /// Copy of the last successfully captured frame, kept on `device` so it
-    /// can be re-submitted to the encoder when `AcquireNextFrame` reports
-    /// `DXGI_ERROR_WAIT_TIMEOUT` (desktop unchanged). A fully idle/static
-    /// desktop — common right after switching to a freshly-activated
-    /// virtual display, where nothing has painted yet — can otherwise never
-    /// produce a single duplication frame, leaving the stream black
-    /// forever. Cleared on `rebind` (resolution/device may have changed).
-    last_frame: Option<ID3D11Texture2D>,
+/// MONITORINFOEXW is not reliably exported by windows-rs across patch versions,
+/// so we define the ABI layout manually. Win32 spec: `MONITORINFO` (40 bytes)
+/// followed by `szDevice[CCHDEVICENAME]` where CCHDEVICENAME = 32 UTF-16 units.
+#[repr(C)]
+struct MonitorInfoEx {
+    base:   MONITORINFO,
+    device: [u16; 32],
 }
 
-impl DesktopCapturer {
-    pub fn new() -> Result<Self> {
-        Self::for_output(None)
-    }
+// ── Module-level EnumDisplayMonitors callbacks ────────────────────────────────
+// These must be free functions (not closures) because their address is passed
+// as a raw function pointer through the Win32 MONITORENUMPROC type alias.
 
-    /// Like [`new`](Self::new), but the startup "first output" fallback skips
-    /// any output whose GDI device name matches `exclude`.
-    ///
-    /// `run()` uses this to keep the boot-time capturer off the virtual
-    /// display. `ensure_enabled_at_boot` cycles `Root\MttVDD`'s devnode,
-    /// which can change WDDM adapter-registration order and make the virtual
-    /// display's adapter enumerate as DXGI adapter 0 — so the "first output"
-    /// fallback would bind the idle boot-time capturer to the *virtual*
-    /// display. A later `activate_for_stream` then [`rebind`](Self::rebind)s
-    /// *the same* capturer to *the same* output (just a different mode): a
-    /// same-output re-`DuplicateOutput`, whose `AcquireNextFrame` never
-    /// produces a frame (perpetual `DXGI_ERROR_ACCESS_LOST`/`INVALIDCALL`),
-    /// leaving the stream black. Excluding the virtual display here
-    /// guarantees that first rebind is a cross-output switch instead.
+struct FindByName { target: String, result: Option<HMONITOR> }
+
+unsafe extern "system" fn enum_find_by_name(
+    hmon: HMONITOR, _: HDC, _: *mut RECT, lparam: LPARAM,
+) -> BOOL {
+    let s = &mut *(lparam.0 as *mut FindByName);
+    let mut info = MonitorInfoEx {
+        base:   MONITORINFO { cbSize: std::mem::size_of::<MonitorInfoEx>() as u32,
+                              ..Default::default() },
+        device: [0u16; 32],
+    };
+    if GetMonitorInfoW(hmon, &mut info.base).as_bool() {
+        let name = String::from_utf16_lossy(&info.device);
+        if name.trim_end_matches('\0').eq_ignore_ascii_case(&s.target) {
+            s.result = Some(hmon);
+            return BOOL(0); // stop enumeration
+        }
+    }
+    BOOL(1)
+}
+
+struct FindExcluding { exclude: String, result: Option<HMONITOR> }
+
+unsafe extern "system" fn enum_find_excluding(
+    hmon: HMONITOR, _: HDC, _: *mut RECT, lparam: LPARAM,
+) -> BOOL {
+    let s = &mut *(lparam.0 as *mut FindExcluding);
+    let mut info = MonitorInfoEx {
+        base:   MONITORINFO { cbSize: std::mem::size_of::<MonitorInfoEx>() as u32,
+                              ..Default::default() },
+        device: [0u16; 32],
+    };
+    if GetMonitorInfoW(hmon, &mut info.base).as_bool() {
+        let name = String::from_utf16_lossy(&info.device);
+        if !name.trim_end_matches('\0').eq_ignore_ascii_case(&s.exclude) {
+            s.result = Some(hmon);
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct WgcCapturer {
+    /// D3D11 device used by both the WGC frame pool and the NVENC encoder.
+    /// Always created on the primary hardware GPU (adapter 0 / NVIDIA).
+    /// WGC handles any required cross-adapter copy internally so this device
+    /// can capture from any monitor regardless of which DXGI adapter it lives on.
+    pub device:   ID3D11Device,
+    pub width:    u32,
+    pub height:   u32,
+    /// Desktop-coordinate origin of the captured monitor — used by `input.rs`
+    /// to map Moonlight's client-relative mouse coordinates correctly.
+    pub origin_x: i32,
+    pub origin_y: i32,
+
+    wrt_device:  windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
+    item:        GraphicsCaptureItem,   // kept alive for session lifetime
+    frame_pool:  Direct3D11CaptureFramePool,
+    session:     GraphicsCaptureSession,
+    is_hdr:      bool,
+    /// Last successfully captured frame, copied to a stable `USAGE_DEFAULT`
+    /// texture so the WGC pool buffer can be freed immediately. Re-submitted
+    /// to the encoder when `try_get_frame` returns `None` (desktop unchanged)
+    /// to keep the stream alive on a static desktop. Cleared on `rebind`.
+    last_frame:  Option<ID3D11Texture2D>,
+}
+
+impl WgcCapturer {
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Starts a WGC capture session on the primary monitor, excluding the
+    /// virtual display device named `exclude` (same semantics as the old
+    /// `DesktopCapturer::new_excluding`). Always starts in SDR mode; the
+    /// caller upgrades to HDR via `rebind(..., is_hdr=true, ...)` once the
+    /// client negotiates HEVC Main10.
     pub fn new_excluding(exclude: Option<&str>) -> Result<Self> {
-        Self::for_output_excluding(None, exclude)
+        unsafe { let _ = RoInitialize(RO_INIT_MULTITHREADED); }
+
+        let hmonitor = match exclude {
+            Some(ex) => Self::first_monitor_excluding(ex)
+                            .unwrap_or_else(Self::primary_hmonitor),
+            None     => Self::primary_hmonitor(),
+        };
+
+        let device     = Self::create_d3d11_device()?;
+        let wrt_device = Self::wrap_d3d11_device(&device)?;
+        Self::open_session(device, wrt_device, hmonitor, false)
     }
 
-    /// Binds to the output whose GDI device name (`DXGI_OUTPUT_DESC::DeviceName`,
-    /// e.g. `\\.\DISPLAY28`) matches `gdi_device_name`. When `gdi_device_name`
-    /// is `None`, or no output matches, falls back to the first output of the
-    /// first adapter — today's default behavior, used at startup before any
-    /// virtual-display activation has happened.
-    pub fn for_output(gdi_device_name: Option<&str>) -> Result<Self> {
-        Self::for_output_excluding(gdi_device_name, None)
+    /// Re-targets capture to `gdi_device_name` (or the physical primary when
+    /// `None`) and recreates the frame pool with the correct pixel format for
+    /// `is_hdr`. Returns `Ok(true)` when the encoder must be recreated
+    /// (resolution changed) — same contract as the old DXGI `rebind`.
+    ///
+    /// `expected_size`: when `Some((w, h))`, polls `GetMonitorInfoW` for up to
+    /// 3 seconds until the VDD reports that size before opening the WGC session.
+    /// This closes the race where `SetDisplayConfig`/`force_resolution` is still
+    /// settling when `rebind` fires, causing WGC to latch the transitional size.
+    /// The HMONITOR is re-resolved each iteration because CCD topology changes
+    /// can reassign handle values.
+    pub fn rebind(
+        &mut self,
+        gdi_device_name: Option<&str>,
+        is_hdr: bool,
+        expected_size: Option<(u32, u32)>,
+    ) -> Result<bool> {
+        unsafe { let _ = RoInitialize(RO_INIT_MULTITHREADED); }
+
+        let mut hmonitor = gdi_device_name
+            .and_then(Self::hmonitor_from_device_name)
+            .unwrap_or_else(Self::primary_hmonitor);
+
+        if let Some((exp_w, exp_h)) = expected_size {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let (w, h) = unsafe {
+                    let mut info = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let _ = GetMonitorInfoW(hmonitor, &mut info);
+                    let r = info.rcMonitor;
+                    ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+                };
+                if w == exp_w && h == exp_h {
+                    println!("✅ VDD settled at {w}×{h} — proceeding with WGC bind");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    println!("⚠️  VDD still {w}×{h} after 3 s (expected {exp_w}×{exp_h}) — binding anyway");
+                    break;
+                }
+                println!("   rebind: VDD at {w}×{h}, waiting for {exp_w}×{exp_h}...");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Re-resolve — HMONITOR handles can be reassigned after CCD topology changes.
+                hmonitor = gdi_device_name
+                    .and_then(Self::hmonitor_from_device_name)
+                    .unwrap_or_else(Self::primary_hmonitor);
+            }
+        }
+
+        // Build the new session — keep the same D3D11 device throughout the
+        // process lifetime (always adapter 0 / primary GPU).
+        let new = Self::open_session(
+            self.device.clone(),
+            self.wrt_device.clone(),
+            hmonitor,
+            is_hdr,
+        )?;
+
+        let resized = new.width != self.width || new.height != self.height;
+
+        // Swap in the new session (old session/pool dropped → capture stops).
+        self.item       = new.item;
+        self.frame_pool = new.frame_pool;
+        self.session    = new.session;
+        self.width      = new.width;
+        self.height     = new.height;
+        self.origin_x   = new.origin_x;
+        self.origin_y   = new.origin_y;
+        self.is_hdr     = is_hdr;
+        self.last_frame = None;
+
+        Ok(resized)
     }
 
-    /// See [`new_excluding`](Self::new_excluding) for `exclude`'s meaning.
-    pub fn for_output_excluding(gdi_device_name: Option<&str>, exclude: Option<&str>) -> Result<Self> {
+    // ── Per-frame API ─────────────────────────────────────────────────────────
+
+    /// Polls the WGC frame pool for the next available frame.
+    ///
+    /// Returns `Some(texture)` where `texture` is a **stable D3D11_USAGE_DEFAULT
+    /// copy** owned by this capturer — NOT the ephemeral WGC pool surface.
+    ///
+    /// WGC pool surfaces use cross-process / keyed-mutex shared memory that DWM
+    /// reclaims the instant `Direct3D11CaptureFrame` drops, which can invalidate
+    /// the GPU mapping before `encode_frame` reads it. By copying to our own
+    /// texture and calling `Flush()` before releasing the frame, we guarantee the
+    /// encoder always reads from a stable, pool-independent buffer.
+    ///
+    /// Returns `None` when no new frame is available (desktop unchanged), or when
+    /// a resolution change is detected (pool recreated; updated `self.width`/
+    /// `self.height` tell the caller to rebind the encoder).
+    pub fn try_get_frame(&mut self) -> Option<ID3D11Texture2D> {
+        let frame = self.frame_pool.TryGetNextFrame().ok()?;
+
+        let size = frame.ContentSize().ok()?;
+        if size.Width as u32 != self.width || size.Height as u32 != self.height {
+            self.width  = size.Width  as u32;
+            self.height = size.Height as u32;
+            let _ = self.frame_pool.Recreate(
+                &self.wrt_device,
+                Self::pixel_format(self.is_hdr),
+                2,
+                SizeInt32 { Width: size.Width, Height: size.Height },
+            );
+            return None;
+        }
+
+        // Pool surface → ID3D11Texture2D (keyed-mutex / cross-process shared).
+        let surface = frame.Surface().ok()?;
+        let access  = surface.cast::<IDirect3DDxgiInterfaceAccess>().ok()?;
+        let pool_tex: ID3D11Texture2D = unsafe { access.GetInterface().ok()? };
+
+        // Copy pool surface → stable D3D11_USAGE_DEFAULT cache, then Flush so
+        // the CopyResource command is dispatched to the GPU before we drop the
+        // WGC frame below. The driver holds a GPU-side reference after Flush, so
+        // the copy completes correctly even after DWM reclaims the pool buffer.
+        self.cache_frame(&pool_tex).ok()?;
+        unsafe { if let Ok(ctx) = self.device.GetImmediateContext() { ctx.Flush(); } }
+
+        // frame and pool_tex drop here → WGC pool buffer returned to DWM.
+        // Return a clone of our stable cached copy — fully independent of pool.
+        self.last_frame.clone()
+    }
+
+    /// The last successfully captured frame — re-submitted to the encoder when
+    /// `try_get_frame` returns `None` (desktop unchanged) to keep the stream
+    /// alive on a static desktop.
+    pub fn cached_texture(&self) -> Option<&ID3D11Texture2D> {
+        self.last_frame.as_ref()
+    }
+
+    /// True once this WGC session has delivered at least one frame.
+    /// Resets to false on every `rebind` (new session, new device name, or
+    /// HDR format change). Used by the capture loop to gate:
+    ///   (a) cached-frame re-submission — never encode a stale texture from a
+    ///       previous session whose format/size may not match the current encoder.
+    ///   (b) the damage-generator jiggle — only jiggle while the VDD is still
+    ///       completely empty; stop once real frames are flowing.
+    pub fn has_frame(&self) -> bool {
+        self.last_frame.is_some()
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Creates the hardware D3D11 device (adapter 0 / primary GPU) that is
+    /// shared between the WGC frame pool and the NVENC encoder for the entire
+    /// process lifetime.
+    fn create_d3d11_device() -> Result<ID3D11Device> {
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let (adapter, output) = Self::find_output(&factory, gdi_device_name, exclude)?;
-            let adapter: IDXGIAdapter = adapter.cast()?;
-
             let mut device = None;
-            let mut context = None;
-
             D3D11CreateDevice(
-                Some(&adapter),
-                D3D_DRIVER_TYPE_UNKNOWN,
+                None,                           // let the system pick the primary GPU
+                D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&[D3D_FEATURE_LEVEL_11_1]),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
                 None,
-                Some(&mut context),
+                None,
             )?;
-
-            let device = device.expect("Failed to create D3D11 device");
-
-            let desc = output.GetDesc()?;
-            let rect = desc.DesktopCoordinates;
-            let width  = (rect.right - rect.left) as u32;
-            let height = (rect.bottom - rect.top) as u32;
-
-            let dxgi_device: IDXGIDevice = device.cast()?;
-            let output1: IDXGIOutput1 = output.cast()?;
-            let dupl = output1.DuplicateOutput(&dxgi_device)?;
-
-            println!("✅ DXGI Desktop Duplication READY! ({}x{})", width, height);
-
-            Ok(Self { dupl, device, width, height, origin_x: rect.left, origin_y: rect.top, last_frame: None })
+            Ok(device.unwrap())
         }
     }
 
-    /// Re-duplicates the output matching `gdi_device_name` (or the default
-    /// output, for `None`), replacing `dupl`/`device`/`width`/`height` in
-    /// place. Used both to follow a display-topology change (the new primary
-    /// becomes the capture target) and to recover from
-    /// `DXGI_ERROR_ACCESS_LOST`, which any `SetDisplayConfig`-class change can
-    /// trigger on an existing duplication interface even if the bound output
-    /// itself didn't move.
-    ///
-    /// `DuplicateOutput` (and a cross-adapter `D3D11CreateDevice`) can fail
-    /// for a frame or two right after a topology change settles, so this
-    /// retries briefly before giving up.
-    ///
-    /// `expected_size`, when `Some((width, height))`, additionally guards
-    /// against `GetDesc().DesktopCoordinates` itself being transiently wrong:
-    /// `set_primary_display`/`deactivate_other_paths`/`force_resolution`
-    /// (virtual_display.rs) can each cause Windows to momentarily report the
-    /// IDD's 800x600 failsafe mode before its `vdd_settings.xml` mode takes
-    /// effect (see `wait_for_display_resolution`'s doc comment — that covers
-    /// the GDI-level view of this transient; DXGI's view can lag
-    /// independently). Each retry attempt re-queries `GetDesc()` on the same
-    /// `IDXGIOutput` (which reflects live state), and if the reported size
-    /// doesn't match `expected_size`, sleeps and retries without spending a
-    /// `DuplicateOutput` call — except on the final attempt, which is
-    /// accepted regardless (with a warning if still mismatched) so `rebind`
-    /// never fails outright just because the expected size never arrived.
-    /// `None` skips this check entirely, preserving the prior behavior
-    /// (accept whatever `GetDesc()` reports on the first successful
-    /// `DuplicateOutput`).
-    ///
-    /// Returns `Ok(true)` if the caller must recreate its `Encoder`: either
-    /// the resolution changed, or the new output lives on a different
-    /// adapter and `device` was recreated (the old `Encoder`'s device pointer
-    /// would otherwise dangle).
-    pub fn rebind(&mut self, gdi_device_name: Option<&str>, expected_size: Option<(u32, u32)>) -> Result<bool> {
+    /// Wraps an `ID3D11Device` in a WinRT `IDirect3DDevice` (required by the
+    /// WGC `Direct3D11CaptureFramePool` APIs).
+    fn wrap_d3d11_device(
+        device: &ID3D11Device,
+    ) -> Result<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice> {
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let (adapter, output) = Self::find_output(&factory, gdi_device_name, None)?;
+            let dxgi: IDXGIDevice = device.cast()?;
+            let inspectable: IInspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?;
+            inspectable.cast()
+        }
+    }
 
-            let current_dxgi_device: IDXGIDevice = self.device.cast()?;
-            let current_adapter: IDXGIAdapter1 = current_dxgi_device.GetAdapter()?.cast()?;
-            let same_adapter = {
-                let a = current_adapter.GetDesc1()?.AdapterLuid;
-                let b = adapter.GetDesc1()?.AdapterLuid;
-                a.LowPart == b.LowPart && a.HighPart == b.HighPart
+    /// Builds a complete WGC pipeline (item → pool → session) for `hmonitor`.
+    fn open_session(
+        device:     ID3D11Device,
+        wrt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
+        hmonitor:   HMONITOR,
+        is_hdr:     bool,
+    ) -> Result<Self> {
+        // Monitor geometry — origin + dimensions
+        let (origin_x, origin_y, width, height) = unsafe {
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
             };
+            let _ = GetMonitorInfoW(hmonitor, &mut info);
+            let r = info.rcMonitor;
+            (r.left, r.top, (r.right - r.left) as u32, (r.bottom - r.top) as u32)
+        };
 
-            let mut last_err = None;
-            for attempt in 0..20 {
-                let desc = output.GetDesc()?;
-                let rect = desc.DesktopCoordinates;
-                let new_width  = (rect.right - rect.left) as u32;
-                let new_height = (rect.bottom - rect.top) as u32;
-
-                let last_attempt = attempt == 19;
-                let size_mismatch = expected_size.is_some_and(|(w, h)| w != new_width || h != new_height);
-                if size_mismatch && !last_attempt {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-
-                let result: Result<(IDXGIOutputDuplication, ID3D11Device)> = if same_adapter {
-                    let output1: IDXGIOutput1 = output.cast()?;
-                    output1.DuplicateOutput(&current_dxgi_device).map(|d| (d, self.device.clone()))
-                } else {
-                    let adapter_base: IDXGIAdapter = adapter.cast()?;
-                    let mut device = None;
-                    let mut context = None;
-                    D3D11CreateDevice(
-                        Some(&adapter_base),
-                        D3D_DRIVER_TYPE_UNKNOWN,
-                        HMODULE::default(),
-                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                        Some(&[D3D_FEATURE_LEVEL_11_1]),
-                        D3D11_SDK_VERSION,
-                        Some(&mut device),
-                        None,
-                        Some(&mut context),
-                    ).and_then(|()| {
-                        let device = device.expect("Failed to create D3D11 device");
-                        let dxgi_device: IDXGIDevice = device.cast()?;
-                        let output1: IDXGIOutput1 = output.cast()?;
-                        output1.DuplicateOutput(&dxgi_device).map(|d| (d, device))
-                    })
-                };
-
-                match result {
-                    Ok((dupl, device)) => {
-                        if size_mismatch {
-                            if let Some((w, h)) = expected_size {
-                                println!("⚠️  DXGI still reports {new_width}x{new_height} after 20 attempts (wanted {w}x{h}) — binding anyway");
-                            }
-                        }
-
-                        let resized = new_width != self.width || new_height != self.height || !same_adapter;
-                        self.dupl   = dupl;
-                        self.device = device;
-                        self.width  = new_width;
-                        self.height = new_height;
-                        self.origin_x = rect.left;
-                        self.origin_y = rect.top;
-                        self.last_frame = None;
-                        println!("✅ DXGI Desktop Duplication re-bound ({}x{})", new_width, new_height);
-                        return Ok(resized);
-                    }
-                    Err(e) => {
+        // Capture item from HMONITOR via the Win32 interop interface.
+        // During a CCD topology transition the HMONITOR can be momentarily
+        // invalid, causing CreateForMonitor to return E_INVALIDARG (0x80070057).
+        // Retry up to 10 × 100 ms so the VDD has time to fully settle.
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        const E_INVALIDARG: windows::core::HRESULT = windows::core::HRESULT(0x80070057_u32 as i32);
+        let item: GraphicsCaptureItem = {
+            let mut last_err: Option<windows::core::Error> = None;
+            let mut found: Option<GraphicsCaptureItem> = None;
+            for attempt in 0..10u32 {
+                match unsafe { interop.CreateForMonitor(hmonitor) } {
+                    Ok(i) => { found = Some(i); break; }
+                    Err(e) if e.code() == E_INVALIDARG => {
+                        println!("⚠️  CreateForMonitor E_INVALIDARG (attempt {}/10) — VDD still transitioning, retrying...", attempt + 1);
                         last_err = Some(e);
-                        std::thread::sleep(Duration::from_millis(50));
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
+                    Err(e) => return Err(e),
                 }
             }
-            Err(last_err.unwrap())
-        }
-    }
-
-    /// Walks every output of every adapter looking for one whose
-    /// `DXGI_OUTPUT_DESC::DeviceName` matches `gdi_device_name`. Always also
-    /// records the first non-`exclude` output it sees as a fallback, returned
-    /// when `gdi_device_name` is `None` or doesn't match anything (e.g. the
-    /// virtual display hasn't appeared in DXGI's enumeration yet).
-    fn find_output(factory: &IDXGIFactory1, gdi_device_name: Option<&str>, exclude: Option<&str>) -> Result<(IDXGIAdapter1, IDXGIOutput)> {
-        let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput)> = None;
-
-        let mut i = 0;
-        while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
-            let mut j = 0;
-            while let Ok(output) = unsafe { adapter.EnumOutputs(j) } {
-                let desc = unsafe { output.GetDesc()? };
-                let name = String::from_utf16_lossy(&desc.DeviceName);
-                let name = name.trim_end_matches('\0');
-
-                if let Some(target) = gdi_device_name {
-                    if name == target {
-                        return Ok((adapter, output));
-                    }
-                }
-                if fallback.is_none() && !exclude.is_some_and(|ex| ex.eq_ignore_ascii_case(name)) {
-                    fallback = Some((adapter.clone(), output.clone()));
-                }
-                j += 1;
+            match found {
+                Some(i) => i,
+                None => return Err(last_err.unwrap()),
             }
-            i += 1;
+        };
+
+        // Frame pool — same D3D11 device as NVENC; WGC handles cross-adapter copy.
+        let size = SizeInt32 { Width: width as i32, Height: height as i32 };
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &wrt_device,
+            Self::pixel_format(is_hdr),
+            2,    // two-frame pool: one being encoded, one being filled
+            size,
+        )?;
+
+        let session = frame_pool.CreateCaptureSession(&item)?;
+        // WGC composites the system cursor directly into the captured frame in
+        // the display's native colour space (FP16 in HDR mode, BGRA8 in SDR).
+        // The shim cursor-compositing pipeline is left idle (no update_cursor_*
+        // calls from the WGC loop), avoiding double compositing.
+        session.SetIsCursorCaptureEnabled(true)?;
+        session.StartCapture()?;
+
+        println!("✅ WGC capture session started ({}x{} {})",
+            width, height, if is_hdr { "FP16/HDR" } else { "BGRA8/SDR" });
+
+        Ok(Self {
+            device, wrt_device, item, frame_pool, session,
+            width, height, origin_x, origin_y,
+            is_hdr, last_frame: None,
+        })
+    }
+
+    fn pixel_format(is_hdr: bool) -> DirectXPixelFormat {
+        if is_hdr {
+            // WGC only supports two frame-pool formats: BGRA8 (SDR) and FP16 (HDR).
+            // R10G10B10A2 is NOT a valid WGC pool format — requesting it causes
+            // CreateFreeThreaded to fail with E_INVALIDARG immediately.
+            // WGC delivers the FP16 linear-scRGB surface that DWM composites to,
+            // tagged DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709. The shim's D3D11
+            // Video Processor converts FP16 scRGB → P010 BT.2020 PQ for NVENC.
+            DirectXPixelFormat::R16G16B16A16Float
+        } else {
+            DirectXPixelFormat::B8G8R8A8UIntNormalized
         }
-
-        match fallback {
-            Some(fb) => {
-                if let Some(target) = gdi_device_name {
-                    println!("⚠️  No DXGI output matches GDI device {target} — falling back to the first available output");
-                }
-                Ok(fb)
-            }
-            None => Err(E_FAIL.into()),
-        }
     }
 
-    /// `timeout_ms` should be roughly the target frame interval (e.g. ~16ms
-    /// at 60fps), not a generous "wait forever" value. A virtual display
-    /// (IDD) with nothing painting to it can sit in WAIT_TIMEOUT forever —
-    /// at a 1000ms timeout that caps the whole capture loop (and therefore
-    /// the duplicate-frame replay in lib.rs) to ~1fps, far below what the
-    /// client negotiated, which Moonlight reports as a poor network
-    /// connection and disconnects over.
-    pub fn acquire_frame(&self, timeout_ms: u32) -> Result<(IDXGIResource, DXGI_OUTDUPL_FRAME_INFO)> {
-        unsafe {
-            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource = None;
-            self.dupl.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)?;
-            Ok((resource.expect("No resource"), frame_info))
-        }
-    }
-
-    pub fn release_frame(&self) -> Result<()> {
-        unsafe { self.dupl.ReleaseFrame()?; }
-        Ok(())
-    }
-
-    pub fn get_texture(&self, resource: &IDXGIResource) -> Result<ID3D11Texture2D> {
-        resource.cast()
-    }
-
-    /// Copies `texture` into the persistent `last_frame` cache (creating it
-    /// on first use, matching `texture`'s description minus the
-    /// shared/CPU-access flags the duplication surface carries). Called
-    /// after every successfully encoded frame so [`cached_texture`] can
-    /// stand in for the next one if `AcquireNextFrame` times out.
-    pub fn cache_frame(&mut self, texture: &ID3D11Texture2D) -> Result<()> {
+    /// Copies `texture` to a stable `D3D11_USAGE_DEFAULT` local texture so the
+    /// WGC pool buffer can be freed (by dropping `Direct3D11CaptureFrame`)
+    /// independently of when the encoder consumes the data.
+    fn cache_frame(&mut self, texture: &ID3D11Texture2D) -> Result<()> {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             texture.GetDesc(&mut desc);
 
             if self.last_frame.is_none() {
-                desc.Usage          = D3D11_USAGE_DEFAULT;
-                desc.BindFlags      = D3D11_BIND_SHADER_RESOURCE.0 as u32;
-                desc.CPUAccessFlags = 0;
-                desc.MiscFlags      = 0;
-
+                let cached_desc = D3D11_TEXTURE2D_DESC {
+                    Usage:          D3D11_USAGE_DEFAULT,
+                    BindFlags:      D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags:      0,
+                    ..desc
+                };
                 let mut cache = None;
-                self.device.CreateTexture2D(&desc, None, Some(&mut cache))?;
+                self.device.CreateTexture2D(&cached_desc, None, Some(&mut cache))?;
                 self.last_frame = cache;
             }
 
-            let context = self.device.GetImmediateContext()?;
-            context.CopyResource(self.last_frame.as_ref().unwrap(), texture);
+            let ctx = self.device.GetImmediateContext()?;
+            ctx.CopyResource(self.last_frame.as_ref().unwrap(), texture);
         }
         Ok(())
     }
 
-    /// The last frame cached via [`cache_frame`], if any — re-submitted to
-    /// the encoder on `DXGI_ERROR_WAIT_TIMEOUT` to keep the stream alive
-    /// while the desktop is static.
-    pub fn cached_texture(&self) -> Option<&ID3D11Texture2D> {
-        self.last_frame.as_ref()
+    // ── HMONITOR resolution helpers ───────────────────────────────────────────
+
+    fn primary_hmonitor() -> HMONITOR {
+        unsafe {
+            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_FROM_FLAGS(1)) // MONITOR_DEFAULTTOPRIMARY
+        }
     }
 
-    /// Fetches the new cursor shape after `acquire_frame()` reports
-    /// `frame_info.PointerShapeBufferSize > 0`. Returns the raw shape bytes
-    /// (MONOCHROME AND/XOR masks, or a BGRA bitmap for COLOR/MASKED_COLOR)
-    /// plus the accompanying `DXGI_OUTDUPL_POINTER_SHAPE_INFO`.
-    pub fn get_pointer_shape(&self, buffer_size: u32) -> Result<(Vec<u8>, DXGI_OUTDUPL_POINTER_SHAPE_INFO)> {
+    fn hmonitor_from_device_name(target: &str) -> Option<HMONITOR> {
+        let mut s = FindByName { target: target.to_string(), result: None };
         unsafe {
-            let mut buffer = vec![0u8; buffer_size as usize];
-            let mut required_size = 0u32;
-            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-            self.dupl.GetFramePointerShape(
-                buffer_size,
-                buffer.as_mut_ptr() as *mut _,
-                &mut required_size,
-                &mut shape_info,
-            )?;
-            Ok((buffer, shape_info))
+            let _ = EnumDisplayMonitors(
+                HDC(std::ptr::null_mut()), None,
+                Some(enum_find_by_name),
+                LPARAM(&mut s as *mut _ as isize),
+            );
         }
+        s.result
+    }
+
+    fn first_monitor_excluding(exclude: &str) -> Option<HMONITOR> {
+        let mut s = FindExcluding { exclude: exclude.to_string(), result: None };
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                HDC(std::ptr::null_mut()), None,
+                Some(enum_find_excluding),
+                LPARAM(&mut s as *mut _ as isize),
+            );
+        }
+        s.result
     }
 }

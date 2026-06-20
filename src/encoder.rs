@@ -105,6 +105,19 @@ impl Codec {
             _               => Codec::H264,
         }
     }
+
+    /// Derive codec from the `/launch` `videoFormat` bitmask that Limelight
+    /// computes from (client `supportedVideoFormats` ∩ server
+    /// `ServerCodecModeSupport`).
+    ///
+    /// Bit layout (moonlight-common-c Limelight.h):
+    ///   0x0001 = H264, 0x0002 = HEVC Main, 0x0102 = HEVC Main10,
+    ///   0x1000 = AV1 Main8, 0x1100 = AV1 Main10.
+    pub fn from_video_format(vf: u32) -> Self {
+        if vf & 0x1000 != 0 { Codec::Av1 }
+        else if vf & 0x0002 != 0 { Codec::Hevc }
+        else { Codec::H264 }
+    }
 }
 
 pub struct EncoderConfig {

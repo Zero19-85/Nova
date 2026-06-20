@@ -60,6 +60,23 @@ pub struct ClientInfo {
     pub video_format: u32,
     /// Client explicitly requested HDR via /launch `hdrMode=1`.
     pub hdr_requested: bool,
+    /// `x-nv-vqos[0].bitStreamFormat` from the RTSP ANNOUNCE SDP — the codec
+    /// the client will actually put on the wire: 0=H264, 1=HEVC, 2=AV1.
+    /// Arrives after `/launch videoFormat` (which is the primary negotiation
+    /// source); used as a belt-and-suspenders cross-check.
+    pub bit_stream_format: u32,
+    /// `x-nv-video[0].dynamicRangeMode` from the RTSP ANNOUNCE SDP.
+    /// 0 = SDR, 1 = HDR10. This is the authoritative source for whether
+    /// the client actually negotiated HDR — more reliable than the /launch
+    /// hdrMode flag, which reflects what the user requested but not what
+    /// the codec intersection actually produced. HDR encoding must only
+    /// be activated when this field is 1.
+    pub dynamic_range_mode: u32,
+    /// Set by the /cancel HTTP handler; cleared by the capture loop after the
+    /// full VDD teardown completes. Distinguishes an intentional "Quit App"
+    /// (teardown VDD, restore host topology) from a natural network disconnect
+    /// (suspend: keep VDD alive so /resume can reconnect without flicker).
+    pub cancelled: bool,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".
@@ -114,7 +131,13 @@ fn resp_options(cseq: u32) -> Vec<u8> {
 
 // Sunshine's cmd_describe: CSeq + a payload of bare "a=" lines (LF-terminated,
 // not full SDP — moonlight-common-c already knows the fixed GameStream ports).
-fn resp_describe(cseq: u32) -> Vec<u8> {
+//
+// `is_hdr`: when true, includes `a=x-nv-video[0].dynamicRangeMode:1` so the
+// client allocates a 10-bit HDR (P010) decoder surface. Without this line the
+// client defaults to SDR (NV12), receives our P010 bitstream, and the chroma
+// planes corrupt immediately (green tint). This line must arrive in the DESCRIBE
+// response (before the client's ANNOUNCE) so the surface is allocated correctly.
+fn resp_describe(cseq: u32, is_hdr: bool) -> Vec<u8> {
     let mut sdp = Vec::new();
     sdp.extend_from_slice(b"a=x-ss-general.featureFlags:0\n");
     // SS_ENC_AUDIO=0x1, SS_ENC_CONTROL_V2=0x4 (Sunshine rtsp.cpp:768-769).
@@ -124,8 +147,23 @@ fn resp_describe(cseq: u32) -> Vec<u8> {
     // every control message then fails AEAD verification.
     sdp.extend_from_slice(b"a=x-ss-general.encryptionSupported:5\n");
     sdp.extend_from_slice(b"a=x-ss-general.encryptionRequested:4\n");
+    // HEVC capability signal that moonlight-common-c actually reads.
+    // Sunshine rtsp.cpp:792-794: `if (active_hevc_mode != 1) ss << "sprop-parameter-sets=AAAAAU"`.
+    // This bare line (no "a=" prefix) is what triggers clientSupportHevc:1 and
+    // bitStreamFormat:1 (HEVC) in the client's ANNOUNCE. The "a=x-nv-video[0].clientSupportHevc:1"
+    // attribute we were sending previously is NOT what Sunshine sends and is ignored by corever=1 clients.
+    sdp.extend_from_slice(b"sprop-parameter-sets=AAAAAU\n");
+    // AV1 capability (Sunshine rtsp.cpp:796-798: `if (active_av1_mode != 1) ss << "a=rtpmap:98 AV1/90000"`).
+    sdp.extend_from_slice(b"a=rtpmap:98 AV1/90000\n");
     // stereo: channelCount=2, streams=1, coupledStreams=1, mapping=[0,1]
     sdp.extend_from_slice(b"a=fmtp:97 surround-params=21101\n");
+    if is_hdr {
+        // Declare HDR10 mode to the client. Moonlight reads this during DESCRIBE
+        // to decide which decoder surface type to allocate (NV12 for SDR, P010
+        // for HDR). If absent, the client defaults to SDR and immediately corrupts
+        // a P010 stream because the chroma planes are sized for 8-bit NV12.
+        sdp.extend_from_slice(b"a=x-nv-video[0].dynamicRangeMode:1\n");
+    }
 
     let mut r = Vec::with_capacity(128 + sdp.len());
     r.extend_from_slice(b"RTSP/1.0 200 OK\r\n");
@@ -263,28 +301,47 @@ fn handle_message(
         "ANNOUNCE" => {
             // The ANNOUNCE SDP carries the client's negotiated stream params.
             let sdp = String::from_utf8_lossy(&body);
-            let packet_size = parse_sdp_u32(&sdp, "x-nv-video[0].packetSize");
-            let fps         = parse_sdp_u32(&sdp, "x-nv-video[0].maxFPS");
-            let width       = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportWd");
-            let height      = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportHt");
-            let min_fec     = parse_sdp_u32(&sdp, "x-nv-vqos[0].fec.minRequiredFecPackets");
-            let bitrate     = parse_sdp_u32(&sdp, "x-nv-vqos[0].bw.maximumBitrateKbps");
-            let feat_flags  = parse_sdp_u32(&sdp, "x-nv-general.featureFlags").unwrap_or(0);
-            let enc_enabled = parse_sdp_u32(&sdp, "x-ss-general.encryptionEnabled").unwrap_or(0);
-            let pkt_dur     = parse_sdp_u32(&sdp, "x-nv-aqos.packetDuration");
+            let packet_size      = parse_sdp_u32(&sdp, "x-nv-video[0].packetSize");
+            let fps              = parse_sdp_u32(&sdp, "x-nv-video[0].maxFPS");
+            let width            = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportWd");
+            let height           = parse_sdp_u32(&sdp, "x-nv-video[0].clientViewportHt");
+            let min_fec          = parse_sdp_u32(&sdp, "x-nv-vqos[0].fec.minRequiredFecPackets");
+            let bitrate          = parse_sdp_u32(&sdp, "x-nv-vqos[0].bw.maximumBitrateKbps");
+            let feat_flags       = parse_sdp_u32(&sdp, "x-nv-general.featureFlags").unwrap_or(0);
+            let enc_enabled      = parse_sdp_u32(&sdp, "x-ss-general.encryptionEnabled").unwrap_or(0);
+            let pkt_dur          = parse_sdp_u32(&sdp, "x-nv-aqos.packetDuration");
+            // bitStreamFormat: 0=H264, 1=HEVC, 2=AV1 — the codec the client
+            // will actually put on the wire. Lives under the vqos[0] namespace
+            // in all observed Xbox/Android Moonlight ANNOUNCE SDPs.
+            let bit_stream_fmt   = parse_sdp_u32(&sdp, "x-nv-vqos[0].bitStreamFormat");
+            // dynamicRangeMode: 0=SDR, 1=HDR10. Authoritative source for
+            // whether HDR was actually negotiated (vs hdrMode in /launch which
+            // is a user request). Only 1 when server advertised SCM_HEVC_MAIN10
+            // (bit 0x100 in ServerCodecModeSupport) AND client supports HDR.
+            let dynamic_range    = parse_sdp_u32(&sdp, "x-nv-video[0].dynamicRangeMode");
+            // clientSupportHevc: 1 if the client supports and negotiated HEVC.
+            let client_hevc      = parse_sdp_u32(&sdp, "x-nv-clientSupportHevc").unwrap_or(0);
 
             let mut guard = client_info.lock().unwrap();
             let mut info  = guard.take().unwrap_or_default();
-            if let Some(v) = packet_size { info.packet_size = v; }
-            if let Some(v) = fps         { info.fps = v; }
-            if let Some(v) = width       { info.width = v; }
-            if let Some(v) = height      { info.height = v; }
-            if let Some(v) = min_fec     { info.min_fec_packets = v; }
-            if let Some(v) = bitrate     { info.bitrate_kbps = v; }
-            if let Some(v) = pkt_dur     { info.audio_packet_duration = v; }
+            if let Some(v) = packet_size  { info.packet_size = v; }
+            if let Some(v) = fps          { info.fps = v; }
+            if let Some(v) = width        { info.width = v; }
+            if let Some(v) = height       { info.height = v; }
+            if let Some(v) = min_fec      { info.min_fec_packets = v; }
+            if let Some(v) = bitrate      { info.bitrate_kbps = v; }
+            if let Some(v) = pkt_dur      { info.audio_packet_duration = v; }
+            if let Some(v) = bit_stream_fmt { info.bit_stream_format = v; }
+            if let Some(v) = dynamic_range  { info.dynamic_range_mode = v; }
             // Sunshine rtsp.cpp:982-987 — legacy nv flag 0x20 or Sunshine
             // extension bit 0x1 both mean "encrypt audio".
             info.audio_encryption = (feat_flags & 0x20) != 0 || (enc_enabled & 0x1) != 0;
+            let bsf_name = match info.bit_stream_format {
+                1 => "HEVC", 2 => "AV1", _ => "H264",
+            };
+            let drm_name = if info.dynamic_range_mode == 1 { "HDR10" } else { "SDR" };
+            println!("   ↳ ANNOUNCE codec: bitStreamFormat={} ({}) dynamicRangeMode={} ({}) clientSupportHevc={}",
+                info.bit_stream_format, bsf_name, info.dynamic_range_mode, drm_name, client_hevc);
             println!("   ↳ ANNOUNCE audio: encryption={} packetDuration={:?}ms",
                 info.audio_encryption, pkt_dur);
             println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?} bitrateKbps={:?}",
@@ -303,7 +360,15 @@ fn handle_message(
     // ── Build raw-byte response ───────────────────────────────────────────
     let response = match method.as_str() {
         "OPTIONS"  => resp_options(cseq),
-        "DESCRIBE" => resp_describe(cseq),
+        "DESCRIBE" => {
+            // /launch sets hdr_requested before RTSP begins, so we can already
+            // tell the client which decoder surface type to allocate.
+            let is_hdr = client_info.lock().unwrap()
+                .as_ref()
+                .map(|info| info.hdr_requested)
+                .unwrap_or(false);
+            resp_describe(cseq, is_hdr)
+        }
         "SETUP" => {
             let (server_port, ss_header, ss_value): (u16, &str, String) =
                 if request.contains("streamid=audio") {

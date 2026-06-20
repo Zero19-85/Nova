@@ -22,15 +22,16 @@ pub const APP_ID_XBOX: u32 = 3;
 pub const APP_ID_RETROARCH: u32 = 4;
 pub const APP_ID_VIRTUAL_DESKTOP: u32 = 5;
 
-/// Does `app_id` correspond to the "Virtual Desktop" app — the only app
-/// allowed to drive [`crate::virtual_display::VirtualDisplay`]?
+/// Universal VDD policy: every app routes through the Virtual Display Driver.
 ///
-/// App 1 ("Desktop") streams the host's existing physical display(s)
-/// untouched (mirror mode) and must never enable, configure, or reposition
-/// the virtual display driver. `lib.rs`'s connect handler gates every
-/// `activate_for_stream`/`deactivate_after_stream` call on this check.
-pub fn uses_virtual_display(app_id: u32) -> bool {
-    app_id == APP_ID_VIRTUAL_DESKTOP
+/// The VDD is the sole capture source regardless of which app the client
+/// launches. Returning `true` here causes `lib.rs`'s connect handler to call
+/// `activate_for_stream` (snapping the VDD to the client-negotiated resolution)
+/// and `rebind_capture_and_encoder` (pointing DXGI + NVENC at the VDD output)
+/// for every session — so SPS, capture rect, and NVENC surface all agree on
+/// exactly the resolution the client requested.
+pub fn uses_virtual_display(_app_id: u32) -> bool {
+    true
 }
 
 const BOX_ART_DESKTOP: &[u8] = include_bytes!("../assets/desktop.jpg");

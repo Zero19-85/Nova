@@ -44,6 +44,10 @@ DXGI_FORMAT GetD3D11Format(NV_ENC_BUFFER_FORMAT eBufferFormat)
         return DXGI_FORMAT_NV12;
     case NV_ENC_BUFFER_FORMAT_ARGB:
         return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case NV_ENC_BUFFER_FORMAT_YUV420_10BIT:
+        return DXGI_FORMAT_P010;  // HEVC Main10 / HDR10 10-bit 4:2:0
+    case NV_ENC_BUFFER_FORMAT_ABGR10:
+        return DXGI_FORMAT_R10G10B10A2_UNORM; // 10-bit packed: A[2]:B[10]:G[10]:R[10]
     default:
         return DXGI_FORMAT_UNKNOWN;
     }

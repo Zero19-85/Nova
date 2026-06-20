@@ -493,16 +493,24 @@ async fn handle_request(
                     r#"<mac>00:11:22:33:44:55</mac>"#,
                     r#"<LocalIP>{}</LocalIP>"#,
                     r#"<ExternalIP>{}</ExternalIP>"#,
-                    // Advertise only the codec the encoder is actually running.
-                    // Clients pick the highest-quality format from (client caps ∩ server caps);
-                    // advertising HEVC here when the encoder is H264 causes a codec mismatch
-                    // and a black screen on strict clients such as Xbox Moonlight UWP.
+                    // H264 (1) + HEVC Main8 (2) + HEVC Main10 (256) = 259.
+                    // Bit 256 = SCM_HEVC_MAIN10; without it moonlight-common-c
+                    // never sets dynamicRangeMode:1 in ANNOUNCE, blocking HDR10.
+                    // The encoder uses dynamicRangeMode from ANNOUNCE (not /launch
+                    // hdrMode) as the authoritative HDR gate to avoid encoding HDR
+                    // when the display is still in SDR mode.
                     r#"<ServerCodecModeSupport>{}</ServerCodecModeSupport>"#,
                     r#"<PairStatus>{}</PairStatus>"#,
                     r#"<currentgame>{}</currentgame>"#,
                     r#"<state>{}</state>"#,
                     r#"<MaxLumaPixelsH264>1869449984</MaxLumaPixelsH264>"#,
                     r#"<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"#,
+                    // Global server-level HDR/HEVC readiness flags. Some
+                    // moonlight-common-c versions gate HEVC negotiation on
+                    // IsHdrSupported rather than (or in addition to) the
+                    // ServerCodecModeSupport bitmask. Setting both is required
+                    // for older compiled clients such as Xbox Moonlight 1.18.0.
+                    r#"<IsHdrSupported>1</IsHdrSupported>"#,
                     r#"<SupportedDisplayModeList>"#,
                     r#"<DisplayMode><Width>1280</Width><Height>720</Height><RefreshRate>30</RefreshRate></DisplayMode>"#,
                     r#"<DisplayMode><Width>1280</Width><Height>720</Height><RefreshRate>60</RefreshRate></DisplayMode>"#,
@@ -669,10 +677,12 @@ async fn handle_request(
                 // alphabetical sort of the app grid lands in this fixed order
                 // (the GameStream /applist XML order itself is not honored
                 // by Moonlight's UI).
-                r#"<App><AppTitle>1. Desktop</AppTitle><ID>1</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
-                r#"<App><AppTitle>2. Steam</AppTitle><ID>2</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
-                r#"<App><AppTitle>3. Xbox App</AppTitle><ID>3</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
-                r#"<App><AppTitle>4. RetroArch</AppTitle><ID>4</ID><IsHdrSupported>0</IsHdrSupported></App>"#,
+                // All apps route through the VDD (universal capture source),
+                // so all apps can do HDR when the client negotiates HEVC Main10.
+                r#"<App><AppTitle>1. Desktop</AppTitle><ID>1</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>2. Steam</AppTitle><ID>2</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>3. Xbox App</AppTitle><ID>3</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
+                r#"<App><AppTitle>4. RetroArch</AppTitle><ID>4</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
                 r#"<App><AppTitle>5. Virtual Desktop</AppTitle><ID>5</ID><IsHdrSupported>1</IsHdrSupported></App>"#,
                 r#"</root>"#,
             );
@@ -696,11 +706,15 @@ async fn handle_request(
         }
 
         "/cancel" => {
-            println!("🛑 Moonlight requested /cancel — stopping stream");
+            println!("🛑 Moonlight requested /cancel — quitting app, full VDD teardown pending");
             if let Ok(mut guard) = client_info.lock() {
                 if let Some(ref mut info) = *guard {
                     info.streaming_active = false;
                     info.app_id = 0;
+                    info.activated = false;
+                    // Signal the capture loop to do a full VDD teardown rather
+                    // than the normal "suspend and wait for /resume" path.
+                    info.cancelled = true;
                 }
             }
             let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><cancel>1</cancel></root>"#;
@@ -758,14 +772,13 @@ async fn handle_request(
                 path, app_id_str, width, height, fps, rikeyid, host_audio);
             println!("   ↳ videoFormat={:#x} ({})  hdrMode={}  ServerCodecModeSupport={}",
                 video_format, vf_name, hdr_requested as u8, codec_mode_support);
-            // Warn immediately if there's a mismatch so the user knows before trying to stream.
-            let encoder_mode_bit = codec_mode_support;
-            let client_base_codec = video_format & 0x00FF; // strip 10-bit flag for codec ID
-            if video_format != 0 && client_base_codec != encoder_mode_bit {
-                println!("⚠️  CODEC MISMATCH: client selected {} (videoFormat={:#x}) but \
-                    encoder is running codec with ServerCodecModeSupport={}. \
-                    Restart nova-server with the matching --codec flag.",
-                    vf_name, video_format, encoder_mode_bit);
+            // Codec is selected dynamically: the encoder will be (re)initialized
+            // at session start using this videoFormat via Codec::from_video_format().
+            // No mismatch is possible — the server advertises all codecs and the
+            // client picks from that intersection.
+            if video_format == 0 {
+                println!("⚠️  /launch videoFormat=0 — client did not send a codec selection. \
+                    Encoder will stay at its current codec until ANNOUNCE is parsed.");
             }
 
             // Store session info — RTSP DESCRIBE reads width/height/fps from here.
@@ -782,10 +795,15 @@ async fn handle_request(
                 info.host_audio    = host_audio;
                 info.video_format  = video_format;
                 info.hdr_requested = hdr_requested;
-                // Trigger the capture loop's pre-activation pass (lib.rs) for
-                // this new launch/resume — runs the VDD/CCD switch during the
-                // handshake gap instead of after the control stream connects.
-                info.activated  = false;
+                // /launch starts a fresh session — reset activation state so the
+                // capture loop's pre-activation pass runs the VDD/CCD switch
+                // during the handshake gap. /resume reattaches to an already-
+                // active VDD: leaving activated=true skips re-activation and
+                // avoids a topology flicker on reconnect.
+                if path == "/launch" {
+                    info.activated = false;
+                    info.cancelled = false; // clear any leftover cancel from the previous session
+                }
                 *guard = Some(info);
             }
 

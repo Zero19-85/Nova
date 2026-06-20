@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::Result;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_MOVE,
+};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::signal;
 
@@ -44,32 +47,20 @@ fn get_local_ip() -> String {
     socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// Re-binds `capturer` to `target` (a GDI device name, or `None` for the
-/// default/physical output), recreating `enc` if the resolution or adapter
-/// changed. Used both for `DXGI_ERROR_ACCESS_LOST`/`INVALIDCALL` recovery and
-/// for following the capture target onto/off of the virtual display as
-/// streams start and stop.
+/// Re-targets the WGC capturer to `target` (GDI device name, or `None` for
+/// the physical primary), recreating the encoder when the resolution changes.
+/// `is_hdr` sets the frame-pool pixel format: `R16G16B16A16Float` for HDR,
+/// `B8G8R8A8UIntNormalized` for SDR.
 ///
-/// `expected_size`, when `Some((width, height))`, is forwarded to
-/// `capturer.rebind` to guard against `GetDesc()` transiently reporting the
-/// virtual display's 800x600 failsafe mode right after a CCD topology change
-/// — see `capture::DesktopCapturer::rebind`'s doc comment.
-///
-/// A failed `rebind` is treated as transient (DXGI needs a moment to settle
-/// after a topology change) and retried on the next call. A failed `Encoder`
-/// recreation is not recoverable — the caller should `break` the capture loop.
-///
-/// Synchronous (not `async`) — `capturer.rebind` and `VirtualDisplay`'s CCD
-/// calls already block via `std::thread::sleep`, and this is called from
-/// inside the `client_info` mutex on connect/disconnect, where holding a
-/// `std::sync::MutexGuard` across an `.await` would be unsound.
+/// Synchronous — WGC session creation and CCD calls block briefly; this is
+/// called while holding the `client_info` mutex where `.await` is unsound.
 fn rebind_capture_and_encoder(
-    capturer: &mut capture::DesktopCapturer,
+    capturer: &mut capture::WgcCapturer,
     enc: &mut Encoder,
     target: Option<&str>,
     expected_size: Option<(u32, u32)>,
 ) -> std::result::Result<(), String> {
-    match capturer.rebind(target, expected_size) {
+    match capturer.rebind(target, enc.config.is_hdr, expected_size) {
         Ok(needs_new_encoder) => {
             if needs_new_encoder {
                 println!("🔁 Capture resolution/device changed — recreating NVENC encoder ({}x{})", capturer.width, capturer.height);
@@ -105,9 +96,9 @@ fn rebind_capture_and_encoder(
             Ok(())
         }
         Err(e) => {
-            eprintln!("⚠️  Capture rebind failed: {:?} — retrying", e);
-            std::thread::sleep(Duration::from_millis(100));
-            Ok(())
+            let msg = format!("Capture rebind failed: {:?}", e);
+            eprintln!("❌ {msg}");
+            Err(msg)
         }
     }
 }
@@ -127,12 +118,16 @@ pub async fn run() -> Result<()> {
     let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
 
-    // Compute ServerCodecModeSupport from the CLI codec so that clients always
-    // select the codec the encoder is actually running.  Advertising HEVC when
-    // the encoder is H264 causes clients to pick HEVC and send the wrong
-    // decoder format — result: black screen on strict clients (Xbox UWP).
-    let codec_mode_support = encoder::Codec::from_str(&args.codec).mode_bit();
-    println!("🎥 Encoder codec: {} (ServerCodecModeSupport={})", args.codec, codec_mode_support);
+    // H264 (1) + HEVC/Main8 (2) + HEVC/Main10 (256) = 259.
+    // Bit 0x100 (256) = SCM_HEVC_MAIN10: signals to moonlight-common-c that
+    // the server can deliver 10-bit HDR10. Without this bit, clients set
+    // dynamicRangeMode:0 in ANNOUNCE even when the user enabled HDR.
+    // Old-protocol clients (Xbox Moonlight 1.18.0, corever=1) read
+    // sprop-parameter-sets=AAAAAU in DESCRIBE for HEVC capability and the
+    // fps cap handles graceful degradation for H264 fallback scenarios.
+    let codec_mode_support: u32 = 259;
+    let startup_codec = encoder::Codec::from_str(&args.codec);
+    println!("🎥 ServerCodecModeSupport={codec_mode_support} (H264+HEVC); startup encoder: {}", startup_codec.as_str());
 
     let startup_frame_interval = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
@@ -156,7 +151,7 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let mut capturer = capture::DesktopCapturer::new_excluding(virtual_device_name.as_deref()).expect("Failed to start DXGI capture");
+    let mut capturer = capture::WgcCapturer::new_excluding(virtual_device_name.as_deref()).expect("Failed to start WGC capture");
     input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
 
     // The DXGI duplication captures at the monitor's native resolution, which
@@ -177,8 +172,8 @@ pub async fn run() -> Result<()> {
             height:       capturer.height as i32,
             fps:          args.fps as i32,
             bitrate_kbps: args.bitrate,
-            codec:        encoder::Codec::from_str(&args.codec),
-            is_hdr:       false, // upgraded to true at RTSP session time when client negotiates HDR
+            codec:        startup_codec,
+            is_hdr:       false, // upgraded per-session when client negotiates HEVC Main10/HDR
         },
     )
     .expect("Failed to initialize NVENC encoder");
@@ -248,14 +243,12 @@ pub async fn run() -> Result<()> {
     // what the link/client can take.
     let mut enc_rate_bytes   = 0u64;
     let mut enc_rate_tick    = Instant::now();
-    // Consecutive ACCESS_LOST/display-change rebinds with no successful
-    // frame in between — used to back off instead of spinning the capture
-    // loop at full frame rate while a display topology change settles.
-    let mut access_lost_streak = 0u32;
-    // Consecutive AcquireNextFrame WAIT_TIMEOUTs (desktop reported no change).
-    // Diagnostic only — helps tell "duplication never produces a frame on
-    // this output" apart from a silent get_texture()/encode failure.
+    // Consecutive WGC iterations with no new frame (desktop unchanged).
     let mut timeout_streak = 0u32;
+    // Stateful tick-tock for the damage-generator jiggle — alternates the
+    // cursor between +1 and -1 each fire so it actually rests at a new
+    // position for ~50 ms, guaranteeing DWM composites a fresh frame.
+    let mut jiggle_toggle = false;
     // Wall-clock time the last frame (real or re-submitted-from-cache) was
     // handed to the encoder — used to pace duplicate frames on WAIT_TIMEOUT.
     let mut last_frame_sent = Instant::now();
@@ -308,30 +301,100 @@ pub async fn run() -> Result<()> {
         // out. Doing it here, during the handshake gap, gives it that time
         // without blocking the latency-critical path.
         if !client_connected {
+            // Handle /cancel that arrived after the client already disconnected
+            // (e.g. user backed out, VDD was suspended, then clicked "Quit App").
+            // The normal disconnect path never ran for this cancel, so we do the
+            // full teardown here while the session is idle.
+            if vd.active_device_name().is_some() {
+                let was_cancelled = client_info.lock()
+                    .map(|g| g.as_ref().is_some_and(|c| c.cancelled))
+                    .unwrap_or(false);
+                if was_cancelled {
+                    println!("🛑 /cancel while suspended — tearing down virtual display");
+                    debug::debug_log("Deferred /cancel: VDD teardown");
+                    if let Err(e) = vd.deactivate_after_stream() {
+                        println!("⚠️  Virtual display deactivation: {e}");
+                    }
+                    enc.config.is_hdr = false;
+                    if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
+                        break;
+                    }
+                    frame_interval  = startup_frame_interval;
+                    next_frame_time = Instant::now();
+                    if let Ok(mut guard) = client_info.lock() {
+                        if let Some(info) = guard.as_mut() {
+                            info.cancelled = false;
+                        }
+                    }
+                }
+            }
+
             if let Ok(mut guard) = client_info.lock() {
                 let pending = guard.as_ref()
                     .filter(|c| c.app_id != 0 && !c.activated && !c.streaming_active)
-                    .map(|c| (c.app_id, c.width, c.height, c.fps));
-                if let Some((app_id, width, height, fps)) = pending {
+                    .map(|c| (c.app_id, c.width, c.height, c.fps, c.video_format));
+                if let Some((app_id, width, height, fps, video_format)) = pending {
                     // Read HDR flag while we still hold the lock.
                     let hdr_req = guard.as_ref().map(|c| c.hdr_requested).unwrap_or(false);
 
-                    // Propagate client-negotiated fps (and HDR mode if HEVC) into
-                    // enc.config BEFORE rebind so the new encoder is initialised
-                    // at the right fps/profile rather than the CLI startup default.
-                    enc.config.fps = fps as i32;
-                    if hdr_req && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr {
-                        println!("🎨 HDR requested with HEVC — enabling Main10/HDR10 in pre-activated encoder");
-                        enc.config.is_hdr = true;
+                    // Derive codec from /launch videoFormat BEFORE rebind so the
+                    // encoder is recreated at the right codec (H264/HEVC/AV1) for
+                    // this session, not the CLI startup default.
+                    let negotiated_codec = encoder::Codec::from_video_format(video_format);
+                    if negotiated_codec != enc.config.codec {
+                        println!("🎥 Codec selected by client: {} (videoFormat={:#x}) — switching encoder",
+                            negotiated_codec.as_str(), video_format);
+                        enc.config.codec  = negotiated_codec;
+                        enc.config.is_hdr = false; // reset; re-armed below if HDR is also requested
                     }
-
+                    enc.config.fps = fps as i32;
                     let vdd_ok = if app_launcher::uses_virtual_display(app_id) {
                         println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
-                            if enc.config.is_hdr { " HDR10" } else { "" });
+                            if hdr_req { " HDR10" } else { "" });
                         match vd.activate_for_stream(width, height, fps) {
                             Ok(()) => {
                                 if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((width, height))).is_err() {
                                     break;
+                                }
+                                // Enable Advanced Color (HDR/scRGB) during the /launch→PLAY gap
+                                // so the ACCESS_LOST storm from the color-space switch settles
+                                // before any frames need to be sent. By connect-time the VDD is
+                                // already stable in FP16 mode — calling set_active_display_hdr
+                                // again there is a no-op (no second storm).
+                                if hdr_req {
+                                    // Check if MttVDD actually supports Advanced Color before
+                                    // trying to enable it. On MttVDD 25.7.23 (and many other
+                                    // IddCx VDD versions) Advanced Color is NOT supported —
+                                    // calling SET_ADVANCED_COLOR_STATE returns success but
+                                    // triggers an endless ACCESS_LOST storm without achieving
+                                    // FP16 mode, causing the client to time out.
+                                    if vd.is_advanced_color_supported() {
+                                        if let Err(e) = vd.set_active_display_hdr(true) {
+                                            println!("⚠️  Advanced Color pre-activation failed: {e}");
+                                        } else {
+                                            println!("⏳ Waiting for VDD to settle in HDR/FP16 mode...");
+                                            std::thread::sleep(Duration::from_secs(2));
+                                            // Recreate the WGC frame pool in R16G16B16A16Float now
+                                            // that the VDD surface is in Advanced Color (FP16 scRGB)
+                                            // mode. enc.config.is_hdr is still false here (codec not
+                                            // confirmed until ANNOUNCE/PLAY), so we cannot use
+                                            // rebind_capture_and_encoder — it would pass is_hdr=false
+                                            // and create a BGRA8 pool that WGC would silently tone-map
+                                            // to SDR, feeding wrong data to the NVENC HDR pipeline.
+                                            match capturer.rebind(vd.active_device_name(), true, Some((width, height))) {
+                                                Ok(_) => {
+                                                    input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
+                                                    println!("✅ WGC frame pool recreated in FP16 — VDD in HDR/Advanced Color mode");
+                                                }
+                                                Err(e) => eprintln!("⚠️  WGC FP16 rebind failed: {e} — HDR frames may be tone-mapped to SDR"),
+                                            }
+                                            println!("✅ VDD in FP16 HDR mode — encoder pipeline ready for HEVC Main10");
+                                        }
+                                    } else {
+                                        println!("⚠️  MttVDD does not support Advanced Color (HDR) — \
+                                            streaming HEVC SDR. The VDD driver must expose HDR modes \
+                                            for true HDR10 output. Check vdd_settings.xml for HDR config.");
+                                    }
                                 }
                                 true
                             }
@@ -341,7 +404,7 @@ pub async fn run() -> Result<()> {
                             }
                         }
                     } else {
-                        println!("🖥️  App {app_id} targets the physical display — virtual display not used");
+                        // universal VDD: this branch is unreachable
                         true
                     };
                     // Only mark activated=true on success; a failure leaves it
@@ -380,29 +443,121 @@ pub async fn run() -> Result<()> {
                         println!("🔑 Codec negotiation: client={}{} (videoFormat={:#x})  encoder={}{}",
                             vf_name, hdr_sfx, client.video_format, enc_name,
                             if enc.config.is_hdr { "/HDR10" } else { "" });
-                        // Belt-and-suspenders mismatch guard: ServerCodecModeSupport
-                        // should prevent this, but warn loudly if it slips through.
-                        let client_base = client.video_format & 0x00FF;
-                        if client.video_format != 0 && client_base != codec_mode_support {
-                            println!("⚠️  CODEC MISMATCH at stream start: client expects {} \
-                                but encoder is {}. Stream will likely fail. \
-                                Restart with --codec {}.",
-                                vf_name, enc_name,
-                                if client_base == 2 { "hevc" } else { "h264" });
+
+                        // Derive codec from /launch videoFormat. Old-protocol clients
+                        // (Xbox Moonlight ≤ 1.18.0) never set videoFormat — the field
+                        // arrives as 0 in that case. For those clients, use
+                        // bitStreamFormat from the RTSP ANNOUNCE SDP instead: it is
+                        // set by moonlight-common-c based on (client caps ∩ server
+                        // ServerCodecModeSupport) and is the authoritative codec for
+                        // the wire stream regardless of protocol version.
+                        let negotiated_codec = if client.video_format != 0 {
+                            encoder::Codec::from_video_format(client.video_format)
+                        } else {
+                            match client.bit_stream_format {
+                                1 => encoder::Codec::Hevc,
+                                2 => encoder::Codec::Av1,
+                                _ => encoder::Codec::H264,
+                            }
+                        };
+                        let bsf_name = match client.bit_stream_format { 1=>"HEVC", 2=>"AV1", _=>"H264" };
+                        println!("🎥 Codec: {} (videoFormat={:#x}  bitStreamFormat={}/{})",
+                            negotiated_codec.as_str(), client.video_format,
+                            client.bit_stream_format, bsf_name);
+
+                        // H264 Level 5.2 fps cap — applied after codec determination so we
+                        // know whether we're actually in H264. Xbox Moonlight 1.18.0
+                        // (corever=1) hardwires H264 and cannot negotiate HEVC from the
+                        // server side; at 4K or 1440p@120fps that exceeds H264 Level 5.2
+                        // (983,040 MB/s). Cap fps to what Level 5.2 allows (4K→30fps,
+                        // 1440p→60fps, 1080p→120fps) so the stream works instead of
+                        // crashing the Xbox hardware H264 decoder.
+                        let session_fps: u32 = {
+                            let mb_per_frame = ((client.width + 15) / 16) as u64
+                                * ((client.height + 15) / 16) as u64;
+                            let mb_per_sec = mb_per_frame * client.fps as u64;
+                            if negotiated_codec == encoder::Codec::H264 && mb_per_sec > 983_040 {
+                                let safe = (983_040u64 / mb_per_frame).max(1) as u32;
+                                println!("⚠️  H264 Level 5.2 cap: {}x{}@{}fps = {} MB/s > 983,040. \
+                                    Reducing to {}fps so Xbox H264 decoder won't crash. \
+                                    (HEVC needed for higher fps — client corever=1 cannot negotiate it.)",
+                                    client.width, client.height, client.fps, mb_per_sec, safe);
+                                enc.config.fps = safe as i32;
+                                safe
+                            } else {
+                                client.fps
+                            }
+                        };
+
+                        if negotiated_codec != enc.config.codec {
+                            enc.config.codec  = negotiated_codec;
+                            enc.config.is_hdr = false;
+                            // rebind_capture_and_encoder only recreates NVENC when the
+                            // capture RESOLUTION changes. A pure codec switch (same VDD,
+                            // same mode) returns needs_new_encoder=false — the H264
+                            // encoder would keep running. Force recreation here directly.
+                            enc.cleanup();
+                            match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
+                                width:        capturer.width as i32,
+                                height:       capturer.height as i32,
+                                fps:          enc.config.fps,
+                                bitrate_kbps: enc.config.bitrate_kbps,
+                                codec:        negotiated_codec,
+                                is_hdr:       false,
+                            }) {
+                                Ok(new_enc) => enc = new_enc,
+                                Err(e) => {
+                                    eprintln!("❌ Failed to recreate NVENC for codec change: {e}");
+                                    break;
+                                }
+                            }
+                            input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
                         }
 
-                        // Wire HDR if the client requested it and the encoder
-                        // hasn't already been armed by the pre-activation pass
-                        // (covers App 1 / physical-display sessions and any race
-                        // where PLAY arrived before the pre-activation tick).
-                        // Requires the display to be in HDR mode so DXGI provides
-                        // R16G16B16A16_FLOAT frames; otherwise the VP's scRGB→P010
-                        // path receives BGRA8 and colours will be wrong — log it.
-                        if client.hdr_requested && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr {
-                            println!("🎨 HDR requested — switching encoder to HEVC Main10/HDR10 \
-                                (display must be in HDR mode for correct colors)");
+                        // HDR10 pipeline: gate on /launch hdrMode=1 (client.hdr_requested).
+                        // Xbox Moonlight 1.18.0 (corever=1) always sends dynamicRangeMode=0
+                        // in the ANNOUNCE regardless of user HDR setting, so dynamicRangeMode
+                        // cannot be used as the gate for old clients.
+                        //
+                        // Two-step activation:
+                        //   1. Enable Windows Advanced Color on the VDD via
+                        //      DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE) so DXGI
+                        //      switches its frame buffer to R16G16B16A16_FLOAT (linear scRGB).
+                        //      This triggers DXGI_ERROR_ACCESS_LOST; the capture loop's
+                        //      ACCESS_LOST rebind re-creates the duplication handle in HDR mode.
+                        //   2. Recreate NVENC as HEVC Main10 with P010 buffer format so the
+                        //      shim's FP16→P010 VP path has a matching output surface.
+                        if client.hdr_requested && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr
+                            && vd.is_advanced_color_supported()
+                        {
+                            // Advanced Color was enabled in pre-activation (during the
+                            // /launch→PLAY gap). Calling set_active_display_hdr(true) again
+                            // when it is already on is a no-op — no ACCESS_LOST storm.
+                            // If pre-activation somehow didn't run, this enables it now.
+                            let _ = vd.set_active_display_hdr(true);
+                            // Recreate NVENC as HEVC Main10/P010.
+                            println!("🎨 HEVC Main10/HDR10 encoder active (hdrMode=1, VDD in FP16 mode)");
                             enc.config.is_hdr = true;
-                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), None).is_err() {
+                            enc.cleanup();
+                            match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
+                                width:        capturer.width as i32,
+                                height:       capturer.height as i32,
+                                fps:          enc.config.fps,
+                                bitrate_kbps: enc.config.bitrate_kbps,
+                                codec:        enc.config.codec,
+                                is_hdr:       true,
+                            }) {
+                                Ok(new_enc) => enc = new_enc,
+                                Err(e) => {
+                                    eprintln!("❌ Failed to recreate NVENC for HDR: {e}");
+                                    break;
+                                }
+                            }
+                            // Rebind so the new P010 NVENC input textures are wired to the
+                            // FP16→P010 VP output. Advanced Color is already on so no
+                            // ACCESS_LOST expected — this is a clean re-DuplicateOutput.
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc,
+                                vd.active_device_name(), Some((client.width, client.height))).is_err() {
                                 break;
                             }
                         }
@@ -415,13 +570,6 @@ pub async fn run() -> Result<()> {
                             if enc.config.is_hdr { "/HDR10" } else { "" },
                             client.width, client.height, client.fps,
                             if client.hdr_requested { " HDR" } else { "" });
-                        if enc.config.width as u32 != client.width || enc.config.height as u32 != client.height {
-                            println!("⚠️  RESOLUTION MISMATCH: SPS will declare {}x{} but client \
-                                expects {}x{}. Use App 5 (Virtual Desktop) for dynamic resolution — \
-                                it drives the VDD to exactly the client-requested size.",
-                                enc.config.width, enc.config.height,
-                                client.width, client.height);
-                        }
 
                         // Normally already done by the pre-activation pass
                         // above during the /launch -> PLAY gap. Fall back to
@@ -431,19 +579,27 @@ pub async fn run() -> Result<()> {
                         // endpoint first — must happen before AudioStreamer
                         // below changes the default device.
                         if client.activated {
-                            println!("🖥️  Virtual display already active for this session");
+                            // VDD topology is already up from pre-activation.
+                            // Force WGC + NVENC recreation to match the session's
+                            // negotiated format (codec/HDR may have changed since
+                            // pre-activation ran, and the "already active" path
+                            // previously skipped this entirely).
+                            println!("🖥️  Virtual display already active — forcing WGC+NVENC recreation \
+                                ({}x{} {})", client.width, client.height,
+                                if enc.config.is_hdr { "FP16/HDR10" } else { "BGRA8/SDR" });
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc,
+                                vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                break;
+                            }
                         } else {
-                            if app_launcher::uses_virtual_display(client.app_id) {
-                                match vd.activate_for_stream(client.width, client.height, client.fps) {
-                                    Ok(()) => {
-                                        if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
-                                            break;
-                                        }
+                            // Universal VDD: activate for every app.
+                            match vd.activate_for_stream(client.width, client.height, client.fps) {
+                                Ok(()) => {
+                                    if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                        break;
                                     }
-                                    Err(e) => println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display"),
                                 }
-                            } else {
-                                println!("🖥️  App {} streaming from the physical display — virtual display not used", client.app_id);
+                                Err(e) => println!("⚠️  Virtual display activation failed: {e} — stream may have wrong resolution"),
                             }
                             // Mirror the pre-activation pass: mark this session
                             // activated so that once the control stream
@@ -458,13 +614,32 @@ pub async fn run() -> Result<()> {
                             }
                         }
 
-                        rtp_sender.set_fps(client.fps.max(1));
-                        let negotiated_interval = Duration::from_secs_f64(1.0 / client.fps.max(1) as f64);
+                        // Resolution guard — runs regardless of activated path.
+                        // If wait_for_display_resolution timed out during pre-activation
+                        // (common for 4K@120fps modes that take >3 s to settle), the VDD
+                        // may have landed at 1080p instead of 4K. Give it one more
+                        // re-snap and rebind attempt now, while the client is waiting.
+                        if enc.config.width as u32 != client.width || enc.config.height as u32 != client.height {
+                            println!("📐 Resolution re-snap: encoder={}x{}  client={}x{}@{}fps — retrying VDD force",
+                                enc.config.width, enc.config.height, client.width, client.height, client.fps);
+                            vd.re_snap_resolution(client.width, client.height, client.fps);
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                break;
+                            }
+                        }
+
+                        rtp_sender.set_fps(session_fps.max(1));
+                        let negotiated_interval = Duration::from_secs_f64(1.0 / session_fps.max(1) as f64);
                         if negotiated_interval != frame_interval {
                             frame_interval = negotiated_interval;
                             next_frame_time = Instant::now(); // rebase pacing — prevents burst if interval shrank
-                            println!("⏱️  Frame interval → {:.2}ms ({} fps, client-negotiated)",
-                                frame_interval.as_secs_f64() * 1000.0, client.fps);
+                            println!("⏱️  Frame interval → {:.2}ms ({} fps{})",
+                                frame_interval.as_secs_f64() * 1000.0, session_fps,
+                                if session_fps != client.fps {
+                                    format!(" [capped from {}fps for H264 Level 5.2]", client.fps)
+                                } else {
+                                    " (client-negotiated)".to_string()
+                                });
                         }
                         // Shard size MUST match the client's negotiated
                         // packetSize (1392 LAN / 1024 remote) or its FEC
@@ -501,13 +676,14 @@ pub async fn run() -> Result<()> {
                         // Moonlight warn "lower your bitrate" and disconnect.
                         if client.bitrate_kbps > 0 {
                             println!("📊 Retargeting encoder to client bitrate: {} Kbps @ {} fps",
-                                client.bitrate_kbps, client.fps);
-                            encoder::reconfigure_bitrate(client.bitrate_kbps, client.fps);
+                                client.bitrate_kbps, session_fps);
+                            encoder::reconfigure_bitrate(client.bitrate_kbps, session_fps);
                             // Mirror negotiated values into enc.config so any
                             // mid-session rebind (resolution/device change) inherits
-                            // the client-negotiated fps and bitrate, not the CLI default.
+                            // the session fps (may be capped below client.fps for H264)
+                            // and bitrate, not the CLI default.
                             enc.config.bitrate_kbps = client.bitrate_kbps as i32;
-                            enc.config.fps          = client.fps.max(1) as i32;
+                            enc.config.fps          = session_fps.max(1) as i32;
                         } else {
                             println!("⚠️  Client did not announce a bitrate — keeping CLI default {} Kbps", args.bitrate);
                         }
@@ -536,35 +712,57 @@ pub async fn run() -> Result<()> {
                 }
             }
         } else {
-            // /cancel or TEARDOWN flips streaming_active back to false —
-            // reset to idle so the next PLAY starts a clean session.
-            let still_active = client_info.lock()
-                .map(|g| g.as_ref().is_some_and(|c| c.streaming_active))
-                .unwrap_or(false);
+            // RTSP TEARDOWN or control-stream drop sets streaming_active=false.
+            // Check whether /cancel was also signalled to determine the path:
+            //   • cancelled=true  → full VDD teardown (user clicked "Quit App")
+            //   • cancelled=false → suspend (user backed out; /resume reconnects)
+            let (still_active, was_cancelled) = client_info.lock()
+                .map(|g| g.as_ref()
+                    .map(|c| (c.streaming_active, c.cancelled))
+                    .unwrap_or((false, false)))
+                .unwrap_or((false, false));
             if !still_active {
-                println!("⏹️  Stream ended — resetting to idle");
-                debug::debug_log("Stream ended, resetting to idle");
+                // Always: stop stream outputs and virtual input devices.
                 rtp_sender.reset();
                 if let Some(streamer) = audio_streamer.take() {
                     streamer.stop();
                 }
-                // Unplug the virtual controller(s) now that the session is over.
                 input::stop_session();
-                // Tear down the virtual display, restore the original
-                // primary/topology, and force the default audio endpoint
-                // back to the cached host speaker.
-                if let Err(e) = vd.deactivate_after_stream() {
-                    println!("⚠️  Virtual display deactivation failed: {e}");
-                }
-                // Follow capture back onto the restored physical display.
-                if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
-                    break;
-                }
-                // Restore idle capture pacing — don't spin at 120fps between sessions.
                 frame_interval  = startup_frame_interval;
                 next_frame_time = Instant::now();
                 client_connected = false;
                 video_learned    = false;
+
+                if was_cancelled {
+                    // Full teardown — restore the host's display topology and
+                    // rebind the encoder to the physical primary monitor.
+                    println!("🛑 /cancel — tearing down virtual display, restoring host topology");
+                    debug::debug_log("Session cancelled — full VDD teardown");
+                    if let Err(e) = vd.deactivate_after_stream() {
+                        println!("⚠️  Virtual display deactivation failed: {e}");
+                    }
+                    // Rebuild encoder as SDR (NV12) — the VP still expects FP16
+                    // input if is_hdr=true, but the physical display provides BGRA8.
+                    enc.config.is_hdr = false;
+                    if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
+                        break;
+                    }
+                    // Clear the flag so a later natural disconnect from the next
+                    // session isn't mistakenly treated as a cancel.
+                    if let Ok(mut guard) = client_info.lock() {
+                        if let Some(info) = guard.as_mut() {
+                            info.cancelled = false;
+                        }
+                    }
+                } else {
+                    // Suspend — VDD stays active at the current resolution and
+                    // HDR mode. enc.config.is_hdr and the WGC session are
+                    // preserved so /resume can reconnect without any topology
+                    // change or Advanced Color flicker.
+                    println!("⏸️  Client disconnected — session suspended \
+                        (VDD active; client can /resume to reconnect)");
+                    debug::debug_log("Session suspended — VDD active");
+                }
             }
         }
 
@@ -587,104 +785,70 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // Texture to feed the encoder this iteration, if any — either a
-        // freshly captured frame, or (on WAIT_TIMEOUT) a re-submission of
-        // the last captured frame so a static desktop doesn't leave the
-        // stream black forever.
+        // Texture to feed the encoder this iteration — either a freshly captured
+        // WGC frame, or (when the desktop is unchanged) a re-submission of the
+        // last cached frame to keep the stream alive on a static desktop.
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;
 
-        match capturer.acquire_frame((frame_interval.as_millis() as u32).max(1)) {
-            Ok((resource, frame_info)) => {
-                access_lost_streak = 0;
+        // WGC cursor note: `IsCursorCaptureEnabled(true)` is set on the
+        // session so WGC composites the system cursor directly into the captured
+        // texture in the display's native colour space (FP16 in HDR mode).
+        // The shim cursor-compositing pipeline is idle — no update_cursor_*
+        // calls are made here to avoid double-compositing.
+        match capturer.try_get_frame() {
+            Some(texture) => {
+                // texture is our stable D3D11_USAGE_DEFAULT cached copy —
+                // the WGC pool frame was already flushed and released inside
+                // try_get_frame before this returns. Safe to encode from.
                 timeout_streak = 0;
-                // PointerPosition is only valid when LastMouseUpdateTime != 0
-                // (DXGI docs) — on frames without a mouse update it can be
-                // stale/zeroed. Updating the shim from a zeroed struct made
-                // the cursor flicker to (0,0)/invisible and back on alternate
-                // frames while the mouse moved, leaving P-frame remnants
-                // along the path (visible as "ghost cursors" until the next
-                // IDR). Only push position when DXGI actually reports a move.
-                if frame_info.LastMouseUpdateTime != 0 {
-                    encoder::update_cursor_position(
-                        frame_info.PointerPosition.Position.x,
-                        frame_info.PointerPosition.Position.y,
-                        frame_info.PointerPosition.Visible.as_bool(),
-                    );
+                texture_to_encode = Some(texture);
+            }
+            None => {
+                timeout_streak += 1;
+                if timeout_streak <= 3 || timeout_streak % 10 == 0 {
+                    println!("⏳ WGC: no new frame on {}x{} — streak {timeout_streak}",
+                        capturer.width, capturer.height);
                 }
-                if frame_info.PointerShapeBufferSize > 0 {
-                    if let Ok((shape_data, shape_info)) = capturer.get_pointer_shape(frame_info.PointerShapeBufferSize) {
-                        encoder::update_cursor_shape(
-                            &shape_data,
-                            shape_info.Type,
-                            shape_info.Width,
-                            shape_info.Height,
-                            shape_info.Pitch,
-                        );
+
+                // ── Damage generator (tick-tock jiggle) ──────────────────────
+                // An empty VDD produces no DWM damage, so WGC never fires.
+                // Every ~50 ms we send a stateful ±1-px relative mouse move via
+                // SendInput. The cursor rests in the new position until the next
+                // fire, guaranteeing a real dirty rect. Windows coalesces +1/-1
+                // in the same tick, but with the toggle they land in separate
+                // loop iterations ~50 ms apart — impossible to coalesce.
+                // Stops as soon as has_frame() is true (real frames flowing).
+                if !capturer.has_frame() && timeout_streak % 25 == 0 {
+                    let (dx, dy): (i32, i32) = if jiggle_toggle { (1, 1) } else { (-1, -1) };
+                    jiggle_toggle = !jiggle_toggle;
+                    unsafe {
+                        let mut input: INPUT = std::mem::zeroed();
+                        input.r#type = INPUT_MOUSE;
+                        input.Anonymous.mi.dx = dx;
+                        input.Anonymous.mi.dy = dy;
+                        input.Anonymous.mi.dwFlags = MOUSEEVENTF_MOVE;
+                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
                     }
                 }
 
-                match capturer.get_texture(&resource) {
-                    Err(e) => println!("⚠️  capturer.get_texture failed: {:?}", e),
-                    Ok(texture) => {
-                        capturer.cache_frame(&texture).ok();
-                        texture_to_encode = Some(texture);
-                    }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+
+                // ── Encoder gate ──────────────────────────────────────────────
+                // No NVENC calls until WGC has delivered its first real frame.
+                // Before that point cached_texture() is None (cleared on rebind)
+                // and passing a null/stale pointer to encode_frame returns 0
+                // bytes. Once has_frame() flips true, cached re-submission is
+                // safe and maintains the 120-fps stream on a static desktop.
+                if !capturer.has_frame() {
+                    continue;
                 }
-                capturer.release_frame().ok();
-            }
-            // DXGI_ERROR_WAIT_TIMEOUT — desktop unchanged this interval, skip frame.
-            Err(e) if e.code().0 == 0x887A0027_u32 as i32 => {
-                timeout_streak += 1;
-                if timeout_streak <= 3 || timeout_streak % 10 == 0 {
-                    println!("⏳ AcquireNextFrame WAIT_TIMEOUT (no desktop change) on {}x{} — streak {timeout_streak}", capturer.width, capturer.height);
-                }
-                // The desktop hasn't changed since the last duplication
-                // frame — which, on a freshly-activated virtual display with
-                // nothing painting to it, can be true forever. Re-submit the
-                // last captured frame at roughly the target frame rate so
-                // the stream keeps flowing instead of going black.
+
                 if last_frame_sent.elapsed() >= frame_interval {
                     texture_to_encode = capturer.cached_texture().cloned();
                 }
-                tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            // DXGI_ERROR_ACCESS_LOST / DXGI_ERROR_INVALIDCALL — any
-            // SetDisplayConfig-class topology/mode change invalidates the
-            // existing duplication interface (ACCESS_LOST), and the same
-            // class of change can also surface as INVALIDCALL on the next
-            // AcquireNextFrame. Re-duplicate instead of tearing down the
-            // whole process. `vd.active_device_name()` follows the capture
-            // target onto the virtual display while a stream is active, or
-            // back to the physical default once it isn't.
-            Err(e) if e.code().0 == 0x887A0026_u32 as i32 || e.code().0 == 0x887A0001_u32 as i32 => {
-                access_lost_streak += 1;
-                // Log every occurrence at first, then taper off — a display
-                // topology change that hasn't settled yet can otherwise spam
-                // tens of thousands of identical lines per minute.
-                if access_lost_streak <= 5 || access_lost_streak % 50 == 0 {
-                    if e.code().0 == 0x887A0001_u32 as i32 {
-                        println!("🔄 Transient DXGI state validation shift detected. Initiating internal handle recovery... (attempt {access_lost_streak})");
-                    } else {
-                        println!("⚠️  DXGI duplication lost (display change) — rebinding capture (attempt {access_lost_streak})");
-                    }
-                }
-                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), vd.active_resolution()).is_err() {
-                    break;
-                }
-                // Back off instead of spinning at full frame rate once the
-                // immediate retries (rebind() already retries internally)
-                // haven't recovered — gives the display topology time to
-                // settle after a CCD/devnode change.
-                if access_lost_streak > 5 {
-                    let backoff_ms = 100u64 * access_lost_streak.min(20) as u64;
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ Capture error: {:?}", e);
-                debug::debug_log(&format!("Capture error: {:?}", e));
-                break;
-            }
+            // No ACCESS_LOST arm: WGC absorbs display mode transitions
+            // (including the FP16 Advanced Color switch) internally.
         }
 
         if let Some(texture) = texture_to_encode {

@@ -42,7 +42,7 @@ clap = { version = "4", features = ["derive"] }
 # (input.rs). Requires the ViGEmBus driver to be installed on the host.
 vigem-client = "0.1"
 
-# Windows DXGI + NVENC
+# Windows DXGI + NVENC + WGC
 windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Gdi",
@@ -61,6 +61,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_Security",
     "Win32_Media_Audio",
+    # Windows Graphics Capture (WGC) — HDR-safe capture backend
+    "Graphics_Capture",                    # Direct3D11CaptureFramePool / GraphicsCaptureSession
+    "Graphics_DirectX",                    # DirectXPixelFormat
+    "Graphics_DirectX_Direct3D11",         # IDirect3DDevice / IDirect3DSurface / IDirect3DDxgiInterfaceAccess
+    "Win32_System_WinRT_Direct3D11",       # CreateDirect3D11DeviceFromDXGIDevice
+    "Win32_System_WinRT_Graphics_Capture", # IGraphicsCaptureItemInterop (HMONITOR → GraphicsCaptureItem)
+    "Win32_System_WinRT",                  # RoInitialize / RO_INIT_MULTITHREADED
 ] }
 rsa = "0.9.10"
 rustls = "0.23.40"
