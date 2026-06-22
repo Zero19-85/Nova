@@ -21,11 +21,12 @@ pub enum TrayCmd {
 ///
 /// * `rx`          — inbound commands from pairing / capture
 /// * `shutdown_tx` — sending `true` here breaks the main capture loop
-/// * `global_pin`  — shared slot the tray writes into when the user enters a PIN
+/// * `global_pin`  — shared slot the tray writes `(pin, device_name)` into
+///                   when the user pre-enters credentials via "Pair Device"
 pub fn spawn(
     rx: mpsc::Receiver<TrayCmd>,
     shutdown_tx: Arc<watch::Sender<bool>>,
-    global_pin: Arc<Mutex<String>>,
+    global_pin: Arc<Mutex<(String, String)>>,
 ) {
     std::thread::Builder::new()
         .name("nova-tray".to_string())
@@ -38,7 +39,7 @@ pub fn spawn(
 fn tray_main(
     rx: mpsc::Receiver<TrayCmd>,
     shutdown_tx: Arc<watch::Sender<bool>>,
-    global_pin: Arc<Mutex<String>>,
+    global_pin: Arc<Mutex<(String, String)>>,
 ) {
     // ── Build the right-click context menu ────────────────────────────────
     let pair_item = MenuItem::new("Pair Device", true, None);
@@ -91,9 +92,9 @@ fn tray_main(
         // internal window proc whenever a menu item is activated.
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == pair_id {
-                match prompt_for_pin() {
-                    Some(pin) => {
-                        *global_pin.lock().unwrap() = pin;
+                match prompt_for_pin_and_name() {
+                    Some((pin, name)) => {
+                        *global_pin.lock().unwrap() = (pin, name);
                         let _ = tray.set_tooltip(Some(
                             "Nova — PIN accepted, completing pairing…",
                         ));
@@ -130,15 +131,17 @@ fn tray_main(
     }
 }
 
-// ── PIN input dialog ───────────────────────────────────────────────────────
+// ── Pairing input dialog ───────────────────────────────────────────────────
 
-/// Show a native Windows `InputBox` using the VisualBasic runtime (ships on
-/// every Windows install).  Blocks until the user clicks OK or Cancel, then
-/// returns the trimmed text.  Returns `None` if the user cancelled.
+/// Show two sequential native Windows `InputBox` dialogs using the
+/// VisualBasic runtime (ships on every Windows install):
+///   1. The 4-digit PIN shown on the Moonlight client.
+///   2. A friendly device name to identify this client (e.g. "Xbox").
 ///
-/// Uses `-WindowStyle Hidden` so no PowerShell console flashes on screen.
-/// This function is intentionally synchronous and runs on the tray OS thread.
-pub fn prompt_for_pin() -> Option<String> {
+/// Returns `Some((pin, name))` on success, `None` if the user cancels
+/// the PIN dialog.  Cancelling the name dialog is accepted — a default
+/// name is generated.  Runs synchronously on the tray OS thread.
+pub fn prompt_for_pin_and_name() -> Option<(String, String)> {
     let output = std::process::Command::new("powershell")
         .args(&[
             "-NoProfile",
@@ -146,18 +149,35 @@ pub fn prompt_for_pin() -> Option<String> {
             "Hidden",
             "-Command",
             "Add-Type -AssemblyName Microsoft.VisualBasic; \
-             [Microsoft.VisualBasic.Interaction]::InputBox(\
+             $pin = [Microsoft.VisualBasic.Interaction]::InputBox(\
                 'Enter the 4-digit PIN displayed on your Moonlight client:', \
-                'Nova Device Pairing', '')",
+                'Nova — Pair Device (1/2)', ''); \
+             if ($pin -eq '') { exit 1 }; \
+             $name = [Microsoft.VisualBasic.Interaction]::InputBox(\
+                'Give this device a name (e.g. Xbox, Phone, TV):', \
+                'Nova — Pair Device (2/2)', 'My Device'); \
+             Write-Output \"$pin|$name\"",
         ])
         .output()
         .ok()?;
 
-    let pin = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return None; // user cancelled the PIN dialog
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut parts = raw.splitn(2, '|');
+    let pin  = parts.next().unwrap_or("").trim().to_string();
+    let name = parts.next().unwrap_or("").trim().to_string();
 
     if pin.is_empty() {
-        None
-    } else {
-        Some(pin)
+        return None;
     }
+
+    let name = if name.is_empty() { "My Device".to_string() } else { name };
+    Some((pin, name))
 }

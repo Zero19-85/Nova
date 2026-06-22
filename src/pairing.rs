@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use url::Url;
 use std::sync::Mutex;
-use std::io::Write as IoWrite; // used by persist_paired_client
 use crate::rtsp;
 
 // TLS/HTTPS Imports
@@ -33,7 +32,7 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS
 
 type PairSessions = Arc<Mutex<HashMap<String, PairSession>>>;
 
-const PAIRED_PATH:        &str = "nova_paired.txt";
+const PAIRED_PATH:        &str = "nova_paired.json";
 const CERT_VERSION_PATH: &str = "nova_cert.version";
 const CERT_VERSION:       u8  = 8;
 
@@ -50,44 +49,87 @@ fn data_dir() -> std::path::PathBuf {
 
 fn data_file(name: &str) -> std::path::PathBuf { data_dir().join(name) }
 
-/// Append a client ID to the persist file (one ID per line).
-fn persist_paired_client(client_id: &str) {
-    use std::fs::OpenOptions;
-    let path = data_file(PAIRED_PATH);
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{}", client_id);
-    }
-}
+// ── JSON paired-device store ───────────────────────────────────────────────
+// Format: { "UNIQUEID": { "name": "Xbox" }, ... }
+// Written one entry per line for easy manual inspection and diff-friendly diffs.
+// No external crate required — the structure is fixed so hand-written
+// serialisation/deserialisation is sufficient.
 
-/// Remove a client ID from the persist file.
-fn remove_paired_client(client_id: &str) {
+fn load_paired_json() -> HashMap<String, String> {
     let path = data_file(PAIRED_PATH);
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        let updated: String = contents
-            .lines()
-            .filter(|l| l.trim() != client_id)
-            .map(|l| format!("{}\n", l))
-            .collect();
-        let _ = std::fs::write(&path, updated);
-    }
-}
-
-/// Load all persisted client IDs and mark them as paired in the sessions map.
-fn load_paired_clients(sessions: &PairSessions) {
-    let path = data_file(PAIRED_PATH);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("📂 No paired-clients file found at {} ({e}) — starting fresh", path.display());
-            return;
-        }
+    let text  = match std::fs::read_to_string(&path) {
+        Ok(s)  => s,
+        Err(_) => return HashMap::new(),
     };
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        // Each data line looks like:   "UNIQUEID": { "name": "VALUE" },
+        let line = line.trim().trim_end_matches(',');
+        if !line.starts_with('"') { continue; }
+        // Extract uniqueid (first quoted token)
+        let inner = &line[1..]; // skip opening "
+        let id_end = match inner.find('"') { Some(i) => i, None => continue };
+        let id = &inner[..id_end];
+        // Extract name field from the rest of the line
+        let rest = &inner[id_end..];
+        let name_marker = "\"name\":";
+        let nm = match rest.find(name_marker) { Some(i) => i, None => continue };
+        let after = rest[nm + name_marker.len()..].trim_start();
+        if !after.starts_with('"') { continue; }
+        let val_inner = &after[1..];
+        let val_end   = match val_inner.find('"') { Some(i) => i, None => continue };
+        let name      = &val_inner[..val_end];
+        if !id.is_empty() {
+            map.insert(id.to_string(), name.to_string());
+        }
+    }
+    map
+}
+
+fn save_paired_json(map: &HashMap<String, String>) {
+    let path = data_file(PAIRED_PATH);
+    let mut out = String::from("{\n");
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+    for (i, (id, name)) in entries.iter().enumerate() {
+        let comma     = if i + 1 < entries.len() { "," } else { "" };
+        let name_esc  = name.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("  \"{}\": {{ \"name\": \"{}\" }}{}\n", id, name_esc, comma));
+    }
+    out.push('}');
+    let _ = std::fs::write(&path, out);
+}
+
+/// Upsert a paired device record (uniqueid → name).
+fn persist_paired_client(client_id: &str, name: &str) {
+    let mut map = load_paired_json();
+    map.insert(client_id.to_string(), name.to_string());
+    save_paired_json(&map);
+}
+
+/// Remove a device record by uniqueid.
+fn remove_paired_client(client_id: &str) {
+    let mut map = load_paired_json();
+    map.remove(client_id);
+    save_paired_json(&map);
+}
+
+/// Load all persisted device records and mark them as paired in the sessions map.
+fn load_paired_clients(sessions: &PairSessions) {
+    let map = load_paired_json();
+    if map.is_empty() {
+        println!("📂 No paired-clients file at {} — starting fresh", data_file(PAIRED_PATH).display());
+        return;
+    }
     let mut lock = sessions.lock().unwrap();
-    for id in contents.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let entry = lock.entry(id.to_string()).or_default();
+    for id in map.keys() {
+        let entry = lock.entry(id.clone()).or_default();
         entry.last_phase = "CLIENTPAIRINGSECRET".to_string();
     }
-    println!("📂 Loaded {} paired client(s) from {}", lock.len(), path.display());
+    println!("📂 Loaded {} paired client(s) from {}:", lock.len(), data_file(PAIRED_PATH).display());
+    for (id, name) in &map {
+        println!("   • {} → \"{}\"", id, name);
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +141,9 @@ struct PairSession {
     server_secret: Option<Vec<u8>>,
     server_challenge: Option<Vec<u8>>,
     client_hash: Option<Vec<u8>>,
+    /// Device name entered by the user during the PIN dialog (stored here so it
+    /// survives from the clientchallenge phase to the clientpairingsecret phase).
+    name: Option<String>,
 }
 
 pub struct ServerCrypto {
@@ -235,7 +280,7 @@ impl ServerCrypto {
         if stored_version.unwrap_or(0) < CERT_VERSION {
             println!("🔄 Nova cert is outdated (v{} < v{}) — deleting to regenerate.",
                 stored_version.unwrap_or(0), CERT_VERSION);
-            println!("   ⚠️  Delete nova_paired.txt and re-pair Moonlight after restart.");
+            println!("   ⚠️  Delete nova_paired.json and re-pair Moonlight after restart.");
             let _ = std::fs::remove_file(data_file(CERT_PATH));
             let _ = std::fs::remove_file(data_file(CERT_PEM_PATH));
             let _ = std::fs::remove_file(data_file(KEY_PATH));
@@ -309,7 +354,7 @@ pub async fn start_pairing_server(
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     codec_mode_support: u32,
     tray_tx: Arc<std::sync::mpsc::SyncSender<crate::tray::TrayCmd>>,
-    global_pin: Arc<Mutex<String>>,
+    global_pin: Arc<Mutex<(String, String)>>,
 ) {
     // ── Phase 1: Crypto ───────────────────────────────────────────────────────
     // Must run first. try_load_from_disk() may delete stale cert files and
@@ -451,7 +496,7 @@ async fn handle_request(
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     codec_mode_support: u32,
     tray_tx: Arc<std::sync::mpsc::SyncSender<crate::tray::TrayCmd>>,
-    global_pin: Arc<Mutex<String>>,
+    global_pin: Arc<Mutex<(String, String)>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let full_uri = req.uri().to_string();
     if !full_uri.contains("/serverinfo") {
@@ -586,23 +631,23 @@ async fn handle_request(
                 //      sends the challenge.  Moonlight holds the HTTP
                 //      connection open while we await; tokio serves other
                 //      requests concurrently.
-                let pin = {
+                let (pin, device_name) = {
                     let preloaded = {
                         let mut p = global_pin.lock().unwrap();
-                        if p.len() == 4 {
-                            let pin = p.clone();
-                            p.clear();
-                            pin
+                        if p.0.len() == 4 {
+                            let pair = p.clone();
+                            *p = (String::new(), String::new());
+                            pair
                         } else {
-                            String::new()
+                            (String::new(), String::new())
                         }
                     };
-                    if !preloaded.is_empty() {
-                        println!("🔑 Phase 2: using pre-entered PIN from tray menu");
+                    if !preloaded.0.is_empty() {
+                        println!("🔑 Phase 2: using pre-entered PIN + name from tray menu");
                         preloaded
                     } else {
-                        println!("⏳ Phase 2: opening PIN dialog (type the PIN shown on Moonlight)...");
-                        tokio::task::spawn_blocking(|| crate::tray::prompt_for_pin())
+                        println!("⏳ Phase 2: opening PIN + device-name dialog...");
+                        tokio::task::spawn_blocking(|| crate::tray::prompt_for_pin_and_name())
                             .await
                             .ok()
                             .flatten()
@@ -614,7 +659,12 @@ async fn handle_request(
                     println!("⚠️  PIN entry cancelled — pairing aborted.");
                     return Ok(make_error_response("PIN entry cancelled"));
                 }
-                println!("🔑 Phase 2: PIN received — completing challenge");
+                let device_name = if device_name.is_empty() {
+                    format!("Device-{}", &client_id[..4.min(client_id.len())])
+                } else {
+                    device_name
+                };
+                println!("🔑 Phase 2: PIN received — completing challenge (device: \"{}\")", device_name);
 
                 let aes_key = derive_aes_key(&salt, &pin);
                 let challenge_hex = client_challenge.unwrap_or_default();
@@ -647,10 +697,11 @@ async fn handle_request(
                 {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
-                    session.aes_key = Some(aes_key);
-                    session.client_hash = Some(decrypted);
-                    session.server_secret = Some(server_secret);
+                    session.aes_key        = Some(aes_key);
+                    session.client_hash    = Some(decrypted);
+                    session.server_secret  = Some(server_secret);
                     session.server_challenge = Some(server_challenge);
+                    session.name           = Some(device_name);
                 }
 
                 let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>{}</challengeresponse></root>"#, hex::encode_upper(encrypted_response));
@@ -676,13 +727,16 @@ async fn handle_request(
                 Ok(make_xml_response(&body))
 
             } else if phrase == "clientpairingsecret" || client_pairing_secret.is_some() {
-                {
+                let device_name = {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
                     session.last_phase = "CLIENTPAIRINGSECRET".to_string();
-                }
-                persist_paired_client(&client_id);
-                println!("🎉 Phase 4: Handshake Complete! Device is officially paired (saved to disk).");
+                    session.name.clone()
+                        .unwrap_or_else(|| format!("Device-{}", &client_id[..4.min(client_id.len())]))
+                };
+                persist_paired_client(&client_id, &device_name);
+                println!("🎉 Phase 4: Handshake Complete! \"{}\" is paired (saved to {}).",
+                    device_name, PAIRED_PATH);
                 let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
                 Ok(make_xml_response(body))
 
@@ -837,8 +891,14 @@ async fn handle_request(
                 // active VDD: leaving activated=true skips re-activation and
                 // avoids a topology flicker on reconnect.
                 if path == "/launch" {
-                    info.activated = false;
-                    info.cancelled = false; // clear any leftover cancel from the previous session
+                    info.activated     = false;
+                    info.cancelled     = false; // clear any leftover cancel from the previous session
+                    // CRITICAL: reset so the control thread re-sends the 0x010e HDR mode
+                    // packet on the first PT_PERIODIC_PING of the NEW session.  Without this
+                    // reset the flag is carried over from the previous ClientInfo via take(),
+                    // the Xbox never receives the packet, and the TV stays in SDR mode →
+                    // "whitewash" on every reconnect.
+                    info.hdr_mode_sent = false;
                 }
                 *guard = Some(info);
             }

@@ -1090,6 +1090,14 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         printf("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
                codec, is_hdr ? "/HDR10/Main10" : "", width, height, bitrate_kbps, fps);
+        // Single-line codec summary so the operator can instantly confirm
+        // which pipeline is running without parsing the full init log.
+        const char* codec_label =
+            (g_encoderCodec == 1 && is_hdr) ? "HEVC (H.265) - 10-bit HDR"  :
+            (g_encoderCodec == 1)            ? "HEVC (H.265) - 8-bit SDR"   :
+            (g_encoderCodec == 2)            ? "AV1"                         :
+                                               "H.264 - 8-bit SDR";
+        printf("[NVENC] Initialized Codec: %s\n", codec_label);
         return 0;
     }
     catch (const std::exception& e) {
@@ -1402,5 +1410,12 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_device)  { g_device->Release();  g_device  = nullptr; }
 
     printf("✅ Cleanup complete.\n");
+    // Reset per-session state so the next InitEncoder always starts from a
+    // known-zero baseline — prevents stale g_isHdr from leaking across
+    // reconnects when CleanupEncoder is called without a matching InitEncoder.
+    g_isHdr            = false;
+    g_hdrMetadataReady = false;
+    g_encoderCodec     = 0;
+    g_encoderFps       = 60;
     return 0;
 }

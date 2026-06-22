@@ -120,7 +120,7 @@ pub async fn run() -> Result<()> {
     // global_pin is the handshake point between the tray PIN dialog and the
     // pairing async task: the tray writes the 4-digit string here and the
     // pairing poll loop reads + clears it.
-    let global_pin: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let global_pin: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((String::new(), String::new())));
     tray::spawn(tray_rx, Arc::new(shutdown_tx), global_pin.clone());
     let tray_tx = Arc::new(tray_tx);
     let args = Args::parse();
@@ -753,36 +753,66 @@ pub async fn run() -> Result<()> {
                 client_connected = false;
                 video_learned    = false;
 
+                // ── Scorched-earth encoder teardown ──────────────────────────
+                // Always destroy the full C++ NVENC/D3D11/VP/RTV pipeline on
+                // every disconnect so the next /launch always re-initialises
+                // from a clean slate.  Without this, stale g_isHdr / RTV / VP
+                // state (and the carried-over enc.config.is_hdr=true) causes
+                // the HDR init block's `!enc.config.is_hdr` guard to be false
+                // on reconnect — the encoder is never recreated, and subtle
+                // NVENC/D3D state from the previous session leaks through.
+                let was_hdr = enc.config.is_hdr;
+                enc.config.is_hdr = false;
+                enc.cleanup(); // releases g_nvEncoder, g_device, VP, RTVs in shim.cpp
+
+                // Disable Windows Advanced Color so the VDD drops back to BGRA8
+                // while idle — the next /launch pre-activation re-enables it.
+                if was_hdr {
+                    if let Err(e) = vd.set_active_display_hdr(false) {
+                        println!("⚠️  Advanced Color disable on disconnect: {e}");
+                    }
+                }
+
                 if was_cancelled {
-                    // Full teardown — restore the host's display topology and
-                    // rebind the encoder to the physical primary monitor.
                     println!("🛑 /cancel — tearing down virtual display, restoring host topology");
                     debug::debug_log("Session cancelled — full VDD teardown");
                     if let Err(e) = vd.deactivate_after_stream() {
                         println!("⚠️  Virtual display deactivation failed: {e}");
                     }
-                    // Rebuild encoder as SDR (NV12) — the VP still expects FP16
-                    // input if is_hdr=true, but the physical display provides BGRA8.
-                    enc.config.is_hdr = false;
-                    if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
-                        break;
-                    }
-                    // Clear the flag so a later natural disconnect from the next
-                    // session isn't mistakenly treated as a cancel.
+                    let _ = capturer.rebind(None, false, None);
                     if let Ok(mut guard) = client_info.lock() {
                         if let Some(info) = guard.as_mut() {
                             info.cancelled = false;
                         }
                     }
                 } else {
-                    // Suspend — VDD stays active at the current resolution and
-                    // HDR mode. enc.config.is_hdr and the WGC session are
-                    // preserved so /resume can reconnect without any topology
-                    // change or Advanced Color flicker.
-                    println!("⏸️  Client disconnected — session suspended \
-                        (VDD active; client can /resume to reconnect)");
-                    debug::debug_log("Session suspended — VDD active");
+                    // Suspend — VDD stays at the current resolution for fast reconnect.
+                    // Advanced Color is now off (above) so WGC provides BGRA8 frames
+                    // while idle.  The next /launch pre-activation re-enables HDR when
+                    // the client negotiates HEVC Main10.
+                    println!("⏸️  Client disconnected — encoder torn down; VDD active for /launch reconnect");
+                    debug::debug_log("Session suspended — VDD active, encoder torn down");
+                    let _ = capturer.rebind(vd.active_device_name(), false, None);
                 }
+
+                // Force-create a new SDR encoder so enc is never in a null-handle
+                // state between sessions.  rebind_capture_and_encoder only recreates
+                // NVENC when the capture RESOLUTION changes, so an explicit rebuild
+                // is needed here regardless of whether the resolution changed.
+                match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
+                    width:        capturer.width  as i32,
+                    height:       capturer.height as i32,
+                    fps:          enc.config.fps,
+                    bitrate_kbps: enc.config.bitrate_kbps,
+                    codec:        enc.config.codec,
+                    is_hdr:       false,
+                }) {
+                    Ok(new_enc) => enc = new_enc,
+                    Err(e)      => eprintln!("❌ Failed to rebuild encoder after disconnect: {e}"),
+                }
+                input::set_active_capture_rect(
+                    capturer.origin_x, capturer.origin_y,
+                    capturer.width,    capturer.height);
             }
         }
 
