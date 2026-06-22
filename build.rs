@@ -67,8 +67,18 @@ fn main() {
 
         // Resource ID 1, type 24 (RT_MANIFEST) — the well-known
         // CREATEPROCESS_MANIFEST_RESOURCE_ID the OS loader looks for.
-        std::fs::write(&rc_path, format!("1 24 \"{manifest_path}\"\n"))
+        // Resource ID 1, type ICON (RT_GROUP_ICON=14) — Windows Explorer
+        // picks the first ICON group resource as the file's visible icon.
+        // Both can share resource ID 1 because they have different types.
+        let ico_path = format!("{manifest_dir}/assets/Nova.ico").replace('\\', "/");
+        let icon_line = if std::path::Path::new(&format!("{manifest_dir}/assets/Nova.ico")).exists() {
+            format!("1 ICON \"{ico_path}\"\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(&rc_path, format!("1 24 \"{manifest_path}\"\n{icon_line}"))
             .expect("failed to write nova-server.rc");
+        println!("cargo:rerun-if-changed=assets/Nova.ico");
 
         let target = std::env::var("TARGET").unwrap();
         let rc_exe = cc::windows_registry::find_tool(&target, "rc.exe")

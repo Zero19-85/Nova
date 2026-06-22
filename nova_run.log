@@ -1,0 +1,4375 @@
+=== Nova Server ===
+🌐 LAN IP: 10.0.0.205
+
+🎥 ServerCodecModeSupport=259 (H264+HEVC); startup encoder: h264
+🖥️  Configuring VDD target topology to: 1920x1080@60Hz
+✅ vdd_settings.xml already advertises 1920x1080@60Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1280x720@30Hz
+✅ vdd_settings.xml already advertises 1280x720@30Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1280x720@60Hz
+✅ vdd_settings.xml already advertises 1280x720@60Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1280x720@120Hz
+✅ vdd_settings.xml already advertises 1280x720@120Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1920x1080@30Hz
+✅ vdd_settings.xml already advertises 1920x1080@30Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1920x1080@60Hz
+✅ vdd_settings.xml already advertises 1920x1080@60Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 1920x1080@120Hz
+✅ vdd_settings.xml already advertises 1920x1080@120Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 2560x1440@60Hz
+✅ vdd_settings.xml already advertises 2560x1440@60Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 2560x1440@120Hz
+✅ vdd_settings.xml already advertises 2560x1440@120Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 3840x2160@30Hz
+✅ vdd_settings.xml already advertises 3840x2160@30Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 3840x2160@60Hz
+✅ vdd_settings.xml already advertises 3840x2160@60Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🖥️  Configuring VDD target topology to: 3840x2160@120Hz
+✅ vdd_settings.xml already advertises 3840x2160@120Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+📋 VDD mode table pre-seeded with 11 resolutions (720p/1080p/1440p/4K × 30/60/120Hz)
+✅ HDRPlus already enabled in vdd_settings.xml
+✅ Root\MttVDD already enabled — cycling to refresh its mode table
+✅ Root\MttVDD devnode disabled
+✅ Root\MttVDD devnode enabled
+⚠️  Failed to stage \\.\DISPLAY13 detach at boot (DISP_CHANGE -2)
+✅ WGC capture session started (2560x1440 BGRA8/SDR)
+⚠️  Monitor native resolution (2560x1440) differs from --width/--height (1920x1080) — using native resolution for capture/encoder pipeline.
+🎧 Virtual audio sink: Speakers (Steam Streaming Speakers)
+✅ NVENC SESSION OPENED
+🔧 Initializing NVENC (h264 @ 2560x1440, 15000 Kbps, 60 fps)...
+ℹ️  NVENC buffer format: NV12 (bufFmt=1) — AllocateInputBuffers will create DXGI_FORMAT_NV12 (103) texture
+📊 NVENC RC config: CBR bitrate=15000000 vbvBufferSize=250000 (1 frame) gop=infinite preset=P1/ULL
+✅ NVENC READY (h264 @ 2560x1440, 15000 Kbps, 60 fps)
+✅ NVENC input texture: 2560x1440 format=0x67 (NV12) — correct
+✅ VP output view created on 2560x1440 format=0x67 texture
+✅ Video Processor (BGRA → NV12 BT.709) initialized
+✅ Cursor compositing pipeline initialized
+🎮 Control stream (ENet) listening on UDP 47999
+🎥 RTSP server listening on port 48010 (Moonlight/GameStream)
+🔑 Loaded existing Nova certificate from disk — SHA-256: 43:06:70:59:0F:70:41:0F:7D:69:3B:24:1C:5D:C5:21:DA:BE:A1:F6:B9:C1:8F:94:92:A4:AE:D0:11:1D:DD:B8
+🔒 Cert SHA-256: 43:06:70:59:0F:70:41:0F:7D:69:3B:24:1C:5D:C5:21:DA:BE:A1:F6:B9:C1:8F:94:92:A4:AE:D0:11:1D:DD:B8
+📂 Loaded 1 paired client(s) from disk
+📡 mDNS broadcaster started for Nova
+▶️  Capture loop running — press Ctrl+C to stop
+🔐 Nova HTTP  server listening on port 47989
+🔒 Nova HTTPS server listening on port 47984
+🎬 First encoded frame: 30117 bytes
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 8924 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 6363 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4701 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4970 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4870 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 5637 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 7823 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 8166 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 6916 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 8474 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 9881 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 8823 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 9064 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 8284 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 8036 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 7028 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 10128 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 7371 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 6238 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4675 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4599 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4638 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4644 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4562 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 4636 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4796 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4614 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4613 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4587 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4805 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4674 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4927 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4810 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4734 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4761 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 4790 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4471 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4686 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4571 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4582 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4712 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4560 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4712 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4805 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4805 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4843 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4661 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4659 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 5014 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4732 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4670 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4747 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4717 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4736 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4530 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4643 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4590 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4510 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4638 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 4645 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4652 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4632 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4760 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4890 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4842 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4647 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4846 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4976 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4599 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4728 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4740 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 4692 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4482 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4601 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4547 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4611 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4839 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4618 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4638 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4880 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4658 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4858 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 5033 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4558 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4605 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4783 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4742 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4697 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4698 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4660 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4675 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4501 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4576 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4797 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4823 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4640 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4647 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 5100 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4909 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4804 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4783 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4680 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4751 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4695 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4600 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4687 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4527 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4566 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4415 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4537 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4684 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4839 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4815 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 5052 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4677 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4690 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4802 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎞  Encoder output: 4794 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4624 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4708 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4610 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4701 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4585 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4464 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4587 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4539 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4664 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4522 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 4840 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4639 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 5420 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 5242 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4530 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4823 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4557 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4583 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4874 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4415 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4576 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4542 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 4618 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4499 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4442 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4670 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4633 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4587 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4807 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4581 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4605 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4832 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4816 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 4776 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4606 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4709 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4738 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4797 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4621 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4612 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4559 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4509 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+🎞  Encoder output: 4567 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4752 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 4621 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🌐 [47989] HTTP from 10.0.0.226:56902
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56903
+⏳ WGC: no new frame on 2560x1440 — streak 10
+✅ [47984] TLS handshake OK from 10.0.0.226:56903
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎞  Encoder output: 4777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 4904 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🌐 [47989] HTTP from 10.0.0.226:56905
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56906
+⏳ WGC: no new frame on 2560x1440 — streak 3
+✅ [47984] TLS handshake OK from 10.0.0.226:56906
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56907
+✅ [47984] TLS handshake OK from 10.0.0.226:56907
+📥 [HTTPS] Moonlight Request: /applist?uniqueid=0123456789ABCDEF&uuid=fd263b68-76c4-46af-4d6faa38
+📋 Moonlight requested /applist
+🌐 [47989] HTTP from 10.0.0.226:56908
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56909
+✅ [47984] TLS handshake OK from 10.0.0.226:56909
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🎞  Encoder output: 4862 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+🎞  Encoder output: 5050 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+🌐 [47989] HTTP from 10.0.0.226:56910
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56911
+✅ [47984] TLS handshake OK from 10.0.0.226:56911
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=0
+🔒 [47984] TLS attempt from 10.0.0.226:56912
+🎞  Encoder output: 4917 Kbps
+✅ [47984] TLS handshake OK from 10.0.0.226:56912
+📥 [HTTPS] Moonlight Request: /launch?uniqueid=0123456789ABCDEF&uuid=3fe0880-af50-4ceb-4e5fcbe8&appid=5&mode=3840x2160x120&additionalStates=1&sops=0&rikey=36d19a30ed560255fac7022ddadcda23&rikeyid=621041928&localAudioPlayMode=0&surroundAudioInfo=196610&remoteControllersBitmap=0&gcmap=0&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0&corever=1
+🔑 /launch rikey: raw="36d19a30ed560255fac7022ddadcda23" (32 chars) decoded=36d19a30ed560255fac7022ddadcda23 rikeyid=621041928
+🚀 /launch app=5 mode=3840x2160@120fps rikeyid=621041928 hostAudio=false
+   ↳ videoFormat=0x0 (H264)  hdrMode=1  ServerCodecModeSupport=259
+⚠️  /launch videoFormat=0 — client did not send a codec selection. Encoder will stay at its current codec until ANNOUNCE is parsed.
+🖥️  Pre-activating virtual display for upcoming session (3840x2160@120fps HDR10)
+🔊 Cached current default audio endpoint before mutating display/audio state
+📸 Saved current display topology from the CCD database (1 path(s))
+🖥️  Configuring VDD target topology to: 3840x2160@120Hz
+✅ vdd_settings.xml already advertises 3840x2160@120Hz (C:\Users\nova-server\target\debug\VirtualDisplayDriver\Dependencies\vdd_settings.xml)
+🔌 Re-activating VDD from dormant 0×0 state via SDC_TOPOLOGY_EXTEND...
+🎥 New RTSP connection from 10.0.0.226:56913
+📥 RTSP 10.0.0.226:56913 OPTIONS (CSeq=1, client_port=0/0)
+📤 RTSP 10.0.0.226:56913 ← 28 bytes:
+RTSP/1.0 200 OK
+CSeq: 1
+🔌 RTSP 10.0.0.226:56913 — closed after OPTIONS
+🎥 New RTSP connection from 10.0.0.226:56914
+📥 RTSP 10.0.0.226:56914 DESCRIBE (CSeq=2, client_port=0/0)
+📤 RTSP 10.0.0.226:56914 ← 266 bytes:
+RTSP/1.0 200 OK
+CSeq: 2
+Content-Type: application/sdp
+Content-Length: 186
+
+a=x-ss-general.featureFlags:0
+a=x-ss-general.encryptionSupported:5
+a=x-ss-general.encryptionRequested:4
+sprop-parameter-sets=AAAAAU
+a=rtpmap:98 AV1/90000
+a=fmtp:97 surround-params=21101
+🔌 RTSP 10.0.0.226:56914 — closed after DESCRIBE
+🎥 New RTSP connection from 10.0.0.226:56915
+📥 RTSP 10.0.0.226:56915 SETUP (CSeq=3, client_port=0/0)
+📤 RTSP 10.0.0.226:56915 ← 131 bytes:
+RTSP/1.0 200 OK
+CSeq: 3
+Session: DEADBEEFCAFE;timeout = 90
+Transport: server_port=48000
+X-SS-Ping-Payload: 252bc58df81dc00c
+🔌 RTSP 10.0.0.226:56915 — closed after SETUP
+✅ VDD re-added to the extended desktop — waiting for topology to settle...
+🎥 New RTSP connection from 10.0.0.226:56916
+📥 RTSP 10.0.0.226:56916 SETUP (CSeq=4, client_port=0/0)
+📤 RTSP 10.0.0.226:56916 ← 131 bytes:
+RTSP/1.0 200 OK
+CSeq: 4
+Session: DEADBEEFCAFE;timeout = 90
+Transport: server_port=47998
+X-SS-Ping-Payload: 252bc58df81dc00c
+🔌 RTSP 10.0.0.226:56916 — closed after SETUP
+🎥 New RTSP connection from 10.0.0.226:56917
+📥 RTSP 10.0.0.226:56917 SETUP (CSeq=5, client_port=0/0)
+📤 RTSP 10.0.0.226:56917 ← 125 bytes:
+RTSP/1.0 200 OK
+CSeq: 5
+Session: DEADBEEFCAFE;timeout = 90
+Transport: server_port=47999
+X-SS-Connect-Data: 2354622383
+🔌 RTSP 10.0.0.226:56917 — closed after SETUP
+🎥 New RTSP connection from 10.0.0.226:56918
+📥 RTSP 10.0.0.226:56918 ANNOUNCE (CSeq=6, client_port=0/0)
+🔧 \\.\DISPLAY13 resolution snapped to 3840x2160@120Hz (DISP_CHANGE_SUCCESSFUL)
+✅ \\.\DISPLAY13 stabilized at 3840x2160 — proceeding with DXGI rebind
+🖥️  \\.\DISPLAY13 is already the desktop primary (CCD source at (0,0))
+🖥️  \\.\DISPLAY13 (3840x2160@120Hz) is now the desktop primary
+🕶️  Physical display path(s) detached — \\.\DISPLAY13 is now the only active display
+🔧 \\.\DISPLAY13 resolution snapped to 3840x2160@120Hz (DISP_CHANGE_SUCCESSFUL)
+✅ \\.\DISPLAY13 stabilized at 3840x2160 — proceeding with DXGI rebind
+⚠️  Capture rebind failed: Error { code: HRESULT(0x80070057), message: "Could not capture the given monitor." } — retrying
+🔍 VDD Advanced Color on \\.\DISPLAY13: supported=true, enabled=false
+🎨 Advanced Color (HDR) enabled → DXGI will provide FP16 scRGB frames on \\.\DISPLAY13
+⏳ Waiting for VDD to settle in HDR/FP16 mode...
+⚠️  WGC FP16 rebind failed: The parameter is incorrect. (0x80070057) — HDR frames may be tone-mapped to SDR
+✅ VDD in FP16 HDR mode — encoder pipeline ready for HEVC Main10
+   ↳ ANNOUNCE codec: bitStreamFormat=1 (HEVC) dynamicRangeMode=0 (SDR) clientSupportHevc=1
+   ↳ ANNOUNCE audio: encryption=true packetDuration=Some(5)ms
+   ↳ ANNOUNCE: packetSize=Some(1024) maxFPS=Some(120) viewport=Some(3840)xSome(2160) minFec=Some(2) bitrateKbps=Some(90400)
+   📋 ANNOUNCE SDP:
+v=0
+o=android 0 14 IN IPv4 10.0.0.205
+s=NVIDIA Streaming Client
+a=x-nv-video[0].clientViewportWd:3840 
+a=x-nv-video[0].clientViewportHt:2160 
+a=x-nv-video[0].maxFPS:120 
+a=x-nv-video[0].packetSize:1024 
+a=x-nv-video[0].rateControlMode:4 
+a=x-nv-video[0].timeoutLengthMs:7000 
+a=x-nv-video[0].framesWithInvalidRefThreshold:0 
+a=x-nv-video[0].initialBitrateKbps:90400 
+a=x-nv-video[0].initialPeakBitrateKbps:90400 
+a=x-nv-vqos[0].bw.minimumBitrateKbps:90400 
+a=x-nv-vqos[0].bw.maximumBitrateKbps:90400 
+a=x-nv-vqos[0].fec.enable:1 
+a=x-nv-vqos[0].videoQualityScoreUpdateTime:5000 
+a=x-nv-vqos[0].qosTrafficType:5 
+a=x-nv-aqos.qosTrafficType:4 
+a=x-nv-general.featureFlags:167 
+a=x-nv-general.useReliableUdp:13 
+a=x-nv-vqos[0].fec.minRequiredFecPackets:2 
+a=x-nv-vqos[0].bllFec.enable:0 
+a=x-nv-vqos[0].drc.enable:0 
+a=x-nv-general.enableRecoveryMode:0 
+a=x-nv-video[0].videoEncoderSlicesPerFrame:1 
+a=x-nv-clientSupportHevc:1 
+a=x-nv-vqos[0].bitStreamFormat:1 
+a=x-nv-video[0].dynamicRangeMode:0 
+a=x-nv-video[0].maxNumReferenceFrames:1 
+a=x-nv-video[0].clientRefreshRateX100:11988 
+a=x-nv-audio.surround.numChannels:2 
+a=x-nv-audio.surround.channelMask:3 
+a=x-nv-audio.surround.enable:0 
+a=x-nv-audio.surround.AudioQuality:0 
+a=x-nv-aqos.packetDuration:5 
+a=x-nv-video[0].encoderCscMode:0 
+t=0 0
+m=video 47998
+📤 RTSP 10.0.0.226:56918 ← 28 bytes:
+RTSP/1.0 200 OK
+CSeq: 6
+🔌 RTSP 10.0.0.226:56918 — closed after ANNOUNCE
+🎞  Encoder output: 143 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+🎥 New RTSP connection from 10.0.0.226:56919
+📥 RTSP 10.0.0.226:56919 PLAY (CSeq=7, client_port=0/0)
+🚀 PLAY — streaming_active=true  target=10.0.0.226:0
+📤 RTSP 10.0.0.226:56919 ← 28 bytes:
+RTSP/1.0 200 OK
+CSeq: 7
+🔌 RTSP 10.0.0.226:56919 — closed after PLAY
+🎮 Moonlight connected: 10.0.0.226 (3840x2160@120fps)
+🔑 Codec negotiation: client=H264 [HDR requested] (videoFormat=0x0)  encoder=h264
+🎥 Codec: hevc (videoFormat=0x0  bitStreamFormat=1/HEVC)
+✅ Cleanu🎮 Control stream: peer connected from 10.0.0.226:50257
+p complete.
+✅ NVENC SESSION OPE🎮 Control: client requested IDR frame
+🎮 Control rx type 0x0307 (5 bytes) on channel 0
+NED
+🔧 Initializing NVENC (hevc @ 2560x1440, 15000 Kbps, 120 fps)...
+ℹ️  NVENC buffer format: NV12 (bufFmt=1) — AllocateInputBuffers will create DXGI_FORMAT_NV12 (103) texture
+📊 NVENC RC config: CBR bitrate=15000000 vbvBufferSize=125000 (1 frame) gop=infinite preset=P1/ULL
+✅ NVENC READY (hevc @ 2560x1440, 15000 Kbps, 120 fps)
+✅ NVENC input texture: 2560x1440 format=0x67 (NV12) — correct
+✅ VP output view created on 2560x1440 format=0x67 texture
+✅ Video Processor (BGRA → NV12 BT.709) initialized
+✅ Cursor compositing pipeline initialized
+🔍 VDD Advanced Color on \\.\DISPLAY13: supported=true, enabled=true
+✅ Advanced Color on \\.\DISPLAY13 already enabled — skipping SET
+🎨 HEVC Main10/HDR10 encoder active (hdrMode=1, VDD in FP16 mode)
+✅ Cleanup complete.
+✅ NVENC SESSION OPENED
+🔧 Initializing NVENC (hevc/HDR10 @ 2560x1440, 15000 Kbps, 120 fps)...
+ℹ️  NVENC buffer format: YUV420_10BIT (bufFmt=65536) — AllocateInputBuffers will create DXGI_FORMAT_P010 (104) texture
+📊 NVENC RC config: CBR bitrate=15000000 vbvBufferSize=125000 (1 frame) gop=infinite preset=P1/ULL
+✅ NVENC READY (hevc/HDR10/Main10 @ 2560x1440, 15000 Kbps, 120 fps)
+✅ NVENC input texture: 2560x1440 format=0x68 (P010) — correct
+✅ VP supports DXGI_FORMAT_P010 output (support=0x03)
+✅ VP output view created on 2560x1440 format=0x68 texture
+✅ VP supports R10G10B10A2_UNORM input (support=0x03)
+✅ Video Processor (R10G10B10A2 BT.2020 PQ → P010 BT.2020 PQ) initialized
+✅ Cursor compositing pipeline initialized
+⚠️  Capture rebind failed: Error { code: HRESULT(0x80070057), message: "The parameter is incorrect." } — retrying
+📐 Encoder: 2560x1440@120fps h264/HDR10  |  Client requested: 3840x2160@120fps HDR
+🖥️  Virtual display already active — forcing WGC+NVENC recreation (3840x2160 FP16/HDR10)
+⚠️  Capture rebind failed: Error { code: HRESULT(0x80070057), message: "The parameter is incorrect." } — retrying
+📐 Resolution re-snap: encoder=2560x1440  client=3840x2160@120fps — retrying VDD force
+📐 VDD re-snap: forcing \\.\DISPLAY13 → 3840x2160@120Hz
+🔧 \\.\DISPLAY13 resolution snapped to 3840x2160@120Hz (DISP_CHANGE_SUCCESSFUL)
+✅ \\.\DISPLAY13 stabilized at 3840x2160 — proceeding with DXGI rebind
+⚠️  Capture rebind failed: Error { code: HRESULT(0x80070057), message: "The parameter is incorrect." } — retrying
+⏱️  Frame interval → 8.33ms (120 fps (client-negotiated))
+📡 Client negotiated packetSize=1024 (announced: 1024), fps=120, fec.minRequired=2
+📐 RTP configured: packetSize=1024 (datagram=1040), fec=20%, minParity=2
+📊 Retargeting encoder to client bitrate: 90400 Kbps @ 120 fps
+📊 NVENC reconfigured: CBR bitrate=90400000 fps=120 vbvBufferSize=753333 (client-negotiated)
+🎮 ViGEm: connected to ViGEmBus — gamepad passthrough enabled
+🎥 Learned client video address: 10.0.0.226:50258
+🎯 Force-IDR requested for first transmitted frame
+⏳ WGC: no new frame on 2560x1440 — streak 2
+🎧 Virtual audio sink: Speakers (Steam Streaming Speakers)
+🎧 Audio: client-only — virtual sink is already the default output
+🎵 Audio capture: 48000 Hz  2 ch  32-bit (virtual sink)
+🎵 Audio stream started: Opus 48kHz stereo 128kbps, 5ms packets, encrypted=true
+🎵 Learned client audio address: 10.0.0.226:50256
+[ENC] frame=5658 size=100160 bytes (P)
+📦 frame 0 : 100160 bytes, 100 data + 20 parity pkt(s), frame_type=1, NALs=["OTHER", "OTHER", "OTHER", "OTHER", "OTHER", "SEI"]
+📊 RTP/s: 1 frames, 100 data + 20 parity pkts, fec=20%, 121.9 KB/s, pktsize=1024
+⏳ WGC: no new frame on 2560x1440 — streak 3
+[ENC] frame=5659 size=90302 bytes (P)
+📦 frame 1 : 90302 bytes, 90 data + 18 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5660 size=93595 bytes (P)
+📦 frame 2 : 93595 bytes, 93 data + 19 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5661 size=82079 bytes (P)
+📦 frame 3 : 82079 bytes, 82 data + 17 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5662 size=81154 bytes (P)
+📦 frame 4 : 81154 bytes, 81 data + 17 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5663 size=67285 bytes (P)
+📦 frame 5 : 67285 bytes, 67 data + 14 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5664 size=57533 bytes (P)
+📦 frame 6 : 57533 bytes, 58 data + 12 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5665 size=45491 bytes (P)
+📦 frame 7 : 45491 bytes, 46 data + 10 parity pkt(s), frame_type=1, NALs=["OTHER"]
+⏳ WGC: no new frame on 2560x1440 — streak 10
+[ENC] frame=5666 size=46878 bytes (P)
+📦 frame 8 : 46878 bytes, 47 data + 10 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5667 size=45920 bytes (P)
+📦 frame 9 : 45920 bytes, 46 data + 10 parity pkt(s), frame_type=1, NALs=["OTHER"]
+[ENC] frame=5668 size=34384 bytes (P)
+[ENC] frame=5669 size=21710 bytes (P)
+[ENC] frame=5670 size=19338 bytes (P)
+[ENC] frame=5671 size=15255 bytes (P)
+[ENC] frame=5672 size=10830 bytes (P)
+[ENC] frame=5673 size=9166 bytes (P)
+[ENC] frame=5674 size=4590 bytes (P)
+[ENC] frame=5675 size=7889 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 20
+[ENC] frame=5676 size=5854 bytes (P)
+[ENC] frame=5677 size=3150 bytes (P)
+[ENC] frame=5678 size=1822 bytes (P)
+[ENC] frame=5679 size=1013 bytes (P)
+[ENC] frame=5680 size=712 bytes (P)
+[ENC] frame=5681 size=658 bytes (P)
+[ENC] frame=5682 size=622 bytes (P)
+[ENC] frame=5683 size=586 bytes (P)
+[ENC] frame=5684 size=582 bytes (P)
+[ENC] frame=5685 size=578 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 30
+[ENC] frame=5686 size=582 bytes (P)
+[ENC] frame=5687 size=578 bytes (P)
+[ENC] frame=5688 size=49831 bytes (P)
+[ENC] frame=5689 size=50457 bytes (P)
+[ENC] frame=5690 size=66180 bytes (P)
+[ENC] frame=5691 size=86542 bytes (P)
+[ENC] frame=5692 size=52602 bytes (P)
+[ENC] frame=5693 size=45035 bytes (P)
+[ENC] frame=5694 size=59986 bytes (P)
+[ENC] frame=5695 size=35648 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 40
+[ENC] frame=5696 size=67973 bytes (P)
+[ENC] frame=5697 size=150377 bytes (P)
+🎞  Encoder output: 12622 Kbps
+[ENC] frame=5698 size=44885 bytes (P)
+[ENC] frame=5699 size=31972 bytes (P)
+[ENC] frame=5700 size=32745 bytes (P)
+[ENC] frame=5701 size=20949 bytes (P)
+[ENC] frame=5702 size=16264 bytes (P)
+[ENC] frame=5703 size=8812 bytes (P)
+[ENC] frame=5704 size=6655 bytes (P)
+[ENC] frame=5705 size=3673 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 50
+[ENC] frame=5706 size=6825 bytes (P)
+[ENC] frame=5707 size=4011 bytes (P)
+[ENC] frame=5708 size=2298 bytes (P)
+[ENC] frame=5709 size=874 bytes (P)
+[ENC] frame=5710 size=590 bytes (P)
+[ENC] frame=5711 size=446 bytes (P)
+[ENC] frame=5712 size=392 bytes (P)
+[ENC] frame=5713 size=353 bytes (P)
+[ENC] frame=5714 size=334 bytes (P)
+[ENC] frame=5715 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 60
+[ENC] frame=5716 size=334 bytes (P)
+[ENC] frame=5717 size=334 bytes (P)
+[ENC] frame=5718 size=49507 bytes (P)
+[ENC] frame=5719 size=50211 bytes (P)
+[ENC] frame=5720 size=66230 bytes (P)
+[ENC] frame=5721 size=86522 bytes (P)
+[ENC] frame=5722 size=52602 bytes (P)
+📊 RTP/s: 64 frames, 1920 data + 442 parity pkts, fec=20%, 2398.9 KB/s, pktsize=1024
+[ENC] frame=5723 size=45031 bytes (P)
+[ENC] frame=5724 size=59986 bytes (P)
+[ENC] frame=5725 size=35633 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 70
+[ENC] frame=5726 size=67973 bytes (P)
+[ENC] frame=5727 size=150377 bytes (P)
+[ENC] frame=5728 size=44885 bytes (P)
+[ENC] frame=5729 size=31972 bytes (P)
+[ENC] frame=5730 size=32745 bytes (P)
+[ENC] frame=5731 size=20949 bytes (P)
+[ENC] frame=5732 size=16264 bytes (P)
+[ENC] frame=5733 size=8812 bytes (P)
+[ENC] frame=5734 size=6655 bytes (P)
+[ENC] frame=5735 size=3673 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 80
+[ENC] frame=5736 size=6825 bytes (P)
+[ENC] frame=5737 size=4011 bytes (P)
+[ENC] frame=5738 size=2298 bytes (P)
+[ENC] frame=5739 size=874 bytes (P)
+[ENC] frame=5740 size=590 bytes (P)
+[ENC] frame=5741 size=446 bytes (P)
+[ENC] frame=5742 size=392 bytes (P)
+[ENC] frame=5743 size=353 bytes (P)
+[ENC] frame=5744 size=334 bytes (P)
+[ENC] frame=5745 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 90
+[ENC] frame=5746 size=334 bytes (P)
+[ENC] frame=5747 size=334 bytes (P)
+[ENC] frame=5748 size=49507 bytes (P)
+[ENC] frame=5749 size=50211 bytes (P)
+[ENC] frame=5750 size=66230 bytes (P)
+[ENC] frame=5751 size=86522 bytes (P)
+[ENC] frame=5752 size=52602 bytes (P)
+[ENC] frame=5753 size=45031 bytes (P)
+[ENC] frame=5754 size=59986 bytes (P)
+[ENC] frame=5755 size=35633 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 100
+[ENC] frame=5756 size=67973 bytes (P)
+[ENC] frame=5757 size=150377 bytes (P)
+[ENC] frame=5758 size=44885 bytes (P)
+[ENC] frame=5759 size=31972 bytes (P)
+[ENC] frame=5760 size=32745 bytes (P)
+[ENC] frame=5761 size=20949 bytes (P)
+[ENC] frame=5762 size=16264 bytes (P)
+🎞  Encoder output: 14440 Kbps
+[ENC] frame=5763 size=8812 bytes (P)
+[ENC] frame=5764 size=6655 bytes (P)
+[ENC] frame=5765 size=3673 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 110
+[ENC] frame=5766 size=6825 bytes (P)
+[ENC] frame=5767 size=4011 bytes (P)
+[ENC] frame=5768 size=2298 bytes (P)
+[ENC] frame=5769 size=874 bytes (P)
+[ENC] frame=5770 size=590 bytes (P)
+[ENC] frame=5771 size=446 bytes (P)
+[ENC] frame=5772 size=392 bytes (P)
+[ENC] frame=5773 size=353 bytes (P)
+[ENC] frame=5774 size=334 bytes (P)
+[ENC] frame=5775 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 120
+[ENC] frame=5776 size=334 bytes (P)
+[ENC] frame=5777 size=334 bytes (P)
+[ENC] frame=5778 size=49507 bytes (P)
+🎮 Control: client requested IDR frame
+[ENC] frame=5779 size=99068 bytes (P)
+[ENC] frame=5780 size=88885 bytes (P)
+[ENC] frame=5781 size=99173 bytes (P)
+[ENC] frame=5782 size=100343 bytes (P)
+[ENC] frame=5783 size=102528 bytes (P)
+[ENC] frame=5784 size=80874 bytes (P)
+[ENC] frame=5785 size=55195 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 130
+[ENC] frame=5786 size=83985 bytes (P)
+[ENC] frame=5787 size=138429 bytes (P)
+📊 RTP/s: 65 frames, 2302 data + 515 parity pkts, fec=20%, 2861.0 KB/s, pktsize=1024
+[ENC] frame=5788 size=64250 bytes (P)
+[ENC] frame=5789 size=49632 bytes (P)
+[ENC] frame=5790 size=43112 bytes (P)
+[ENC] frame=5791 size=45622 bytes (P)
+[ENC] frame=5792 size=33611 bytes (P)
+[ENC] frame=5793 size=23863 bytes (P)
+[ENC] frame=5794 size=19484 bytes (P)
+[ENC] frame=5795 size=14772 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 140
+[ENC] frame=5796 size=10323 bytes (P)
+[ENC] frame=5797 size=9070 bytes (P)
+[ENC] frame=5798 size=4252 bytes (P)
+[ENC] frame=5799 size=7543 bytes (P)
+[ENC] frame=5800 size=5107 bytes (P)
+[ENC] frame=5801 size=2754 bytes (P)
+[ENC] frame=5802 size=1199 bytes (P)
+[ENC] frame=5803 size=782 bytes (P)
+[ENC] frame=5804 size=456 bytes (P)
+[ENC] frame=5805 size=536 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 150
+[ENC] frame=5806 size=358 bytes (P)
+[ENC] frame=5807 size=305 bytes (P)
+[ENC] frame=5808 size=305 bytes (P)
+[ENC] frame=5809 size=49642 bytes (P)
+[ENC] frame=5810 size=50262 bytes (P)
+[ENC] frame=5811 size=66136 bytes (P)
+[ENC] frame=5812 size=86546 bytes (P)
+[ENC] frame=5813 size=52602 bytes (P)
+[ENC] frame=5814 size=45029 bytes (P)
+[ENC] frame=5815 size=59988 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 160
+[ENC] frame=5816 size=35646 bytes (P)
+[ENC] frame=5817 size=67976 bytes (P)
+[ENC] frame=5818 size=150377 bytes (P)
+[ENC] frame=5819 size=44885 bytes (P)
+[ENC] frame=5820 size=31972 bytes (P)
+[ENC] frame=5821 size=32745 bytes (P)
+[ENC] frame=5822 size=20949 bytes (P)
+[ENC] frame=5823 size=16264 bytes (P)
+[ENC] frame=5824 size=8812 bytes (P)
+[ENC] frame=5825 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 170
+[ENC] frame=5826 size=3673 bytes (P)
+🎞  Encoder output: 16798 Kbps
+[ENC] frame=5827 size=6825 bytes (P)
+[ENC] frame=5828 size=4011 bytes (P)
+[ENC] frame=5829 size=2298 bytes (P)
+[ENC] frame=5830 size=874 bytes (P)
+[ENC] frame=5831 size=590 bytes (P)
+[ENC] frame=5832 size=446 bytes (P)
+[ENC] frame=5833 size=392 bytes (P)
+[ENC] frame=5834 size=353 bytes (P)
+[ENC] frame=5835 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 180
+[ENC] frame=5836 size=334 bytes (P)
+[ENC] frame=5837 size=334 bytes (P)
+[ENC] frame=5838 size=334 bytes (P)
+[ENC] frame=5839 size=49507 bytes (P)
+[ENC] frame=5840 size=50211 bytes (P)
+[ENC] frame=5841 size=66230 bytes (P)
+[ENC] frame=5842 size=86522 bytes (P)
+[ENC] frame=5843 size=52602 bytes (P)
+[ENC] frame=5844 size=45031 bytes (P)
+[ENC] frame=5845 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 190
+[ENC] frame=5846 size=35633 bytes (P)
+[ENC] frame=5847 size=67973 bytes (P)
+[ENC] frame=5848 size=150377 bytes (P)
+[ENC] frame=5849 size=44885 bytes (P)
+[ENC] frame=5850 size=31972 bytes (P)
+[ENC] frame=5851 size=32745 bytes (P)
+[ENC] frame=5852 size=20949 bytes (P)
+📊 RTP/s: 65 frames, 1997 data + 450 parity pkts, fec=20%, 2485.2 KB/s, pktsize=1024
+[ENC] frame=5853 size=16264 bytes (P)
+[ENC] frame=5854 size=8812 bytes (P)
+[ENC] frame=5855 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 200
+[ENC] frame=5856 size=3673 bytes (P)
+[ENC] frame=5857 size=6825 bytes (P)
+[ENC] frame=5858 size=4011 bytes (P)
+[ENC] frame=5859 size=2298 bytes (P)
+[ENC] frame=5860 size=874 bytes (P)
+[ENC] frame=5861 size=590 bytes (P)
+[ENC] frame=5862 size=446 bytes (P)
+[ENC] frame=5863 size=392 bytes (P)
+[ENC] frame=5864 size=353 bytes (P)
+[ENC] frame=5865 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 210
+[ENC] frame=5866 size=334 bytes (P)
+🎮 ViGEm: plugged in virtual Xbox 360 controller #0
+[ENC] frame=5867 size=334 bytes (P)
+[ENC] frame=5868 size=334 bytes (P)
+[ENC] frame=5869 size=49507 bytes (P)
+[ENC] frame=5870 size=50211 bytes (P)
+[ENC] frame=5871 size=66230 bytes (P)
+[ENC] frame=5872 size=86522 bytes (P)
+[ENC] frame=5873 size=52602 bytes (P)
+[ENC] frame=5874 size=45031 bytes (P)
+[ENC] frame=5875 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 220
+[ENC] frame=5876 size=35633 bytes (P)
+[ENC] frame=5877 size=67973 bytes (P)
+[ENC] frame=5878 size=150377 bytes (P)
+[ENC] frame=5879 size=44885 bytes (P)
+[ENC] frame=5880 size=31972 bytes (P)
+[ENC] frame=5881 size=32745 bytes (P)
+[ENC] frame=5882 size=20949 bytes (P)
+[ENC] frame=5883 size=16264 bytes (P)
+[ENC] frame=5884 size=8812 bytes (P)
+[ENC] frame=5885 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 230
+[ENC] frame=5886 size=3673 bytes (P)
+[ENC] frame=5887 size=6825 bytes (P)
+[ENC] frame=5888 size=4011 bytes (P)
+[ENC] frame=5889 size=2298 bytes (P)
+[ENC] frame=5890 size=874 bytes (P)
+[ENC] frame=5891 size=590 bytes (P)
+🎞  Encoder output: 13620 Kbps
+[ENC] frame=5892 size=446 bytes (P)
+[ENC] frame=5893 size=392 bytes (P)
+[ENC] frame=5894 size=353 bytes (P)
+[ENC] frame=5895 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 240
+[ENC] frame=5896 size=334 bytes (P)
+[ENC] frame=5897 size=334 bytes (P)
+[ENC] frame=5898 size=334 bytes (P)
+[ENC] frame=5899 size=49507 bytes (P)
+[ENC] frame=5900 size=50211 bytes (P)
+[ENC] frame=5901 size=66230 bytes (P)
+[ENC] frame=5902 size=86522 bytes (P)
+[ENC] frame=5903 size=52602 bytes (P)
+[ENC] frame=5904 size=45031 bytes (P)
+[ENC] frame=5905 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 250
+[ENC] frame=5906 size=35633 bytes (P)
+[ENC] frame=5907 size=67973 bytes (P)
+[ENC] frame=5908 size=150377 bytes (P)
+[ENC] frame=5909 size=44885 bytes (P)
+[ENC] frame=5910 size=31972 bytes (P)
+[ENC] frame=5911 size=32745 bytes (P)
+[ENC] frame=5912 size=20949 bytes (P)
+[ENC] frame=5913 size=16264 bytes (P)
+[ENC] frame=5914 size=8812 bytes (P)
+[ENC] frame=5915 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 260
+[ENC] frame=5916 size=3673 bytes (P)
+[ENC] frame=5917 size=6825 bytes (P)
+📊 RTP/s: 65 frames, 1754 data + 408 parity pkts, fec=20%, 2195.8 KB/s, pktsize=1024
+[ENC] frame=5918 size=4011 bytes (P)
+[ENC] frame=5919 size=2298 bytes (P)
+[ENC] frame=5920 size=874 bytes (P)
+[ENC] frame=5921 size=590 bytes (P)
+[ENC] frame=5922 size=446 bytes (P)
+[ENC] frame=5923 size=392 bytes (P)
+[ENC] frame=5924 size=353 bytes (P)
+[ENC] frame=5925 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 270
+[ENC] frame=5926 size=334 bytes (P)
+[ENC] frame=5927 size=334 bytes (P)
+[ENC] frame=5928 size=334 bytes (P)
+[ENC] frame=5929 size=49507 bytes (P)
+[ENC] frame=5930 size=50211 bytes (P)
+[ENC] frame=5931 size=66230 bytes (P)
+[ENC] frame=5932 size=86522 bytes (P)
+[ENC] frame=5933 size=52602 bytes (P)
+[ENC] frame=5934 size=45031 bytes (P)
+[ENC] frame=5935 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 280
+[ENC] frame=5936 size=35633 bytes (P)
+[ENC] frame=5937 size=67973 bytes (P)
+[ENC] frame=5938 size=150377 bytes (P)
+[ENC] frame=5939 size=44885 bytes (P)
+[ENC] frame=5940 size=31972 bytes (P)
+[ENC] frame=5941 size=32745 bytes (P)
+[ENC] frame=5942 size=20949 bytes (P)
+[ENC] frame=5943 size=16264 bytes (P)
+[ENC] frame=5944 size=8812 bytes (P)
+[ENC] frame=5945 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 290
+[ENC] frame=5946 size=3673 bytes (P)
+[ENC] frame=5947 size=6825 bytes (P)
+[ENC] frame=5948 size=4011 bytes (P)
+[ENC] frame=5949 size=2298 bytes (P)
+[ENC] frame=5950 size=874 bytes (P)
+[ENC] frame=5951 size=590 bytes (P)
+[ENC] frame=5952 size=446 bytes (P)
+[ENC] frame=5953 size=392 bytes (P)
+[ENC] frame=5954 size=353 bytes (P)
+[ENC] frame=5955 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 300
+[ENC] frame=5956 size=334 bytes (P)
+🎞  Encoder output: 13568 Kbps
+[ENC] frame=5957 size=334 bytes (P)
+[ENC] frame=5958 size=334 bytes (P)
+[ENC] frame=5959 size=49507 bytes (P)
+[ENC] frame=5960 size=50211 bytes (P)
+[ENC] frame=5961 size=66230 bytes (P)
+[ENC] frame=5962 size=86522 bytes (P)
+[ENC] frame=5963 size=52602 bytes (P)
+[ENC] frame=5964 size=45031 bytes (P)
+[ENC] frame=5965 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 310
+[ENC] frame=5966 size=35633 bytes (P)
+[ENC] frame=5967 size=67973 bytes (P)
+[ENC] frame=5968 size=150377 bytes (P)
+[ENC] frame=5969 size=44885 bytes (P)
+[ENC] frame=5970 size=31972 bytes (P)
+[ENC] frame=5971 size=32745 bytes (P)
+[ENC] frame=5972 size=20949 bytes (P)
+[ENC] frame=5973 size=16264 bytes (P)
+[ENC] frame=5974 size=8812 bytes (P)
+[ENC] frame=5975 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 320
+[ENC] frame=5976 size=3673 bytes (P)
+[ENC] frame=5977 size=6825 bytes (P)
+[ENC] frame=5978 size=4011 bytes (P)
+[ENC] frame=5979 size=2298 bytes (P)
+[ENC] frame=5980 size=874 bytes (P)
+[ENC] frame=5981 size=590 bytes (P)
+[ENC] frame=5982 size=446 bytes (P)
+📊 RTP/s: 65 frames, 1720 data + 406 parity pkts, fec=20%, 2159.2 KB/s, pktsize=1024
+[ENC] frame=5983 size=392 bytes (P)
+[ENC] frame=5984 size=353 bytes (P)
+[ENC] frame=5985 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 330
+[ENC] frame=5986 size=334 bytes (P)
+[ENC] frame=5987 size=334 bytes (P)
+[ENC] frame=5988 size=334 bytes (P)
+[ENC] frame=5989 size=49507 bytes (P)
+[ENC] frame=5990 size=50211 bytes (P)
+[ENC] frame=5991 size=66230 bytes (P)
+[ENC] frame=5992 size=86522 bytes (P)
+[ENC] frame=5993 size=52602 bytes (P)
+[ENC] frame=5994 size=45031 bytes (P)
+[ENC] frame=5995 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 340
+[ENC] frame=5996 size=35633 bytes (P)
+[ENC] frame=5997 size=67973 bytes (P)
+[ENC] frame=5998 size=150377 bytes (P)
+[ENC] frame=5999 size=44885 bytes (P)
+[ENC] frame=6000 size=31972 bytes (P)
+[ENC] frame=6001 size=32745 bytes (P)
+[ENC] frame=6002 size=20949 bytes (P)
+[ENC] frame=6003 size=16264 bytes (P)
+[ENC] frame=6004 size=8812 bytes (P)
+[ENC] frame=6005 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 350
+[ENC] frame=6006 size=3673 bytes (P)
+[ENC] frame=6007 size=6825 bytes (P)
+[ENC] frame=6008 size=4011 bytes (P)
+[ENC] frame=6009 size=2298 bytes (P)
+[ENC] frame=6010 size=874 bytes (P)
+[ENC] frame=6011 size=590 bytes (P)
+[ENC] frame=6012 size=446 bytes (P)
+[ENC] frame=6013 size=392 bytes (P)
+[ENC] frame=6014 size=353 bytes (P)
+[ENC] frame=6015 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 360
+[ENC] frame=6016 size=334 bytes (P)
+[ENC] frame=6017 size=334 bytes (P)
+[ENC] frame=6018 size=334 bytes (P)
+[ENC] frame=6019 size=49507 bytes (P)
+[ENC] frame=6020 size=50211 bytes (P)
+[ENC] frame=6021 size=66230 bytes (P)
+🎞  Encoder output: 15576 Kbps
+[ENC] frame=6022 size=86522 bytes (P)
+[ENC] frame=6023 size=52602 bytes (P)
+[ENC] frame=6024 size=45031 bytes (P)
+[ENC] frame=6025 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 370
+[ENC] frame=6026 size=35633 bytes (P)
+[ENC] frame=6027 size=67973 bytes (P)
+[ENC] frame=6028 size=150377 bytes (P)
+[ENC] frame=6029 size=44885 bytes (P)
+[ENC] frame=6030 size=31972 bytes (P)
+[ENC] frame=6031 size=32745 bytes (P)
+[ENC] frame=6032 size=20949 bytes (P)
+[ENC] frame=6033 size=16264 bytes (P)
+[ENC] frame=6034 size=8812 bytes (P)
+[ENC] frame=6035 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 380
+[ENC] frame=6036 size=3673 bytes (P)
+[ENC] frame=6037 size=6825 bytes (P)
+[ENC] frame=6038 size=4011 bytes (P)
+[ENC] frame=6039 size=2298 bytes (P)
+[ENC] frame=6040 size=874 bytes (P)
+[ENC] frame=6041 size=590 bytes (P)
+[ENC] frame=6042 size=446 bytes (P)
+[ENC] frame=6043 size=392 bytes (P)
+[ENC] frame=6044 size=353 bytes (P)
+[ENC] frame=6045 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 390
+[ENC] frame=6046 size=334 bytes (P)
+[ENC] frame=6047 size=334 bytes (P)
+📊 RTP/s: 65 frames, 1715 data + 406 parity pkts, fec=20%, 2154.1 KB/s, pktsize=1024
+[ENC] frame=6048 size=334 bytes (P)
+[ENC] frame=6049 size=49507 bytes (P)
+[ENC] frame=6050 size=50211 bytes (P)
+[ENC] frame=6051 size=66230 bytes (P)
+[ENC] frame=6052 size=86522 bytes (P)
+[ENC] frame=6053 size=52602 bytes (P)
+[ENC] frame=6054 size=45031 bytes (P)
+[ENC] frame=6055 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 400
+[ENC] frame=6056 size=35633 bytes (P)
+[ENC] frame=6057 size=67973 bytes (P)
+[ENC] frame=6058 size=150377 bytes (P)
+[ENC] frame=6059 size=44885 bytes (P)
+[ENC] frame=6060 size=31972 bytes (P)
+[ENC] frame=6061 size=32745 bytes (P)
+[ENC] frame=6062 size=20949 bytes (P)
+[ENC] frame=6063 size=16264 bytes (P)
+[ENC] frame=6064 size=8812 bytes (P)
+[ENC] frame=6065 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 410
+[ENC] frame=6066 size=3673 bytes (P)
+[ENC] frame=6067 size=6825 bytes (P)
+[ENC] frame=6068 size=4011 bytes (P)
+[ENC] frame=6069 size=2298 bytes (P)
+[ENC] frame=6070 size=874 bytes (P)
+[ENC] frame=6071 size=590 bytes (P)
+[ENC] frame=6072 size=446 bytes (P)
+[ENC] frame=6073 size=392 bytes (P)
+[ENC] frame=6074 size=353 bytes (P)
+[ENC] frame=6075 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 420
+[ENC] frame=6076 size=334 bytes (P)
+[ENC] frame=6077 size=334 bytes (P)
+[ENC] frame=6078 size=334 bytes (P)
+[ENC] frame=6079 size=49507 bytes (P)
+[ENC] frame=6080 size=50211 bytes (P)
+[ENC] frame=6081 size=66230 bytes (P)
+[ENC] frame=6082 size=86522 bytes (P)
+[ENC] frame=6083 size=52602 bytes (P)
+[ENC] frame=6084 size=45031 bytes (P)
+[ENC] frame=6085 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 430
+[ENC] frame=6086 size=35633 bytes (P)
+🎞  Encoder output: 15644 Kbps
+[ENC] frame=6087 size=67973 bytes (P)
+[ENC] frame=6088 size=150377 bytes (P)
+[ENC] frame=6089 size=44885 bytes (P)
+[ENC] frame=6090 size=31972 bytes (P)
+[ENC] frame=6091 size=32745 bytes (P)
+[ENC] frame=6092 size=20949 bytes (P)
+[ENC] frame=6093 size=16264 bytes (P)
+[ENC] frame=6094 size=8812 bytes (P)
+[ENC] frame=6095 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 440
+[ENC] frame=6096 size=3673 bytes (P)
+[ENC] frame=6097 size=6825 bytes (P)
+[ENC] frame=6098 size=4011 bytes (P)
+[ENC] frame=6099 size=2298 bytes (P)
+[ENC] frame=6100 size=874 bytes (P)
+[ENC] frame=6101 size=590 bytes (P)
+[ENC] frame=6102 size=446 bytes (P)
+[ENC] frame=6103 size=392 bytes (P)
+[ENC] frame=6104 size=353 bytes (P)
+[ENC] frame=6105 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 450
+[ENC] frame=6106 size=334 bytes (P)
+[ENC] frame=6107 size=334 bytes (P)
+[ENC] frame=6108 size=334 bytes (P)
+[ENC] frame=6109 size=49507 bytes (P)
+[ENC] frame=6110 size=50211 bytes (P)
+[ENC] frame=6111 size=66230 bytes (P)
+[ENC] frame=6112 size=86522 bytes (P)
+📊 RTP/s: 65 frames, 1963 data + 450 parity pkts, fec=20%, 2450.7 KB/s, pktsize=1024
+[ENC] frame=6113 size=52602 bytes (P)
+[ENC] frame=6114 size=45031 bytes (P)
+[ENC] frame=6115 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 460
+[ENC] frame=6116 size=35633 bytes (P)
+[ENC] frame=6117 size=67973 bytes (P)
+[ENC] frame=6118 size=150377 bytes (P)
+[ENC] frame=6119 size=44885 bytes (P)
+[ENC] frame=6120 size=31972 bytes (P)
+[ENC] frame=6121 size=32745 bytes (P)
+[ENC] frame=6122 size=20949 bytes (P)
+[ENC] frame=6123 size=16264 bytes (P)
+[ENC] frame=6124 size=8812 bytes (P)
+[ENC] frame=6125 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 470
+[ENC] frame=6126 size=3673 bytes (P)
+[ENC] frame=6127 size=6825 bytes (P)
+[ENC] frame=6128 size=4011 bytes (P)
+[ENC] frame=6129 size=2298 bytes (P)
+[ENC] frame=6130 size=874 bytes (P)
+[ENC] frame=6131 size=590 bytes (P)
+[ENC] frame=6132 size=446 bytes (P)
+[ENC] frame=6133 size=392 bytes (P)
+[ENC] frame=6134 size=353 bytes (P)
+[ENC] frame=6135 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 480
+[ENC] frame=6136 size=334 bytes (P)
+[ENC] frame=6137 size=334 bytes (P)
+[ENC] frame=6138 size=334 bytes (P)
+[ENC] frame=6139 size=49507 bytes (P)
+[ENC] frame=6140 size=50211 bytes (P)
+[ENC] frame=6141 size=66230 bytes (P)
+[ENC] frame=6142 size=86522 bytes (P)
+[ENC] frame=6143 size=52602 bytes (P)
+[ENC] frame=6144 size=45031 bytes (P)
+[ENC] frame=6145 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 490
+[ENC] frame=6146 size=35633 bytes (P)
+[ENC] frame=6147 size=67973 bytes (P)
+[ENC] frame=6148 size=150377 bytes (P)
+[ENC] frame=6149 size=44885 bytes (P)
+[ENC] frame=6150 size=31972 bytes (P)
+[ENC] frame=6151 size=32745 bytes (P)
+🎞  Encoder output: 15801 Kbps
+[ENC] frame=6152 size=20949 bytes (P)
+[ENC] frame=6153 size=16264 bytes (P)
+[ENC] frame=6154 size=8812 bytes (P)
+[ENC] frame=6155 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 500
+[ENC] frame=6156 size=3673 bytes (P)
+[ENC] frame=6157 size=6825 bytes (P)
+[ENC] frame=6158 size=4011 bytes (P)
+[ENC] frame=6159 size=2298 bytes (P)
+[ENC] frame=6160 size=874 bytes (P)
+[ENC] frame=6161 size=590 bytes (P)
+[ENC] frame=6162 size=446 bytes (P)
+[ENC] frame=6163 size=392 bytes (P)
+[ENC] frame=6164 size=353 bytes (P)
+[ENC] frame=6165 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 510
+[ENC] frame=6166 size=334 bytes (P)
+[ENC] frame=6167 size=334 bytes (P)
+[ENC] frame=6168 size=334 bytes (P)
+[ENC] frame=6169 size=49507 bytes (P)
+[ENC] frame=6170 size=50211 bytes (P)
+[ENC] frame=6171 size=66230 bytes (P)
+[ENC] frame=6172 size=86522 bytes (P)
+[ENC] frame=6173 size=52602 bytes (P)
+[ENC] frame=6174 size=45031 bytes (P)
+[ENC] frame=6175 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 520
+[ENC] frame=6176 size=35633 bytes (P)
+[ENC] frame=6177 size=67973 bytes (P)
+📊 RTP/s: 65 frames, 1972 data + 450 parity pkts, fec=20%, 2459.8 KB/s, pktsize=1024
+[ENC] frame=6178 size=150377 bytes (P)
+[ENC] frame=6179 size=44885 bytes (P)
+[ENC] frame=6180 size=31972 bytes (P)
+[ENC] frame=6181 size=32745 bytes (P)
+[ENC] frame=6182 size=20949 bytes (P)
+[ENC] frame=6183 size=16264 bytes (P)
+[ENC] frame=6184 size=8812 bytes (P)
+[ENC] frame=6185 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 530
+[ENC] frame=6186 size=3673 bytes (P)
+[ENC] frame=6187 size=6825 bytes (P)
+[ENC] frame=6188 size=4011 bytes (P)
+[ENC] frame=6189 size=2298 bytes (P)
+[ENC] frame=6190 size=874 bytes (P)
+[ENC] frame=6191 size=590 bytes (P)
+[ENC] frame=6192 size=446 bytes (P)
+[ENC] frame=6193 size=392 bytes (P)
+[ENC] frame=6194 size=353 bytes (P)
+[ENC] frame=6195 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 540
+[ENC] frame=6196 size=334 bytes (P)
+[ENC] frame=6197 size=334 bytes (P)
+[ENC] frame=6198 size=334 bytes (P)
+[ENC] frame=6199 size=49507 bytes (P)
+[ENC] frame=6200 size=50211 bytes (P)
+[ENC] frame=6201 size=66230 bytes (P)
+[ENC] frame=6202 size=86522 bytes (P)
+[ENC] frame=6203 size=52602 bytes (P)
+[ENC] frame=6204 size=45031 bytes (P)
+[ENC] frame=6205 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 550
+[ENC] frame=6206 size=35633 bytes (P)
+[ENC] frame=6207 size=67973 bytes (P)
+[ENC] frame=6208 size=150377 bytes (P)
+[ENC] frame=6209 size=44885 bytes (P)
+[ENC] frame=6210 size=31972 bytes (P)
+[ENC] frame=6211 size=32745 bytes (P)
+[ENC] frame=6212 size=20949 bytes (P)
+[ENC] frame=6213 size=16264 bytes (P)
+[ENC] frame=6214 size=8812 bytes (P)
+[ENC] frame=6215 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 560
+[ENC] frame=6216 size=3673 bytes (P)
+🎞  Encoder output: 13892 Kbps
+[ENC] frame=6217 size=6825 bytes (P)
+[ENC] frame=6218 size=4011 bytes (P)
+[ENC] frame=6219 size=2298 bytes (P)
+[ENC] frame=6220 size=874 bytes (P)
+[ENC] frame=6221 size=590 bytes (P)
+[ENC] frame=6222 size=446 bytes (P)
+[ENC] frame=6223 size=392 bytes (P)
+[ENC] frame=6224 size=353 bytes (P)
+[ENC] frame=6225 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 570
+[ENC] frame=6226 size=334 bytes (P)
+[ENC] frame=6227 size=334 bytes (P)
+[ENC] frame=6228 size=334 bytes (P)
+[ENC] frame=6229 size=49507 bytes (P)
+[ENC] frame=6230 size=50211 bytes (P)
+[ENC] frame=6231 size=66230 bytes (P)
+[ENC] frame=6232 size=86522 bytes (P)
+[ENC] frame=6233 size=52602 bytes (P)
+[ENC] frame=6234 size=45031 bytes (P)
+[ENC] frame=6235 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 580
+[ENC] frame=6236 size=35633 bytes (P)
+[ENC] frame=6237 size=67973 bytes (P)
+[ENC] frame=6238 size=150377 bytes (P)
+[ENC] frame=6239 size=44885 bytes (P)
+[ENC] frame=6240 size=31972 bytes (P)
+[ENC] frame=6241 size=32745 bytes (P)
+[ENC] frame=6242 size=20949 bytes (P)
+📊 RTP/s: 65 frames, 1991 data + 454 parity pkts, fec=20%, 2483.2 KB/s, pktsize=1024
+[ENC] frame=6243 size=16264 bytes (P)
+[ENC] frame=6244 size=8812 bytes (P)
+[ENC] frame=6245 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 590
+[ENC] frame=6246 size=3673 bytes (P)
+[ENC] frame=6247 size=6825 bytes (P)
+[ENC] frame=6248 size=4011 bytes (P)
+[ENC] frame=6249 size=2298 bytes (P)
+[ENC] frame=6250 size=874 bytes (P)
+[ENC] frame=6251 size=590 bytes (P)
+[ENC] frame=6252 size=446 bytes (P)
+[ENC] frame=6253 size=392 bytes (P)
+[ENC] frame=6254 size=353 bytes (P)
+[ENC] frame=6255 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 600
+[ENC] frame=6256 size=334 bytes (P)
+[ENC] frame=6257 size=334 bytes (P)
+[ENC] frame=6258 size=334 bytes (P)
+[ENC] frame=6259 size=49507 bytes (P)
+[ENC] frame=6260 size=50211 bytes (P)
+[ENC] frame=6261 size=66230 bytes (P)
+[ENC] frame=6262 size=86522 bytes (P)
+[ENC] frame=6263 size=52602 bytes (P)
+[ENC] frame=6264 size=45031 bytes (P)
+[ENC] frame=6265 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 610
+[ENC] frame=6266 size=35633 bytes (P)
+[ENC] frame=6267 size=67973 bytes (P)
+[ENC] frame=6268 size=150377 bytes (P)
+[ENC] frame=6269 size=44885 bytes (P)
+[ENC] frame=6270 size=31972 bytes (P)
+[ENC] frame=6271 size=32745 bytes (P)
+[ENC] frame=6272 size=20949 bytes (P)
+[ENC] frame=6273 size=16264 bytes (P)
+[ENC] frame=6274 size=8812 bytes (P)
+[ENC] frame=6275 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 620
+[ENC] frame=6276 size=3673 bytes (P)
+[ENC] frame=6277 size=6825 bytes (P)
+[ENC] frame=6278 size=4011 bytes (P)
+[ENC] frame=6279 size=2298 bytes (P)
+[ENC] frame=6280 size=874 bytes (P)
+[ENC] frame=6281 size=590 bytes (P)
+🎞  Encoder output: 13620 Kbps
+[ENC] frame=6282 size=446 bytes (P)
+[ENC] frame=6283 size=392 bytes (P)
+[ENC] frame=6284 size=353 bytes (P)
+[ENC] frame=6285 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 630
+[ENC] frame=6286 size=334 bytes (P)
+[ENC] frame=6287 size=334 bytes (P)
+[ENC] frame=6288 size=334 bytes (P)
+[ENC] frame=6289 size=49507 bytes (P)
+[ENC] frame=6290 size=50211 bytes (P)
+[ENC] frame=6291 size=66230 bytes (P)
+[ENC] frame=6292 size=86522 bytes (P)
+[ENC] frame=6293 size=52602 bytes (P)
+[ENC] frame=6294 size=45031 bytes (P)
+[ENC] frame=6295 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 640
+[ENC] frame=6296 size=35633 bytes (P)
+[ENC] frame=6297 size=67973 bytes (P)
+[ENC] frame=6298 size=150377 bytes (P)
+[ENC] frame=6299 size=44885 bytes (P)
+[ENC] frame=6300 size=31972 bytes (P)
+[ENC] frame=6301 size=32745 bytes (P)
+[ENC] frame=6302 size=20949 bytes (P)
+[ENC] frame=6303 size=16264 bytes (P)
+[ENC] frame=6304 size=8812 bytes (P)
+[ENC] frame=6305 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 650
+[ENC] frame=6306 size=3673 bytes (P)
+[ENC] frame=6307 size=6825 bytes (P)
+📊 RTP/s: 65 frames, 1754 data + 408 parity pkts, fec=20%, 2195.8 KB/s, pktsize=1024
+[ENC] frame=6308 size=4011 bytes (P)
+[ENC] frame=6309 size=2298 bytes (P)
+[ENC] frame=6310 size=874 bytes (P)
+[ENC] frame=6311 size=590 bytes (P)
+[ENC] frame=6312 size=446 bytes (P)
+[ENC] frame=6313 size=392 bytes (P)
+[ENC] frame=6314 size=353 bytes (P)
+[ENC] frame=6315 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 660
+[ENC] frame=6316 size=334 bytes (P)
+[ENC] frame=6317 size=334 bytes (P)
+[ENC] frame=6318 size=334 bytes (P)
+[ENC] frame=6319 size=49507 bytes (P)
+[ENC] frame=6320 size=50211 bytes (P)
+[ENC] frame=6321 size=66230 bytes (P)
+[ENC] frame=6322 size=86522 bytes (P)
+[ENC] frame=6323 size=52602 bytes (P)
+[ENC] frame=6324 size=45031 bytes (P)
+[ENC] frame=6325 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 670
+[ENC] frame=6326 size=35633 bytes (P)
+[ENC] frame=6327 size=67973 bytes (P)
+[ENC] frame=6328 size=150377 bytes (P)
+[ENC] frame=6329 size=44885 bytes (P)
+[ENC] frame=6330 size=31972 bytes (P)
+[ENC] frame=6331 size=32745 bytes (P)
+[ENC] frame=6332 size=20949 bytes (P)
+[ENC] frame=6333 size=16264 bytes (P)
+[ENC] frame=6334 size=8812 bytes (P)
+[ENC] frame=6335 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 680
+[ENC] frame=6336 size=3673 bytes (P)
+[ENC] frame=6337 size=6825 bytes (P)
+[ENC] frame=6338 size=4011 bytes (P)
+[ENC] frame=6339 size=2298 bytes (P)
+[ENC] frame=6340 size=874 bytes (P)
+[ENC] frame=6341 size=590 bytes (P)
+[ENC] frame=6342 size=446 bytes (P)
+[ENC] frame=6343 size=392 bytes (P)
+[ENC] frame=6344 size=353 bytes (P)
+[ENC] frame=6345 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 690
+[ENC] frame=6346 size=334 bytes (P)
+🎞  Encoder output: 13568 Kbps
+[ENC] frame=6347 size=334 bytes (P)
+[ENC] frame=6348 size=334 bytes (P)
+[ENC] frame=6349 size=49507 bytes (P)
+[ENC] frame=6350 size=50211 bytes (P)
+[ENC] frame=6351 size=66230 bytes (P)
+[ENC] frame=6352 size=86522 bytes (P)
+[ENC] frame=6353 size=52602 bytes (P)
+[ENC] frame=6354 size=45031 bytes (P)
+[ENC] frame=6355 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 700
+[ENC] frame=6356 size=35633 bytes (P)
+[ENC] frame=6357 size=67973 bytes (P)
+[ENC] frame=6358 size=150377 bytes (P)
+[ENC] frame=6359 size=44885 bytes (P)
+[ENC] frame=6360 size=31972 bytes (P)
+[ENC] frame=6361 size=32745 bytes (P)
+[ENC] frame=6362 size=20949 bytes (P)
+[ENC] frame=6363 size=16264 bytes (P)
+[ENC] frame=6364 size=8812 bytes (P)
+[ENC] frame=6365 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 710
+[ENC] frame=6366 size=3673 bytes (P)
+[ENC] frame=6367 size=6825 bytes (P)
+[ENC] frame=6368 size=4011 bytes (P)
+[ENC] frame=6369 size=2298 bytes (P)
+[ENC] frame=6370 size=874 bytes (P)
+[ENC] frame=6371 size=590 bytes (P)
+[ENC] frame=6372 size=446 bytes (P)
+📊 RTP/s: 65 frames, 1720 data + 406 parity pkts, fec=20%, 2159.2 KB/s, pktsize=1024
+[ENC] frame=6373 size=392 bytes (P)
+[ENC] frame=6374 size=353 bytes (P)
+[ENC] frame=6375 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 720
+[ENC] frame=6376 size=334 bytes (P)
+[ENC] frame=6377 size=334 bytes (P)
+[ENC] frame=6378 size=334 bytes (P)
+[ENC] frame=6379 size=49507 bytes (P)
+[ENC] frame=6380 size=50211 bytes (P)
+[ENC] frame=6381 size=66230 bytes (P)
+[ENC] frame=6382 size=86522 bytes (P)
+[ENC] frame=6383 size=52602 bytes (P)
+[ENC] frame=6384 size=45031 bytes (P)
+[ENC] frame=6385 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 730
+[ENC] frame=6386 size=35633 bytes (P)
+[ENC] frame=6387 size=67973 bytes (P)
+[ENC] frame=6388 size=150377 bytes (P)
+[ENC] frame=6389 size=44885 bytes (P)
+[ENC] frame=6390 size=31972 bytes (P)
+[ENC] frame=6391 size=32745 bytes (P)
+[ENC] frame=6392 size=20949 bytes (P)
+[ENC] frame=6393 size=16264 bytes (P)
+[ENC] frame=6394 size=8812 bytes (P)
+[ENC] frame=6395 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 740
+[ENC] frame=6396 size=3673 bytes (P)
+[ENC] frame=6397 size=6825 bytes (P)
+[ENC] frame=6398 size=4011 bytes (P)
+[ENC] frame=6399 size=2298 bytes (P)
+[ENC] frame=6400 size=874 bytes (P)
+[ENC] frame=6401 size=590 bytes (P)
+[ENC] frame=6402 size=446 bytes (P)
+[ENC] frame=6403 size=392 bytes (P)
+[ENC] frame=6404 size=353 bytes (P)
+[ENC] frame=6405 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 750
+[ENC] frame=6406 size=334 bytes (P)
+[ENC] frame=6407 size=334 bytes (P)
+[ENC] frame=6408 size=334 bytes (P)
+[ENC] frame=6409 size=49507 bytes (P)
+[ENC] frame=6410 size=50211 bytes (P)
+[ENC] frame=6411 size=66230 bytes (P)
+🎞  Encoder output: 15576 Kbps
+[ENC] frame=6412 size=86522 bytes (P)
+[ENC] frame=6413 size=52602 bytes (P)
+[ENC] frame=6414 size=45031 bytes (P)
+[ENC] frame=6415 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 760
+[ENC] frame=6416 size=35633 bytes (P)
+[ENC] frame=6417 size=67973 bytes (P)
+[ENC] frame=6418 size=150377 bytes (P)
+[ENC] frame=6419 size=44885 bytes (P)
+[ENC] frame=6420 size=31972 bytes (P)
+[ENC] frame=6421 size=32745 bytes (P)
+[ENC] frame=6422 size=20949 bytes (P)
+[ENC] frame=6423 size=16264 bytes (P)
+[ENC] frame=6424 size=8812 bytes (P)
+[ENC] frame=6425 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 770
+[ENC] frame=6426 size=3673 bytes (P)
+[ENC] frame=6427 size=6825 bytes (P)
+[ENC] frame=6428 size=4011 bytes (P)
+[ENC] frame=6429 size=2298 bytes (P)
+[ENC] frame=6430 size=874 bytes (P)
+[ENC] frame=6431 size=590 bytes (P)
+[ENC] frame=6432 size=446 bytes (P)
+[ENC] frame=6433 size=392 bytes (P)
+[ENC] frame=6434 size=353 bytes (P)
+[ENC] frame=6435 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 780
+[ENC] frame=6436 size=334 bytes (P)
+📊 RTP/s: 64 frames, 1714 data + 404 parity pkts, fec=20%, 2151.1 KB/s, pktsize=1024
+[ENC] frame=6437 size=334 bytes (P)
+[ENC] frame=6438 size=334 bytes (P)
+[ENC] frame=6439 size=49507 bytes (P)
+[ENC] frame=6440 size=50211 bytes (P)
+[ENC] frame=6441 size=66230 bytes (P)
+[ENC] frame=6442 size=86522 bytes (P)
+[ENC] frame=6443 size=52602 bytes (P)
+[ENC] frame=6444 size=45031 bytes (P)
+[ENC] frame=6445 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 790
+[ENC] frame=6446 size=35633 bytes (P)
+[ENC] frame=6447 size=67973 bytes (P)
+[ENC] frame=6448 size=150377 bytes (P)
+[ENC] frame=6449 size=44885 bytes (P)
+[ENC] frame=6450 size=31972 bytes (P)
+[ENC] frame=6451 size=32745 bytes (P)
+[ENC] frame=6452 size=20949 bytes (P)
+[ENC] frame=6453 size=16264 bytes (P)
+[ENC] frame=6454 size=8812 bytes (P)
+[ENC] frame=6455 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 800
+[ENC] frame=6456 size=3673 bytes (P)
+[ENC] frame=6457 size=6825 bytes (P)
+[ENC] frame=6458 size=4011 bytes (P)
+[ENC] frame=6459 size=2298 bytes (P)
+[ENC] frame=6460 size=874 bytes (P)
+[ENC] frame=6461 size=590 bytes (P)
+[ENC] frame=6462 size=446 bytes (P)
+[ENC] frame=6463 size=392 bytes (P)
+[ENC] frame=6464 size=353 bytes (P)
+[ENC] frame=6465 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 810
+[ENC] frame=6466 size=334 bytes (P)
+[ENC] frame=6467 size=334 bytes (P)
+[ENC] frame=6468 size=334 bytes (P)
+[ENC] frame=6469 size=49507 bytes (P)
+[ENC] frame=6470 size=50211 bytes (P)
+[ENC] frame=6471 size=66230 bytes (P)
+[ENC] frame=6472 size=86522 bytes (P)
+[ENC] frame=6473 size=52602 bytes (P)
+[ENC] frame=6474 size=45031 bytes (P)
+🎞  Encoder output: 14815 Kbps
+[ENC] frame=6475 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 820
+[ENC] frame=6476 size=35633 bytes (P)
+[ENC] frame=6477 size=67973 bytes (P)
+[ENC] frame=6478 size=150377 bytes (P)
+[ENC] frame=6479 size=44885 bytes (P)
+[ENC] frame=6480 size=31972 bytes (P)
+[ENC] frame=6481 size=32745 bytes (P)
+[ENC] frame=6482 size=20949 bytes (P)
+[ENC] frame=6483 size=16264 bytes (P)
+[ENC] frame=6484 size=8812 bytes (P)
+[ENC] frame=6485 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 830
+[ENC] frame=6486 size=3673 bytes (P)
+[ENC] frame=6487 size=6825 bytes (P)
+[ENC] frame=6488 size=4011 bytes (P)
+[ENC] frame=6489 size=2298 bytes (P)
+[ENC] frame=6490 size=874 bytes (P)
+[ENC] frame=6491 size=590 bytes (P)
+[ENC] frame=6492 size=446 bytes (P)
+[ENC] frame=6493 size=392 bytes (P)
+[ENC] frame=6494 size=353 bytes (P)
+[ENC] frame=6495 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 840
+[ENC] frame=6496 size=334 bytes (P)
+[ENC] frame=6497 size=334 bytes (P)
+[ENC] frame=6498 size=334 bytes (P)
+[ENC] frame=6499 size=49507 bytes (P)
+📊 RTP/s: 63 frames, 1762 data + 410 parity pkts, fec=20%, 2205.9 KB/s, pktsize=1024
+[ENC] frame=6500 size=50211 bytes (P)
+[ENC] frame=6501 size=66230 bytes (P)
+[ENC] frame=6502 size=86522 bytes (P)
+[ENC] frame=6503 size=52602 bytes (P)
+[ENC] frame=6504 size=45031 bytes (P)
+[ENC] frame=6505 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 850
+[ENC] frame=6506 size=35633 bytes (P)
+[ENC] frame=6507 size=67973 bytes (P)
+[ENC] frame=6508 size=150377 bytes (P)
+[ENC] frame=6509 size=44885 bytes (P)
+[ENC] frame=6510 size=31972 bytes (P)
+[ENC] frame=6511 size=32745 bytes (P)
+[ENC] frame=6512 size=20949 bytes (P)
+[ENC] frame=6513 size=16264 bytes (P)
+[ENC] frame=6514 size=8812 bytes (P)
+[ENC] frame=6515 size=6655 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 860
+[ENC] frame=6516 size=3673 bytes (P)
+[ENC] frame=6517 size=6825 bytes (P)
+[ENC] frame=6518 size=4011 bytes (P)
+[ENC] frame=6519 size=2298 bytes (P)
+[ENC] frame=6520 size=874 bytes (P)
+[ENC] frame=6521 size=590 bytes (P)
+[ENC] frame=6522 size=446 bytes (P)
+[ENC] frame=6523 size=392 bytes (P)
+[ENC] frame=6524 size=353 bytes (P)
+[ENC] frame=6525 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 870
+[ENC] frame=6526 size=334 bytes (P)
+[ENC] frame=6527 size=334 bytes (P)
+[ENC] frame=6528 size=334 bytes (P)
+[ENC] frame=6529 size=49507 bytes (P)
+[ENC] frame=6530 size=50211 bytes (P)
+[ENC] frame=6531 size=66230 bytes (P)
+[ENC] frame=6532 size=86522 bytes (P)
+[ENC] frame=6533 size=52602 bytes (P)
+[ENC] frame=6534 size=45031 bytes (P)
+[ENC] frame=6535 size=59986 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 880
+[ENC] frame=6536 size=35633 bytes (P)
+[ENC] frame=6537 size=67973 bytes (P)
+🎞  Encoder output: 15586 Kbps
+[ENC] frame=6538 size=150377 bytes (P)
+🌐 [47989] HTTP from 10.0.0.226:56945
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+[ENC] frame=6539 size=44885 bytes (P)
+🔒 [47984] TLS attempt from 10.0.0.226:56946
+✅ [47984] TLS handshake OK from 10.0.0.226:56946
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+[ENC] frame=6540 size=31972 bytes (P)
+[ENC] frame=6541 size=32745 bytes (P)
+[ENC] frame=6542 size=20949 bytes (P)
+[ENC] frame=6543 size=16264 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 890
+[ENC] frame=6544 size=8812 bytes (P)
+[ENC] frame=6545 size=6655 bytes (P)
+[ENC] frame=6546 size=3673 bytes (P)
+[ENC] frame=6547 size=6825 bytes (P)
+[ENC] frame=6548 size=4011 bytes (P)
+[ENC] frame=6549 size=2298 bytes (P)
+[ENC] frame=6550 size=874 bytes (P)
+[ENC] frame=6551 size=590 bytes (P)
+[ENC] frame=6552 size=446 bytes (P)
+[ENC] frame=6553 size=392 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 900
+[ENC] frame=6554 size=353 bytes (P)
+[ENC] frame=6555 size=334 bytes (P)
+[ENC] frame=6556 size=334 bytes (P)
+[ENC] frame=6557 size=334 bytes (P)
+[ENC] frame=6558 size=334 bytes (P)
+[ENC] frame=6559 size=49507 bytes (P)
+[ENC] frame=6560 size=50211 bytes (P)
+[ENC] frame=6561 size=66230 bytes (P)
+[ENC] frame=6562 size=86522 bytes (P)
+📊 RTP/s: 63 frames, 1912 data + 438 parity pkts, fec=20%, 2386.7 KB/s, pktsize=1024
+[ENC] frame=6563 size=52602 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 910
+[ENC] frame=6564 size=45031 bytes (P)
+[ENC] frame=6565 size=59986 bytes (P)
+[ENC] frame=6566 size=35633 bytes (P)
+[ENC] frame=6567 size=67973 bytes (P)
+[ENC] frame=6568 size=150377 bytes (P)
+[ENC] frame=6569 size=44885 bytes (P)
+[ENC] frame=6570 size=31972 bytes (P)
+[ENC] frame=6571 size=32745 bytes (P)
+[ENC] frame=6572 size=20949 bytes (P)
+[ENC] frame=6573 size=16264 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 920
+[ENC] frame=6574 size=8812 bytes (P)
+[ENC] frame=6575 size=6655 bytes (P)
+[ENC] frame=6576 size=3673 bytes (P)
+[ENC] frame=6577 size=6825 bytes (P)
+[ENC] frame=6578 size=4011 bytes (P)
+[ENC] frame=6579 size=2298 bytes (P)
+[ENC] frame=6580 size=874 bytes (P)
+[ENC] frame=6581 size=590 bytes (P)
+[ENC] frame=6582 size=446 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 930
+[ENC] frame=6583 size=392 bytes (P)
+[ENC] frame=6584 size=353 bytes (P)
+[ENC] frame=6585 size=334 bytes (P)
+[ENC] frame=6586 size=334 bytes (P)
+[ENC] frame=6587 size=334 bytes (P)
+[ENC] frame=6588 size=334 bytes (P)
+[ENC] frame=6589 size=49507 bytes (P)
+🎞  Encoder output: 9039 Kbps
+[ENC] frame=6590 size=50211 bytes (P)
+[ENC] frame=6591 size=66230 bytes (P)
+[ENC] frame=6592 size=86522 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 940
+[ENC] frame=6593 size=52602 bytes (P)
+[ENC] frame=6594 size=45031 bytes (P)
+[ENC] frame=6595 size=59986 bytes (P)
+[ENC] frame=6596 size=35633 bytes (P)
+[ENC] frame=6597 size=67973 bytes (P)
+[ENC] frame=6598 size=150377 bytes (P)
+[ENC] frame=6599 size=44885 bytes (P)
+[ENC] frame=6600 size=31972 bytes (P)
+[ENC] frame=6601 size=32745 bytes (P)
+[ENC] frame=6602 size=20949 bytes (P)
+📊 RTP/s: 40 frames, 1398 data + 310 parity pkts, fec=20%, 1734.7 KB/s, pktsize=1024
+⏳ WGC: no new frame on 2560x1440 — streak 950
+[ENC] frame=6603 size=16264 bytes (P)
+[ENC] frame=6604 size=8812 bytes (P)
+[ENC] frame=6605 size=6655 bytes (P)
+[ENC] frame=6606 size=3673 bytes (P)
+[ENC] frame=6607 size=6825 bytes (P)
+[ENC] frame=6608 size=4011 bytes (P)
+[ENC] frame=6609 size=2298 bytes (P)
+[ENC] frame=6610 size=874 bytes (P)
+[ENC] frame=6611 size=590 bytes (P)
+[ENC] frame=6612 size=446 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 960
+[ENC] frame=6613 size=392 bytes (P)
+[ENC] frame=6614 size=353 bytes (P)
+[ENC] frame=6615 size=334 bytes (P)
+[ENC] frame=6616 size=334 bytes (P)
+[ENC] frame=6617 size=334 bytes (P)
+[ENC] frame=6618 size=334 bytes (P)
+[ENC] frame=6619 size=49507 bytes (P)
+[ENC] frame=6620 size=50211 bytes (P)
+[ENC] frame=6621 size=66230 bytes (P)
+🎞  Encoder output: 7999 Kbps
+[ENC] frame=6622 size=86522 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 970
+[ENC] frame=6623 size=52602 bytes (P)
+[ENC] frame=6624 size=45031 bytes (P)
+[ENC] frame=6625 size=59986 bytes (P)
+[ENC] frame=6626 size=35633 bytes (P)
+[ENC] frame=6627 size=67973 bytes (P)
+[ENC] frame=6628 size=150377 bytes (P)
+[ENC] frame=6629 size=44885 bytes (P)
+[ENC] frame=6630 size=31972 bytes (P)
+[ENC] frame=6631 size=32745 bytes (P)
+[ENC] frame=6632 size=20949 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 980
+[ENC] frame=6633 size=16264 bytes (P)
+[ENC] frame=6634 size=8812 bytes (P)
+📊 RTP/s: 32 frames, 881 data + 204 parity pkts, fec=20%, 1102.0 KB/s, pktsize=1024
+[ENC] frame=6635 size=6655 bytes (P)
+[ENC] frame=6636 size=3673 bytes (P)
+[ENC] frame=6637 size=6825 bytes (P)
+[ENC] frame=6638 size=4011 bytes (P)
+[ENC] frame=6639 size=2298 bytes (P)
+[ENC] frame=6640 size=874 bytes (P)
+[ENC] frame=6641 size=590 bytes (P)
+[ENC] frame=6642 size=446 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 990
+[ENC] frame=6643 size=392 bytes (P)
+[ENC] frame=6644 size=353 bytes (P)
+[ENC] frame=6645 size=334 bytes (P)
+[ENC] frame=6646 size=334 bytes (P)
+[ENC] frame=6647 size=334 bytes (P)
+[ENC] frame=6648 size=334 bytes (P)
+[ENC] frame=6649 size=49507 bytes (P)
+[ENC] frame=6650 size=50211 bytes (P)
+[ENC] frame=6651 size=66230 bytes (P)
+[ENC] frame=6652 size=86522 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1000
+[ENC] frame=6653 size=52602 bytes (P)
+🎞  Encoder output: 7558 Kbps
+[ENC] frame=6654 size=45031 bytes (P)
+[ENC] frame=6655 size=59986 bytes (P)
+[ENC] frame=6656 size=35633 bytes (P)
+[ENC] frame=6657 size=67973 bytes (P)
+[ENC] frame=6658 size=150377 bytes (P)
+[ENC] frame=6659 size=44885 bytes (P)
+[ENC] frame=6660 size=31972 bytes (P)
+[ENC] frame=6661 size=32745 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1010
+[ENC] frame=6662 size=20949 bytes (P)
+[ENC] frame=6663 size=16264 bytes (P)
+[ENC] frame=6664 size=8812 bytes (P)
+[ENC] frame=6665 size=6655 bytes (P)
+[ENC] frame=6666 size=3673 bytes (P)
+📊 RTP/s: 32 frames, 866 data + 202 parity pkts, fec=20%, 1084.7 KB/s, pktsize=1024
+[ENC] frame=6667 size=6825 bytes (P)
+[ENC] frame=6668 size=4011 bytes (P)
+[ENC] frame=6669 size=2298 bytes (P)
+[ENC] frame=6670 size=874 bytes (P)
+[ENC] frame=6671 size=590 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1020
+[ENC] frame=6672 size=446 bytes (P)
+[ENC] frame=6673 size=392 bytes (P)
+[ENC] frame=6674 size=353 bytes (P)
+[ENC] frame=6675 size=334 bytes (P)
+[ENC] frame=6676 size=334 bytes (P)
+[ENC] frame=6677 size=334 bytes (P)
+[ENC] frame=6678 size=334 bytes (P)
+[ENC] frame=6679 size=49507 bytes (P)
+[ENC] frame=6680 size=50211 bytes (P)
+[ENC] frame=6681 size=66230 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1030
+[ENC] frame=6682 size=86522 bytes (P)
+[ENC] frame=6683 size=52602 bytes (P)
+[ENC] frame=6684 size=45031 bytes (P)
+[ENC] frame=6685 size=59986 bytes (P)
+🎞  Encoder output: 7542 Kbps
+[ENC] frame=6686 size=35633 bytes (P)
+[ENC] frame=6687 size=67973 bytes (P)
+[ENC] frame=6688 size=150377 bytes (P)
+[ENC] frame=6689 size=44885 bytes (P)
+[ENC] frame=6690 size=31972 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1040
+[ENC] frame=6691 size=32745 bytes (P)
+[ENC] frame=6692 size=20949 bytes (P)
+[ENC] frame=6693 size=16264 bytes (P)
+[ENC] frame=6694 size=8812 bytes (P)
+[ENC] frame=6695 size=6655 bytes (P)
+[ENC] frame=6696 size=3673 bytes (P)
+[ENC] frame=6697 size=6825 bytes (P)
+[ENC] frame=6698 size=4011 bytes (P)
+📊 RTP/s: 32 frames, 866 data + 202 parity pkts, fec=20%, 1084.7 KB/s, pktsize=1024
+[ENC] frame=6699 size=2298 bytes (P)
+[ENC] frame=6700 size=874 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1050
+[ENC] frame=6701 size=590 bytes (P)
+[ENC] frame=6702 size=446 bytes (P)
+[ENC] frame=6703 size=392 bytes (P)
+[ENC] frame=6704 size=353 bytes (P)
+[ENC] frame=6705 size=334 bytes (P)
+[ENC] frame=6706 size=334 bytes (P)
+[ENC] frame=6707 size=334 bytes (P)
+[ENC] frame=6708 size=334 bytes (P)
+[ENC] frame=6709 size=49507 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1060
+[ENC] frame=6710 size=50211 bytes (P)
+[ENC] frame=6711 size=66230 bytes (P)
+[ENC] frame=6712 size=86522 bytes (P)
+[ENC] frame=6713 size=52602 bytes (P)
+[ENC] frame=6714 size=45031 bytes (P)
+🌐 [47989] HTTP from 10.0.0.226:56948
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56949
+✅ [47984] TLS handshake OK from 10.0.0.226:56949
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+[ENC] frame=6715 size=59986 bytes (P)
+[ENC] frame=6716 size=35633 bytes (P)
+🎞  Encoder output: 7321 Kbps
+[ENC] frame=6717 size=67973 bytes (P)
+[ENC] frame=6718 size=150377 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1070
+[ENC] frame=6719 size=44885 bytes (P)
+[ENC] frame=6720 size=31972 bytes (P)
+[ENC] frame=6721 size=32745 bytes (P)
+[ENC] frame=6722 size=20949 bytes (P)
+[ENC] frame=6723 size=16264 bytes (P)
+[ENC] frame=6724 size=8812 bytes (P)
+[ENC] frame=6725 size=6655 bytes (P)
+[ENC] frame=6726 size=3673 bytes (P)
+[ENC] frame=6727 size=6825 bytes (P)
+[ENC] frame=6728 size=4011 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1080
+[ENC] frame=6729 size=2298 bytes (P)
+[ENC] frame=6730 size=874 bytes (P)
+📊 RTP/s: 32 frames, 859 data + 202 parity pkts, fec=20%, 1077.6 KB/s, pktsize=1024
+[ENC] frame=6731 size=590 bytes (P)
+[ENC] frame=6732 size=446 bytes (P)
+[ENC] frame=6733 size=392 bytes (P)
+[ENC] frame=6734 size=353 bytes (P)
+[ENC] frame=6735 size=334 bytes (P)
+[ENC] frame=6736 size=334 bytes (P)
+[ENC] frame=6737 size=334 bytes (P)
+[ENC] frame=6738 size=334 bytes (P)
+⏳ WGC: no new frame on 2560x1440 — streak 1090
+[ENC] frame=6739 size=49507 bytes (P)
+🎮 Control stream: peer 10.0.0.226:50257 disconnected
+🎮 Control stream lost → ending session (resetting stream state)
+[ENC] frame=6740 size=50211 bytes (P)
+⏹️  Stream ended — resetting to idle
+✅ Audio cleanup complete.
+🎵 Audio stream stopped
+🎮 ViGEm: unplugged virtual Xbox 360 controller #0
+🎨 Advanced Color (HDR) disabled → DXGI back to BGRA8 SDR on \\.\DISPLAY13
+🖥️  Restored the original display topology — virtual display detached
+🔊 Default audio output forced back to the cached pre-stream speaker
+✅ WGC capture session started (2560x1440 BGRA8/SDR)
+🎞  Encoder output: 3995 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 1
+⏳ WGC: no new frame on 2560x1440 — streak 2
+⏳ WGC: no new frame on 2560x1440 — streak 3
+⏳ WGC: no new frame on 2560x1440 — streak 10
+⏳ WGC: no new frame on 2560x1440 — streak 20
+⏳ WGC: no new frame on 2560x1440 — streak 30
+🎞  Encoder output: 12144 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 40
+⏳ WGC: no new frame on 2560x1440 — streak 50
+⏳ WGC: no new frame on 2560x1440 — streak 60
+⏳ WGC: no new frame on 2560x1440 — streak 70
+⏳ WGC: no new frame on 2560x1440 — streak 80
+⏳ WGC: no new frame on 2560x1440 — streak 90
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 100
+⏳ WGC: no new frame on 2560x1440 — streak 110
+⏳ WGC: no new frame on 2560x1440 — streak 120
+⏳ WGC: no new frame on 2560x1440 — streak 130
+⏳ WGC: no new frame on 2560x1440 — streak 140
+⏳ WGC: no new frame on 2560x1440 — streak 150
+🎞  Encoder output: 6809 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 160
+⏳ WGC: no new frame on 2560x1440 — streak 170
+⏳ WGC: no new frame on 2560x1440 — streak 180
+🌐 [47989] HTTP from 10.0.0.226:56950
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56951
+✅ [47984] TLS handshake OK from 10.0.0.226:56951
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 190
+⏳ WGC: no new frame on 2560x1440 — streak 200
+⏳ WGC: no new frame on 2560x1440 — streak 210
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 220
+⏳ WGC: no new frame on 2560x1440 — streak 230
+⏳ WGC: no new frame on 2560x1440 — streak 240
+⏳ WGC: no new frame on 2560x1440 — streak 250
+⏳ WGC: no new frame on 2560x1440 — streak 260
+⏳ WGC: no new frame on 2560x1440 — streak 270
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 280
+⏳ WGC: no new frame on 2560x1440 — streak 290
+⏳ WGC: no new frame on 2560x1440 — streak 300
+⏳ WGC: no new frame on 2560x1440 — streak 310
+⏳ WGC: no new frame on 2560x1440 — streak 320
+⏳ WGC: no new frame on 2560x1440 — streak 330
+🎞  Encoder output: 6795 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 340
+⏳ WGC: no new frame on 2560x1440 — streak 350
+⏳ WGC: no new frame on 2560x1440 — streak 360
+⏳ WGC: no new frame on 2560x1440 — streak 370
+⏳ WGC: no new frame on 2560x1440 — streak 380
+⏳ WGC: no new frame on 2560x1440 — streak 390
+🎞  Encoder output: 6784 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 400
+⏳ WGC: no new frame on 2560x1440 — streak 410
+⏳ WGC: no new frame on 2560x1440 — streak 420
+⏳ WGC: no new frame on 2560x1440 — streak 430
+⏳ WGC: no new frame on 2560x1440 — streak 440
+⏳ WGC: no new frame on 2560x1440 — streak 450
+🎞  Encoder output: 6781 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 460
+⏳ WGC: no new frame on 2560x1440 — streak 470
+⏳ WGC: no new frame on 2560x1440 — streak 480
+🌐 [47989] HTTP from 10.0.0.226:56952
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56953
+✅ [47984] TLS handshake OK from 10.0.0.226:56953
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 490
+⏳ WGC: no new frame on 2560x1440 — streak 500
+⏳ WGC: no new frame on 2560x1440 — streak 510
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 520
+⏳ WGC: no new frame on 2560x1440 — streak 530
+⏳ WGC: no new frame on 2560x1440 — streak 540
+⏳ WGC: no new frame on 2560x1440 — streak 550
+⏳ WGC: no new frame on 2560x1440 — streak 560
+⏳ WGC: no new frame on 2560x1440 — streak 570
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 580
+⏳ WGC: no new frame on 2560x1440 — streak 590
+⏳ WGC: no new frame on 2560x1440 — streak 600
+⏳ WGC: no new frame on 2560x1440 — streak 610
+⏳ WGC: no new frame on 2560x1440 — streak 620
+⏳ WGC: no new frame on 2560x1440 — streak 630
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 640
+⏳ WGC: no new frame on 2560x1440 — streak 650
+⏳ WGC: no new frame on 2560x1440 — streak 660
+⏳ WGC: no new frame on 2560x1440 — streak 670
+⏳ WGC: no new frame on 2560x1440 — streak 680
+⏳ WGC: no new frame on 2560x1440 — streak 690
+⏳ WGC: no new frame on 2560x1440 — streak 700
+🎞  Encoder output: 6780 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 710
+⏳ WGC: no new frame on 2560x1440 — streak 720
+⏳ WGC: no new frame on 2560x1440 — streak 730
+⏳ WGC: no new frame on 2560x1440 — streak 740
+⏳ WGC: no new frame on 2560x1440 — streak 750
+⏳ WGC: no new frame on 2560x1440 — streak 760
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 770
+⏳ WGC: no new frame on 2560x1440 — streak 780
+🌐 [47989] HTTP from 10.0.0.226:56954
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56955
+✅ [47984] TLS handshake OK from 10.0.0.226:56955
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 790
+⏳ WGC: no new frame on 2560x1440 — streak 800
+⏳ WGC: no new frame on 2560x1440 — streak 810
+⏳ WGC: no new frame on 2560x1440 — streak 820
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 830
+⏳ WGC: no new frame on 2560x1440 — streak 840
+⏳ WGC: no new frame on 2560x1440 — streak 850
+⏳ WGC: no new frame on 2560x1440 — streak 860
+⏳ WGC: no new frame on 2560x1440 — streak 870
+⏳ WGC: no new frame on 2560x1440 — streak 880
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 890
+⏳ WGC: no new frame on 2560x1440 — streak 900
+⏳ WGC: no new frame on 2560x1440 — streak 910
+⏳ WGC: no new frame on 2560x1440 — streak 920
+⏳ WGC: no new frame on 2560x1440 — streak 930
+⏳ WGC: no new frame on 2560x1440 — streak 940
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 950
+⏳ WGC: no new frame on 2560x1440 — streak 960
+⏳ WGC: no new frame on 2560x1440 — streak 970
+⏳ WGC: no new frame on 2560x1440 — streak 980
+⏳ WGC: no new frame on 2560x1440 — streak 990
+⏳ WGC: no new frame on 2560x1440 — streak 1000
+🎞  Encoder output: 6780 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1010
+⏳ WGC: no new frame on 2560x1440 — streak 1020
+⏳ WGC: no new frame on 2560x1440 — streak 1030
+⏳ WGC: no new frame on 2560x1440 — streak 1040
+⏳ WGC: no new frame on 2560x1440 — streak 1050
+⏳ WGC: no new frame on 2560x1440 — streak 1060
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1070
+⏳ WGC: no new frame on 2560x1440 — streak 1080
+🌐 [47989] HTTP from 10.0.0.226:56956
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56957
+✅ [47984] TLS handshake OK from 10.0.0.226:56957
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 1090
+⏳ WGC: no new frame on 2560x1440 — streak 1100
+⏳ WGC: no new frame on 2560x1440 — streak 1110
+⏳ WGC: no new frame on 2560x1440 — streak 1120
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1130
+⏳ WGC: no new frame on 2560x1440 — streak 1140
+⏳ WGC: no new frame on 2560x1440 — streak 1150
+⏳ WGC: no new frame on 2560x1440 — streak 1160
+⏳ WGC: no new frame on 2560x1440 — streak 1170
+⏳ WGC: no new frame on 2560x1440 — streak 1180
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1190
+⏳ WGC: no new frame on 2560x1440 — streak 1200
+⏳ WGC: no new frame on 2560x1440 — streak 1210
+⏳ WGC: no new frame on 2560x1440 — streak 1220
+⏳ WGC: no new frame on 2560x1440 — streak 1230
+⏳ WGC: no new frame on 2560x1440 — streak 1240
+🎞  Encoder output: 6780 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1250
+⏳ WGC: no new frame on 2560x1440 — streak 1260
+⏳ WGC: no new frame on 2560x1440 — streak 1270
+⏳ WGC: no new frame on 2560x1440 — streak 1280
+⏳ WGC: no new frame on 2560x1440 — streak 1290
+⏳ WGC: no new frame on 2560x1440 — streak 1300
+🎞  Encoder output: 6779 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1310
+⏳ WGC: no new frame on 2560x1440 — streak 1320
+⏳ WGC: no new frame on 2560x1440 — streak 1330
+⏳ WGC: no new frame on 2560x1440 — streak 1340
+⏳ WGC: no new frame on 2560x1440 — streak 1350
+⏳ WGC: no new frame on 2560x1440 — streak 1360
+🎞  Encoder output: 6779 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1370
+⏳ WGC: no new frame on 2560x1440 — streak 1380
+🌐 [47989] HTTP from 10.0.0.226:56958
+⏳ WGC: no new frame on 2560x1440 — streak 1390
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56959
+✅ [47984] TLS handshake OK from 10.0.0.226:56959
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 1400
+⏳ WGC: no new frame on 2560x1440 — streak 1410
+⏳ WGC: no new frame on 2560x1440 — streak 1420
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1430
+⏳ WGC: no new frame on 2560x1440 — streak 1440
+⏳ WGC: no new frame on 2560x1440 — streak 1450
+⏳ WGC: no new frame on 2560x1440 — streak 1460
+⏳ WGC: no new frame on 2560x1440 — streak 1470
+⏳ WGC: no new frame on 2560x1440 — streak 1480
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1490
+⏳ WGC: no new frame on 2560x1440 — streak 1500
+⏳ WGC: no new frame on 2560x1440 — streak 1510
+⏳ WGC: no new frame on 2560x1440 — streak 1520
+⏳ WGC: no new frame on 2560x1440 — streak 1530
+⏳ WGC: no new frame on 2560x1440 — streak 1540
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1550
+⏳ WGC: no new frame on 2560x1440 — streak 1560
+⏳ WGC: no new frame on 2560x1440 — streak 1570
+⏳ WGC: no new frame on 2560x1440 — streak 1580
+⏳ WGC: no new frame on 2560x1440 — streak 1590
+⏳ WGC: no new frame on 2560x1440 — streak 1600
+⏳ WGC: no new frame on 2560x1440 — streak 1610
+🎞  Encoder output: 6779 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1620
+⏳ WGC: no new frame on 2560x1440 — streak 1630
+⏳ WGC: no new frame on 2560x1440 — streak 1640
+⏳ WGC: no new frame on 2560x1440 — streak 1650
+⏳ WGC: no new frame on 2560x1440 — streak 1660
+⏳ WGC: no new frame on 2560x1440 — streak 1670
+🎞  Encoder output: 6779 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1680
+⏳ WGC: no new frame on 2560x1440 — streak 1690
+🌐 [47989] HTTP from 10.0.0.226:56960
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56961
+✅ [47984] TLS handshake OK from 10.0.0.226:56961
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 1700
+⏳ WGC: no new frame on 2560x1440 — streak 1710
+⏳ WGC: no new frame on 2560x1440 — streak 1720
+⏳ WGC: no new frame on 2560x1440 — streak 1730
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1740
+⏳ WGC: no new frame on 2560x1440 — streak 1750
+⏳ WGC: no new frame on 2560x1440 — streak 1760
+⏳ WGC: no new frame on 2560x1440 — streak 1770
+⏳ WGC: no new frame on 2560x1440 — streak 1780
+⏳ WGC: no new frame on 2560x1440 — streak 1790
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1800
+⏳ WGC: no new frame on 2560x1440 — streak 1810
+⏳ WGC: no new frame on 2560x1440 — streak 1820
+⏳ WGC: no new frame on 2560x1440 — streak 1830
+⏳ WGC: no new frame on 2560x1440 — streak 1840
+⏳ WGC: no new frame on 2560x1440 — streak 1850
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1860
+⏳ WGC: no new frame on 2560x1440 — streak 1870
+⏳ WGC: no new frame on 2560x1440 — streak 1880
+⏳ WGC: no new frame on 2560x1440 — streak 1890
+⏳ WGC: no new frame on 2560x1440 — streak 1900
+⏳ WGC: no new frame on 2560x1440 — streak 1910
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1920
+⏳ WGC: no new frame on 2560x1440 — streak 1930
+⏳ WGC: no new frame on 2560x1440 — streak 1940
+⏳ WGC: no new frame on 2560x1440 — streak 1950
+⏳ WGC: no new frame on 2560x1440 — streak 1960
+⏳ WGC: no new frame on 2560x1440 — streak 1970
+🎞  Encoder output: 7173 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 1980
+⏳ WGC: no new frame on 2560x1440 — streak 1990
+🌐 [47989] HTTP from 10.0.0.226:56964
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56965
+✅ [47984] TLS handshake OK from 10.0.0.226:56965
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 2000
+⏳ WGC: no new frame on 2560x1440 — streak 2010
+⏳ WGC: no new frame on 2560x1440 — streak 2020
+⏳ WGC: no new frame on 2560x1440 — streak 2030
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2040
+⏳ WGC: no new frame on 2560x1440 — streak 2050
+⏳ WGC: no new frame on 2560x1440 — streak 2060
+⏳ WGC: no new frame on 2560x1440 — streak 2070
+⏳ WGC: no new frame on 2560x1440 — streak 2080
+⏳ WGC: no new frame on 2560x1440 — streak 2090
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2100
+⏳ WGC: no new frame on 2560x1440 — streak 2110
+⏳ WGC: no new frame on 2560x1440 — streak 2120
+⏳ WGC: no new frame on 2560x1440 — streak 2130
+⏳ WGC: no new frame on 2560x1440 — streak 2140
+⏳ WGC: no new frame on 2560x1440 — streak 2150
+🎞  Encoder output: 7178 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2160
+⏳ WGC: no new frame on 2560x1440 — streak 2170
+⏳ WGC: no new frame on 2560x1440 — streak 2180
+⏳ WGC: no new frame on 2560x1440 — streak 2190
+⏳ WGC: no new frame on 2560x1440 — streak 2200
+⏳ WGC: no new frame on 2560x1440 — streak 2210
+⏳ WGC: no new frame on 2560x1440 — streak 2220
+🎞  Encoder output: 7307 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2230
+⏳ WGC: no new frame on 2560x1440 — streak 2240
+⏳ WGC: no new frame on 2560x1440 — streak 2250
+⏳ WGC: no new frame on 2560x1440 — streak 2260
+⏳ WGC: no new frame on 2560x1440 — streak 2270
+⏳ WGC: no new frame on 2560x1440 — streak 2280
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2290
+🌐 [47989] HTTP from 10.0.0.226:56966
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56967
+✅ [47984] TLS handshake OK from 10.0.0.226:56967
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 2300
+⏳ WGC: no new frame on 2560x1440 — streak 2310
+⏳ WGC: no new frame on 2560x1440 — streak 2320
+⏳ WGC: no new frame on 2560x1440 — streak 2330
+⏳ WGC: no new frame on 2560x1440 — streak 2340
+🎞  Encoder output: 7469 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2350
+⏳ WGC: no new frame on 2560x1440 — streak 2360
+⏳ WGC: no new frame on 2560x1440 — streak 2370
+⏳ WGC: no new frame on 2560x1440 — streak 2380
+⏳ WGC: no new frame on 2560x1440 — streak 2390
+⏳ WGC: no new frame on 2560x1440 — streak 2400
+🎞  Encoder output: 7198 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2410
+⏳ WGC: no new frame on 2560x1440 — streak 2420
+⏳ WGC: no new frame on 2560x1440 — streak 2430
+⏳ WGC: no new frame on 2560x1440 — streak 2440
+⏳ WGC: no new frame on 2560x1440 — streak 2450
+⏳ WGC: no new frame on 2560x1440 — streak 2460
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2470
+⏳ WGC: no new frame on 2560x1440 — streak 2480
+⏳ WGC: no new frame on 2560x1440 — streak 2490
+⏳ WGC: no new frame on 2560x1440 — streak 2500
+⏳ WGC: no new frame on 2560x1440 — streak 2510
+⏳ WGC: no new frame on 2560x1440 — streak 2520
+🎞  Encoder output: 7137 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2530
+⏳ WGC: no new frame on 2560x1440 — streak 2540
+⏳ WGC: no new frame on 2560x1440 — streak 2550
+⏳ WGC: no new frame on 2560x1440 — streak 2560
+⏳ WGC: no new frame on 2560x1440 — streak 2570
+⏳ WGC: no new frame on 2560x1440 — streak 2580
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2590
+🌐 [47989] HTTP from 10.0.0.226:56968
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56969
+⏳ WGC: no new frame on 2560x1440 — streak 2600
+✅ [47984] TLS handshake OK from 10.0.0.226:56969
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 2610
+⏳ WGC: no new frame on 2560x1440 — streak 2620
+⏳ WGC: no new frame on 2560x1440 — streak 2630
+⏳ WGC: no new frame on 2560x1440 — streak 2640
+🎞  Encoder output: 7257 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2650
+⏳ WGC: no new frame on 2560x1440 — streak 2660
+⏳ WGC: no new frame on 2560x1440 — streak 2670
+⏳ WGC: no new frame on 2560x1440 — streak 2680
+⏳ WGC: no new frame on 2560x1440 — streak 2690
+⏳ WGC: no new frame on 2560x1440 — streak 2700
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2710
+⏳ WGC: no new frame on 2560x1440 — streak 2720
+⏳ WGC: no new frame on 2560x1440 — streak 2730
+⏳ WGC: no new frame on 2560x1440 — streak 2740
+⏳ WGC: no new frame on 2560x1440 — streak 2750
+⏳ WGC: no new frame on 2560x1440 — streak 2760
+🎞  Encoder output: 7062 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2770
+⏳ WGC: no new frame on 2560x1440 — streak 2780
+⏳ WGC: no new frame on 2560x1440 — streak 2790
+⏳ WGC: no new frame on 2560x1440 — streak 2800
+⏳ WGC: no new frame on 2560x1440 — streak 2810
+⏳ WGC: no new frame on 2560x1440 — streak 2820
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2830
+⏳ WGC: no new frame on 2560x1440 — streak 2840
+⏳ WGC: no new frame on 2560x1440 — streak 2850
+⏳ WGC: no new frame on 2560x1440 — streak 2860
+⏳ WGC: no new frame on 2560x1440 — streak 2870
+⏳ WGC: no new frame on 2560x1440 — streak 2880
+⏳ WGC: no new frame on 2560x1440 — streak 2890
+🎞  Encoder output: 7321 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2900
+🌐 [47989] HTTP from 10.0.0.226:56970
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56971
+✅ [47984] TLS handshake OK from 10.0.0.226:56971
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 2910
+⏳ WGC: no new frame on 2560x1440 — streak 2920
+⏳ WGC: no new frame on 2560x1440 — streak 2930
+⏳ WGC: no new frame on 2560x1440 — streak 2940
+⏳ WGC: no new frame on 2560x1440 — streak 2950
+🎞  Encoder output: 7980 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 2960
+⏳ WGC: no new frame on 2560x1440 — streak 2970
+⏳ WGC: no new frame on 2560x1440 — streak 2980
+⏳ WGC: no new frame on 2560x1440 — streak 2990
+⏳ WGC: no new frame on 2560x1440 — streak 3000
+⏳ WGC: no new frame on 2560x1440 — streak 3010
+🎞  Encoder output: 7136 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3020
+⏳ WGC: no new frame on 2560x1440 — streak 3030
+⏳ WGC: no new frame on 2560x1440 — streak 3040
+⏳ WGC: no new frame on 2560x1440 — streak 3050
+⏳ WGC: no new frame on 2560x1440 — streak 3060
+⏳ WGC: no new frame on 2560x1440 — streak 3070
+🎞  Encoder output: 7032 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3080
+⏳ WGC: no new frame on 2560x1440 — streak 3090
+⏳ WGC: no new frame on 2560x1440 — streak 3100
+⏳ WGC: no new frame on 2560x1440 — streak 3110
+⏳ WGC: no new frame on 2560x1440 — streak 3120
+⏳ WGC: no new frame on 2560x1440 — streak 3130
+🎞  Encoder output: 7039 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3140
+⏳ WGC: no new frame on 2560x1440 — streak 3150
+⏳ WGC: no new frame on 2560x1440 — streak 3160
+⏳ WGC: no new frame on 2560x1440 — streak 3170
+⏳ WGC: no new frame on 2560x1440 — streak 3180
+⏳ WGC: no new frame on 2560x1440 — streak 3190
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3200
+🌐 [47989] HTTP from 10.0.0.226:56972
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56973
+✅ [47984] TLS handshake OK from 10.0.0.226:56973
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 3210
+⏳ WGC: no new frame on 2560x1440 — streak 3220
+⏳ WGC: no new frame on 2560x1440 — streak 3230
+⏳ WGC: no new frame on 2560x1440 — streak 3240
+⏳ WGC: no new frame on 2560x1440 — streak 3250
+⏳ WGC: no new frame on 2560x1440 — streak 3260
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3270
+⏳ WGC: no new frame on 2560x1440 — streak 3280
+⏳ WGC: no new frame on 2560x1440 — streak 3290
+⏳ WGC: no new frame on 2560x1440 — streak 3300
+⏳ WGC: no new frame on 2560x1440 — streak 3310
+⏳ WGC: no new frame on 2560x1440 — streak 3320
+🎞  Encoder output: 6944 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3330
+⏳ WGC: no new frame on 2560x1440 — streak 3340
+⏳ WGC: no new frame on 2560x1440 — streak 3350
+⏳ WGC: no new frame on 2560x1440 — streak 3360
+⏳ WGC: no new frame on 2560x1440 — streak 3370
+⏳ WGC: no new frame on 2560x1440 — streak 3380
+🎞  Encoder output: 6907 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3390
+⏳ WGC: no new frame on 2560x1440 — streak 3400
+⏳ WGC: no new frame on 2560x1440 — streak 3410
+⏳ WGC: no new frame on 2560x1440 — streak 3420
+⏳ WGC: no new frame on 2560x1440 — streak 3430
+⏳ WGC: no new frame on 2560x1440 — streak 3440
+🎞  Encoder output: 6847 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3450
+⏳ WGC: no new frame on 2560x1440 — streak 3460
+⏳ WGC: no new frame on 2560x1440 — streak 3470
+⏳ WGC: no new frame on 2560x1440 — streak 3480
+⏳ WGC: no new frame on 2560x1440 — streak 3490
+⏳ WGC: no new frame on 2560x1440 — streak 3500
+🌐 [47989] HTTP from 10.0.0.226:56974
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56975
+✅ [47984] TLS handshake OK from 10.0.0.226:56975
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3510
+⏳ WGC: no new frame on 2560x1440 — streak 3520
+⏳ WGC: no new frame on 2560x1440 — streak 3530
+⏳ WGC: no new frame on 2560x1440 — streak 3540
+⏳ WGC: no new frame on 2560x1440 — streak 3550
+⏳ WGC: no new frame on 2560x1440 — streak 3560
+🎞  Encoder output: 6830 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3570
+⏳ WGC: no new frame on 2560x1440 — streak 3580
+⏳ WGC: no new frame on 2560x1440 — streak 3590
+⏳ WGC: no new frame on 2560x1440 — streak 3600
+⏳ WGC: no new frame on 2560x1440 — streak 3610
+⏳ WGC: no new frame on 2560x1440 — streak 3620
+🎞  Encoder output: 6723 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3630
+⏳ WGC: no new frame on 2560x1440 — streak 3640
+⏳ WGC: no new frame on 2560x1440 — streak 3650
+⏳ WGC: no new frame on 2560x1440 — streak 3660
+⏳ WGC: no new frame on 2560x1440 — streak 3670
+⏳ WGC: no new frame on 2560x1440 — streak 3680
+⏳ WGC: no new frame on 2560x1440 — streak 3690
+🎞  Encoder output: 6859 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3700
+⏳ WGC: no new frame on 2560x1440 — streak 3710
+⏳ WGC: no new frame on 2560x1440 — streak 3720
+⏳ WGC: no new frame on 2560x1440 — streak 3730
+⏳ WGC: no new frame on 2560x1440 — streak 3740
+⏳ WGC: no new frame on 2560x1440 — streak 3750
+🎞  Encoder output: 6831 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3760
+⏳ WGC: no new frame on 2560x1440 — streak 3770
+⏳ WGC: no new frame on 2560x1440 — streak 3780
+⏳ WGC: no new frame on 2560x1440 — streak 3790
+⏳ WGC: no new frame on 2560x1440 — streak 3800
+🌐 [47989] HTTP from 10.0.0.226:56976
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56977
+✅ [47984] TLS handshake OK from 10.0.0.226:56977
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 3810
+🎞  Encoder output: 6809 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3820
+⏳ WGC: no new frame on 2560x1440 — streak 3830
+⏳ WGC: no new frame on 2560x1440 — streak 3840
+⏳ WGC: no new frame on 2560x1440 — streak 3850
+⏳ WGC: no new frame on 2560x1440 — streak 3860
+⏳ WGC: no new frame on 2560x1440 — streak 3870
+🎞  Encoder output: 6795 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3880
+⏳ WGC: no new frame on 2560x1440 — streak 3890
+⏳ WGC: no new frame on 2560x1440 — streak 3900
+⏳ WGC: no new frame on 2560x1440 — streak 3910
+⏳ WGC: no new frame on 2560x1440 — streak 3920
+⏳ WGC: no new frame on 2560x1440 — streak 3930
+🎞  Encoder output: 6784 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 3940
+⏳ WGC: no new frame on 2560x1440 — streak 3950
+⏳ WGC: no new frame on 2560x1440 — streak 3960
+⏳ WGC: no new frame on 2560x1440 — streak 3970
+⏳ WGC: no new frame on 2560x1440 — streak 3980
+⏳ WGC: no new frame on 2560x1440 — streak 3990
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4000
+⏳ WGC: no new frame on 2560x1440 — streak 4010
+⏳ WGC: no new frame on 2560x1440 — streak 4020
+⏳ WGC: no new frame on 2560x1440 — streak 4030
+⏳ WGC: no new frame on 2560x1440 — streak 4040
+⏳ WGC: no new frame on 2560x1440 — streak 4050
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4060
+⏳ WGC: no new frame on 2560x1440 — streak 4070
+⏳ WGC: no new frame on 2560x1440 — streak 4080
+⏳ WGC: no new frame on 2560x1440 — streak 4090
+⏳ WGC: no new frame on 2560x1440 — streak 4100
+🌐 [47989] HTTP from 10.0.0.226:56978
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56979
+✅ [47984] TLS handshake OK from 10.0.0.226:56979
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4110
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4120
+⏳ WGC: no new frame on 2560x1440 — streak 4130
+⏳ WGC: no new frame on 2560x1440 — streak 4140
+⏳ WGC: no new frame on 2560x1440 — streak 4150
+⏳ WGC: no new frame on 2560x1440 — streak 4160
+⏳ WGC: no new frame on 2560x1440 — streak 4170
+⏳ WGC: no new frame on 2560x1440 — streak 4180
+🎞  Encoder output: 6781 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4190
+⏳ WGC: no new frame on 2560x1440 — streak 4200
+⏳ WGC: no new frame on 2560x1440 — streak 4210
+⏳ WGC: no new frame on 2560x1440 — streak 4220
+🎞  Encoder output: 6631 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4230
+⏳ WGC: no new frame on 2560x1440 — streak 4240
+⏳ WGC: no new frame on 2560x1440 — streak 4250
+⏳ WGC: no new frame on 2560x1440 — streak 4260
+⏳ WGC: no new frame on 2560x1440 — streak 4270
+🎞  Encoder output: 4275 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4280
+⏳ WGC: no new frame on 2560x1440 — streak 4290
+⏳ WGC: no new frame on 2560x1440 — streak 4300
+⏳ WGC: no new frame on 2560x1440 — streak 4310
+🎞  Encoder output: 3063 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4320
+⏳ WGC: no new frame on 2560x1440 — streak 4330
+⏳ WGC: no new frame on 2560x1440 — streak 4340
+🌐 [47989] HTTP from 10.0.0.226:56980
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4350
+🔒 [47984] TLS attempt from 10.0.0.226:56981
+✅ [47984] TLS handshake OK from 10.0.0.226:56981
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4360
+🎞  Encoder output: 6364 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4370
+⏳ WGC: no new frame on 2560x1440 — streak 4380
+⏳ WGC: no new frame on 2560x1440 — streak 4390
+⏳ WGC: no new frame on 2560x1440 — streak 4400
+🎞  Encoder output: 6574 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4410
+⏳ WGC: no new frame on 2560x1440 — streak 4420
+⏳ WGC: no new frame on 2560x1440 — streak 4430
+⏳ WGC: no new frame on 2560x1440 — streak 4440
+⏳ WGC: no new frame on 2560x1440 — streak 4450
+🎞  Encoder output: 3785 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4460
+⏳ WGC: no new frame on 2560x1440 — streak 4470
+⏳ WGC: no new frame on 2560x1440 — streak 4480
+⏳ WGC: no new frame on 2560x1440 — streak 4490
+🎞  Encoder output: 3211 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4500
+⏳ WGC: no new frame on 2560x1440 — streak 4510
+⏳ WGC: no new frame on 2560x1440 — streak 4520
+⏳ WGC: no new frame on 2560x1440 — streak 4530
+⏳ WGC: no new frame on 2560x1440 — streak 4540
+🎞  Encoder output: 6752 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4550
+⏳ WGC: no new frame on 2560x1440 — streak 4560
+🌐 [47989] HTTP from 10.0.0.226:56982
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4570
+🔒 [47984] TLS attempt from 10.0.0.226:56983
+✅ [47984] TLS handshake OK from 10.0.0.226:56983
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4580
+🎞  Encoder output: 6381 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4590
+⏳ WGC: no new frame on 2560x1440 — streak 4600
+⏳ WGC: no new frame on 2560x1440 — streak 4610
+⏳ WGC: no new frame on 2560x1440 — streak 4620
+⏳ WGC: no new frame on 2560x1440 — streak 4630
+🎞  Encoder output: 3221 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4640
+⏳ WGC: no new frame on 2560x1440 — streak 4650
+⏳ WGC: no new frame on 2560x1440 — streak 4660
+⏳ WGC: no new frame on 2560x1440 — streak 4670
+🎞  Encoder output: 3971 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4680
+⏳ WGC: no new frame on 2560x1440 — streak 4690
+⏳ WGC: no new frame on 2560x1440 — streak 4700
+⏳ WGC: no new frame on 2560x1440 — streak 4710
+🎞  Encoder output: 6732 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4720
+⏳ WGC: no new frame on 2560x1440 — streak 4730
+⏳ WGC: no new frame on 2560x1440 — streak 4740
+⏳ WGC: no new frame on 2560x1440 — streak 4750
+⏳ WGC: no new frame on 2560x1440 — streak 4760
+🎞  Encoder output: 5977 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4770
+⏳ WGC: no new frame on 2560x1440 — streak 4780
+🌐 [47989] HTTP from 10.0.0.226:56984
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56985
+⏳ WGC: no new frame on 2560x1440 — streak 4790
+✅ [47984] TLS handshake OK from 10.0.0.226:56985
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 4800
+🎞  Encoder output: 2869 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4810
+⏳ WGC: no new frame on 2560x1440 — streak 4820
+⏳ WGC: no new frame on 2560x1440 — streak 4830
+⏳ WGC: no new frame on 2560x1440 — streak 4840
+⏳ WGC: no new frame on 2560x1440 — streak 4850
+🎞  Encoder output: 4746 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4860
+⏳ WGC: no new frame on 2560x1440 — streak 4870
+⏳ WGC: no new frame on 2560x1440 — streak 4880
+⏳ WGC: no new frame on 2560x1440 — streak 4890
+🎞  Encoder output: 6650 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4900
+⏳ WGC: no new frame on 2560x1440 — streak 4910
+⏳ WGC: no new frame on 2560x1440 — streak 4920
+⏳ WGC: no new frame on 2560x1440 — streak 4930
+⏳ WGC: no new frame on 2560x1440 — streak 4940
+🎞  Encoder output: 5449 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4950
+⏳ WGC: no new frame on 2560x1440 — streak 4960
+⏳ WGC: no new frame on 2560x1440 — streak 4970
+⏳ WGC: no new frame on 2560x1440 — streak 4980
+🎞  Encoder output: 2262 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 4990
+⏳ WGC: no new frame on 2560x1440 — streak 5000
+🌐 [47989] HTTP from 10.0.0.226:56986
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56987
+⏳ WGC: no new frame on 2560x1440 — streak 5010
+✅ [47984] TLS handshake OK from 10.0.0.226:56987
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 5020
+⏳ WGC: no new frame on 2560x1440 — streak 5030
+⏳ WGC: no new frame on 2560x1440 — streak 5040
+🎞  Encoder output: 5979 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5050
+⏳ WGC: no new frame on 2560x1440 — streak 5060
+⏳ WGC: no new frame on 2560x1440 — streak 5070
+⏳ WGC: no new frame on 2560x1440 — streak 5080
+⏳ WGC: no new frame on 2560x1440 — streak 5090
+🎞  Encoder output: 6763 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5100
+⏳ WGC: no new frame on 2560x1440 — streak 5110
+⏳ WGC: no new frame on 2560x1440 — streak 5120
+⏳ WGC: no new frame on 2560x1440 — streak 5130
+🎞  Encoder output: 6624 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5140
+⏳ WGC: no new frame on 2560x1440 — streak 5150
+⏳ WGC: no new frame on 2560x1440 — streak 5160
+⏳ WGC: no new frame on 2560x1440 — streak 5170
+⏳ WGC: no new frame on 2560x1440 — streak 5180
+🎞  Encoder output: 4275 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5190
+⏳ WGC: no new frame on 2560x1440 — streak 5200
+⏳ WGC: no new frame on 2560x1440 — streak 5210
+⏳ WGC: no new frame on 2560x1440 — streak 5220
+🎞  Encoder output: 3063 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5230
+⏳ WGC: no new frame on 2560x1440 — streak 5240
+🌐 [47989] HTTP from 10.0.0.226:56988
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56989
+✅ [47984] TLS handshake OK from 10.0.0.226:56989
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 5250
+⏳ WGC: no new frame on 2560x1440 — streak 5260
+🎞  Encoder output: 6360 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5270
+⏳ WGC: no new frame on 2560x1440 — streak 5280
+⏳ WGC: no new frame on 2560x1440 — streak 5290
+⏳ WGC: no new frame on 2560x1440 — streak 5300
+⏳ WGC: no new frame on 2560x1440 — streak 5310
+🎞  Encoder output: 6507 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5320
+⏳ WGC: no new frame on 2560x1440 — streak 5330
+⏳ WGC: no new frame on 2560x1440 — streak 5340
+⏳ WGC: no new frame on 2560x1440 — streak 5350
+🎞  Encoder output: 3570 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5360
+⏳ WGC: no new frame on 2560x1440 — streak 5370
+⏳ WGC: no new frame on 2560x1440 — streak 5380
+⏳ WGC: no new frame on 2560x1440 — streak 5390
+⏳ WGC: no new frame on 2560x1440 — streak 5400
+🎞  Encoder output: 3493 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5410
+⏳ WGC: no new frame on 2560x1440 — streak 5420
+⏳ WGC: no new frame on 2560x1440 — streak 5430
+⏳ WGC: no new frame on 2560x1440 — streak 5440
+⏳ WGC: no new frame on 2560x1440 — streak 5450
+⏳ WGC: no new frame on 2560x1440 — streak 5460
+🎞  Encoder output: 6777 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5470
+⏳ WGC: no new frame on 2560x1440 — streak 5480
+⏳ WGC: no new frame on 2560x1440 — streak 5490
+🌐 [47989] HTTP from 10.0.0.226:56990
+📊 [HTTP] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+🔒 [47984] TLS attempt from 10.0.0.226:56991
+✅ [47984] TLS handshake OK from 10.0.0.226:56991
+📊 [HTTPS] /serverinfo — id=0123456789ABCDEF pair=1 game=5
+⏳ WGC: no new frame on 2560x1440 — streak 5500
+⏳ WGC: no new frame on 2560x1440 — streak 5510
+⏳ WGC: no new frame on 2560x1440 — streak 5520
+⏳ WGC: no new frame on 2560x1440 — streak 5530
+🎞  Encoder output: 7577 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5540
+⏳ WGC: no new frame on 2560x1440 — streak 5550
+⏳ WGC: no new frame on 2560x1440 — streak 5560
+⏳ WGC: no new frame on 2560x1440 — streak 5570
+⏳ WGC: no new frame on 2560x1440 — streak 5580
+⏳ WGC: no new frame on 2560x1440 — streak 5590
+🎞  Encoder output: 8420 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5600
+⏳ WGC: no new frame on 2560x1440 — streak 5610
+⏳ WGC: no new frame on 2560x1440 — streak 5620
+⏳ WGC: no new frame on 2560x1440 — streak 5630
+⏳ WGC: no new frame on 2560x1440 — streak 5640
+⏳ WGC: no new frame on 2560x1440 — streak 5650
+⏳ WGC: no new frame on 2560x1440 — streak 5660
+🎞  Encoder output: 7902 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5670
+⏳ WGC: no new frame on 2560x1440 — streak 5680
+⏳ WGC: no new frame on 2560x1440 — streak 5690
+⏳ WGC: no new frame on 2560x1440 — streak 5700
+⏳ WGC: no new frame on 2560x1440 — streak 5710
+⏳ WGC: no new frame on 2560x1440 — streak 5720
+🎞  Encoder output: 8883 Kbps
+⏳ WGC: no new frame on 2560x1440 — streak 5730
+⏳ WGC: no new frame on 2560x1440 — streak 5740
+⏳ WGC: no new frame on 2560x1440 — streak 5750
+⏳ WGC: no new frame on 2560x1440 — streak 5760
+⏳ WGC: no new frame on 2560x1440 — streak 5770
+⏳ WGC: no new frame on 2560x1440 — streak 5780

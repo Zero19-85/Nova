@@ -68,7 +68,13 @@ windows = { version = "0.58", features = [
     "Win32_System_WinRT_Direct3D11",       # CreateDirect3D11DeviceFromDXGIDevice
     "Win32_System_WinRT_Graphics_Capture", # IGraphicsCaptureItemInterop (HMONITOR → GraphicsCaptureItem)
     "Win32_System_WinRT",                  # RoInitialize / RO_INIT_MULTITHREADED
+    # System tray + balloon notifications
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+    # Windows Service installation (--install / --uninstall)
+    "Win32_System_Services",
 ] }
+windows-service = "0.7"
 rsa = "0.9.10"
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"

@@ -8,6 +8,7 @@ mod input;
 mod pairing;
 mod rtp;
 mod rtsp;
+pub mod tray;
 mod virtual_display;
 
 use clap::Parser;
@@ -109,6 +110,12 @@ pub async fn run() -> Result<()> {
     // device, fix that up before anything else (host would otherwise stay
     // silent with no client connected).
     audio::recover_stuck_sink();
+
+    // System tray: spawn before anything else so pairing PIN notifications
+    // are visible from the moment the server is ready.
+    let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel::<tray::TrayCmd>(32);
+    tray::spawn(tray_rx);
+    let tray_tx = std::sync::Arc::new(tray_tx);
     let args = Args::parse();
     let local_ip = get_local_ip();
     println!("=== Nova Server ===\n🌐 LAN IP: {}\n", local_ip);
@@ -200,6 +207,7 @@ pub async fn run() -> Result<()> {
         server_mac.to_string(),
         client_info.clone(),
         codec_mode_support,
+        tray_tx.clone(),
     ));
 
     // mDNS — Sunshine-compatible service record

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use url::Url;
 use std::sync::Mutex;
-use std::io::Write as IoWrite;
+use std::io::Write as IoWrite; // used by persist_paired_client
 use crate::rtsp;
 
 // TLS/HTTPS Imports
@@ -24,7 +24,7 @@ use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::cipher::generic_array::GenericArray; 
 use sha2::{Sha256, Digest};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 
 // RSA Generation Imports 
@@ -80,6 +80,9 @@ struct PairSession {
     server_secret: Option<Vec<u8>>,
     server_challenge: Option<Vec<u8>>,
     client_hash: Option<Vec<u8>>,
+    /// Server-generated pairing PIN (4 digits). Generated when the client
+    /// sends `getservercert`; consumed in the `clientchallenge` phase.
+    pin: Option<String>,
 }
 
 pub struct ServerCrypto {
@@ -289,6 +292,7 @@ pub async fn start_pairing_server(
     server_mac: String,
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     codec_mode_support: u32,
+    tray_tx: Arc<std::sync::mpsc::SyncSender<crate::tray::TrayCmd>>,
 ) {
     // ── Phase 1: Crypto ───────────────────────────────────────────────────────
     // Must run first. try_load_from_disk() may delete stale cert files and
@@ -329,31 +333,14 @@ pub async fn start_pairing_server(
     println!("🔐 Nova HTTP  server listening on port {}", port);
     println!("🔒 Nova HTTPS server listening on port 47984");
 
-    // --- PIN CHANNEL ---
-    let global_pin = Arc::new(Mutex::new(String::new()));
-    let pin_thread_ref = global_pin.clone();
-    
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        loop {
-            let mut input = String::new();
-            if stdin.read_line(&mut input).is_ok() {
-                let trimmed = input.trim().to_string();
-                if trimmed.len() == 4 {
-                    *pin_thread_ref.lock().unwrap() = trimmed;
-                }
-            }
-        }
-    });
-
     // --- SPAWN HTTPS LOOP ---
     let crypto_https = crypto.clone();
     let sessions_https = sessions.clone();
     let ip_https = host_ip.clone();
     let id_https = server_id.clone();
     let mac_https = server_mac.clone();
-    let pin_https = global_pin.clone();
     let ci_https = client_info.clone();
+    let tray_https = tray_tx.clone();
     let tls_acceptor_clone = tls_acceptor.clone();
 
     tokio::task::spawn(async move {
@@ -365,9 +352,9 @@ pub async fn start_pairing_server(
             let mac_clone = mac_https.clone();
             let crypt = crypto_https.clone();
             let sess = sessions_https.clone();
-            let pin = pin_https.clone();
             let ci = ci_https.clone();
-            let cms = codec_mode_support; // Copy
+            let tray = tray_https.clone();
+            let cms = codec_mode_support;
 
             tokio::task::spawn(async move {
                 println!("🔒 [47984] TLS attempt from {}", peer);
@@ -390,9 +377,9 @@ pub async fn start_pairing_server(
                         let mac = mac_clone.clone();
                         let crypt = crypt.clone();
                         let sess = sess.clone();
-                        let pin = pin.clone();
                         let ci = ci.clone();
-                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, pin, ci, cms).await }
+                        let tray = tray.clone();
+                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, ci, cms, tray).await }
                     }))
                     .await;
             });
@@ -409,9 +396,9 @@ pub async fn start_pairing_server(
         let mac_clone = server_mac.clone();
         let crypto_clone = crypto.clone();
         let sessions_clone = sessions.clone();
-        let pin_clone = global_pin.clone();
         let ci_clone = client_info.clone();
-        let cms = codec_mode_support; // Copy
+        let tray_clone = tray_tx.clone();
+        let cms = codec_mode_support;
 
         tokio::task::spawn(async move {
             println!("🌐 [47989] HTTP from {}", peer_str);
@@ -422,9 +409,9 @@ pub async fn start_pairing_server(
                     let mac = mac_clone.clone();
                     let crypt = crypto_clone.clone();
                     let sess = sessions_clone.clone();
-                    let pin = pin_clone.clone();
                     let ci = ci_clone.clone();
-                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, pin, ci, cms).await }
+                    let tray = tray_clone.clone();
+                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, ci, cms, tray).await }
                 }))
                 .await;
         });
@@ -439,9 +426,9 @@ async fn handle_request(
     _server_mac: String,
     crypto: Arc<ServerCrypto>,
     sessions: PairSessions,
-    global_pin: Arc<Mutex<String>>,
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     codec_mode_support: u32,
+    tray_tx: Arc<std::sync::mpsc::SyncSender<crate::tray::TrayCmd>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let full_uri = req.uri().to_string();
     if !full_uri.contains("/serverinfo") {
@@ -537,48 +524,45 @@ async fn handle_request(
 
             if phrase == "getservercert" || params.contains_key("getservercert") {
                 let salt = params.get("salt").cloned().unwrap_or_default();
+
+                // Generate the pairing PIN server-side (Sunshine-style): the
+                // user reads it from the tray notification and types it into
+                // Moonlight's pairing dialog.
+                let pin = format!("{:04}", rand::thread_rng().gen_range(0u32..10000));
+
                 {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
                     session.last_phase = "GETSERVERCERT".to_string();
                     session.client_cert = params.get("clientcert").cloned();
                     session.salt = Some(salt.clone());
-                    session.aes_key = None; 
+                    session.aes_key = None;
+                    session.pin = Some(pin.clone());
                 }
 
-                println!("🤝 Phase 1: Awaiting PIN...");
+                println!("🤝 Phase 1: Pairing PIN = {} — enter this in Moonlight", pin);
+                // Notify the system tray; also print as a fallback for headless runs.
+                let _ = tray_tx.try_send(crate::tray::TrayCmd::PairingPin(pin.clone()));
+
                 let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>{}</plaincert></root>"#, crypto.cert_hex);
                 Ok(make_xml_response(&body))
 
             } else if phrase == "clientchallenge" || client_challenge.is_some() {
-                let salt = {
+                let (salt, pin) = {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
                     session.last_phase = "CLIENTCHALLENGE".to_string();
-                    session.salt.clone().unwrap_or_default()
+                    (
+                        session.salt.clone().unwrap_or_default(),
+                        session.pin.clone().unwrap_or_default(),
+                    )
                 };
 
-                println!("⏳ Please type the 4-digit PIN from Moonlight into this console and press Enter...");
-                let mut attempts = 0;
-                let mut pin = String::new();
-                
-                while attempts < 600 { 
-                    {
-                        let mut p_guard = global_pin.lock().unwrap();
-                        if p_guard.len() == 4 {
-                            pin = p_guard.clone();
-                            *p_guard = String::new();
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    attempts += 1;
-                }
-
                 if pin.is_empty() {
-                    println!("⏳ PIN input timed out. Please restart the pairing process.");
-                    return Ok(make_error_response("Timeout waiting for PIN"));
+                    println!("⚠️  clientchallenge arrived with no PIN in session — pairing aborted.");
+                    return Ok(make_error_response("No PIN for this session"));
                 }
+                println!("🔑 Phase 2: Challenge received — using PIN {}", pin);
 
                 let aes_key = derive_aes_key(&salt, &pin);
                 let challenge_hex = client_challenge.unwrap_or_default();
