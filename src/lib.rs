@@ -117,7 +117,11 @@ pub async fn run() -> Result<()> {
     // menu item sends `true`; the capture-loop select! below breaks on it.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel::<tray::TrayCmd>(32);
-    tray::spawn(tray_rx, Arc::new(shutdown_tx));
+    // global_pin is the handshake point between the tray PIN dialog and the
+    // pairing async task: the tray writes the 4-digit string here and the
+    // pairing poll loop reads + clears it.
+    let global_pin: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    tray::spawn(tray_rx, Arc::new(shutdown_tx), global_pin.clone());
     let tray_tx = Arc::new(tray_tx);
     let args = Args::parse();
     let local_ip = get_local_ip();
@@ -211,6 +215,7 @@ pub async fn run() -> Result<()> {
         client_info.clone(),
         codec_mode_support,
         tray_tx.clone(),
+        global_pin.clone(),
     ));
 
     // mDNS — Sunshine-compatible service record
