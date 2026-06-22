@@ -37,38 +37,57 @@ const PAIRED_PATH:        &str = "nova_paired.txt";
 const CERT_VERSION_PATH: &str = "nova_cert.version";
 const CERT_VERSION:       u8  = 8;
 
+/// All data files are stored next to the running executable so the paths are
+/// stable regardless of the current working directory (service runs, shells
+/// started from different locations, etc.).  Relative paths break when Nova is
+/// launched as a Windows service because the SCM sets CWD to System32.
+fn data_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+fn data_file(name: &str) -> std::path::PathBuf { data_dir().join(name) }
+
 /// Append a client ID to the persist file (one ID per line).
 fn persist_paired_client(client_id: &str) {
     use std::fs::OpenOptions;
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(PAIRED_PATH) {
+    let path = data_file(PAIRED_PATH);
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{}", client_id);
     }
 }
 
 /// Remove a client ID from the persist file.
 fn remove_paired_client(client_id: &str) {
-    if let Ok(contents) = std::fs::read_to_string(PAIRED_PATH) {
+    let path = data_file(PAIRED_PATH);
+    if let Ok(contents) = std::fs::read_to_string(&path) {
         let updated: String = contents
             .lines()
             .filter(|l| l.trim() != client_id)
             .map(|l| format!("{}\n", l))
             .collect();
-        let _ = std::fs::write(PAIRED_PATH, updated);
+        let _ = std::fs::write(&path, updated);
     }
 }
 
 /// Load all persisted client IDs and mark them as paired in the sessions map.
 fn load_paired_clients(sessions: &PairSessions) {
-    let contents = match std::fs::read_to_string(PAIRED_PATH) {
+    let path = data_file(PAIRED_PATH);
+    let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            println!("📂 No paired-clients file found at {} ({e}) — starting fresh", path.display());
+            return;
+        }
     };
     let mut lock = sessions.lock().unwrap();
     for id in contents.lines().map(str::trim).filter(|s| !s.is_empty()) {
         let entry = lock.entry(id.to_string()).or_default();
         entry.last_phase = "CLIENTPAIRINGSECRET".to_string();
     }
-    println!("📂 Loaded {} paired client(s) from disk", lock.len());
+    println!("📂 Loaded {} paired client(s) from {}", lock.len(), path.display());
 }
 
 #[derive(Default)]
@@ -182,16 +201,16 @@ impl ServerCrypto {
         let cert_der = cert.der().to_vec();
         let cert_pem = der_to_pem(&cert_der);
 
-        if let Err(e) = std::fs::write(CERT_PATH, &cert_der) {
+        if let Err(e) = std::fs::write(data_file(CERT_PATH), &cert_der) {
             eprintln!("⚠️ Could not save {}: {}", CERT_PATH, e);
         }
-        if let Err(e) = std::fs::write(CERT_PEM_PATH, &cert_pem) {
+        if let Err(e) = std::fs::write(data_file(CERT_PEM_PATH), &cert_pem) {
             eprintln!("⚠️ Could not save {}: {}", CERT_PEM_PATH, e);
         }
-        if let Err(e) = std::fs::write(KEY_PATH, &private_key_der) {
+        if let Err(e) = std::fs::write(data_file(KEY_PATH), &private_key_der) {
             eprintln!("⚠️ Could not save {}: {}", KEY_PATH, e);
         }
-        if let Err(e) = std::fs::write(CERT_VERSION_PATH, &[CERT_VERSION]) {
+        if let Err(e) = std::fs::write(data_file(CERT_VERSION_PATH), &[CERT_VERSION]) {
             eprintln!("⚠️ Could not save {}: {}", CERT_VERSION_PATH, e);
         }
 
@@ -210,30 +229,30 @@ impl ServerCrypto {
     fn try_load_from_disk() -> Option<Self> {
         // Version gate: certs generated before CERT_VERSION lack KeyCertSign/EKU/DN.
         // Delete stale files so new() regenerates with the correct extensions.
-        let stored_version = std::fs::read(CERT_VERSION_PATH)
+        let stored_version = std::fs::read(data_file(CERT_VERSION_PATH))
             .ok()
             .and_then(|b| b.first().copied());
         if stored_version.unwrap_or(0) < CERT_VERSION {
             println!("🔄 Nova cert is outdated (v{} < v{}) — deleting to regenerate.",
                 stored_version.unwrap_or(0), CERT_VERSION);
             println!("   ⚠️  Delete nova_paired.txt and re-pair Moonlight after restart.");
-            let _ = std::fs::remove_file(CERT_PATH);
-            let _ = std::fs::remove_file(CERT_PEM_PATH);
-            let _ = std::fs::remove_file(KEY_PATH);
-            let _ = std::fs::remove_file(CERT_VERSION_PATH);
+            let _ = std::fs::remove_file(data_file(CERT_PATH));
+            let _ = std::fs::remove_file(data_file(CERT_PEM_PATH));
+            let _ = std::fs::remove_file(data_file(KEY_PATH));
+            let _ = std::fs::remove_file(data_file(CERT_VERSION_PATH));
             return None;
         }
 
-        let cert_der        = std::fs::read(CERT_PATH).ok()?;
-        let private_key_der = std::fs::read(KEY_PATH).ok()?;
+        let cert_der        = std::fs::read(data_file(CERT_PATH)).ok()?;
+        let private_key_der = std::fs::read(data_file(KEY_PATH)).ok()?;
         if cert_der.is_empty() || private_key_der.is_empty() {
             return None;
         }
         // PEM file might not exist on older installs — derive it from DER.
-        let cert_pem = std::fs::read_to_string(CERT_PEM_PATH)
+        let cert_pem = std::fs::read_to_string(data_file(CERT_PEM_PATH))
             .unwrap_or_else(|_| {
                 let pem = der_to_pem(&cert_der);
-                let _ = std::fs::write(CERT_PEM_PATH, &pem);
+                let _ = std::fs::write(data_file(CERT_PEM_PATH), &pem);
                 pem
             });
         let cert_hex = hex::encode_upper(cert_pem.as_bytes());
@@ -557,21 +576,43 @@ async fn handle_request(
                     session.salt.clone().unwrap_or_default()
                 };
 
-                // Wait indefinitely for the user to enter the PIN via the
-                // tray "Pair Device" menu item.  No timeout — the user takes
-                // however long they need to open the tray and type the PIN.
-                println!("⏳ Phase 2: Waiting for PIN via tray menu (no timeout)...");
-                let mut pin = String::new();
-                loop {
-                    {
+                // Collect the PIN without blocking the tokio executor.
+                //
+                // Strategy:
+                //   1. Check global_pin first — the user may have clicked
+                //      "Pair Device" in the tray before this request arrived.
+                //   2. Otherwise open the native InputBox immediately via
+                //      spawn_blocking so the dialog pops the moment Moonlight
+                //      sends the challenge.  Moonlight holds the HTTP
+                //      connection open while we await; tokio serves other
+                //      requests concurrently.
+                let pin = {
+                    let preloaded = {
                         let mut p = global_pin.lock().unwrap();
                         if p.len() == 4 {
-                            pin = p.clone();
-                            p.clear(); // consume so the next pairing starts fresh
-                            break;
+                            let pin = p.clone();
+                            p.clear();
+                            pin
+                        } else {
+                            String::new()
                         }
+                    };
+                    if !preloaded.is_empty() {
+                        println!("🔑 Phase 2: using pre-entered PIN from tray menu");
+                        preloaded
+                    } else {
+                        println!("⏳ Phase 2: opening PIN dialog (type the PIN shown on Moonlight)...");
+                        tokio::task::spawn_blocking(|| crate::tray::prompt_for_pin())
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default()
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                };
+
+                if pin.is_empty() {
+                    println!("⚠️  PIN entry cancelled — pairing aborted.");
+                    return Ok(make_error_response("PIN entry cancelled"));
                 }
                 println!("🔑 Phase 2: PIN received — completing challenge");
 
