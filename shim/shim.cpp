@@ -113,15 +113,97 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 }
 )";
 
+// ── YUV conversion shader (Apollo-style typed-RTV approach) ──────────────────
+// Replaces both VideoProcessorBlt (SDR) and the CS+UAV path (HDR).
+// A single fullscreen-triangle vertex shader drives four pixel shaders:
+//   ps_sdr_y  : BGRA8 full-range → R8_UNORM  Y  (BT.709 limited-range, plane 0 of NV12)
+//   ps_sdr_uv : BGRA8 full-range → R8G8_UNORM UV (BT.709 limited-range, plane 1 of NV12)
+//   ps_hdr_y  : FP16 scRGB       → R16_UNORM  Y  (BT.2020 PQ full-range, plane 0 of P010)
+//   ps_hdr_uv : FP16 scRGB       → R16G16_UNORM UV(BT.2020 PQ full-range, plane 1 of P010)
+// The UV viewport is set to width/2 × height/2; the same UV coords [0,1] sample the
+// input at half-frequency, providing 4:2:0 bilinear downsampling automatically.
+// D3D11 infers the plane from the typed RTV format (R8/R8G8 → plane 0/1 of NV12;
+// R16/R16G16 → plane 0/1 of P010) — no PlaneSlice extension required.
+static const char* kYuvShaderSrc = R"(
+struct VS_OUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
+
+VS_OUT vs_main(uint vid : SV_VertexID) {
+    VS_OUT o;
+    if      (vid == 0) { o.pos = float4(-1,-1,0,1); o.uv = float2(0,1); }
+    else if (vid == 1) { o.pos = float4(-1, 3,0,1); o.uv = float2(0,-1); }
+    else               { o.pos = float4( 3,-1,0,1); o.uv = float2(2,1); }
+    return o;
+}
+
+Texture2D<float4> src : register(t0);
+SamplerState      smp : register(s0);
+
+// ── SDR: BGRA8 full-range → NV12 BT.709 limited-range ────────────────────
+// Coefficients from BT.601/BT.709; limited-range scaling Y∈[16,235], UV∈[16,240].
+float  ps_sdr_y (VS_OUT i) : SV_TARGET {
+    float3 c = src.SampleLevel(smp, i.uv, 0).rgb;
+    return 16.0/255.0 + (219.0/255.0)*(0.2126*c.r + 0.7152*c.g + 0.0722*c.b);
+}
+float2 ps_sdr_uv(VS_OUT i) : SV_TARGET {
+    float3 c = src.SampleLevel(smp, i.uv, 0).rgb;
+    float Cb = 128.0/255.0 + (112.0/255.0)*(-0.1146*c.r - 0.3854*c.g + 0.5000*c.b);
+    float Cr = 128.0/255.0 + (112.0/255.0)*( 0.5000*c.r - 0.4542*c.g - 0.0458*c.b);
+    return float2(Cb, Cr);
+}
+
+// ── HDR: FP16 scRGB → P010 BT.2020 NCL PQ full-range ─────────────────────
+static const float3x3 scRGB_to_BT2020 = {
+    0.627404f, 0.329282f, 0.043314f,
+    0.069097f, 0.919540f, 0.011363f,
+    0.016391f, 0.088013f, 0.895596f
+};
+static const float3x3 BT2020_to_YUV = {
+     0.262700f,  0.678000f,  0.059300f,
+    -0.139630f, -0.360370f,  0.500000f,
+     0.500000f, -0.459786f, -0.040214f
+};
+float3 PQ(float3 L) {
+    L = saturate(L / 125.0f);
+    float m1 = 2610.0f/16384.0f, m2 = 128.0f*2523.0f/4096.0f;
+    float c1 = 3424.0f/4096.0f,  c2 = 32.0f*2413.0f/4096.0f, c3 = 32.0f*2392.0f/4096.0f;
+    float3 Lp = pow(L, m1);
+    return pow((c1 + c2*Lp)/(1.0f + c3*Lp), m2);
+}
+float  ps_hdr_y (VS_OUT i) : SV_TARGET {
+    float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, src.SampleLevel(smp,i.uv,0).rgb)));
+    return yuv.x;
+}
+float2 ps_hdr_uv(VS_OUT i) : SV_TARGET {
+    float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, src.SampleLevel(smp,i.uv,0).rgb)));
+    return float2(yuv.y + 0.5f, yuv.z + 0.5f);
+}
+)";
+
+// YUV conversion shader objects (shared by SDR and HDR, compiled once in InitColorConversion).
+static ID3D11VertexShader* g_yuvVS     = nullptr;
+static ID3D11PixelShader*  g_sdrYPS    = nullptr;  // BGRA8 → R8_UNORM    Y
+static ID3D11PixelShader*  g_sdrUVPS   = nullptr;  // BGRA8 → R8G8_UNORM  UV
+static ID3D11PixelShader*  g_hdrYPS    = nullptr;  // FP16  → R16_UNORM   Y
+static ID3D11PixelShader*  g_hdrUVPS   = nullptr;  // FP16  → R16G16_UNORM UV
+
+// Typed RTVs on the planar output textures.
+// D3D11 selects the correct plane via format: R8→plane0, R8G8→plane1 on NV12;
+//                                             R16→plane0, R16G16→plane1 on P010.
+static ID3D11RenderTargetView* g_nv12YRtv  = nullptr; // R8_UNORM    → NV12 Y  plane (SDR)
+static ID3D11RenderTargetView* g_nv12UVRtv = nullptr; // R8G8_UNORM  → NV12 UV plane (SDR)
+static ID3D11RenderTargetView* g_p010YRtv  = nullptr; // R16_UNORM   → P010 Y  plane (HDR)
+static ID3D11RenderTargetView* g_p010UVRtv = nullptr; // R16G16_UNORM→ P010 UV plane (HDR)
+
 // HDR compute shader bridge resources (lazily created on first HDR frame in EncodeFrame).
-static ID3D11ComputeShader*       g_hdrCS      = nullptr; // compiled once at HDR init
+// g_hdrCS is kept for legacy cleanup; the active HDR path uses g_hdrYPS/g_hdrUVPS + RTVs.
+static ID3D11ComputeShader*       g_hdrCS      = nullptr;
 static ID3D11Texture2D*           g_hdrP010Tex = nullptr; // DXGI_FORMAT_P010 intermediate
-static ID3D11UnorderedAccessView* g_hdrYUAV    = nullptr; // Y plane (R16_UNORM, PlaneSlice=0)
-static ID3D11UnorderedAccessView* g_hdrUVUAV   = nullptr; // UV plane (R16G16_UNORM, PlaneSlice=1)
+static ID3D11UnorderedAccessView* g_hdrYUAV    = nullptr; // kept for cleanup only
+static ID3D11UnorderedAccessView* g_hdrUVUAV   = nullptr; // kept for cleanup only
 
 // NVENC's pre-registered input texture — borrowed from NvEncoderD3D11 (do NOT Release).
-// For HDR: P010/YUV420_10BIT — CS output CopyResource'd here, VP bypassed entirely.
-// For SDR: NV12 — written by VideoProcessorBlt via g_vpOutView as before.
+// For HDR: P010/YUV420_10BIT — RTV shader output CopyResource'd here.
+// For SDR: NV12 — RTV shader draws directly into this texture.
 static ID3D11Texture2D* g_nvencInputTex = nullptr;
 
 // ==================== CURSOR COMPOSITING GLOBALS ====================
@@ -709,80 +791,117 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
 
     // HDR: CS writes directly into g_hdrP010Tex; CopyResource feeds NVENC. VP is unused.
     // SDR: VP output view on NVENC's NV12 texture — VideoProcessorBlt writes here zero-copy.
-    if (is_hdr) {
-        g_nvencInputTex = nvencInputTex; // borrowed — do NOT AddRef or Release
-        D3D11_TEXTURE2D_DESC d = {};
-        nvencInputTex->GetDesc(&d);
-        printf("ℹ️  HDR VP bypass: NVENC P010 input cached (%dx%d format=0x%X)\n",
-               d.Width, d.Height, (unsigned)d.Format);
-    } else {
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
-        ovDesc.ViewDimension      = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        ovDesc.Texture2D.MipSlice = 0;
-        hr = g_videoDevice->CreateVideoProcessorOutputView(nvencInputTex, g_vpEnum, &ovDesc, &g_vpOutView);
-        if (FAILED(hr)) {
-            printf("❌ CreateVideoProcessorOutputView failed: hr=0x%08X\n", (unsigned)hr);
-            return -7;
+    // Cache the NVENC input texture for both paths.
+    g_nvencInputTex = nvencInputTex; // borrowed — do NOT AddRef or Release
+
+    // ── Compile the YUV conversion shaders (once per process) ────────────────
+    // Apollo-style: typed RTV draws replace both VideoProcessorBlt (SDR) and
+    // the CS+UAV path (HDR).  RTVs with typed planar formats (R8_UNORM / R8G8_UNORM
+    // on NV12; R16_UNORM / R16G16_UNORM on P010) are supported on all NVIDIA
+    // D3D11.1+ hardware, unlike optional typed-UAV-store formats which silently
+    // produce zeros when unsupported — the root cause of the green-screen bug.
+    if (!g_yuvVS) {
+        auto compile_shader = [&](const char* entry, const char* profile,
+                                  ID3DBlob** out) -> bool {
+            ID3DBlob* err = nullptr;
+            HRESULT h = D3DCompile(kYuvShaderSrc, strlen(kYuvShaderSrc),
+                                   nullptr, nullptr, nullptr,
+                                   entry, profile, 0, 0, out, &err);
+            if (FAILED(h)) {
+                if (err) { printf("❌ Shader %s error: %s\n", entry,
+                                  (char*)err->GetBufferPointer()); err->Release(); }
+                return false;
+            }
+            if (err) err->Release();
+            return true;
+        };
+
+        ID3DBlob *vsBlob=nullptr, *sdrYBlob=nullptr, *sdrUVBlob=nullptr,
+                 *hdrYBlob=nullptr, *hdrUVBlob=nullptr;
+        bool ok = compile_shader("vs_main",   "vs_5_0", &vsBlob)
+               && compile_shader("ps_sdr_y",  "ps_5_0", &sdrYBlob)
+               && compile_shader("ps_sdr_uv", "ps_5_0", &sdrUVBlob)
+               && compile_shader("ps_hdr_y",  "ps_5_0", &hdrYBlob)
+               && compile_shader("ps_hdr_uv", "ps_5_0", &hdrUVBlob);
+
+        if (ok) {
+            device->CreateVertexShader(vsBlob->GetBufferPointer(),
+                                       vsBlob->GetBufferSize(), nullptr, &g_yuvVS);
+            device->CreatePixelShader(sdrYBlob->GetBufferPointer(),
+                                      sdrYBlob->GetBufferSize(), nullptr, &g_sdrYPS);
+            device->CreatePixelShader(sdrUVBlob->GetBufferPointer(),
+                                      sdrUVBlob->GetBufferSize(), nullptr, &g_sdrUVPS);
+            device->CreatePixelShader(hdrYBlob->GetBufferPointer(),
+                                      hdrYBlob->GetBufferSize(), nullptr, &g_hdrYPS);
+            device->CreatePixelShader(hdrUVBlob->GetBufferPointer(),
+                                      hdrUVBlob->GetBufferSize(), nullptr, &g_hdrUVPS);
+            printf("✅ YUV conversion shaders compiled (SDR: BT.709 lim-range; HDR: BT.2020 PQ full-range)\n");
+        } else {
+            printf("❌ YUV shader compilation failed — video output will be corrupted\n");
         }
-        D3D11_TEXTURE2D_DESC d = {};
-        nvencInputTex->GetDesc(&d);
-        printf("✅ VP output view created on %dx%d format=0x%X texture\n",
-               d.Width, d.Height, (unsigned)d.Format);
+        if (vsBlob)    vsBlob->Release();
+        if (sdrYBlob)  sdrYBlob->Release();
+        if (sdrUVBlob) sdrUVBlob->Release();
+        if (hdrYBlob)  hdrYBlob->Release();
+        if (hdrUVBlob) hdrUVBlob->Release();
     }
 
-    // Pin source/dest/output rects to the full dynamic surface. Without this,
-    // VideoProcessorBlt on NVIDIA drivers can default to a stale/partial
-    // rectangle, leaving everything below it black — exactly the "bottom of
-    // frame black" symptom.
-    RECT fullRect = {0, 0, (LONG)width, (LONG)height};
-    g_videoContext->VideoProcessorSetStreamSourceRect(g_vp, 0, TRUE, &fullRect);
-    g_videoContext->VideoProcessorSetStreamDestRect(g_vp, 0, TRUE, &fullRect);
-    g_videoContext->VideoProcessorSetOutputTargetRect(g_vp, TRUE, &fullRect);
+    // ── Create typed RTVs on the NVENC input texture (SDR) ───────────────────
+    // D3D11 selects the plane by format: R8_UNORM → plane 0 (Y), R8G8_UNORM → plane 1 (UV).
+    // The NV12 texture was created by NvEncoderD3D11 with D3D11_BIND_RENDER_TARGET. ✓
+    if (!is_hdr) {
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.ViewDimension      = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Texture2D.MipSlice = 0;
 
+        if (g_nv12YRtv)  { g_nv12YRtv->Release();  g_nv12YRtv  = nullptr; }
+        if (g_nv12UVRtv) { g_nv12UVRtv->Release(); g_nv12UVRtv = nullptr; }
+
+        rtvDesc.Format = DXGI_FORMAT_R8_UNORM;   // Y plane
+        hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_nv12YRtv);
+        if (FAILED(hr)) { printf("❌ NV12 Y RTV failed: 0x%08X\n", (unsigned)hr); return -10; }
+
+        rtvDesc.Format = DXGI_FORMAT_R8G8_UNORM; // UV plane
+        hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_nv12UVRtv);
+        if (FAILED(hr)) { printf("❌ NV12 UV RTV failed: 0x%08X\n", (unsigned)hr); return -11; }
+
+        printf("✅ NV12 typed RTVs created (R8_UNORM Y, R8G8_UNORM UV) — Apollo-style SDR path\n");
+    }
+
+    // ── Create P010 intermediate + typed RTVs (HDR) ──────────────────────────
+    // Intermediate texture uses BIND_RENDER_TARGET (not UNORDERED_ACCESS).
+    // R16_UNORM → Y plane, R16G16_UNORM → UV plane — same typed-RTV pattern as Apollo.
     if (is_hdr) {
-        // HDR: CS writes BT.2020 NCL PQ YCbCr directly to P010 plane UAVs.
-        // VP is not involved — no colorspace declarations needed here.
-        if (!g_hdrCS) {
-            ID3DBlob* csBlob  = nullptr;
-            ID3DBlob* errBlob = nullptr;
-            HRESULT hrCs = D3DCompile(kHdrCsHlsl, strlen(kHdrCsHlsl),
-                                      nullptr, nullptr, nullptr,
-                                      "main", "cs_5_0", 0, 0, &csBlob, &errBlob);
-            if (FAILED(hrCs)) {
-                if (errBlob) {
-                    printf("❌ HDR CS compile error: %s\n", (char*)errBlob->GetBufferPointer());
-                    errBlob->Release();
-                }
-                return -11;
-            }
-            hrCs = device->CreateComputeShader(csBlob->GetBufferPointer(),
-                                               csBlob->GetBufferSize(), nullptr, &g_hdrCS);
-            csBlob->Release();
-            if (FAILED(hrCs)) {
-                printf("❌ CreateComputeShader failed: hr=0x%08X\n", (unsigned)hrCs);
-                return -12;
-            }
-            printf("✅ HDR CS compiled: FP16 scRGB → P010 BT.2020 NCL PQ (plane UAVs, D3D11.3)\n");
-        }
-        printf("✅ HDR encoder ready: CS → P010 (plane UAVs) → CopyResource → NVENC (VP bypassed)\n");
-    } else {
-        // SDR path: BGRA8 desktop full-range → NV12 BT.709 limited-range — UNCHANGED.
-        // A mismatch here vs the VUI parameters set in InitEncoder produces structurally-
-        // correct but wrong-colored output (blocky pixelation from the wrong YUV matrix/range).
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace = {};
-        inputColorSpace.Usage         = 0;
-        inputColorSpace.RGB_Range     = 0; // full range 0-255 (desktop BGRA)
-        inputColorSpace.YCbCr_Matrix  = 1; // BT.709
-        inputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-        g_videoContext->VideoProcessorSetStreamColorSpace(g_vp, 0, &inputColorSpace);
+        if (g_p010YRtv)  { g_p010YRtv->Release();  g_p010YRtv  = nullptr; }
+        if (g_p010UVRtv) { g_p010UVRtv->Release(); g_p010UVRtv = nullptr; }
+        if (g_hdrP010Tex){ g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr; }
 
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace = {};
-        outputColorSpace.Usage         = 0;
-        outputColorSpace.RGB_Range     = 0;
-        outputColorSpace.YCbCr_Matrix  = 1; // BT.709
-        outputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-        g_videoContext->VideoProcessorSetOutputColorSpace(g_vp, &outputColorSpace);
-        printf("✅ Video Processor (BGRA → NV12 BT.709) initialized\n");
+        D3D11_TEXTURE2D_DESC p010Desc = {};
+        p010Desc.Width            = (UINT)width;
+        p010Desc.Height           = (UINT)height;
+        p010Desc.MipLevels        = 1;
+        p010Desc.ArraySize        = 1;
+        p010Desc.Format           = DXGI_FORMAT_P010;
+        p010Desc.SampleDesc.Count = 1;
+        p010Desc.Usage            = D3D11_USAGE_DEFAULT;
+        p010Desc.BindFlags        = D3D11_BIND_RENDER_TARGET; // RTV, not UAV
+        hr = device->CreateTexture2D(&p010Desc, nullptr, &g_hdrP010Tex);
+        if (FAILED(hr)) { printf("❌ P010 RTV texture failed: 0x%08X\n", (unsigned)hr); return -12; }
+
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.ViewDimension      = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Texture2D.MipSlice = 0;
+
+        rtvDesc.Format = DXGI_FORMAT_R16_UNORM;     // Y plane
+        hr = device->CreateRenderTargetView(g_hdrP010Tex, &rtvDesc, &g_p010YRtv);
+        if (FAILED(hr)) { printf("❌ P010 Y RTV failed: 0x%08X\n", (unsigned)hr); return -13; }
+
+        rtvDesc.Format = DXGI_FORMAT_R16G16_UNORM;  // UV plane
+        hr = device->CreateRenderTargetView(g_hdrP010Tex, &rtvDesc, &g_p010UVRtv);
+        if (FAILED(hr)) { printf("❌ P010 UV RTV failed: 0x%08X\n", (unsigned)hr); return -14; }
+
+        printf("✅ P010 typed RTVs created (%dx%d, R16_UNORM Y, R16G16_UNORM UV) — Apollo-style HDR path\n",
+               width, height);
     }
 
     if (!InitCursorPipeline(device)) {
@@ -1058,133 +1177,109 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // HDR: CS writes BT.2020 NCL PQ YCbCr directly to P010 plane UAVs (D3D11.3
     // per-plane typed views on a single DXGI_FORMAT_P010 intermediate texture).
     // CopyResource (P010→P010, same format) then feeds NVENC — no VP involved.
-    if (g_isHdr && g_hdrCS) {
-        // Lazily create / resize g_hdrP010Tex and its per-plane UAVs.
-        if (g_hdrP010Tex) {
-            D3D11_TEXTURE2D_DESC existing = {};
-            g_hdrP010Tex->GetDesc(&existing);
-            if (existing.Width != frameDesc.Width || existing.Height != frameDesc.Height) {
-                if (g_hdrYUAV)  { g_hdrYUAV->Release();  g_hdrYUAV  = nullptr; }
-                if (g_hdrUVUAV) { g_hdrUVUAV->Release(); g_hdrUVUAV = nullptr; }
-                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
-            }
-        }
-        if (!g_hdrP010Tex) {
-            D3D11_TEXTURE2D_DESC d = {};
-            d.Width            = frameDesc.Width;
-            d.Height           = frameDesc.Height;
-            d.MipLevels        = 1;
-            d.ArraySize        = 1;
-            d.Format           = DXGI_FORMAT_P010;
-            d.SampleDesc.Count = 1;
-            d.Usage            = D3D11_USAGE_DEFAULT;
-            d.BindFlags        = D3D11_BIND_UNORDERED_ACCESS;
-            if (FAILED(g_device->CreateTexture2D(&d, nullptr, &g_hdrP010Tex))) {
-                printf("❌ Failed to create P010 UAV texture (driver may not support "
-                       "D3D11_BIND_UNORDERED_ACCESS on DXGI_FORMAT_P010)\n");
-                return 0;
-            }
-
-            // Per-plane typed UAVs via ID3D11Device3 (D3D11.3 PlaneSlice feature).
-            ID3D11Device3* dev3 = nullptr;
-            if (FAILED(g_device->QueryInterface(__uuidof(ID3D11Device3), (void**)&dev3))) {
-                printf("❌ ID3D11Device3 unavailable — cannot create P010 plane UAVs\n");
-                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
-                return 0;
-            }
-            D3D11_UNORDERED_ACCESS_VIEW_DESC1 uavDesc = {};
-            uavDesc.ViewDimension        = D3D11_UAV_DIMENSION_TEXTURE2D;
-            uavDesc.Texture2D.MipSlice   = 0;
-
-            uavDesc.Format               = DXGI_FORMAT_R16_UNORM;
-            uavDesc.Texture2D.PlaneSlice = 0; // Y luma plane
-            ID3D11UnorderedAccessView1* yUav = nullptr;
-            HRESULT hrY = dev3->CreateUnorderedAccessView1(g_hdrP010Tex, &uavDesc, &yUav);
-
-            uavDesc.Format               = DXGI_FORMAT_R16G16_UNORM;
-            uavDesc.Texture2D.PlaneSlice = 1; // UV chroma plane (half-res in hardware)
-            ID3D11UnorderedAccessView1* uvUav = nullptr;
-            HRESULT hrUV = dev3->CreateUnorderedAccessView1(g_hdrP010Tex, &uavDesc, &uvUav);
-            dev3->Release();
-
-            if (FAILED(hrY) || FAILED(hrUV)) {
-                printf("❌ P010 plane UAV creation failed: hrY=0x%08X hrUV=0x%08X\n",
-                       (unsigned)hrY, (unsigned)hrUV);
-                if (yUav)  yUav->Release();
-                if (uvUav) uvUav->Release();
-                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
-                return 0;
-            }
-            // ID3D11UnorderedAccessView1 inherits ID3D11UnorderedAccessView — safe to upcast.
-            g_hdrYUAV  = yUav;
-            g_hdrUVUAV = uvUav;
-            printf("✅ HDR P010 intermediate created (%dx%d) with R16/R16G16 plane UAVs\n",
-                   (int)frameDesc.Width, (int)frameDesc.Height);
+    if (g_isHdr && g_hdrYPS) {
+        // HDR path: FP16 scRGB composite → P010 via typed-RTV pixel shaders (Apollo approach).
+        // Replaces the CS+UAV path whose R16_UNORM typed-UAV-store support is optional
+        // and silently produces zeros (green screen) when unsupported by the driver.
+        if (!g_hdrP010Tex || !g_p010YRtv || !g_p010UVRtv) {
+            printf("⚠️  HDR P010 RTVs not ready — frame dropped\n");
+            return 0;
         }
 
-        // Per-frame SRV on the FP16 composite texture for the CS to read.
-        // Per-frame is intentional: g_compositeTex is recreated by EnsureSizedTexture
-        // on resolution changes, so a cached SRV would silently go stale.
+        // Per-frame SRV on the FP16 composite texture.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         if (FAILED(g_device->CreateShaderResourceView(g_compositeTex, nullptr, &srcSRV))) {
-            printf("❌ Failed to create FP16 SRV for HDR CS input\n");
+            printf("❌ HDR: CreateShaderResourceView on FP16 composite failed\n");
             return 0;
         }
 
-        // Clear any RTV the cursor overlay may have left bound (SRV/RTV hazard).
-        {
-            ID3D11RenderTargetView* nullRTV = nullptr;
-            g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
-        }
+        const float W = (float)frameDesc.Width, H = (float)frameDesc.Height;
 
-        // Dispatch: each 8×8 thread group covers a 16×16 pixel tile (2×2 per thread).
-        // Ceiling division handles non-16-aligned heights (e.g. 1080p: 1080 % 16 != 0).
-        ID3D11UnorderedAccessView* uavs[2] = { g_hdrYUAV, g_hdrUVUAV };
-        g_context->CSSetShader(g_hdrCS, nullptr, 0);
-        g_context->CSSetShaderResources(0, 1, &srcSRV);
-        g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-        g_context->Dispatch((frameDesc.Width + 15) / 16, (frameDesc.Height + 15) / 16, 1);
+        // Unbind any lingering RTV (cursor overlay).
+        ID3D11RenderTargetView* nullRTV = nullptr;
+        g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
 
-        // Unbind before CopyResource — UAV hazard with source texture is UB.
-        ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
-        g_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_context->IASetInputLayout(nullptr);
+        g_context->VSSetShader(g_yuvVS, nullptr, 0);
+        g_context->PSSetShaderResources(0, 1, &srcSRV);
+        g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
+
+        // Y plane pass — full resolution.
+        D3D11_VIEWPORT vp = { 0, 0, W, H, 0.0f, 1.0f };
+        g_context->RSSetViewports(1, &vp);
+        g_context->OMSetRenderTargets(1, &g_p010YRtv, nullptr);
+        g_context->PSSetShader(g_hdrYPS, nullptr, 0);
+        g_context->Draw(3, 0);
+
+        // UV plane pass — half resolution.
+        vp.Width = W * 0.5f; vp.Height = H * 0.5f;
+        g_context->RSSetViewports(1, &vp);
+        g_context->OMSetRenderTargets(1, &g_p010UVRtv, nullptr);
+        g_context->PSSetShader(g_hdrUVPS, nullptr, 0);
+        g_context->Draw(3, 0);
+
+        // Unbind before CopyResource — RTV/SRV hazard.
+        g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
         ID3D11ShaderResourceView* nullSRV = nullptr;
-        g_context->CSSetShaderResources(0, 1, &nullSRV);
-        g_context->CSSetShader(nullptr, nullptr, 0);
+        g_context->PSSetShaderResources(0, 1, &nullSRV);
+        g_context->VSSetShader(nullptr, nullptr, 0);
+        g_context->PSSetShader(nullptr, nullptr, 0);
         srcSRV->Release();
 
-        // CopyResource: P010 → P010 (same format, same dimensions) — always valid in D3D11.
-        if (!g_nvencInputTex) {
-            printf("❌ g_nvencInputTex not cached — HDR frame dropped\n");
-            return 0;
-        }
+        // CopyResource: P010 → P010 (same format, same dimensions).
         g_context->CopyResource(g_nvencInputTex, g_hdrP010Tex);
     } else {
-        // SDR path: VP converts BGRA8 composite → NV12 into NVENC's input buffer.
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
-        ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        ID3D11VideoProcessorInputView* vpInputView = nullptr;
-        HRESULT hr = g_videoDevice->CreateVideoProcessorInputView(
-            vpSourceTexture, g_vpEnum, &ivDesc, &vpInputView);
-        if (SUCCEEDED(hr)) {
-            D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-            stream.Enable        = TRUE;
-            stream.pInputSurface = vpInputView;
-            HRESULT bltHr = g_videoContext->VideoProcessorBlt(g_vp, g_vpOutView, 0, 1, &stream);
-            vpInputView->Release();
-            if (FAILED(bltHr)) {
-                printf("⚠️  VideoProcessorBlt failed: hr=0x%08X — frame dropped\n", (unsigned)bltHr);
-                return 0;
-            }
-        } else {
-            D3D11_TEXTURE2D_DESC srcDesc = {};
-            vpSourceTexture->GetDesc(&srcDesc);
-            printf("⚠️  CreateVideoProcessorInputView failed: hr=0x%08X "
-                   "(src format=0x%X %dx%d) — frame dropped\n",
-                   (unsigned)hr, (unsigned)srcDesc.Format,
-                   (int)srcDesc.Width, (int)srcDesc.Height);
+        // SDR path: BGRA8 composite → NV12 via typed-RTV shader draws (Apollo approach).
+        // Two passes: Y plane (full resolution) then UV plane (half resolution).
+        // Replacing VideoProcessorBlt which silently misproduces NV12 on some drivers.
+        if (!g_yuvVS || !g_sdrYPS || !g_sdrUVPS || !g_nv12YRtv || !g_nv12UVRtv) {
+            printf("⚠️  SDR shader/RTV not ready — frame dropped\n");
             return 0;
         }
+
+        // Create an SRV on the BGRA8 composite texture for the pixel shaders to sample.
+        ID3D11ShaderResourceView* srcSRV = nullptr;
+        if (FAILED(g_device->CreateShaderResourceView(vpSourceTexture, nullptr, &srcSRV))) {
+            printf("⚠️  SDR: CreateShaderResourceView failed — frame dropped\n");
+            return 0;
+        }
+
+        D3D11_TEXTURE2D_DESC frameInfo = {};
+        vpSourceTexture->GetDesc(&frameInfo);
+        const float W = (float)frameInfo.Width, H = (float)frameInfo.Height;
+
+        // Unbind any lingering RTV (cursor overlay) before setting new ones.
+        ID3D11RenderTargetView* nullRTV = nullptr;
+        g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
+
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_context->IASetInputLayout(nullptr);
+        g_context->VSSetShader(g_yuvVS, nullptr, 0);
+        g_context->PSSetShaderResources(0, 1, &srcSRV);
+        g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
+
+        // Y plane pass — full resolution.
+        D3D11_VIEWPORT vp = { 0, 0, W, H, 0.0f, 1.0f };
+        g_context->RSSetViewports(1, &vp);
+        g_context->OMSetRenderTargets(1, &g_nv12YRtv, nullptr);
+        g_context->PSSetShader(g_sdrYPS, nullptr, 0);
+        g_context->Draw(3, 0);
+
+        // UV plane pass — half resolution (4:2:0 chroma subsampling).
+        vp.Width = W * 0.5f; vp.Height = H * 0.5f;
+        g_context->RSSetViewports(1, &vp);
+        g_context->OMSetRenderTargets(1, &g_nv12UVRtv, nullptr);
+        g_context->PSSetShader(g_sdrUVPS, nullptr, 0);
+        g_context->Draw(3, 0);
+
+        // Unbind to avoid RTV/SRV hazards on subsequent calls.
+        g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        g_context->PSSetShaderResources(0, 1, &nullSRV);
+        g_context->VSSetShader(nullptr, nullptr, 0);
+        g_context->PSSetShader(nullptr, nullptr, 0);
+        srcSRV->Release();
     }
 
     std::vector<NvEncOutputFrame> vPacket;
@@ -1282,16 +1377,24 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     g_cursorTexW = 0;
     g_cursorTexH = 0;
 
-    // HDR compute shader bridge resources.
+    // YUV conversion shaders and RTVs.
+    if (g_yuvVS)    { g_yuvVS->Release();    g_yuvVS    = nullptr; }
+    if (g_sdrYPS)   { g_sdrYPS->Release();   g_sdrYPS   = nullptr; }
+    if (g_sdrUVPS)  { g_sdrUVPS->Release();  g_sdrUVPS  = nullptr; }
+    if (g_hdrYPS)   { g_hdrYPS->Release();   g_hdrYPS   = nullptr; }
+    if (g_hdrUVPS)  { g_hdrUVPS->Release();  g_hdrUVPS  = nullptr; }
+    if (g_nv12YRtv) { g_nv12YRtv->Release(); g_nv12YRtv = nullptr; }
+    if (g_nv12UVRtv){ g_nv12UVRtv->Release();g_nv12UVRtv= nullptr; }
+    if (g_p010YRtv) { g_p010YRtv->Release(); g_p010YRtv = nullptr; }
+    if (g_p010UVRtv){ g_p010UVRtv->Release();g_p010UVRtv= nullptr; }
+
+    // HDR intermediate texture (now BIND_RENDER_TARGET, not UNORDERED_ACCESS).
     if (g_hdrYUAV)    { g_hdrYUAV->Release();    g_hdrYUAV    = nullptr; }
     if (g_hdrUVUAV)   { g_hdrUVUAV->Release();   g_hdrUVUAV   = nullptr; }
     if (g_hdrP010Tex) { g_hdrP010Tex->Release();  g_hdrP010Tex = nullptr; }
     if (g_hdrCS)      { g_hdrCS->Release();       g_hdrCS      = nullptr; }
     g_nvencInputTex = nullptr; // borrowed from NvEncoderD3D11 — do NOT Release
 
-    // g_vpOutView is our own view object onto NVENC's input texture — releasing
-    // it does not destroy that texture (NvEncoderD3D11::ReleaseD3D11Resources,
-    // called from DestroyEncoder() below, owns and releases it separately).
     if (g_vpOutView)    { g_vpOutView->Release();    g_vpOutView    = nullptr; }
     if (g_vp)           { g_vp->Release();           g_vp           = nullptr; }
     if (g_vpEnum)       { g_vpEnum->Release();       g_vpEnum       = nullptr; }
