@@ -31,8 +31,25 @@ Phase 5 (VDD headless orchestration + dynamic resolution negotiation) is complet
 - **HDR mode signalling:** `0x010e` control packet (`SS_HDR_METADATA`, 33 bytes) sent on first `PT_PERIODIC_PING` — this is what triggers `RequestSetCurrentDisplayModeAsync(Eotf2084)` on the Xbox, physically switching the TV's HDMI port into HDR10 mode. **This was the root cause of the "whitewash": Nova was missing this packet entirely.**
 - **D3D11 VP bypassed for HDR:** NVIDIA driver bug zeroes chroma on any P2020 colorspace declaration; CS→P010 direct path works correctly.
 
-**Phase 7 candidates:**
+**Phase 7 — Native Windows UX Polish (2026-06-22, complete):**
+Nova is now a fully headless, tray-resident background application. No terminal window is ever shown.
+
+- **Executable icon:** `assets/Nova.ico` compiled into the `.exe` via `build.rs` + `rc.exe` (resource ID 1 RT_GROUP_ICON alongside the existing UAC manifest). Windows Explorer shows the exploding-star logo.
+- **System tray (`tray-icon` crate):** A dedicated OS thread owns the tray icon. Right-click shows a two-item context menu built with `muda`:
+  - **Pair Device** — opens a native Windows `InputBox` (PowerShell `-WindowStyle Hidden`, VB runtime) so the user can type the PIN shown on their Moonlight device. The PIN is written to `global_pin: Arc<Mutex<String>>`, which wakes the pairing `clientchallenge` polling loop.
+  - **Quit Nova** — sends `true` on a `tokio::sync::watch` channel; the main capture-loop `select!` breaks and runs full teardown (audio restore, VDD deactivate).
+- **Pairing UX:** Moonlight generates and displays the PIN on the client device (standard GameStream protocol). Nova shows a tooltip update `"Nova — Pairing Request"` and waits up to 5 minutes for the user to enter the PIN via the tray menu. **Do not** generate the PIN server-side — that breaks standard Moonlight clients.
+- **Headless mode:** `#![windows_subsystem = "windows"]` in `src/bin/nova-server.rs`. No console window on double-click or SCM launch.
+- **Windows Service:** `windows-service = "0.7"` crate. CLI flags:
+  - `nova-server.exe --install` → registers `NovaServer` as an auto-start service via Win32 SCM (`CreateServiceW`).
+  - `nova-server.exe --uninstall` → marks for deletion.
+  - `nova-server.exe --run-service` → entry point the SCM calls; dispatches through `service_dispatcher::start`.
+- **Graceful shutdown path:** Tray "Quit" → `watch::Sender<bool>` → `shutdown_rx.changed()` in capture-loop `select!` → break → `AudioStreamer::drop()` restores host audio device.
+- **Key architecture decision:** The tray event loop (`MenuEvent::receiver().try_recv()` + `TrayIconEvent::receiver().try_recv()` + `PeekMessageW` pump) runs on a dedicated OS thread, not inside the tokio runtime. `global_pin` and `shutdown_tx` bridge the sync tray world and the async capture world.
+
+**Phase 8 candidates:**
 - Verify HDR10 colours on Android Moonlight (HEVC Main10 + TV) after 0x010e fix
 - AV1 end-to-end test (advertised, shim implemented, not yet confirmed live)
 - Xbox HEVC support (currently reports `x-nv-clientSupportHevc:0` in v1.18.0)
+- `--install` console output (currently silent with `windows_subsystem = "windows"`; fix with `AttachConsole(ATTACH_PARENT_PROCESS)` or a `MessageBoxW` result dialog)
 See memory/project_nova_state.md for full history.
