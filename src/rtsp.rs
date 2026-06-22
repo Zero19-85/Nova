@@ -77,6 +77,12 @@ pub struct ClientInfo {
     /// (teardown VDD, restore host topology) from a natural network disconnect
     /// (suspend: keep VDD alive so /resume can reconnect without flicker).
     pub cancelled: bool,
+    /// True after the 0x010e HDR mode control packet has been sent this session.
+    /// Apollo sends this once at stream start; Nova sends it on the first
+    /// PT_PERIODIC_PING (encoder is running by then). Without it, Moonlight
+    /// never calls RequestSetCurrentDisplayModeAsync(Eotf2084) and the TV
+    /// stays in SDR regardless of VUI or SEI settings.
+    pub hdr_mode_sent: bool,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".

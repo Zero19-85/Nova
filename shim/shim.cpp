@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <vector>
@@ -36,21 +37,40 @@ static int                    g_encoderCodec     = 0;    // 0=H264, 1=HEVC, 2=AV
 static bool                   g_isHdr            = false;
 static MASTERING_DISPLAY_INFO g_masteringDisplay  = {};
 static CONTENT_LIGHT_LEVEL    g_contentLightLevel = {};
-static bool                   g_hdrMetadataReady = false;
+static bool                   g_hdrMetadataReady  = false;
 
-// HDR compute shader bridge: converts WGC's R16G16B16A16_FLOAT (linear scRGB,
-// 1.0 = 80 nit SDR white) to R10G10B10A2_UNORM (BT.2020 PQ, HDR10).
-// Required because the D3D11 Video Processor supports FP16 only as an *output*
-// (support=0x02), not as an input view — VideoProcessorBlt returns E_INVALIDARG
-// on FP16 input textures even on modern NVIDIA hardware.
+// Raw HEVC SEI byte payloads built by BuildHdrSeiPayloads() and injected via
+// NV_ENC_PIC_PARAMS_HEVC::seiPayloadArray on every forced IDR. This replicates
+// exactly what FFmpeg (and therefore Apollo/Sunshine) does internally — the
+// NVENC native pMasteringDisplay/pMaxCll path is silently ignored by the driver.
+static uint8_t          g_mdcvSeiBytes[24]    = {};  // SEI type 137 payload
+static uint8_t          g_cllSeiBytes[4]      = {};  // SEI type 144 payload
+static NV_ENC_SEI_PAYLOAD g_hdrSeiPayloads[2] = {};
+
+// HDR compute shader bridge: converts WGC's R16G16B16A16_FLOAT (linear scRGB)
+// directly to P010 YCbCr 4:2:0 via ID3D11Device3 per-plane typed UAVs on a
+// single DXGI_FORMAT_P010 intermediate texture (R16_UNORM for Y, R16G16_UNORM
+// for UV). A single CopyResource (P010→P010, same format) then feeds NVENC —
+// bypassing both the VP (which zeros chroma on P2020 declarations) and NVENC's
+// internal RGB→YCbCr converter (hardwired BT.709, ignores HDR input).
+// Each 8×8 thread group covers a 16×16 pixel tile (2×2 pixels per thread),
+// writing 4 luma samples and 1 averaged chroma sample per thread.
 static const char* kHdrCsHlsl = R"(
-Texture2D<float4>         InputTex  : register(t0);
-RWTexture2D<unorm float4> OutputTex : register(u0);
+Texture2D<float4>         InputTex : register(t0);
+RWTexture2D<unorm float>  YPlane   : register(u0);  // P010 plane 0 via R16_UNORM UAV
+RWTexture2D<unorm float2> UVPlane  : register(u1);  // P010 plane 1 via R16G16_UNORM UAV
 
 static const float3x3 scRGB_to_BT2020 = {
     0.627404f, 0.329282f, 0.0433136f,
     0.069097f, 0.919540f, 0.0113612f,
     0.016391f, 0.088013f, 0.895595f
+};
+
+// BT.2020 Non-Constant Luminance RGB to YCbCr (full-range coefficients).
+static const float3x3 BT2020_to_YUV = {
+     0.262700f,  0.678000f,  0.059300f,
+    -0.139630f, -0.360370f,  0.500000f,
+     0.500000f, -0.459786f, -0.040214f
 };
 
 float3 LinearToPQ(float3 linearColor) {
@@ -67,23 +87,40 @@ float3 LinearToPQ(float3 linearColor) {
 
 [numthreads(8, 8, 1)]
 void main(uint3 DTid : SV_DispatchThreadID) {
-    float4 color  = InputTex[DTid.xy];
-    float3 bt2020 = mul(scRGB_to_BT2020, color.rgb);
-    float3 pq     = LinearToPQ(bt2020);
-    // alpha=1.0: WGC FP16 frames carry alpha=0.0 (DWM composition surface).
-    // The VP pre-multiplies RGB by alpha before the YUV conversion — alpha=0
-    // zeros all three planes, producing a green-tinted frame on the decoder.
-    OutputTex[DTid.xy] = float4(pq, 1.0f);
+    uint2 pos = DTid.xy * 2;
+
+    // Bounds guard for non-16-aligned heights (e.g. 1080p: 1080 % 16 != 0).
+    uint w, h;
+    InputTex.GetDimensions(w, h);
+    if (pos.x + 1 >= w || pos.y + 1 >= h) return;
+
+    float3 rgb00 = LinearToPQ(mul(scRGB_to_BT2020, InputTex[pos].rgb));
+    float3 rgb10 = LinearToPQ(mul(scRGB_to_BT2020, InputTex[pos + uint2(1, 0)].rgb));
+    float3 rgb01 = LinearToPQ(mul(scRGB_to_BT2020, InputTex[pos + uint2(0, 1)].rgb));
+    float3 rgb11 = LinearToPQ(mul(scRGB_to_BT2020, InputTex[pos + uint2(1, 1)].rgb));
+
+    // Full Range Y: BT.2020 NCL luma maps naturally to [0, 1] for in-gamut PQ values.
+    YPlane[pos]               = mul(BT2020_to_YUV, rgb00).x;
+    YPlane[pos + uint2(1, 0)] = mul(BT2020_to_YUV, rgb10).x;
+    YPlane[pos + uint2(0, 1)] = mul(BT2020_to_YUV, rgb01).x;
+    YPlane[pos + uint2(1, 1)] = mul(BT2020_to_YUV, rgb11).x;
+
+    // Average 4 PQ-converted pixels for 4:2:0 chroma (post-PQ averaging).
+    float3 avg_rgb = (rgb00 + rgb10 + rgb01 + rgb11) * 0.25f;
+    float3 yuv_avg = mul(BT2020_to_YUV, avg_rgb);
+    // Shift Cb/Cr from [-0.5, 0.5] to [0.0, 1.0] for full-range UNORM storage.
+    UVPlane[DTid.xy] = float2(yuv_avg.y + 0.5f, yuv_avg.z + 0.5f);
 }
 )";
 
-// HDR compute shader bridge resources (lazily created per-frame in EncodeFrame).
-static ID3D11ComputeShader*       g_hdrCS     = nullptr; // compiled once at HDR init
-static ID3D11Texture2D*           g_hdrR10Tex = nullptr; // R10G10B10A2_UNORM intermediate
-static ID3D11UnorderedAccessView* g_hdrR10UAV = nullptr; // CS write target
+// HDR compute shader bridge resources (lazily created on first HDR frame in EncodeFrame).
+static ID3D11ComputeShader*       g_hdrCS      = nullptr; // compiled once at HDR init
+static ID3D11Texture2D*           g_hdrP010Tex = nullptr; // DXGI_FORMAT_P010 intermediate
+static ID3D11UnorderedAccessView* g_hdrYUAV    = nullptr; // Y plane (R16_UNORM, PlaneSlice=0)
+static ID3D11UnorderedAccessView* g_hdrUVUAV   = nullptr; // UV plane (R16G16_UNORM, PlaneSlice=1)
 
 // NVENC's pre-registered input texture — borrowed from NvEncoderD3D11 (do NOT Release).
-// For HDR: ABGR10/R10G10B10A2_UNORM — CS output CopyResource'd here, VP bypassed.
+// For HDR: P010/YUV420_10BIT — CS output CopyResource'd here, VP bypassed entirely.
 // For SDR: NV12 — written by VideoProcessorBlt via g_vpOutView as before.
 static ID3D11Texture2D* g_nvencInputTex = nullptr;
 
@@ -557,10 +594,40 @@ extern "C" __declspec(dllexport) void UpdateCursorPosition(int x, int y, int vis
 }
 
 // ==================== HDR METADATA ====================
+
+// Serialises g_masteringDisplay / g_contentLightLevel into raw big-endian HEVC SEI
+// payload bytes. HEVC spec D.2.28 (MDCV, type 137) = 24 bytes G/B/R primaries +
+// white point + luminance. HEVC spec D.2.35 (MaxCLL, type 144) = 4 bytes.
+// This matches what FFmpeg packs internally before calling NVENC seiPayloadArray.
+static void BuildHdrSeiPayloads() {
+    auto be16 = [](uint8_t* b, uint16_t v) {
+        b[0] = (uint8_t)(v >> 8); b[1] = (uint8_t)v;
+    };
+    auto be32 = [](uint8_t* b, uint32_t v) {
+        b[0] = (uint8_t)(v >> 24); b[1] = (uint8_t)(v >> 16);
+        b[2] = (uint8_t)(v >>  8); b[3] = (uint8_t)v;
+    };
+    // MDCV: G, B, R primaries (HEVC D.2.28 order), white point, max/min luminance
+    be16(g_mdcvSeiBytes +  0, g_masteringDisplay.g.x);
+    be16(g_mdcvSeiBytes +  2, g_masteringDisplay.g.y);
+    be16(g_mdcvSeiBytes +  4, g_masteringDisplay.b.x);
+    be16(g_mdcvSeiBytes +  6, g_masteringDisplay.b.y);
+    be16(g_mdcvSeiBytes +  8, g_masteringDisplay.r.x);
+    be16(g_mdcvSeiBytes + 10, g_masteringDisplay.r.y);
+    be16(g_mdcvSeiBytes + 12, g_masteringDisplay.whitePoint.x);
+    be16(g_mdcvSeiBytes + 14, g_masteringDisplay.whitePoint.y);
+    be32(g_mdcvSeiBytes + 16, g_masteringDisplay.maxLuma);
+    be32(g_mdcvSeiBytes + 20, g_masteringDisplay.minLuma);
+    g_hdrSeiPayloads[0] = { 24, 137, g_mdcvSeiBytes };
+
+    // MaxCLL: MaxCLL (u16), MaxFALL (u16)
+    be16(g_cllSeiBytes + 0, g_contentLightLevel.maxContentLightLevel);
+    be16(g_cllSeiBytes + 2, g_contentLightLevel.maxPicAverageLightLevel);
+    g_hdrSeiPayloads[1] = { 4, 144, g_cllSeiBytes };
+}
+
 // Fills g_masteringDisplay / g_contentLightLevel with session-constant BT.2020 / 1000-nit
-// alpha defaults. Called once at the end of InitEncoder when is_hdr == true. NVENC injects
-// these into the HEVC/AV1 per-frame metadata on every IDR via NV_ENC_PIC_PARAMS_HEVC::
-// pMasteringDisplay / pMaxCll — no manual SEI byte-packing required.
+// values, then serialises them to SEI bytes via BuildHdrSeiPayloads().
 static void BuildHdrMetadata() {
     // BT.2020 primaries in units of 1/50000 (HEVC D.2.28, G/B/R order):
     g_masteringDisplay.g          = { 8500, 39850 }; // G(0.170, 0.797)
@@ -573,6 +640,7 @@ static void BuildHdrMetadata() {
     g_contentLightLevel.maxContentLightLevel    = 1000; // MaxCLL  = 1000 nit
     g_contentLightLevel.maxPicAverageLightLevel = 400;  // MaxFALL = 400 nit
     g_hdrMetadataReady = true;
+    BuildHdrSeiPayloads();
 }
 
 // ==================== INIT COLOR CONVERSION ====================
@@ -602,21 +670,21 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
 
     // ── Verify NVENC staging texture format ───────────────────────────────────
     // AllocateInputBuffers creates this texture with GetD3D11Format(GetPixelFormat()).
-    // For is_hdr=true: NV_ENC_BUFFER_FORMAT_ABGR10 → DXGI_FORMAT_R10G10B10A2_UNORM (0x18).
-    // For is_hdr=false: NV_ENC_BUFFER_FORMAT_NV12  → DXGI_FORMAT_NV12 (103).
+    // For is_hdr=true: NV_ENC_BUFFER_FORMAT_YUV420_10BIT → DXGI_FORMAT_P010 (0x68).
+    // For is_hdr=false: NV_ENC_BUFFER_FORMAT_NV12        → DXGI_FORMAT_NV12 (0x67).
     {
         D3D11_TEXTURE2D_DESC nvencDesc = {};
         nvencInputTex->GetDesc(&nvencDesc);
-        DXGI_FORMAT expectedFmt = is_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_NV12;
+        DXGI_FORMAT expectedFmt = is_hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
         if (nvencDesc.Format == expectedFmt) {
             printf("✅ NVENC input texture: %dx%d format=0x%X (%s) — correct\n",
                 nvencDesc.Width, nvencDesc.Height, (unsigned)nvencDesc.Format,
-                is_hdr ? "ABGR10/R10G10B10A2_UNORM" : "NV12");
+                is_hdr ? "YUV420_10BIT/P010" : "NV12");
         } else {
             printf("❌ NVENC input texture format MISMATCH: got=0x%X expected=0x%X "
                    "(%s) — image will be corrupted!\n",
                    (unsigned)nvencDesc.Format, (unsigned)expectedFmt,
-                   is_hdr ? "wanted R10G10B10A2_UNORM=0x18" : "wanted NV12=103");
+                   is_hdr ? "wanted P010=0x68" : "wanted NV12=103");
         }
     }
 
@@ -639,18 +707,15 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     hr = g_videoDevice->CreateVideoProcessor(g_vpEnum, 0, &g_vp);
     if (FAILED(hr)) return -6;
 
-    // HDR bypass: cache NVENC's input texture for CopyResource in EncodeFrame.
-    // SDR:        create a VP output view so VideoProcessorBlt can write NV12 directly.
+    // HDR: CS writes directly into g_hdrP010Tex; CopyResource feeds NVENC. VP is unused.
+    // SDR: VP output view on NVENC's NV12 texture — VideoProcessorBlt writes here zero-copy.
     if (is_hdr) {
-        // NVENC accepts R10G10B10A2_UNORM (ABGR10) and does BT.2020 RGB→YCbCr internally.
-        // We do NOT AddRef — this texture is owned by NvEncoderD3D11 for the encoder lifetime.
-        g_nvencInputTex = nvencInputTex;
+        g_nvencInputTex = nvencInputTex; // borrowed — do NOT AddRef or Release
         D3D11_TEXTURE2D_DESC d = {};
         nvencInputTex->GetDesc(&d);
-        printf("ℹ️  HDR VP bypass: NVENC ABGR10 input cached (%dx%d format=0x%X)\n",
+        printf("ℹ️  HDR VP bypass: NVENC P010 input cached (%dx%d format=0x%X)\n",
                d.Width, d.Height, (unsigned)d.Format);
     } else {
-        // SDR: VP output view targets NVENC's NV12 texture — VideoProcessorBlt writes here.
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
         ovDesc.ViewDimension      = D3D11_VPOV_DIMENSION_TEXTURE2D;
         ovDesc.Texture2D.MipSlice = 0;
@@ -675,13 +740,8 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     g_videoContext->VideoProcessorSetOutputTargetRect(g_vp, TRUE, &fullRect);
 
     if (is_hdr) {
-        // HDR pipeline: CS bridge converts FP16 scRGB → R10G10B10A2 BT.2020 PQ,
-        // then EncodeFrame CopyResources it directly into NVENC's ABGR10 input buffer.
-        // The D3D11 VP is bypassed entirely — no VP color-space declarations needed.
-        // NVENC applies the BT.2020 RGB→YCbCr matrix internally, sidestepping the
-        // NVIDIA driver bug that zeroed chroma on any P2020 VP color-space declaration.
-
-        // Compile the HDR compute shader once per encoder lifetime.
+        // HDR: CS writes BT.2020 NCL PQ YCbCr directly to P010 plane UAVs.
+        // VP is not involved — no colorspace declarations needed here.
         if (!g_hdrCS) {
             ID3DBlob* csBlob  = nullptr;
             ID3DBlob* errBlob = nullptr;
@@ -702,9 +762,9 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
                 printf("❌ CreateComputeShader failed: hr=0x%08X\n", (unsigned)hrCs);
                 return -12;
             }
-            printf("✅ HDR compute shader compiled (FP16 scRGB → R10G10B10A2 BT.2020 PQ)\n");
+            printf("✅ HDR CS compiled: FP16 scRGB → P010 BT.2020 NCL PQ (plane UAVs, D3D11.3)\n");
         }
-        printf("✅ HDR encoder ready: CS bridge → NVENC ABGR10 bypass (VP not used)\n");
+        printf("✅ HDR encoder ready: CS → P010 (plane UAVs) → CopyResource → NVENC (VP bypassed)\n");
     } else {
         // SDR path: BGRA8 desktop full-range → NV12 BT.709 limited-range — UNCHANGED.
         // A mismatch here vs the VUI parameters set in InitEncoder produces structurally-
@@ -770,16 +830,16 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
     try {
         // nExtraOutputDelay=0 eliminates the 3-frame pipeline buffer — zero-copy latency path.
-        // HDR: ABGR10 = DXGI_FORMAT_R10G10B10A2_UNORM. NVENC accepts 10-bit RGB directly
-        // and applies the BT.2020 RGB→YCbCr matrix internally, bypassing the D3D11 VP
-        // (which zeroes chroma on any P2020 color-space declaration — a confirmed driver bug).
+        // HDR: YUV420_10BIT = DXGI_FORMAT_P010. Our CS outputs BT.2020 NCL PQ YCbCr 4:2:0
+        // directly into P010 planes, bypassing NVENC's internal RGB→YCbCr converter (which
+        // was hardwired to BT.709 coefficients regardless of the ABGR10 input format).
         // SDR: NV12 — VP still handles BGRA8→NV12 via VideoProcessorBlt.
-        NV_ENC_BUFFER_FORMAT bufFmt = is_hdr ? NV_ENC_BUFFER_FORMAT_ABGR10
+        NV_ENC_BUFFER_FORMAT bufFmt = is_hdr ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
                                              : NV_ENC_BUFFER_FORMAT_NV12;
         printf("ℹ️  NVENC buffer format: %s (bufFmt=%u) — AllocateInputBuffers will create "
                "DXGI_FORMAT_%s texture\n",
-               is_hdr ? "ABGR10" : "NV12", (unsigned)bufFmt,
-               is_hdr ? "R10G10B10A2_UNORM (0x18)" : "NV12 (103)");
+               is_hdr ? "YUV420_10BIT" : "NV12", (unsigned)bufFmt,
+               is_hdr ? "P010 (0x68)" : "NV12 (103)");
         g_nvEncoder = new NvEncoderD3D11(g_device, width, height, bufFmt, 0);
 
         g_initParams = NV_ENC_INITIALIZE_PARAMS{ NV_ENC_INITIALIZE_PARAMS_VER };
@@ -835,7 +895,8 @@ extern "C" __declspec(dllexport) int InitEncoder(
         NV_ENC_CONFIG_H264_VUI_PARAMETERS vuiParams = {};
         vuiParams.videoSignalTypePresentFlag   = 1;
         vuiParams.videoFormat                  = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-        vuiParams.videoFullRangeFlag           = 0; // limited range in both SDR and HDR
+        // CS outputs full-range [0,1] YCbCr; SDR VP outputs studio range.
+        vuiParams.videoFullRangeFlag           = is_hdr ? 1 : 0;
         vuiParams.colourDescriptionPresentFlag = 1;
         vuiParams.bitstreamRestrictionFlag     = 1;
         if (is_hdr) {
@@ -879,8 +940,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
             auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
             hevc.inputBitDepth        = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
             hevc.outputBitDepth       = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
-            hevc.outputMasteringDisplay = is_hdr ? 1 : 0; // emit MDCV SEI on IDR frames
-            hevc.outputMaxCll           = is_hdr ? 1 : 0; // emit CLL SEI on IDR frames
+            // Disable NVENC's native HDR SEI auto-generator (silently ignored by driver).
+            // SEI is injected manually via seiPayloadArray in EncodeFrame instead.
+            hevc.outputMasteringDisplay = 0;
+            hevc.outputMaxCll           = 0;
             hevc.repeatSPSPPS         = 1;
             hevc.idrPeriod            = NVENC_INFINITE_GOPLENGTH;
             hevc.sliceMode            = 3;
@@ -889,6 +952,19 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
             hevc.enableFillerDataInsertion = 0;
             hevc.hevcVUIParameters    = vuiParams;
+            if (is_hdr) {
+                // Belt-and-suspenders: explicitly stamp HDR10 VUI as raw integer
+                // values after the struct copy. Guards against any SDK version
+                // where NV_ENC_CONFIG_HEVC_VUI_PARAMETERS diverges from the H264
+                // typedef and the struct-by-value copy silently drops fields.
+                hevc.hevcVUIParameters.videoSignalTypePresentFlag   = 1;
+                hevc.hevcVUIParameters.videoFormat                  = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+                hevc.hevcVUIParameters.videoFullRangeFlag           = 1; // full-range CS output
+                hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
+                hevc.hevcVUIParameters.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+                hevc.hevcVUIParameters.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+                hevc.hevcVUIParameters.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+            }
             hevc.enableIntraRefresh = 1;
             hevc.intraRefreshPeriod = 30;
             hevc.intraRefreshCnt    = 10;
@@ -979,83 +1055,110 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         DrawCursorOverlay();
     }
 
-    // HDR bridge: compute shader converts the FP16 scRGB composite texture to
-    // R10G10B10A2_UNORM BT.2020 PQ so the D3D11 VP can accept it as an input
-    // view (VP rejects FP16 input; support=0x02 means output-only on all
-    // shipping NVIDIA drivers).
+    // HDR: CS writes BT.2020 NCL PQ YCbCr directly to P010 plane UAVs (D3D11.3
+    // per-plane typed views on a single DXGI_FORMAT_P010 intermediate texture).
+    // CopyResource (P010→P010, same format) then feeds NVENC — no VP involved.
     if (g_isHdr && g_hdrCS) {
-        // Lazily create / resize the R10G10B10A2 intermediate texture.
-        if (g_hdrR10Tex) {
+        // Lazily create / resize g_hdrP010Tex and its per-plane UAVs.
+        if (g_hdrP010Tex) {
             D3D11_TEXTURE2D_DESC existing = {};
-            g_hdrR10Tex->GetDesc(&existing);
+            g_hdrP010Tex->GetDesc(&existing);
             if (existing.Width != frameDesc.Width || existing.Height != frameDesc.Height) {
-                if (g_hdrR10UAV) { g_hdrR10UAV->Release(); g_hdrR10UAV = nullptr; }
-                g_hdrR10Tex->Release(); g_hdrR10Tex = nullptr;
+                if (g_hdrYUAV)  { g_hdrYUAV->Release();  g_hdrYUAV  = nullptr; }
+                if (g_hdrUVUAV) { g_hdrUVUAV->Release(); g_hdrUVUAV = nullptr; }
+                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
             }
         }
-        if (!g_hdrR10Tex) {
+        if (!g_hdrP010Tex) {
             D3D11_TEXTURE2D_DESC d = {};
             d.Width            = frameDesc.Width;
             d.Height           = frameDesc.Height;
             d.MipLevels        = 1;
             d.ArraySize        = 1;
-            d.Format           = DXGI_FORMAT_R10G10B10A2_UNORM;
+            d.Format           = DXGI_FORMAT_P010;
             d.SampleDesc.Count = 1;
             d.Usage            = D3D11_USAGE_DEFAULT;
-            d.BindFlags        = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-            if (FAILED(g_device->CreateTexture2D(&d, nullptr, &g_hdrR10Tex)) ||
-                FAILED(g_device->CreateUnorderedAccessView(g_hdrR10Tex, nullptr, &g_hdrR10UAV))) {
-                printf("❌ Failed to create HDR R10 intermediate texture/UAV\n");
+            d.BindFlags        = D3D11_BIND_UNORDERED_ACCESS;
+            if (FAILED(g_device->CreateTexture2D(&d, nullptr, &g_hdrP010Tex))) {
+                printf("❌ Failed to create P010 UAV texture (driver may not support "
+                       "D3D11_BIND_UNORDERED_ACCESS on DXGI_FORMAT_P010)\n");
                 return 0;
             }
-            printf("✅ HDR R10G10B10A2 bridge texture created (%dx%d)\n",
+
+            // Per-plane typed UAVs via ID3D11Device3 (D3D11.3 PlaneSlice feature).
+            ID3D11Device3* dev3 = nullptr;
+            if (FAILED(g_device->QueryInterface(__uuidof(ID3D11Device3), (void**)&dev3))) {
+                printf("❌ ID3D11Device3 unavailable — cannot create P010 plane UAVs\n");
+                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
+                return 0;
+            }
+            D3D11_UNORDERED_ACCESS_VIEW_DESC1 uavDesc = {};
+            uavDesc.ViewDimension        = D3D11_UAV_DIMENSION_TEXTURE2D;
+            uavDesc.Texture2D.MipSlice   = 0;
+
+            uavDesc.Format               = DXGI_FORMAT_R16_UNORM;
+            uavDesc.Texture2D.PlaneSlice = 0; // Y luma plane
+            ID3D11UnorderedAccessView1* yUav = nullptr;
+            HRESULT hrY = dev3->CreateUnorderedAccessView1(g_hdrP010Tex, &uavDesc, &yUav);
+
+            uavDesc.Format               = DXGI_FORMAT_R16G16_UNORM;
+            uavDesc.Texture2D.PlaneSlice = 1; // UV chroma plane (half-res in hardware)
+            ID3D11UnorderedAccessView1* uvUav = nullptr;
+            HRESULT hrUV = dev3->CreateUnorderedAccessView1(g_hdrP010Tex, &uavDesc, &uvUav);
+            dev3->Release();
+
+            if (FAILED(hrY) || FAILED(hrUV)) {
+                printf("❌ P010 plane UAV creation failed: hrY=0x%08X hrUV=0x%08X\n",
+                       (unsigned)hrY, (unsigned)hrUV);
+                if (yUav)  yUav->Release();
+                if (uvUav) uvUav->Release();
+                g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr;
+                return 0;
+            }
+            // ID3D11UnorderedAccessView1 inherits ID3D11UnorderedAccessView — safe to upcast.
+            g_hdrYUAV  = yUav;
+            g_hdrUVUAV = uvUav;
+            printf("✅ HDR P010 intermediate created (%dx%d) with R16/R16G16 plane UAVs\n",
                    (int)frameDesc.Width, (int)frameDesc.Height);
         }
 
-        // Create a per-frame SRV on the FP16 composite texture for the CS to read.
-        // Creating per-frame is intentional: g_compositeTex is recreated by
-        // EnsureSizedTexture whenever the resolution changes, so a cached SRV
-        // would silently go stale. CreateShaderResourceView is a driver-side
-        // metadata op with no GPU work — the overhead is negligible.
+        // Per-frame SRV on the FP16 composite texture for the CS to read.
+        // Per-frame is intentional: g_compositeTex is recreated by EnsureSizedTexture
+        // on resolution changes, so a cached SRV would silently go stale.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         if (FAILED(g_device->CreateShaderResourceView(g_compositeTex, nullptr, &srcSRV))) {
             printf("❌ Failed to create FP16 SRV for HDR CS input\n");
             return 0;
         }
 
-        // Clear any RTV the cursor overlay may have left bound. The D3D11 runtime
-        // blocks binding a texture as an SRV while it is simultaneously bound as
-        // an RTV — silently promoting the SRV bind to a no-op and leaving the CS
-        // reading stale data. OMSetRenderTargets(null) releases that hazard.
+        // Clear any RTV the cursor overlay may have left bound (SRV/RTV hazard).
         {
             ID3D11RenderTargetView* nullRTV = nullptr;
             g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
         }
 
-        // Dispatch: 8×8 thread groups tile the full frame.
+        // Dispatch: each 8×8 thread group covers a 16×16 pixel tile (2×2 per thread).
+        // Ceiling division handles non-16-aligned heights (e.g. 1080p: 1080 % 16 != 0).
+        ID3D11UnorderedAccessView* uavs[2] = { g_hdrYUAV, g_hdrUVUAV };
         g_context->CSSetShader(g_hdrCS, nullptr, 0);
         g_context->CSSetShaderResources(0, 1, &srcSRV);
-        g_context->CSSetUnorderedAccessViews(0, 1, &g_hdrR10UAV, nullptr);
-        g_context->Dispatch((frameDesc.Width + 7) / 8, (frameDesc.Height + 7) / 8, 1);
+        g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+        g_context->Dispatch((frameDesc.Width + 15) / 16, (frameDesc.Height + 15) / 16, 1);
 
-        // Unbind CS slots before the VP. A texture simultaneously bound as a UAV
-        // and as a VP input view is undefined behaviour — the driver may read the
-        // pre-dispatch contents or produce garbage. Unbind UAV first, then SRV.
-        ID3D11UnorderedAccessView* nullUAV = nullptr;
-        g_context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-        ID3D11ShaderResourceView*  nullSRV = nullptr;
+        // Unbind before CopyResource — UAV hazard with source texture is UB.
+        ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+        g_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+        ID3D11ShaderResourceView* nullSRV = nullptr;
         g_context->CSSetShaderResources(0, 1, &nullSRV);
         g_context->CSSetShader(nullptr, nullptr, 0);
         srcSRV->Release();
 
-        // VP bypass: CopyResource the CS output directly into NVENC's ABGR10 input buffer.
-        // Both textures are DXGI_FORMAT_R10G10B10A2_UNORM — no format conversion needed.
-        // NVENC handles BT.2020 RGB→YCbCr internally, eliminating the VP chroma-zeroing bug.
+        // CopyResource: P010 → P010 (same format, same dimensions) — always valid in D3D11.
         if (!g_nvencInputTex) {
             printf("❌ g_nvencInputTex not cached — HDR frame dropped\n");
             return 0;
         }
-        g_context->CopyResource(g_nvencInputTex, g_hdrR10Tex);
+        g_context->CopyResource(g_nvencInputTex, g_hdrP010Tex);
     } else {
         // SDR path: VP converts BGRA8 composite → NV12 into NVENC's input buffer.
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
@@ -1088,18 +1191,13 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     if (g_force_idr.exchange(false)) {
         NV_ENC_PIC_PARAMS picParams = {};
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-        if (g_isHdr && g_hdrMetadataReady) {
-            // Inject Mastering Display Colour Volume + Content Light Level metadata on
-            // every IDR so the client's HDR tone-mapper has the display capabilities it
-            // needs to activate HDR mode. NVENC packs these into the correct SEI (HEVC)
-            // or OBU metadata (AV1) payloads automatically — no manual byte-packing.
-            if (g_encoderCodec == 1) { // HEVC
-                picParams.codecPicParams.hevcPicParams.pMasteringDisplay = &g_masteringDisplay;
-                picParams.codecPicParams.hevcPicParams.pMaxCll           = &g_contentLightLevel;
-            } else if (g_encoderCodec == 2) { // AV1
-                picParams.codecPicParams.av1PicParams.pMasteringDisplay = &g_masteringDisplay;
-                picParams.codecPicParams.av1PicParams.pMaxCll           = &g_contentLightLevel;
-            }
+        if (g_isHdr && g_hdrMetadataReady && g_encoderCodec == 1) {
+            // Manual byte-packed SEI injection matching FFmpeg/Apollo/Sunshine:
+            // MDCV (type 137, 24 bytes big-endian) + MaxCLL (type 144, 4 bytes).
+            // seiPayloadArray bypasses NVENC's broken native pMasteringDisplay path
+            // and writes the SEI NAL unit bytes directly into the bitstream.
+            picParams.codecPicParams.hevcPicParams.seiPayloadArrayCnt = 2;
+            picParams.codecPicParams.hevcPicParams.seiPayloadArray    = g_hdrSeiPayloads;
         }
         g_nvEncoder->EncodeFrame(vPacket, &picParams);
     } else {
@@ -1185,9 +1283,10 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     g_cursorTexH = 0;
 
     // HDR compute shader bridge resources.
-    if (g_hdrR10UAV) { g_hdrR10UAV->Release(); g_hdrR10UAV = nullptr; }
-    if (g_hdrR10Tex) { g_hdrR10Tex->Release(); g_hdrR10Tex = nullptr; }
-    if (g_hdrCS)     { g_hdrCS->Release();     g_hdrCS     = nullptr; }
+    if (g_hdrYUAV)    { g_hdrYUAV->Release();    g_hdrYUAV    = nullptr; }
+    if (g_hdrUVUAV)   { g_hdrUVUAV->Release();   g_hdrUVUAV   = nullptr; }
+    if (g_hdrP010Tex) { g_hdrP010Tex->Release();  g_hdrP010Tex = nullptr; }
+    if (g_hdrCS)      { g_hdrCS->Release();       g_hdrCS      = nullptr; }
     g_nvencInputTex = nullptr; // borrowed from NvEncoderD3D11 — do NOT Release
 
     // g_vpOutView is our own view object onto NVENC's input texture — releasing

@@ -57,6 +57,44 @@ const PT_LOSS_STATS:            u16 = 0x0201;
 const PT_PERIODIC_PING:         u16 = 0x0200;
 const PT_REQUEST_IDR_FRAME:     u16 = 0x0302;
 const PT_INPUT_DATA:            u16 = 0x0206;
+// Sunshine extension: host→client HDR mode notification (Apollo stream.cpp IDX_HDR_MODE).
+// Triggers Moonlight's VideoRenderer::SetHDR() → LiGetHdrMetadata() →
+// SetDisplayHDR() → RequestSetCurrentDisplayModeAsync(Eotf2084), which
+// physically switches the TV's HDMI port into HDR10 mode.
+const PT_HDR_MODE:              u16 = 0x010e;
+
+/// Builds the payload for a 0x010e HDR mode packet: `enabled(u8)` followed by
+/// SS_HDR_METADATA (little-endian, #pragma pack(1), Apollo stream.cpp).
+///
+/// Field order: displayPrimaries[3]×{x:u16,y:u16} (R,G,B) + whitePoint×{x:u16,y:u16}
+/// + maxDisplayLuminance(u32 nits) + minDisplayLuminance(u32, 0.0001-nit units)
+/// + maxContentLightLevel(u16) + maxFrameAverageLightLevel(u16) + maxFullFrameLuminance(u32).
+/// Total payload: 1 + 32 = 33 bytes.
+fn build_hdr_mode_payload() -> Vec<u8> {
+    let mut p = Vec::with_capacity(33);
+    p.push(1u8); // enabled = true
+
+    // SS_HDR_METADATA — BT.2020 D65 primaries, 1000-nit panel (matches our shim SEI values).
+    // Primary order in SS_HDR_METADATA: [0]=Red, [1]=Green, [2]=Blue (Apollo display_base.cpp).
+    // Units: chromaticity × 50000 (u16), luminance in nits (u32).
+    let w = |v: u16| v.to_le_bytes();
+    let d = |v: u32| v.to_le_bytes();
+
+    p.extend_from_slice(&w(35400)); // Red x   (0.708 × 50000)
+    p.extend_from_slice(&w(14600)); // Red y   (0.292 × 50000)
+    p.extend_from_slice(&w(8500));  // Green x (0.170 × 50000)
+    p.extend_from_slice(&w(39850)); // Green y (0.797 × 50000)
+    p.extend_from_slice(&w(6550));  // Blue x  (0.131 × 50000)
+    p.extend_from_slice(&w(2300));  // Blue y  (0.046 × 50000)
+    p.extend_from_slice(&w(15635)); // WhitePoint x (D65 0.3127 × 50000)
+    p.extend_from_slice(&w(16450)); // WhitePoint y (D65 0.3290 × 50000)
+    p.extend_from_slice(&d(1000));  // maxDisplayLuminance: 1000 nits
+    p.extend_from_slice(&d(500));   // minDisplayLuminance: 0.05 nit × 10000
+    p.extend_from_slice(&w(0));     // maxContentLightLevel: 0 (Apollo: content-specific)
+    p.extend_from_slice(&w(0));     // maxFrameAverageLightLevel: 0
+    p.extend_from_slice(&d(400));   // maxFullFrameLuminance: 400 nits (typical for 1000-nit panel)
+    p
+}
 
 /// Decrypt a 0x0001 encrypted control envelope (Sunshine stream.cpp
 /// control_encrypted_t + IDX_ENCRYPTED handler):
@@ -239,16 +277,32 @@ fn handle_control_message(
         // Echo the ping payload straight back as a basic keepalive ACK —
         // without any reply on the encrypted control channel, long-running
         // sessions look idle/dead to the client and it tears down the stream.
+        // On the very first ping, also send the 0x010e HDR mode packet if
+        // the session is HDR — this is what makes the Xbox call
+        // RequestSetCurrentDisplayModeAsync(Eotf2084) and switch the TV to HDR.
         PT_PERIODIC_PING => {
             let session = client_info.lock().ok().and_then(|mut g| {
                 g.as_mut().map(|c| {
                     let seq = c.control_out_seq;
                     c.control_out_seq = c.control_out_seq.wrapping_add(1);
-                    (c.rikey, seq)
+                    let hdr_pkt = if c.hdr_requested && !c.hdr_mode_sent {
+                        c.hdr_mode_sent = true;
+                        let hdr_seq = c.control_out_seq;
+                        c.control_out_seq = c.control_out_seq.wrapping_add(1);
+                        Some((c.rikey, hdr_seq))
+                    } else {
+                        None
+                    };
+                    (c.rikey, seq, hdr_pkt)
                 })
             });
-            if let Some((rikey, seq)) = session {
+            if let Some((rikey, seq, hdr_pkt)) = session {
                 send_control_reply(peer, channel_id, &rikey, seq, PT_PERIODIC_PING, &data[4..]);
+                if let Some((hdr_rikey, hdr_seq)) = hdr_pkt {
+                    let payload = build_hdr_mode_payload();
+                    send_control_reply(peer, channel_id, &hdr_rikey, hdr_seq, PT_HDR_MODE, &payload);
+                    println!("🎨 Control: HDR mode packet sent (0x010e, BT.2020 1000-nit metadata)");
+                }
             }
         }
         // Gamepad, mouse, and keyboard input (see input.rs): controller
