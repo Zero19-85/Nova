@@ -868,39 +868,30 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
         printf("✅ NV12 typed RTVs created (R8_UNORM Y, R8G8_UNORM UV) — Apollo-style SDR path\n");
     }
 
-    // ── Create P010 intermediate + typed RTVs (HDR) ──────────────────────────
-    // Intermediate texture uses BIND_RENDER_TARGET (not UNORDERED_ACCESS).
-    // R16_UNORM → Y plane, R16G16_UNORM → UV plane — same typed-RTV pattern as Apollo.
+    // ── Create P010 typed RTVs directly on the NVENC input texture (HDR) ───────
+    // Write directly into the NVENC P010 surface — same pattern as NV12/SDR above.
+    // The intermediate g_hdrP010Tex + CopyResource approach was the bug: D3D11's
+    // CopyResource for P010 only guaranteed the Y subresource on some NVIDIA drivers,
+    // leaving the UV subresource zeroed (all-zero full-range UV → green bottom half).
+    // Drawing straight into nvencInputTex eliminates the copy entirely.
+    // nvencInputTex was created by NvEncoderD3D11 with D3D11_BIND_RENDER_TARGET. ✓
     if (is_hdr) {
         if (g_p010YRtv)  { g_p010YRtv->Release();  g_p010YRtv  = nullptr; }
         if (g_p010UVRtv) { g_p010UVRtv->Release(); g_p010UVRtv = nullptr; }
-        if (g_hdrP010Tex){ g_hdrP010Tex->Release(); g_hdrP010Tex = nullptr; }
-
-        D3D11_TEXTURE2D_DESC p010Desc = {};
-        p010Desc.Width            = (UINT)width;
-        p010Desc.Height           = (UINT)height;
-        p010Desc.MipLevels        = 1;
-        p010Desc.ArraySize        = 1;
-        p010Desc.Format           = DXGI_FORMAT_P010;
-        p010Desc.SampleDesc.Count = 1;
-        p010Desc.Usage            = D3D11_USAGE_DEFAULT;
-        p010Desc.BindFlags        = D3D11_BIND_RENDER_TARGET; // RTV, not UAV
-        hr = device->CreateTexture2D(&p010Desc, nullptr, &g_hdrP010Tex);
-        if (FAILED(hr)) { printf("❌ P010 RTV texture failed: 0x%08X\n", (unsigned)hr); return -12; }
 
         D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
         rtvDesc.ViewDimension      = D3D11_RTV_DIMENSION_TEXTURE2D;
         rtvDesc.Texture2D.MipSlice = 0;
 
-        rtvDesc.Format = DXGI_FORMAT_R16_UNORM;     // Y plane
-        hr = device->CreateRenderTargetView(g_hdrP010Tex, &rtvDesc, &g_p010YRtv);
-        if (FAILED(hr)) { printf("❌ P010 Y RTV failed: 0x%08X\n", (unsigned)hr); return -13; }
+        rtvDesc.Format = DXGI_FORMAT_R16_UNORM;    // plane 0 → Y
+        hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_p010YRtv);
+        if (FAILED(hr)) { printf("❌ P010 Y RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -12; }
 
-        rtvDesc.Format = DXGI_FORMAT_R16G16_UNORM;  // UV plane
-        hr = device->CreateRenderTargetView(g_hdrP010Tex, &rtvDesc, &g_p010UVRtv);
-        if (FAILED(hr)) { printf("❌ P010 UV RTV failed: 0x%08X\n", (unsigned)hr); return -14; }
+        rtvDesc.Format = DXGI_FORMAT_R16G16_UNORM; // plane 1 → UV
+        hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_p010UVRtv);
+        if (FAILED(hr)) { printf("❌ P010 UV RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -13; }
 
-        printf("✅ P010 typed RTVs created (%dx%d, R16_UNORM Y, R16G16_UNORM UV) — Apollo-style HDR path\n",
+        printf("✅ P010 RTVs created directly on NVENC input tex (%dx%d) — no intermediate, no CopyResource\n",
                width, height);
     }
 
@@ -1181,7 +1172,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         // HDR path: FP16 scRGB composite → P010 via typed-RTV pixel shaders (Apollo approach).
         // Replaces the CS+UAV path whose R16_UNORM typed-UAV-store support is optional
         // and silently produces zeros (green screen) when unsupported by the driver.
-        if (!g_hdrP010Tex || !g_p010YRtv || !g_p010UVRtv) {
+        if (!g_p010YRtv || !g_p010UVRtv) {
             printf("⚠️  HDR P010 RTVs not ready — frame dropped\n");
             return 0;
         }
@@ -1227,8 +1218,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->PSSetShader(nullptr, nullptr, 0);
         srcSRV->Release();
 
-        // CopyResource: P010 → P010 (same format, same dimensions).
-        g_context->CopyResource(g_nvencInputTex, g_hdrP010Tex);
+        // No CopyResource — we drew directly into the NVENC P010 input texture.
     } else {
         // SDR path: BGRA8 composite → NV12 via typed-RTV shader draws (Apollo approach).
         // Two passes: Y plane (full resolution) then UV plane (half resolution).
