@@ -113,9 +113,12 @@ pub async fn run() -> Result<()> {
 
     // System tray: spawn before anything else so pairing PIN notifications
     // are visible from the moment the server is ready.
+    // The watch channel is the graceful-shutdown bridge: the tray's "Quit"
+    // menu item sends `true`; the capture-loop select! below breaks on it.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel::<tray::TrayCmd>(32);
-    tray::spawn(tray_rx);
-    let tray_tx = std::sync::Arc::new(tray_tx);
+    tray::spawn(tray_rx, Arc::new(shutdown_tx));
+    let tray_tx = Arc::new(tray_tx);
     let args = Args::parse();
     let local_ip = get_local_ip();
     println!("=== Nova Server ===\n🌐 LAN IP: {}\n", local_ip);
@@ -295,6 +298,10 @@ pub async fn run() -> Result<()> {
                 }
                 _ = ctrl_logoff.recv() => {
                     println!("\n🛑 User logoff — shutting down ({} frames encoded)", frames_encoded);
+                    break;
+                }
+                _ = shutdown_rx.changed() => {
+                    println!("\n🛑 Tray exit — shutting down ({} frames encoded)", frames_encoded);
                     break;
                 }
             }

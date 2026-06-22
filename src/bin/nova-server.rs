@@ -1,3 +1,7 @@
+// Silent background app — no console window on launch.
+// --install / --uninstall allocate a temporary console for user feedback.
+#![windows_subsystem = "windows"]
+
 // Windows service plumbing — define_windows_service! must live in the binary
 // crate (it generates an extern "system" fn entry point used by the SCM).
 use windows_service::{
