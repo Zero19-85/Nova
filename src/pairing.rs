@@ -601,14 +601,13 @@ async fn handle_request(
                     session.aes_key = None;
                 }
 
-                // Moonlight generates and displays the PIN on the client device.
-                // Notify the user to enter it via the tray context menu.
-                println!("🤝 Phase 1: Pairing initiated — enter PIN via tray ▶ 'Enter Pairing PIN'");
-                let _ = tray_tx.try_send(crate::tray::TrayCmd::Notify(
-                    "Nova — Pairing Request".to_string(),
-                    "Moonlight is pairing. Right-click the Nova tray icon and select \
-                     \"Enter Pairing PIN\" to type the PIN shown on your device.".to_string(),
-                ));
+                // Open the PIN + device-name dialog immediately on the tray thread
+                // so it is already showing by the time clientchallenge arrives
+                // (clientchallenge follows getservercert with ~0 ms delay and the
+                // server must hold that HTTP connection open while waiting for the
+                // PIN — any client-side response timeout starts ticking NOW).
+                println!("🤝 Phase 1: Pairing initiated — opening PIN dialog on tray thread");
+                let _ = tray_tx.try_send(crate::tray::TrayCmd::OpenPairDialog);
 
                 let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>{}</plaincert></root>"#, crypto.cert_hex);
                 Ok(make_xml_response(&body))
@@ -623,36 +622,26 @@ async fn handle_request(
 
                 // Collect the PIN without blocking the tokio executor.
                 //
-                // Strategy:
-                //   1. Check global_pin first — the user may have clicked
-                //      "Pair Device" in the tray before this request arrived.
-                //   2. Otherwise open the native InputBox immediately via
-                //      spawn_blocking so the dialog pops the moment Moonlight
-                //      sends the challenge.  Moonlight holds the HTTP
-                //      connection open while we await; tokio serves other
-                //      requests concurrently.
-                let (pin, device_name) = {
-                    let preloaded = {
+                // Poll global_pin indefinitely — no timeout.
+                // The tray thread opened the PIN dialog during getservercert so
+                // it is already showing by the time we reach here.  We just wait
+                // for the user to click OK; the HTTP connection stays open until
+                // they respond.  tokio's cooperative scheduler lets other tasks
+                // (RTSP, control, etc.) run normally during the 200 ms sleeps.
+                println!("⏳ Phase 2: waiting for PIN entry (no timeout)…");
+                let (pin, device_name) = loop {
+                    let ready = {
                         let mut p = global_pin.lock().unwrap();
-                        if p.0.len() == 4 {
+                        if !p.0.is_empty() {
                             let pair = p.clone();
                             *p = (String::new(), String::new());
-                            pair
+                            Some(pair)
                         } else {
-                            (String::new(), String::new())
+                            None
                         }
                     };
-                    if !preloaded.0.is_empty() {
-                        println!("🔑 Phase 2: using pre-entered PIN + name from tray menu");
-                        preloaded
-                    } else {
-                        println!("⏳ Phase 2: opening PIN + device-name dialog...");
-                        tokio::task::spawn_blocking(|| crate::tray::prompt_for_pin_and_name())
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default()
-                    }
+                    if let Some(pair) = ready { break pair; }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 };
 
                 if pin.is_empty() {

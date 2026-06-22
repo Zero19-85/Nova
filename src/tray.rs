@@ -13,6 +13,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub enum TrayCmd {
     /// Update the tray tooltip to show a status string (e.g., "Pairing…").
     Notify(String, String),
+    /// Immediately open the PIN + device-name dialog (triggered by getservercert
+    /// so the dialog is already showing before clientchallenge arrives — avoids
+    /// any client-side HTTP response timeout).  No-op if a PIN is already waiting.
+    OpenPairDialog,
     /// Force the tray thread to exit.
     Quit,
 }
@@ -122,6 +126,25 @@ fn tray_main(
                 // hovering the icon shows the pairing status.
                 let tip = format!("Nova — {title}");
                 let _ = tray.set_tooltip(Some(&tip));
+            }
+            Ok(TrayCmd::OpenPairDialog) => {
+                // Only open if no PIN is already waiting (avoid double-prompt
+                // when the user pre-entered via "Pair Device" before this arrives).
+                let needs_input = global_pin.lock().unwrap().0.is_empty();
+                if needs_input {
+                    let _ = tray.set_tooltip(Some("Nova — Enter pairing PIN…"));
+                    match prompt_for_pin_and_name() {
+                        Some((pin, name)) => {
+                            *global_pin.lock().unwrap() = (pin, name);
+                            let _ = tray.set_tooltip(Some(
+                                "Nova — PIN accepted, completing pairing…",
+                            ));
+                        }
+                        None => {
+                            let _ = tray.set_tooltip(Some("Nova Game Streaming"));
+                        }
+                    }
+                }
             }
             Ok(TrayCmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
             Err(mpsc::TryRecvError::Empty) => {}
