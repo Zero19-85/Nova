@@ -141,8 +141,12 @@ struct PairSession {
     server_secret: Option<Vec<u8>>,
     server_challenge: Option<Vec<u8>>,
     client_hash: Option<Vec<u8>>,
+    /// The pairing PIN entered by the user.  Collected during getservercert
+    /// (which Android Moonlight waits for without a read timeout) so that
+    /// clientchallenge (7-second read timeout) can respond instantly.
+    pin: Option<String>,
     /// Device name entered by the user during the PIN dialog (stored here so it
-    /// survives from the clientchallenge phase to the clientpairingsecret phase).
+    /// survives from the getservercert phase to the clientpairingsecret phase).
     name: Option<String>,
 }
 
@@ -601,34 +605,28 @@ async fn handle_request(
                     session.aes_key = None;
                 }
 
-                // Open the PIN + device-name dialog immediately on the tray thread
-                // so it is already showing by the time clientchallenge arrives
-                // (clientchallenge follows getservercert with ~0 ms delay and the
-                // server must hold that HTTP connection open while waiting for the
-                // PIN — any client-side response timeout starts ticking NOW).
-                println!("🤝 Phase 1: Pairing initiated — opening PIN dialog on tray thread");
+                // ── PIN collection happens HERE, during getservercert ─────────
+                //
+                // Android Moonlight (NvHTTP.java) calls getservercert with
+                // enableReadTimeout=false (unlimited wait) and clientchallenge
+                // with enableReadTimeout=true (READ_TIMEOUT = 7 seconds).
+                //
+                // GFE's model: server generates PIN, shows it on the host screen,
+                // responds to getservercert immediately.  By the time clientchallenge
+                // arrives GFE already has the PIN in memory → responds in < 1 ms.
+                //
+                // Nova's model is the reverse: Moonlight shows the PIN on the
+                // client device and the user must type it on the Nova host.
+                // Collecting the PIN during clientchallenge was burning through
+                // the 7-second budget (PowerShell Add-Type JIT alone takes 3-5 s),
+                // and the client timed out before the user could finish typing.
+                //
+                // Fix: collect the PIN NOW while Android waits without a timeout.
+                // clientchallenge then reads session.pin and responds in < 50 ms.
+                println!("🤝 Phase 1: Pairing initiated — collecting PIN during getservercert (no client timeout here)");
                 let _ = tray_tx.try_send(crate::tray::TrayCmd::OpenPairDialog);
 
-                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>{}</plaincert></root>"#, crypto.cert_hex);
-                Ok(make_xml_response(&body))
-
-            } else if phrase == "clientchallenge" || client_challenge.is_some() {
-                let salt = {
-                    let mut lock = sessions.lock().unwrap();
-                    let session = lock.entry(client_id.clone()).or_default();
-                    session.last_phase = "CLIENTCHALLENGE".to_string();
-                    session.salt.clone().unwrap_or_default()
-                };
-
-                // Collect the PIN without blocking the tokio executor.
-                //
-                // Poll global_pin indefinitely — no timeout.
-                // The tray thread opened the PIN dialog during getservercert so
-                // it is already showing by the time we reach here.  We just wait
-                // for the user to click OK; the HTTP connection stays open until
-                // they respond.  tokio's cooperative scheduler lets other tasks
-                // (RTSP, control, etc.) run normally during the 200 ms sleeps.
-                println!("⏳ Phase 2: waiting for PIN entry (no timeout)…");
+                println!("⏳ Phase 1: waiting for PIN + device name (no timeout)…");
                 let (pin, device_name) = loop {
                     let ready = {
                         let mut p = global_pin.lock().unwrap();
@@ -645,7 +643,7 @@ async fn handle_request(
                 };
 
                 if pin.is_empty() {
-                    println!("⚠️  PIN entry cancelled — pairing aborted.");
+                    println!("⚠️  PIN entry cancelled during getservercert — aborting");
                     return Ok(make_error_response("PIN entry cancelled"));
                 }
                 let device_name = if device_name.is_empty() {
@@ -653,7 +651,37 @@ async fn handle_request(
                 } else {
                     device_name
                 };
-                println!("🔑 Phase 2: PIN received — completing challenge (device: \"{}\")", device_name);
+                println!("🔑 Phase 1: PIN received (device: \"{}\") — responding to getservercert", device_name);
+
+                // Stash PIN + name in the session so clientchallenge can derive
+                // the AES key instantly without any dialog or polling.
+                {
+                    let mut lock = sessions.lock().unwrap();
+                    let session = lock.entry(client_id.clone()).or_default();
+                    session.pin  = Some(pin);
+                    session.name = Some(device_name);
+                }
+
+                let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>{}</plaincert></root>"#, crypto.cert_hex);
+                Ok(make_xml_response(&body))
+
+            } else if phrase == "clientchallenge" || client_challenge.is_some() {
+                // PIN was collected during getservercert (no read timeout there).
+                // Read it instantly from the session — must respond within Android's
+                // 7-second READ_TIMEOUT or the client will abort the pairing.
+                let (salt, pin) = {
+                    let mut lock = sessions.lock().unwrap();
+                    let session = lock.entry(client_id.clone()).or_default();
+                    session.last_phase = "CLIENTCHALLENGE".to_string();
+                    (session.salt.clone().unwrap_or_default(),
+                     session.pin.clone().unwrap_or_default())
+                };
+
+                if pin.is_empty() {
+                    println!("⚠️  clientchallenge arrived but no PIN in session — pairing aborted.");
+                    return Ok(make_error_response("PIN not available"));
+                }
+                println!("🔑 Phase 2: PIN from session — completing challenge instantly");
 
                 let aes_key = derive_aes_key(&salt, &pin);
                 let challenge_hex = client_challenge.unwrap_or_default();
@@ -686,11 +714,11 @@ async fn handle_request(
                 {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
-                    session.aes_key        = Some(aes_key);
-                    session.client_hash    = Some(decrypted);
-                    session.server_secret  = Some(server_secret);
+                    session.aes_key          = Some(aes_key);
+                    session.client_hash      = Some(decrypted);
+                    session.server_secret    = Some(server_secret);
                     session.server_challenge = Some(server_challenge);
-                    session.name           = Some(device_name);
+                    // session.name already set during getservercert — do not overwrite
                 }
 
                 let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>{}</challengeresponse></root>"#, hex::encode_upper(encrypted_response));
