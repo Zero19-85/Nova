@@ -557,12 +557,12 @@ async fn handle_request(
                     session.salt.clone().unwrap_or_default()
                 };
 
-                // Wait up to 5 minutes for the user to enter the PIN via the
-                // tray "Enter Pairing PIN" dialog.  global_pin is written by
-                // the tray thread when the PowerShell InputBox returns.
-                println!("⏳ Phase 2: Waiting for PIN via tray menu (5 min timeout)...");
+                // Wait indefinitely for the user to enter the PIN via the
+                // tray "Pair Device" menu item.  No timeout — the user takes
+                // however long they need to open the tray and type the PIN.
+                println!("⏳ Phase 2: Waiting for PIN via tray menu (no timeout)...");
                 let mut pin = String::new();
-                for _ in 0..600 {
+                loop {
                     {
                         let mut p = global_pin.lock().unwrap();
                         if p.len() == 4 {
@@ -572,11 +572,6 @@ async fn handle_request(
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-
-                if pin.is_empty() {
-                    println!("⏳ PIN timeout — pairing aborted. Please try again.");
-                    return Ok(make_error_response("Timeout waiting for PIN"));
                 }
                 println!("🔑 Phase 2: PIN received — completing challenge");
 
