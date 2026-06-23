@@ -22,16 +22,16 @@ pub const APP_ID_XBOX: u32 = 3;
 pub const APP_ID_RETROARCH: u32 = 4;
 pub const APP_ID_VIRTUAL_DESKTOP: u32 = 5;
 
-/// Universal VDD policy: every app routes through the Virtual Display Driver.
+/// Returns `true` when the given `app_id` should activate the Virtual Display
+/// Driver (headless mode) for its session.
 ///
-/// The VDD is the sole capture source regardless of which app the client
-/// launches. Returning `true` here causes `lib.rs`'s connect handler to call
-/// `activate_for_stream` (snapping the VDD to the client-negotiated resolution)
-/// and `rebind_capture_and_encoder` (pointing DXGI + NVENC at the VDD output)
-/// for every session — so SPS, capture rect, and NVENC surface all agree on
-/// exactly the resolution the client requested.
-pub fn uses_virtual_display(_app_id: u32) -> bool {
-    true
+/// When `headless_for_all` is `true` (the default from `nova.toml`), every app
+/// routes through the VDD regardless of ID — capture always targets the virtual
+/// display, and the physical monitors are detached for the duration of the
+/// stream. When `false`, only App 5 (Virtual Desktop) activates headless mode;
+/// all other apps stream whatever is on the host's physical primary display.
+pub fn uses_virtual_display(app_id: u32, headless_for_all: bool) -> bool {
+    headless_for_all || app_id == APP_ID_VIRTUAL_DESKTOP
 }
 
 const BOX_ART_DESKTOP: &[u8] = include_bytes!("../assets/desktop.jpg");

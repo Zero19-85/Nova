@@ -29,15 +29,6 @@ extern "C" {
     fn RequestIdrFrame(encoder: *mut c_void);
     fn ReconfigureBitrate(bitrate_kbps: i32, fps: i32) -> i32;
 
-    fn UpdateCursorShape(
-        data: *const u8,
-        data_len: i32,
-        shape_type: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-    ) -> i32;
-    fn UpdateCursorPosition(x: i32, y: i32, visible: i32);
 }
 
 /// Pass the log file path (UTF-16, null-terminated) to the C++ shim so that
@@ -45,22 +36,6 @@ extern "C" {
 /// immediately after `debug::init_debug_logger()`, before `Encoder::new()`.
 pub fn init_shim_log(log_path_wide: *const u16) {
     unsafe { InitShimLog(log_path_wide); }
-}
-
-/// Upload a new cursor shape (DXGI MONOCHROME/COLOR/MASKED_COLOR raw shape
-/// data) — call only when `DXGI_OUTDUPL_FRAME_INFO.PointerShapeBufferSize > 0`.
-pub fn update_cursor_shape(data: &[u8], shape_type: u32, width: u32, height: u32, pitch: u32) {
-    unsafe {
-        UpdateCursorShape(data.as_ptr(), data.len() as i32, shape_type, width, height, pitch);
-    }
-}
-
-/// Update the cursor's on-screen position/visibility — call every frame from
-/// `DXGI_OUTDUPL_FRAME_INFO.PointerPosition`.
-pub fn update_cursor_position(x: i32, y: i32, visible: bool) {
-    unsafe {
-        UpdateCursorPosition(x, y, if visible { 1 } else { 0 });
-    }
 }
 
 /// Thread-safe IDR trigger callable from any thread (e.g. the control-stream
@@ -101,6 +76,7 @@ impl Codec {
 
     /// GameStream ServerCodecModeSupport bitmask contribution.
     /// H264=bit0, HEVC=bit1, AV1=bit8 (matches Sunshine's bitmask).
+    #[allow(dead_code)]
     pub fn mode_bit(self) -> u32 {
         match self {
             Codec::H264 => 1,
@@ -210,7 +186,8 @@ impl Encoder {
         }
     }
 
-    /// Raw device pointer — needed by InitColorConversion and passed back to C++.
+    /// Raw device pointer — available for future FFI that needs the D3D11 device.
+    #[allow(dead_code)]
     pub fn device_ptr(&self) -> *mut c_void {
         self.device_ptr
     }

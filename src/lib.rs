@@ -1,6 +1,7 @@
 mod app_launcher;
 mod audio;
 mod capture;
+mod config;
 mod control;
 pub mod debug; // pub so nova-server binary can call init_debug_logger() during --install/--uninstall
 mod encoder;
@@ -23,23 +24,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::signal;
 
+/// CLI overrides — all optional; omitted fields fall back to nova.toml values.
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Nova Server")]
 struct Args {
-    #[arg(long, default_value_t = 1920)]
-    width: i32,
-    #[arg(long, default_value_t = 1080)]
-    height: i32,
-    #[arg(long, default_value_t = 15000)]
-    bitrate: i32,
-    #[arg(long, default_value = "h264")]
-    codec: String,
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
-    /// FEC parity percentage (0 disables FEC — A/B test knob for RS
-    /// matrix-compatibility debugging). Default 20, matching Sunshine.
-    #[arg(long, default_value_t = 20)]
-    fec: u32,
+    /// Override nova.toml stream.width
+    #[arg(long)] width:   Option<i32>,
+    /// Override nova.toml stream.height
+    #[arg(long)] height:  Option<i32>,
+    /// Override nova.toml stream.bitrate_kbps
+    #[arg(long)] bitrate: Option<i32>,
+    /// Override nova.toml stream.codec ("h264" | "hevc" | "av1")
+    #[arg(long)] codec:   Option<String>,
+    /// Override nova.toml stream.fps
+    #[arg(long)] fps:     Option<u32>,
+    /// Override nova.toml network.fec_percentage (0 = disable)
+    #[arg(long)] fec:     Option<u32>,
 }
 
 fn get_local_ip() -> String {
@@ -138,11 +138,19 @@ pub async fn run() -> Result<()> {
     let global_pin: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((String::new(), String::new())));
     tray::spawn(tray_rx, Arc::new(shutdown_tx), global_pin.clone());
     let tray_tx = Arc::new(tray_tx);
+    // Load nova.toml first; CLI args override individual fields.
+    let cfg  = config::NovaConfig::load();
     let args = Args::parse();
+    let width   = args.width  .unwrap_or(cfg.stream.width);
+    let height  = args.height .unwrap_or(cfg.stream.height);
+    let bitrate = args.bitrate.unwrap_or(cfg.stream.bitrate_kbps);
+    let codec   = args.codec  .unwrap_or_else(|| cfg.stream.codec.clone());
+    let fps     = args.fps    .unwrap_or(cfg.stream.fps);
+    let fec     = args.fec    .unwrap_or(cfg.network.fec_percentage);
     let local_ip = get_local_ip();
     println!("=== Nova Server ===\n🌐 LAN IP: {}\n", local_ip);
     debug::debug_log(&format!("Nova started — {}x{} {} {} Kbps {} fps",
-        args.width, args.height, args.codec, args.bitrate, args.fps));
+        width, height, codec, bitrate, fps));
 
     let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
@@ -155,10 +163,13 @@ pub async fn run() -> Result<()> {
     // sprop-parameter-sets=AAAAAU in DESCRIBE for HEVC capability and the
     // fps cap handles graceful degradation for H264 fallback scenarios.
     let codec_mode_support: u32 = 259;
-    let startup_codec = encoder::Codec::from_str(&args.codec);
+    let startup_codec = encoder::Codec::from_str(&codec);
     println!("🎥 ServerCodecModeSupport={codec_mode_support} (H264+HEVC); startup encoder: {}", startup_codec.as_str());
+    if cfg.stream.enable_hdr {
+        println!("✨ nova.toml: enable_hdr=true — HDR10 will activate for HEVC sessions regardless of VDD capability query");
+    }
 
-    let startup_frame_interval = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
+    let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
 
     // Owns the virtual-display lifecycle for the whole process.
@@ -172,7 +183,7 @@ pub async fn run() -> Result<()> {
     // resolution. Bringing it up once at boot means the devnode has long
     // since settled at the configured mode by the time any client connects.
     let mut vd = virtual_display::VirtualDisplay::new();
-    let virtual_device_name = match vd.ensure_enabled_at_boot(args.width as u32, args.height as u32, args.fps) {
+    let virtual_device_name = match vd.ensure_enabled_at_boot(width as u32, height as u32, fps) {
         Ok(name) => name,
         Err(e) => {
             println!("⚠️  Failed to enable Root\\MttVDD at boot: {e} — Virtual Desktop sessions will be unavailable");
@@ -183,15 +194,14 @@ pub async fn run() -> Result<()> {
     let mut capturer = capture::WgcCapturer::new_excluding(virtual_device_name.as_deref()).expect("Failed to start WGC capture");
     input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
 
-    // The DXGI duplication captures at the monitor's native resolution, which
-    // may not match --width/--height (CLI defaults 1920x1080). The encoder and
-    // the D3D11 video processor's NV12 conversion surface must be sized to the
-    // ACTUAL captured texture — a mismatch leaves the video processor blitting
-    // into a differently-sized output, which can leave the bottom portion of
-    // the NV12 surface (and therefore the encoded frame) black/garbage.
-    if capturer.width as i32 != args.width || capturer.height as i32 != args.height {
-        println!("⚠️  Monitor native resolution ({}x{}) differs from --width/--height ({}x{}) — using native resolution for capture/encoder pipeline.",
-            capturer.width, capturer.height, args.width, args.height);
+    // The WGC frame pool captures at the monitor's native resolution, which may
+    // not match nova.toml's width/height target. The encoder and D3D11 video
+    // processor must be sized to the ACTUAL captured texture — a mismatch leaves
+    // the VP blitting into a differently-sized output, producing black/garbage in
+    // the bottom portion of every encoded frame.
+    if capturer.width as i32 != width || capturer.height as i32 != height {
+        println!("⚠️  Monitor native resolution ({}x{}) differs from nova.toml target ({}x{}) — using native resolution for capture/encoder pipeline.",
+            capturer.width, capturer.height, width, height);
     }
 
     let mut enc = Encoder::new(
@@ -199,8 +209,8 @@ pub async fn run() -> Result<()> {
         EncoderConfig {
             width:        capturer.width as i32,
             height:       capturer.height as i32,
-            fps:          args.fps as i32,
-            bitrate_kbps: args.bitrate,
+            fps:          fps as i32,
+            bitrate_kbps: bitrate,
             codec:        startup_codec,
             is_hdr:       false, // upgraded per-session when client negotiates HEVC Main10/HDR
         },
@@ -367,8 +377,8 @@ pub async fn run() -> Result<()> {
             if let Ok(mut guard) = client_info.lock() {
                 let pending = guard.as_ref()
                     .filter(|c| c.app_id != 0 && !c.activated && !c.streaming_active)
-                    .map(|c| (c.app_id, c.width, c.height, c.fps, c.video_format));
-                if let Some((app_id, width, height, fps, video_format)) = pending {
+                    .map(|c| (c.app_id, c.width, c.height, c.fps, c.video_format, c.device_name.clone()));
+                if let Some((app_id, width, height, fps, video_format, session_device_name)) = pending {
                     // Read HDR flag while we still hold the lock.
                     let hdr_req = guard.as_ref().map(|c| c.hdr_requested).unwrap_or(false);
 
@@ -383,11 +393,20 @@ pub async fn run() -> Result<()> {
                         enc.config.is_hdr = false; // reset; re-armed below if HDR is also requested
                     }
                     enc.config.fps = fps as i32;
-                    let vdd_ok = if app_launcher::uses_virtual_display(app_id) {
+                    let vdd_ok = if app_launcher::uses_virtual_display(app_id, cfg.stream.headless_for_all_apps) {
                         println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
                             if hdr_req { " HDR10" } else { "" });
                         match vd.activate_for_stream(width, height, fps) {
                             Ok(()) => {
+                                // Rename the virtual monitor so Display Settings and Device
+                                // Manager show the client device name (e.g. "Xbox") instead
+                                // of the driver's generic "VDD by MTT" label.
+                                if !session_device_name.is_empty() {
+                                    match vd.rename_devnode(&session_device_name) {
+                                        Ok(()) => println!("🏷️  Virtual monitor renamed to \"{}\"", session_device_name),
+                                        Err(e) => println!("⚠️  Monitor rename: {e}"),
+                                    }
+                                }
                                 if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((width, height))).is_err() {
                                     break;
                                 }
@@ -397,13 +416,11 @@ pub async fn run() -> Result<()> {
                                 // already stable in FP16 mode — calling set_active_display_hdr
                                 // again there is a no-op (no second storm).
                                 if hdr_req {
-                                    // Check if MttVDD actually supports Advanced Color before
-                                    // trying to enable it. On MttVDD 25.7.23 (and many other
-                                    // IddCx VDD versions) Advanced Color is NOT supported —
-                                    // calling SET_ADVANCED_COLOR_STATE returns success but
-                                    // triggers an endless ACCESS_LOST storm without achieving
-                                    // FP16 mode, causing the client to time out.
-                                    if vd.is_advanced_color_supported() {
+                                    // enable_hdr=true in nova.toml lets the user force HDR
+                                    // even when is_advanced_color_supported() is slow to
+                                    // reflect HDRPlus=true after a devnode cycle.
+                                    let hdr_ok = cfg.stream.enable_hdr || vd.is_advanced_color_supported();
+                                    if hdr_ok {
                                         if let Err(e) = vd.set_active_display_hdr(true) {
                                             println!("⚠️  Advanced Color pre-activation failed: {e}");
                                         } else {
@@ -427,8 +444,8 @@ pub async fn run() -> Result<()> {
                                         }
                                     } else {
                                         println!("⚠️  MttVDD does not support Advanced Color (HDR) — \
-                                            streaming HEVC SDR. The VDD driver must expose HDR modes \
-                                            for true HDR10 output. Check vdd_settings.xml for HDR config.");
+                                            streaming HEVC SDR. Set enable_hdr=true in nova.toml or \
+                                            enable HDRPlus in vdd_settings.xml for true HDR10 output.");
                                     }
                                 }
                                 true
@@ -562,8 +579,9 @@ pub async fn run() -> Result<()> {
                         //      ACCESS_LOST rebind re-creates the duplication handle in HDR mode.
                         //   2. Recreate NVENC as HEVC Main10 with P010 buffer format so the
                         //      shim's FP16→P010 VP path has a matching output surface.
+                        let hdr_ok = cfg.stream.enable_hdr || vd.is_advanced_color_supported();
                         if client.hdr_requested && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr
-                            && vd.is_advanced_color_supported()
+                            && hdr_ok
                         {
                             // Advanced Color was enabled in pre-activation (during the
                             // /launch→PLAY gap). Calling set_active_display_hdr(true) again
@@ -626,26 +644,35 @@ pub async fn run() -> Result<()> {
                                 vd.active_device_name(), Some((client.width, client.height))).is_err() {
                                 break;
                             }
-                        } else {
-                            // Universal VDD: activate for every app.
+                        } else if app_launcher::uses_virtual_display(client.app_id, cfg.stream.headless_for_all_apps) {
+                            // Pre-activation didn't run (PLAY arrived before the first idle-loop tick).
+                            // Activate the VDD now, then rename the virtual monitor.
                             match vd.activate_for_stream(client.width, client.height, client.fps) {
                                 Ok(()) => {
+                                    if !client.device_name.is_empty() {
+                                        match vd.rename_devnode(&client.device_name) {
+                                            Ok(()) => println!("🏷️  Virtual monitor renamed to \"{}\"", client.device_name),
+                                            Err(e) => println!("⚠️  Monitor rename: {e}"),
+                                        }
+                                    }
                                     if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
                                         break;
                                     }
                                 }
                                 Err(e) => println!("⚠️  Virtual display activation failed: {e} — stream may have wrong resolution"),
                             }
-                            // Mirror the pre-activation pass: mark this session
-                            // activated so that once the control stream
-                            // disconnects, the idle-loop pre-activation check
-                            // (app_id != 0 && !activated && !streaming_active)
-                            // doesn't see a stale "not yet activated" session
-                            // and re-run this block with no client connected.
+                            // Mirror the pre-activation pass: mark activated so the idle-loop
+                            // doesn't attempt a second activate once streaming starts.
                             if let Ok(mut guard) = client_info.lock() {
                                 if let Some(info) = guard.as_mut() {
                                     info.activated = true;
                                 }
+                            }
+                        } else {
+                            // headless_for_all_apps=false and non-VD app: capture stays on
+                            // the physical primary display. Just rebind to whatever is current.
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
+                                break;
                             }
                         }
 
@@ -702,7 +729,7 @@ pub async fn run() -> Result<()> {
                                 capturer.width, capturer.height, client.width, client.height,
                                 native_px as f64 / client_px as f64);
                         }
-                        rtp_sender.configure(pkt_size, args.fec as usize, min_fec);
+                        rtp_sender.configure(pkt_size, fec as usize, min_fec);
 
                         // Retarget CBR to the client's negotiated bitrate.
                         // Without this the encoder streams at the CLI default
@@ -720,7 +747,7 @@ pub async fn run() -> Result<()> {
                             enc.config.bitrate_kbps = client.bitrate_kbps as i32;
                             enc.config.fps          = session_fps.max(1) as i32;
                         } else {
-                            println!("⚠️  Client did not announce a bitrate — keeping CLI default {} Kbps", args.bitrate);
+                            println!("⚠️  Client did not announce a bitrate — keeping nova.toml default {} Kbps", bitrate);
                         }
 
                         // Start the audio pipeline (WASAPI → Opus → RTP 48000).
@@ -896,7 +923,7 @@ pub async fn run() -> Result<()> {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
 
                 // ── Encoder gate ──────────────────────────────────────────────
                 // No NVENC calls until WGC has delivered its first real frame.
@@ -959,7 +986,25 @@ pub async fn run() -> Result<()> {
         streamer.stop();
     }
 
+    // Release the NVENC/D3D pipeline before tearing down the VDD. The encoder
+    // holds D3D texture references on the VDD adapter; releasing them first
+    // avoids a dangling-reference when SetDisplayConfig removes the virtual
+    // output from the device tree. enc.cleanup() is idempotent (no-ops when
+    // the session was already torn down by the normal disconnect path).
+    enc.cleanup();
+
+    // Restore the physical display topology if a virtual desktop session was
+    // active when the shutdown signal arrived (Ctrl+C, console close, OS logoff,
+    // OS shutdown). deactivate_after_stream() is a no-op when vd.active is false
+    // so it is always safe to call here. VirtualDisplay::drop() is the safety
+    // net for panics; this explicit call gives us the correct enc→vd teardown
+    // order and visible log output.
+    if let Err(e) = vd.deactivate_after_stream() {
+        println!("⚠️  VDD shutdown teardown: {e}");
+    }
+
     println!("✅ Capture loop done — {} frames encoded", frames_encoded);
-    // `enc` drops here → CleanupEncoder flushes + closes test.h264
+    // `enc` drops here → CleanupEncoder is idempotent after enc.cleanup() above.
+    // `vd` drops here → VirtualDisplay::drop() is a no-op because active=false.
     Ok(())
 }

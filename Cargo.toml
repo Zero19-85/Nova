@@ -80,6 +80,8 @@ windows = { version = "0.58", features = [
 # System tray icon + native right-click context menu (handles all Win32 quirks
 # — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).
 tray-icon = "0.14"
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
 rsa = "0.9.10"
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"

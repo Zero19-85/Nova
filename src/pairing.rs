@@ -829,6 +829,20 @@ async fn handle_request(
         }
 
         "/launch" | "/resume" => {
+            // Dump every parameter Moonlight sends so we can identify undocumented
+            // flags (e.g. headless toggles, client type hints, display selections).
+            // The rikey is redacted — it's a per-session AES key and must not appear
+            // in plain-text logs.
+            {
+                let mut sorted: Vec<(&String, &String)> = params.iter().collect();
+                sorted.sort_by_key(|(k, _)| k.as_str());
+                println!("📋 {} params ({} total):", path, sorted.len());
+                for (k, v) in &sorted {
+                    let display = if *k == "rikey" { "<redacted>" } else { v.as_str() };
+                    println!("   {:<30} = {}", k, display);
+                }
+            }
+
             // Parse mode string "WxHxFPS" (e.g. "1920x1080x60")
             let mode_str = params.get("mode").map(|s| s.as_str()).unwrap_or("1280x720x60");
             let mut mode_parts = mode_str.split('x');
@@ -888,6 +902,26 @@ async fn handle_request(
                     Encoder will stay at its current codec until ANNOUNCE is parsed.");
             }
 
+            // Resolve the paired device's friendly name from nova_paired.json using
+            // the `uniqueid` Moonlight includes in every authenticated request.
+            // Falls back to a short hex prefix of the uniqueid so the rename always
+            // produces a non-empty, human-readable label.
+            let client_uniqueid = params.get("uniqueid").map(|s| s.as_str()).unwrap_or("");
+            let session_device_name = if client_uniqueid.is_empty() {
+                String::new()
+            } else {
+                load_paired_json()
+                    .get(client_uniqueid)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let prefix = &client_uniqueid[..client_uniqueid.len().min(8)];
+                        format!("Client-{}", prefix)
+                    })
+            };
+            if !session_device_name.is_empty() {
+                println!("🏷️  Device: \"{}\" (uniqueid={})", session_device_name, client_uniqueid);
+            }
+
             // Store session info — RTSP DESCRIBE reads width/height/fps from here.
             // Setting app_id causes /serverinfo to return currentgame=N (BUSY state),
             // which is what Moonlight checks before proceeding with the RTSP handshake.
@@ -902,6 +936,7 @@ async fn handle_request(
                 info.host_audio    = host_audio;
                 info.video_format  = video_format;
                 info.hdr_requested = hdr_requested;
+                info.device_name   = session_device_name;
                 // /launch starts a fresh session — reset activation state so the
                 // capture loop's pre-activation pass runs the VDD/CCD switch
                 // during the handshake gap. /resume reattaches to an already-

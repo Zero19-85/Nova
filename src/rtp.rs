@@ -32,10 +32,13 @@ const DEFAULT_MIN_PARITY_SHARDS: usize = 2;
 // Packet pacing: a ~45-packet IDR blasted in one sub-millisecond burst can
 // overflow the router/AP transmit queue, dropping the tail packets — the
 // decoder then renders the top of the frame and corrupts everything below.
-// Send in small batches with a short gap (~285 Mbps effective), like
-// Sunshine's ratecontrol batching (≤64KB batches at 80% of link rate).
+// Send in small batches with a short gap, like Sunshine's ratecontrol
+// batching (≤64KB batches at 80% of link rate).
+//
+// PACE_GAP is no longer a constant — see `send_frame`, which computes it as
+// 300µs × (60 / fps) so total pacing overhead stays proportional to the
+// frame budget (e.g. 150µs at 120fps vs 300µs at 60fps).
 const PACE_BATCH_PACKETS: usize = 10;
-const PACE_GAP: Duration = Duration::from_micros(300);
 
 /// Busy-wait for sub-millisecond pacing gaps. `thread::sleep` is unusable
 /// here: Windows sleep granularity is 1-15ms, which would stretch a 45-packet
@@ -81,7 +84,7 @@ impl RtpSender {
         // Give the OS headroom for the ~25-packet bursts sent per frame so a
         // momentary full send buffer blocks (and retries) rather than drops.
         let sock2 = socket2::Socket::from(socket);
-        sock2.set_send_buffer_size(2 * 1024 * 1024)?;
+        sock2.set_send_buffer_size(4 * 1024 * 1024)?;
         let socket: UdpSocket = sock2.into();
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -276,6 +279,14 @@ impl RtpSender {
             rs.encode(&mut shards).expect("all shards are block_size");
         }
 
+        // ── Pacing gap — scaled to fps so overhead fits the frame budget ────
+        // 300µs × (60 / fps): at 60fps = 300µs, at 120fps = 150µs.
+        // A 50-packet IDR at 120fps produces 4 gaps = 600µs (<10% of 8.33ms)
+        // vs the old 1200µs (>14%). Clamped 50–300µs so very high fps values
+        // don't approach zero and very low fps values don't exceed 300µs.
+        let pace_gap_us = (300u64 * 60 / self.fps.max(1) as u64).clamp(50, 300);
+        let pace_gap = Duration::from_micros(pace_gap_us);
+
         // ── Finalize per-packet fields and send (data + parity) ─────────────
         for (x, shard) in shards.iter_mut().enumerate() {
             // RTP header — X bit set (Sunshine's FLAG_EXTENSION) → 4B reserved
@@ -298,9 +309,9 @@ impl RtpSender {
 
             self.send_packet(shard, target);
 
-            // Inter-batch pacing gap (see PACE_* constants above).
+            // Inter-batch pacing gap.
             if (x + 1) % PACE_BATCH_PACKETS == 0 && x + 1 < total_shards {
-                spin_wait(PACE_GAP);
+                spin_wait(pace_gap);
             }
         }
 

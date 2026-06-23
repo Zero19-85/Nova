@@ -83,6 +83,11 @@ pub struct ClientInfo {
     /// never calls RequestSetCurrentDisplayModeAsync(Eotf2084) and the TV
     /// stays in SDR regardless of VUI or SEI settings.
     pub hdr_mode_sent: bool,
+    /// Friendly name of the connected client device (e.g. "Xbox", "Steam Deck"),
+    /// looked up from `nova_paired.json` via the `uniqueid` in `/launch`.
+    /// Used to rename the virtual display devnode so Device Manager and Display
+    /// Settings show the client name instead of "VDD by MTT".
+    pub device_name: String,
 }
 
 // Fixed session token, matches Sunshine's hardcoded "DEADBEEFCAFE".

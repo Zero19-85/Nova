@@ -34,7 +34,7 @@
 
 use windows::core::{Interface, Result, IInspectable};
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFrame, Direct3D11CaptureFramePool,
+    Direct3D11CaptureFramePool,
     GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::DirectXPixelFormat;

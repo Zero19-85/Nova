@@ -117,10 +117,12 @@ use std::process::Command;
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND, LUID, POINTL};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL, CDS_NORESET,
-    CDS_RESET, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL,
+    CDS_RESET, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL,
     DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
 };
+#[cfg(test)]
+use windows::Win32::Graphics::Gdi::{CDS_NORESET, CDS_TYPE};
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::DISPLAY_DEVICE_PRIMARY_DEVICE;
 use windows::Win32::Devices::Display::{
@@ -138,9 +140,10 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CM_PROB_DISABLED, CR_SUCCESS,
     SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetClassInstallParamsW,
+    SetupDiSetDeviceRegistryPropertyW,
     DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIGCF_PRESENT,
     GUID_DEVCLASS_DISPLAY, HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
-    SPDRP_HARDWAREID,
+    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID,
 };
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{
@@ -1112,6 +1115,43 @@ impl VirtualDisplay {
         Ok(virtual_device)
     }
 
+    // -------------------------------------------------------------
+    // Device naming
+    // -------------------------------------------------------------
+
+    /// Set the `Root\MttVDD` adapter devnode's friendly name to `display_name`.
+    ///
+    /// Windows uses `SPDRP_FRIENDLYNAME` as the device label shown in Device
+    /// Manager and, on most Windows 11 builds, in the "Display" page of Settings
+    /// when the virtual monitor is active.  The change is written to the registry
+    /// immediately and persists until Nova renames it again (e.g. on the next
+    /// session with a different client) or the driver is reinstalled.
+    ///
+    /// Called from `lib.rs` right after `activate_for_stream` succeeds, so the
+    /// virtual display is already the active output when the rename lands.
+    /// Requires administrator privileges (embedded manifest guarantees this).
+    pub fn rename_devnode(&self, display_name: &str) -> Result<(), String> {
+        let Some((hdevinfo, mut devinfo_data)) = Self::open_devnode()
+            .map_err(|e| format!("enumerate display devnodes: {e}"))? else {
+            return Err("Root\\MttVDD devnode not found — driver not installed?".to_string());
+        };
+
+        // REG_SZ: UTF-16LE, null-terminated.
+        let name_w: Vec<u16> = display_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes: Vec<u8>   = name_w.iter().flat_map(|c| c.to_le_bytes()).collect();
+
+        let result = unsafe {
+            SetupDiSetDeviceRegistryPropertyW(
+                hdevinfo,
+                &mut devinfo_data,
+                SPDRP_FRIENDLYNAME,
+                Some(&bytes),
+            )
+        };
+        unsafe { let _ = SetupDiDestroyDeviceInfoList(hdevinfo); }
+        result.map_err(|e| format!("rename VDD devnode to \"{display_name}\": {e}"))
+    }
+
     /// Phase 5.3: immediately after enabling `Root\MttVDD`, detaches the
     /// virtual display by snapping its mode to 0x0 via the legacy
     /// `ChangeDisplaySettingsExW`/`DEVMODEW` API — not CCD.
@@ -1132,70 +1172,73 @@ impl VirtualDisplay {
     /// [`wait_for_virtual_display_device_name`] — `None` if it never appeared
     /// in GDI enumeration.
     ///
-    /// Steps:
-    ///   1. `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` — if it succeeds and
-    ///      already reports 0x0, no-op (steady state on later boots).
-    ///   2. Overwrite `dmFields = DM_PELSWIDTH | DM_PELSHEIGHT`,
-    ///      `dmPelsWidth = dmPelsHeight = 0`, apply via
-    ///      `ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY | CDS_NORESET)` —
-    ///      `CDS_NORESET` stages the change in the registry without
-    ///      immediately repainting the desktop.
-    ///   3. A second, global `ChangeDisplaySettingsExW(NULL, NULL, NULL, 0,
-    ///      NULL)` commits every pending `CDS_NORESET` change at once — the
-    ///      same two-call apply idiom as `set_primary_noop_diagnostic`.
+    /// Uses [`ccd_deactivate_vdd_path`] to clear `DISPLAYCONFIG_PATH_ACTIVE`
+    /// on the VDD's CCD path via `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG
+    /// | SDC_SAVE_TO_DATABASE)`.  The legacy `ChangeDisplaySettingsExW(0×0)`
+    /// approach is intentionally NOT used: MttVDD's IddCx driver rejects 0×0
+    /// with `DISP_CHANGE_BADMODE (-2)` because 0×0 is not in its mode list,
+    /// so the old two-call stage+apply sequence always bailed out early and the
+    /// VDD remained in the active topology — visible in Display Settings as a
+    /// second monitor and sometimes promoted to primary.
     ///
-    /// Best-effort: logs success or failure either way and never blocks
+    /// Best-effort: logs success or failure and never blocks
     /// [`ensure_enabled_at_boot`]'s return.
     fn isolate_virtual_display_at_boot(virtual_device: Option<&str>) {
         let Some(virtual_device) = virtual_device else {
             println!("⚠️  Root\\MttVDD enabled but never appeared in GDI enumeration — cannot isolate it at boot");
             return;
         };
-
-        let name_w: Vec<u16> = virtual_device.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let mut mode = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            ..Default::default()
-        };
-        let enum_ok = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() };
-
-        if enum_ok && mode.dmPelsWidth == 0 && mode.dmPelsHeight == 0 {
-            println!("✅ {virtual_device} already dormant (0x0) at boot");
-            return;
+        match Self::ccd_deactivate_vdd_path(virtual_device) {
+            Ok(true)  => println!("✅ {virtual_device} already dormant at boot — no isolation needed"),
+            Ok(false) => println!("🕶️  {virtual_device} removed from active CCD topology — dormant until a stream activates it"),
+            Err(e)    => println!("⚠️  Failed to isolate {virtual_device} at boot: {e}"),
         }
+    }
 
-        mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        mode.dmPelsWidth = 0;
-        mode.dmPelsHeight = 0;
-        // Defensive: IddCx virtual displays can report a nonzero
-        // dmDriverExtra from EnumDisplaySettingsW, which would need a
-        // matching trailing private-data buffer if echoed back as-is.
-        // NOTE: -2 below is DISP_CHANGE_BADMODE ("mode not supported"), not
-        // DISP_CHANGE_BADPARAM (-5) — dmDriverExtra isn't the cause of that
-        // failure; 0x0 simply isn't in this driver's enumerated mode list.
-        mode.dmDriverExtra = 0;
+    /// Clears `DISPLAYCONFIG_PATH_ACTIVE` on every active CCD path whose
+    /// source resolves to `virtual_device`, leaving all physical paths
+    /// untouched.  `SDC_SAVE_TO_DATABASE` persists the "VDD dormant" state so
+    /// Windows does not auto-promote the virtual monitor to primary on the
+    /// next reboot.
+    ///
+    /// This is the exact inverse of [`deactivate_other_paths`] — that function
+    /// kills the physical paths and keeps the VDD active; this one kills the
+    /// VDD path and keeps everything else active.  Both use the same
+    /// `QDC_ALL_PATHS` + `SDC_USE_SUPPLIED_DISPLAY_CONFIG` pattern that is
+    /// proven to round-trip on this driver stack.
+    ///
+    /// Returns `Ok(true)` when the VDD was already inactive (no-op),
+    /// `Ok(false)` when it was found and successfully deactivated.
+    fn ccd_deactivate_vdd_path(virtual_device: &str) -> Result<bool, String> {
+        let (mut paths, modes) = Self::query_all_topology()?;
 
-        let result = unsafe {
-            ChangeDisplaySettingsExW(
-                PCWSTR(name_w.as_ptr()),
-                Some(&mode),
-                HWND(std::ptr::null_mut()),
-                CDS_UPDATEREGISTRY | CDS_NORESET,
-                None,
+        let mut found = false;
+        for path in &mut paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue; // already inactive — leave it alone
+            }
+            let is_vdd = Self::gdi_device_name_for_source(
+                path.sourceInfo.adapterId,
+                path.sourceInfo.id,
             )
-        };
-        if result != DISP_CHANGE_SUCCESSFUL {
-            println!("⚠️  Failed to stage {virtual_device} detach at boot (DISP_CHANGE {})", result.0);
-            return;
+            .is_some_and(|name| name.eq_ignore_ascii_case(virtual_device));
+
+            if is_vdd {
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+                found = true;
+            }
         }
 
-        let apply = unsafe { ChangeDisplaySettingsExW(PCWSTR::null(), None, HWND(std::ptr::null_mut()), CDS_TYPE(0), None) };
-        if apply == DISP_CHANGE_SUCCESSFUL {
-            println!("🕶️  {virtual_device} detached at boot (0x0) — dormant until a stream activates it");
-        } else {
-            println!("⚠️  {virtual_device} staged for detach but the global apply failed (DISP_CHANGE {})", apply.0);
+        if !found {
+            return Ok(true); // VDD not in active topology — already dormant
         }
+
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if status != 0 {
+            return Err(format!("SetDisplayConfig could not deactivate VDD CCD path (error {status})"));
+        }
+        Ok(false)
     }
 
     // -------------------------------------------------------------
@@ -1395,6 +1438,7 @@ impl VirtualDisplay {
     /// it has run. Used by the steady-state DXGI rebind in lib.rs's `run()`
     /// to pass `expected_size` to
     /// [`crate::capture::DesktopCapturer::rebind`].
+    #[allow(dead_code)]
     pub fn active_resolution(&self) -> Option<(u32, u32)> {
         self.active_resolution
     }
@@ -2192,6 +2236,17 @@ impl VirtualDisplay {
 impl Default for VirtualDisplay {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for VirtualDisplay {
+    fn drop(&mut self) {
+        if self.active {
+            println!("🛡️  VirtualDisplay drop — restoring physical display topology before exit");
+            if let Err(e) = self.deactivate_after_stream() {
+                println!("⚠️  VirtualDisplay drop cleanup failed: {e}");
+            }
+        }
     }
 }
 

@@ -42,7 +42,6 @@
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
-use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
@@ -53,7 +52,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
@@ -304,28 +303,28 @@ pub fn handle_input_packet(payload: &[u8]) {
 }
 
 // ---------------------------------------------------------------------
-// Mouse & keyboard injection via SendInput.
+// Mouse injection via SendInput — two distinct paths by packet type.
 //
-// Per project requirements, mouse positioning is ALWAYS injected as an
-// absolute SendInput move (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-// 0-65535 normalized to the Win32 virtual screen — SM_XVIRTUALSCREEN/
-// SM_YVIRTUALSCREEN/SM_CXVIRTUALSCREEN/SM_CYVIRTUALSCREEN). Even
-// client-relative deltas (NV_REL_MOUSE_MOVE_PACKET) are resolved against the
-// host's current cursor position and re-injected absolutely — true relative
-// SendInput moves would let the client's and host's notions of cursor
-// position drift apart (desync).
+// ABS packets (MOUSE_MOVE_ABS_MAGIC) carry a fractional position within the
+// client's view — used for desktop cursor control.  These are resolved to
+// desktop coordinates and injected as MOUSEEVENTF_ABSOLUTE |
+// MOUSEEVENTF_VIRTUALDESK (0-65535 normalized to the Win32 virtual screen).
+// Plain MOUSEEVENTF_ABSOLUTE (without VIRTUALDESK) maps onto the GDI *primary*
+// monitor only; VIRTUALDESK covers the full multi-monitor desktop, which is
+// essential during a Virtual Desktop session where the VDD is primary.
+// Coordinates are computed against the ACTIVE CAPTURE RECT (set by
+// `set_active_capture_rect` after every rebind) via `virtual_desktop_to_absolute`.
 //
-// Plain MOUSEEVENTF_ABSOLUTE (without VIRTUALDESK) maps 0-65535 onto the GDI
-// *primary* monitor's bounds, which is NOT necessarily the display
-// `capture::DesktopCapturer` is duplicating — on a multi-monitor host, DXGI
-// output 0 of adapter 0 isn't guaranteed to be the primary, and during a
-// Virtual Desktop session the virtual display becomes primary while other
-// physical paths are detached rather than removed. So every absolute move
-// below is computed in desktop coordinates (the same top-left-origin,
-// Y-increases-downward space as DXGI's DesktopCoordinates / GetCursorPos —
-// matching the wire format, so no axis is ever flipped) against the ACTIVE
-// CAPTURE RECT (see `set_active_capture_rect`), then converted to the
-// VIRTUALDESK 0-65535 space via `virtual_desktop_to_absolute`.
+// REL packets (MOUSE_MOVE_REL_MAGIC_GEN5) carry raw camera/look deltas —
+// game input, not desktop cursor control.  Games consume these through the
+// Win32 raw-input path (WM_INPUT / GetRawInputData), not absolute cursor
+// position.  These are injected as plain MOUSEEVENTF_MOVE (no ABSOLUTE flag),
+// passing the wire delta straight to the OS in one SendInput call.
+//
+// The old REL path converted deltas to absolute by calling GetCursorPos then
+// 4×GetSystemMetrics, which was 5 kernel transitions per packet.  At 100–200
+// REL packets/s during a camera pan that was 500–1000 syscalls/s of overhead,
+// plus subtle jitter when the game warped the cursor on its own frame.
 // ---------------------------------------------------------------------
 
 /// Position (`origin_x`/`origin_y`, desktop coordinates — i.e.
@@ -459,39 +458,24 @@ fn inject_mouse_move_abs(payload: &[u8]) {
 ///   deltaX : i16 BE @8
 ///   deltaY : i16 BE @10
 ///
-/// Resolved against the host's current cursor position (GetCursorPos),
-/// clamped to the active capture rect (see [`active_capture_rect`]), and
-/// re-injected as an absolute move — see the module-level note on why
-/// relative SendInput moves aren't used.
+/// Passed directly to SendInput as a relative move (no `MOUSEEVENTF_ABSOLUTE`
+/// flag). Games read camera deltas via raw input (`WM_INPUT` /
+/// `GetRawInputData`), not the absolute cursor position, so this is both
+/// correct and optimal: one `SendInput` call, zero extra syscalls.
 fn inject_mouse_move_rel(payload: &[u8]) {
     if payload.len() < 12 {
         return;
     }
     let dx = i16::from_be_bytes([payload[8], payload[9]]) as i32;
     let dy = i16::from_be_bytes([payload[10], payload[11]]) as i32;
-
-    let mut pos = POINT::default();
-    if unsafe { GetCursorPos(&mut pos) }.is_err() {
+    if dx == 0 && dy == 0 {
         return;
     }
-
-    let (origin_x, origin_y, capture_w, capture_h) = active_capture_rect();
-    if capture_w <= 0 || capture_h <= 0 {
-        return;
-    }
-
-    let new_x = (pos.x + dx).clamp(origin_x, origin_x + capture_w - 1);
-    let new_y = (pos.y + dy).clamp(origin_y, origin_y + capture_h - 1);
-
-    let Some((nx, ny)) = virtual_desktop_to_absolute(new_x as f64, new_y as f64) else {
-        return;
-    };
-
     send_mouse_input(MOUSEINPUT {
-        dx: nx,
-        dy: ny,
+        dx,
+        dy,
         mouseData: 0,
-        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        dwFlags: MOUSEEVENTF_MOVE,
         time: 0,
         dwExtraInfo: 0,
     });
