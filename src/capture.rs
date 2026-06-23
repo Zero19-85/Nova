@@ -318,7 +318,18 @@ impl WgcCapturer {
                 Some(&mut device),
                 None,
                 None,
-            )?;
+            ).map_err(|e| {
+                println!(
+                    "[Capture] ❌ D3D11CreateDevice FAILED: HRESULT=0x{:08X}  {:?}\n\
+                     [Capture]    Common causes in a Windows Service:\n\
+                     [Capture]      0x887A0004 = DXGI_ERROR_DEVICE_REMOVED (GPU reset/TDR)\n\
+                     [Capture]      0x80004005 = E_FAIL (no GPU visible from Session 0)\n\
+                     [Capture]      0x80070005 = E_ACCESSDENIED (Session 0 GPU isolation)\n\
+                     [Capture]    Nova must run as the logged-on user, not as a SYSTEM service.",
+                    e.code().0 as u32, e
+                );
+                e
+            })?;
             Ok(device.unwrap())
         }
     }

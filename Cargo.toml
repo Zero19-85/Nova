@@ -71,10 +71,12 @@ windows = { version = "0.58", features = [
     # System tray + balloon notifications
     "Win32_UI_Shell",
     "Win32_System_LibraryLoader",
-    # Windows Service installation (--install / --uninstall)
-    "Win32_System_Services",
+    # DPI awareness: SetProcessDpiAwarenessContext (belt-and-suspenders alongside manifest)
+    "Win32_UI_HiDpi",
+    # File logger: CreateFileW for the log file, SetStdHandle to redirect println!
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
 ] }
-windows-service = "0.7"
 # System tray icon + native right-click context menu (handles all Win32 quirks
 # — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).
 tray-icon = "0.14"

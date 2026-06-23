@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+  <!-- ── UAC: require admin token ─────────────────────────────────────────── -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -7,4 +9,32 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
+
+  <!-- ── DPI awareness ────────────────────────────────────────────────────── -->
+  <!--
+    Without this, Windows applies DPI virtualisation to the process.  On a
+    4K display set to 200% scaling the OS lies to GetMonitorInfoW and DXGI,
+    reporting a "logical" resolution of 1920×1080.  The WGC frame pool is
+    therefore created at 1920×1080, but the NVENC encoder is initialised at
+    the true 3840×2160 — the captured frame fills only the top-left quarter
+    of the encode buffer; the remainder is uninitialised memory, producing
+    exactly the "top-right smear / bottom-half green" artefact.
+
+    Per-Monitor V2 (Windows 10 1703+) tells every display API to return the
+    true physical pixel count, making WGC, DXGI, and GetMonitorInfoW all
+    agree on the real resolution.
+
+    Two elements are required for full coverage:
+      • dpiAware        — legacy Win 8.1 / GDI path (value "true/pm")
+      • dpiAwareness    — Win 10 1607+ path; takes precedence over dpiAware
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware
+        xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness
+        xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
 </assembly>

@@ -4,11 +4,85 @@
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <io.h>       // _open_osfhandle, _dup2, _close
+#include <fcntl.h>    // _O_APPEND, _O_TEXT
 #include <vector>
 #include <atomic>
 
 #include "nvEncodeAPI.h"
 #include "NvEncoderD3D11.h"
+
+// ==================== SHIM FILE LOGGER ====================
+// Writes to the same nova.log as the Rust side.
+// Called by InitShimLog() which is the first shim function invoked from Rust.
+
+static HANDLE g_logFile = INVALID_HANDLE_VALUE;
+
+// ShimLog: write a formatted message to the log file AND to CRT stdout.
+// Use this instead of ShimLog() everywhere in this file.
+static void ShimLog(const char* fmt, ...) {
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, (int)sizeof(buf) - 2, fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+    if (n >= (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 2;
+    // Ensure the buffer ends with a newline so log lines don't merge.
+    if (buf[n - 1] != '\n') { buf[n++] = '\n'; buf[n] = '\0'; }
+
+    // Win32 WriteFile — works regardless of CRT stdio state, never buffered.
+    if (g_logFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(g_logFile, buf, (DWORD)n, &written, nullptr);
+    }
+    // Also write to CRT stdout (visible in `cargo run`, no-op in service).
+    fwrite(buf, 1, (size_t)n, stdout);
+    fflush(stdout);
+}
+
+// Called from Rust (encoder.rs::init_shim_log) before any other shim function.
+// Opens nova.log and redirects the CRT's fd 1 / fd 2 so that any legacy
+// ShimLog() calls we haven't yet converted also land in the log file.
+extern "C" __declspec(dllexport) void InitShimLog(const wchar_t* log_path) {
+    if (!log_path) return;
+
+    g_logFile = CreateFileW(
+        log_path,
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (g_logFile == INVALID_HANDLE_VALUE) {
+        // Can't open the file — fall back to stdout only (useful in cargo run).
+        return;
+    }
+
+    // Redirect the Win32 stdout/stderr handles so Rust's println! (which
+    // already called SetStdHandle) and our own WriteFile share the same file.
+    SetStdHandle(STD_OUTPUT_HANDLE, g_logFile);
+    SetStdHandle(STD_ERROR_HANDLE,  g_logFile);
+
+    // Also redirect CRT file descriptors 1 (stdout) and 2 (stderr) so any
+    // remaining ShimLog() calls in this DLL land in the log file too.
+    int fd = _open_osfhandle((intptr_t)g_logFile, _O_APPEND | _O_TEXT);
+    if (fd >= 0) {
+        _dup2(fd, 1);
+        _dup2(fd, 2);
+        _close(fd);
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+
+    ShimLog("[Shim] InitShimLog: logging active → %S", log_path);
+    ShimLog("[Shim] nova_shim.dll loaded in PID %lu  Session %lu",
+        GetCurrentProcessId(), WTSGetActiveConsoleSessionId());
+}
 
 // ==================== VIDEO PROCESSOR GLOBALS ====================
 static ID3D11VideoDevice*              g_videoDevice   = nullptr;
@@ -297,7 +371,7 @@ static bool InitCursorPipeline(ID3D11Device* device) {
                              "main_vs", "vs_5_0", 0, 0, &vsBlob, &errBlob);
     if (FAILED(hr)) {
         if (errBlob) {
-            printf("❌ Cursor VS compile error: %s\n", (char*)errBlob->GetBufferPointer());
+            ShimLog("❌ Cursor VS compile error: %s\n", (char*)errBlob->GetBufferPointer());
             errBlob->Release();
         }
         return false;
@@ -310,7 +384,7 @@ static bool InitCursorPipeline(ID3D11Device* device) {
                      "main_ps", "ps_5_0", 0, 0, &psBlob, &errBlob);
     if (FAILED(hr)) {
         if (errBlob) {
-            printf("❌ Cursor PS compile error: %s\n", (char*)errBlob->GetBufferPointer());
+            ShimLog("❌ Cursor PS compile error: %s\n", (char*)errBlob->GetBufferPointer());
             errBlob->Release();
         }
         return false;
@@ -351,7 +425,7 @@ static bool InitCursorPipeline(ID3D11Device* device) {
     hr = device->CreateSamplerState(&sdesc, &g_cursorSampler);
     if (FAILED(hr)) return false;
 
-    printf("✅ Cursor compositing pipeline initialized\n");
+    ShimLog("✅ Cursor compositing pipeline initialized\n");
     return true;
 }
 
@@ -728,13 +802,28 @@ static void BuildHdrMetadata() {
 // ==================== INIT COLOR CONVERSION ====================
 extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height, bool is_hdr, int fps) {
     g_isHdr = is_hdr;
-    if (!device || !g_context) return -1;
+    if (!device || !g_context) {
+        ShimLog("❌ InitColorConversion: device=%p context=%p — null pointer (Session 0 D3D11 failure?)\n",
+            device, g_context);
+        return -1;
+    }
+
+    ShimLog("🔧 InitColorConversion: %dx%d  is_hdr=%d  fps=%d\n", width, height, (int)is_hdr, fps);
 
     HRESULT hr = device->QueryInterface(__uuidof(ID3D11VideoDevice), (void**)&g_videoDevice);
-    if (FAILED(hr)) return -2;
+    if (FAILED(hr)) {
+        ShimLog("❌ QueryInterface(ID3D11VideoDevice) FAILED: HRESULT=0x%08X\n"
+                "   In Session 0 the D3D11 video device is often unavailable.\n"
+                "   Nova must run as the logged-on user, not as a SYSTEM service.\n",
+                (unsigned)hr);
+        return -2;
+    }
 
     hr = g_context->QueryInterface(__uuidof(ID3D11VideoContext), (void**)&g_videoContext);
-    if (FAILED(hr)) return -3;
+    if (FAILED(hr)) {
+        ShimLog("❌ QueryInterface(ID3D11VideoContext) FAILED: HRESULT=0x%08X\n", (unsigned)hr);
+        return -3;
+    }
 
     // Zero-copy handoff: rather than converting BGRA -> NV12 into our own
     // texture and then CopyResource-ing that into NVENC's input buffer, point
@@ -759,11 +848,11 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
         nvencInputTex->GetDesc(&nvencDesc);
         DXGI_FORMAT expectedFmt = is_hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
         if (nvencDesc.Format == expectedFmt) {
-            printf("✅ NVENC input texture: %dx%d format=0x%X (%s) — correct\n",
+            ShimLog("✅ NVENC input texture: %dx%d format=0x%X (%s) — correct\n",
                 nvencDesc.Width, nvencDesc.Height, (unsigned)nvencDesc.Format,
                 is_hdr ? "YUV420_10BIT/P010" : "NV12");
         } else {
-            printf("❌ NVENC input texture format MISMATCH: got=0x%X expected=0x%X "
+            ShimLog("❌ NVENC input texture format MISMATCH: got=0x%X expected=0x%X "
                    "(%s) — image will be corrupted!\n",
                    (unsigned)nvencDesc.Format, (unsigned)expectedFmt,
                    is_hdr ? "wanted P010=0x68" : "wanted NV12=103");
@@ -784,10 +873,20 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     contentDesc.Usage                       = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
     hr = g_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &g_vpEnum);
-    if (FAILED(hr)) return -5;
+    if (FAILED(hr)) {
+        ShimLog("❌ CreateVideoProcessorEnumerator FAILED: HRESULT=0x%08X\n"
+                "   This commonly fails in Windows Session 0 (service account without GPU access).\n"
+                "   Error 0x887A0004 = DXGI_ERROR_DEVICE_REMOVED  "
+                "   0x80070005 = E_ACCESSDENIED (Session 0)\n",
+                (unsigned)hr);
+        return -5;
+    }
 
     hr = g_videoDevice->CreateVideoProcessor(g_vpEnum, 0, &g_vp);
-    if (FAILED(hr)) return -6;
+    if (FAILED(hr)) {
+        ShimLog("❌ CreateVideoProcessor FAILED: HRESULT=0x%08X\n", (unsigned)hr);
+        return -6;
+    }
 
     // HDR: CS writes directly into g_hdrP010Tex; CopyResource feeds NVENC. VP is unused.
     // SDR: VP output view on NVENC's NV12 texture — VideoProcessorBlt writes here zero-copy.
@@ -808,7 +907,7 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
                                    nullptr, nullptr, nullptr,
                                    entry, profile, 0, 0, out, &err);
             if (FAILED(h)) {
-                if (err) { printf("❌ Shader %s error: %s\n", entry,
+                if (err) { ShimLog("❌ Shader %s error: %s\n", entry,
                                   (char*)err->GetBufferPointer()); err->Release(); }
                 return false;
             }
@@ -835,9 +934,9 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
                                       hdrYBlob->GetBufferSize(), nullptr, &g_hdrYPS);
             device->CreatePixelShader(hdrUVBlob->GetBufferPointer(),
                                       hdrUVBlob->GetBufferSize(), nullptr, &g_hdrUVPS);
-            printf("✅ YUV conversion shaders compiled (SDR: BT.709 lim-range; HDR: BT.2020 PQ full-range)\n");
+            ShimLog("✅ YUV conversion shaders compiled (SDR: BT.709 lim-range; HDR: BT.2020 PQ full-range)\n");
         } else {
-            printf("❌ YUV shader compilation failed — video output will be corrupted\n");
+            ShimLog("❌ YUV shader compilation failed — video output will be corrupted\n");
         }
         if (vsBlob)    vsBlob->Release();
         if (sdrYBlob)  sdrYBlob->Release();
@@ -859,13 +958,13 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
 
         rtvDesc.Format = DXGI_FORMAT_R8_UNORM;   // Y plane
         hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_nv12YRtv);
-        if (FAILED(hr)) { printf("❌ NV12 Y RTV failed: 0x%08X\n", (unsigned)hr); return -10; }
+        if (FAILED(hr)) { ShimLog("❌ NV12 Y RTV failed: 0x%08X\n", (unsigned)hr); return -10; }
 
         rtvDesc.Format = DXGI_FORMAT_R8G8_UNORM; // UV plane
         hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_nv12UVRtv);
-        if (FAILED(hr)) { printf("❌ NV12 UV RTV failed: 0x%08X\n", (unsigned)hr); return -11; }
+        if (FAILED(hr)) { ShimLog("❌ NV12 UV RTV failed: 0x%08X\n", (unsigned)hr); return -11; }
 
-        printf("✅ NV12 typed RTVs created (R8_UNORM Y, R8G8_UNORM UV) — Apollo-style SDR path\n");
+        ShimLog("✅ NV12 typed RTVs created (R8_UNORM Y, R8G8_UNORM UV) — Apollo-style SDR path\n");
     }
 
     // ── Create P010 typed RTVs directly on the NVENC input texture (HDR) ───────
@@ -885,18 +984,18 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
 
         rtvDesc.Format = DXGI_FORMAT_R16_UNORM;    // plane 0 → Y
         hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_p010YRtv);
-        if (FAILED(hr)) { printf("❌ P010 Y RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -12; }
+        if (FAILED(hr)) { ShimLog("❌ P010 Y RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -12; }
 
         rtvDesc.Format = DXGI_FORMAT_R16G16_UNORM; // plane 1 → UV
         hr = device->CreateRenderTargetView(nvencInputTex, &rtvDesc, &g_p010UVRtv);
-        if (FAILED(hr)) { printf("❌ P010 UV RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -13; }
+        if (FAILED(hr)) { ShimLog("❌ P010 UV RTV on NVENC tex failed: 0x%08X\n", (unsigned)hr); return -13; }
 
-        printf("✅ P010 RTVs created directly on NVENC input tex (%dx%d) — no intermediate, no CopyResource\n",
+        ShimLog("✅ P010 RTVs created directly on NVENC input tex (%dx%d) — no intermediate, no CopyResource\n",
                width, height);
     }
 
     if (!InitCursorPipeline(device)) {
-        printf("⚠️  Cursor compositing pipeline failed to initialize — stream will have no cursor\n");
+        ShimLog("⚠️  Cursor compositing pipeline failed to initialize — stream will have no cursor\n");
     }
 
     return 0;
@@ -905,14 +1004,51 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
 // ==================== OPEN + INIT ====================
 extern "C" __declspec(dllexport) int OpenNvEncSession(void* d3d11_device, void** out_encoder) {
     if (!d3d11_device || !out_encoder) return -1;
-    // Disable C stdout buffering so shim printf appears immediately in the
-    // redirected log file even when Stop-Process -Force is used to kill the
-    // server (Force skips CRT flush, losing any pending buffered output).
+
+    // Unbuffer CRT stdout so ShimLog output appears in the log immediately
+    // even if the process is killed without a clean CRT shutdown.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // ── Session 0 diagnostic ──────────────────────────────────────────────────
+    // D3D11CreateDevice itself succeeds in Session 0, but DXGI output
+    // duplication, the D3D11 Video Processor, and Windows Graphics Capture
+    // all require an interactive session.  Log session info up front so
+    // the log tells us immediately whether we're in the wrong session.
+    DWORD session = WTSGetActiveConsoleSessionId();
+    DWORD current = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &current);
+    ShimLog("[Shim] OpenNvEncSession  PID=%lu  CurrentSession=%lu  ActiveConsoleSession=%lu\n",
+        GetCurrentProcessId(), current, session);
+    if (current == 0) {
+        ShimLog("[Shim] ⚠️  Running in Session 0 (Windows Service isolation).\n"
+                "[Shim]    DXGI Desktop Duplication and the D3D11 Video Processor are NOT\n"
+                "[Shim]    available from Session 0 — expect green/smeared frames.\n"
+                "[Shim]    Fix: run Nova as the logged-on user (Task Scheduler / tray app)\n"
+                "[Shim]    rather than as a SYSTEM service, or use a session-migration shim.\n");
+    }
+
     g_device = (ID3D11Device*)d3d11_device;
     g_device->AddRef();
     g_device->GetImmediateContext(&g_context);
-    printf("✅ NVENC SESSION OPENED\n");
+
+    // Log the DXGI adapter name so we know which GPU is being used.
+    {
+        IDXGIDevice* dxgiDev = nullptr;
+        if (SUCCEEDED(g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev))) {
+            IDXGIAdapter* adapter = nullptr;
+            if (SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+                DXGI_ADAPTER_DESC desc = {};
+                if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                    ShimLog("[Shim] D3D11 GPU adapter: %S  (VRAM: %zu MB)\n",
+                        desc.Description, desc.DedicatedVideoMemory / (1024*1024));
+                }
+                adapter->Release();
+            }
+            dxgiDev->Release();
+        }
+    }
+
+    ShimLog("✅ NVENC SESSION OPENED\n");
     *out_encoder = g_device;
     return 0;
 }
@@ -935,7 +1071,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
     }
     g_isHdr = is_hdr;
 
-    printf("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
+    ShimLog("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
            codec, is_hdr ? "/HDR10" : "", width, height, bitrate_kbps, fps);
 
     try {
@@ -946,7 +1082,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
         // SDR: NV12 — VP still handles BGRA8→NV12 via VideoProcessorBlt.
         NV_ENC_BUFFER_FORMAT bufFmt = is_hdr ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
                                              : NV_ENC_BUFFER_FORMAT_NV12;
-        printf("ℹ️  NVENC buffer format: %s (bufFmt=%u) — AllocateInputBuffers will create "
+        ShimLog("ℹ️  NVENC buffer format: %s (bufFmt=%u) — AllocateInputBuffers will create "
                "DXGI_FORMAT_%s texture\n",
                is_hdr ? "YUV420_10BIT" : "NV12", (unsigned)bufFmt,
                is_hdr ? "P010 (0x68)" : "NV12 (103)");
@@ -1080,7 +1216,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.intraRefreshCnt    = 10;
         }
 
-        printf("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
+        ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
                encodeConfig.rcParams.averageBitRate,
                encodeConfig.rcParams.vbvBufferSize);
 
@@ -1088,7 +1224,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         if (is_hdr) BuildHdrMetadata();
 
-        printf("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
+        ShimLog("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
                codec, is_hdr ? "/HDR10/Main10" : "", width, height, bitrate_kbps, fps);
         // Single-line codec summary so the operator can instantly confirm
         // which pipeline is running without parsing the full init log.
@@ -1097,11 +1233,11 @@ extern "C" __declspec(dllexport) int InitEncoder(
             (g_encoderCodec == 1)            ? "HEVC (H.265) - 8-bit SDR"   :
             (g_encoderCodec == 2)            ? "AV1"                         :
                                                "H.264 - 8-bit SDR";
-        printf("[NVENC] Initialized Codec: %s\n", codec_label);
+        ShimLog("[NVENC] Initialized Codec: %s\n", codec_label);
         return 0;
     }
     catch (const std::exception& e) {
-        printf("❌ InitEncoder failed: %s\n", e.what());
+        ShimLog("❌ InitEncoder failed: %s\n", e.what());
         return -1;
     }
 }
@@ -1181,14 +1317,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         // Replaces the CS+UAV path whose R16_UNORM typed-UAV-store support is optional
         // and silently produces zeros (green screen) when unsupported by the driver.
         if (!g_p010YRtv || !g_p010UVRtv) {
-            printf("⚠️  HDR P010 RTVs not ready — frame dropped\n");
+            ShimLog("⚠️  HDR P010 RTVs not ready — frame dropped\n");
             return 0;
         }
 
         // Per-frame SRV on the FP16 composite texture.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         if (FAILED(g_device->CreateShaderResourceView(g_compositeTex, nullptr, &srcSRV))) {
-            printf("❌ HDR: CreateShaderResourceView on FP16 composite failed\n");
+            ShimLog("❌ HDR: CreateShaderResourceView on FP16 composite failed\n");
             return 0;
         }
 
@@ -1232,14 +1368,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         // Two passes: Y plane (full resolution) then UV plane (half resolution).
         // Replacing VideoProcessorBlt which silently misproduces NV12 on some drivers.
         if (!g_yuvVS || !g_sdrYPS || !g_sdrUVPS || !g_nv12YRtv || !g_nv12UVRtv) {
-            printf("⚠️  SDR shader/RTV not ready — frame dropped\n");
+            ShimLog("⚠️  SDR shader/RTV not ready — frame dropped\n");
             return 0;
         }
 
         // Create an SRV on the BGRA8 composite texture for the pixel shaders to sample.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         if (FAILED(g_device->CreateShaderResourceView(vpSourceTexture, nullptr, &srcSRV))) {
-            printf("⚠️  SDR: CreateShaderResourceView failed — frame dropped\n");
+            ShimLog("⚠️  SDR: CreateShaderResourceView failed — frame dropped\n");
             return 0;
         }
 
@@ -1340,11 +1476,11 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
     try {
         g_nvEncoder->Reconfigure(&rp);
     } catch (const std::exception& e) {
-        printf("❌ ReconfigureBitrate failed: %s\n", e.what());
+        ShimLog("❌ ReconfigureBitrate failed: %s\n", e.what());
         return -2;
     }
 
-    printf("📊 NVENC reconfigured: CBR bitrate=%u fps=%u vbvBufferSize=%u (client-negotiated)\n",
+    ShimLog("📊 NVENC reconfigured: CBR bitrate=%u fps=%u vbvBufferSize=%u (client-negotiated)\n",
            g_encConfig.rcParams.averageBitRate, (uint32_t)fps, g_encConfig.rcParams.vbvBufferSize);
     return 0;
 }
@@ -1409,7 +1545,7 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_context) { g_context->Release(); g_context = nullptr; }
     if (g_device)  { g_device->Release();  g_device  = nullptr; }
 
-    printf("✅ Cleanup complete.\n");
+    ShimLog("✅ Cleanup complete.\n");
     // Reset per-session state so the next InitEncoder always starts from a
     // known-zero baseline — prevents stale g_isHdr from leaking across
     // reconnects when CleanupEncoder is called without a matching InitEncoder.

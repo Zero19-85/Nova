@@ -2,7 +2,7 @@ mod app_launcher;
 mod audio;
 mod capture;
 mod control;
-mod debug;
+pub mod debug; // pub so nova-server binary can call init_debug_logger() during --install/--uninstall
 mod encoder;
 mod input;
 mod pairing;
@@ -105,7 +105,22 @@ fn rebind_capture_and_encoder(
 }
 
 pub async fn run() -> Result<()> {
+    // ── File logging: must be first so all subsequent println! go to nova.log ─
     debug::init_debug_logger();
+
+    // Tell the C++ shim where to write its own log output.  The shim opens the
+    // file independently (CRT file descriptors don't follow SetStdHandle) and
+    // also _dup2's the CRT stdout/stderr so any stray printf() lands there too.
+    {
+        let wide = debug::log_path_wide();
+        encoder::init_shim_log(wide.as_ptr());
+    }
+
+    // Log which nova_shim.dll is actually on disk / in the search path.
+    // "half-green / half-smeared" service output means a stale DLL or Session 0
+    // D3D11 failure — this line makes the root cause visible immediately.
+    debug::log_shim_dll_path();
+
     // If a previous run was killed/closed without restoring the default audio
     // device, fix that up before anything else (host would otherwise stay
     // silent with no client connected).

@@ -2,6 +2,10 @@ use std::ffi::{c_void, CString};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 extern "C" {
+    /// Tell the C++ shim where to write its log output.  Must be called before
+    /// any other shim function so that D3D11/NVENC init errors are captured.
+    fn InitShimLog(log_path: *const u16);
+
     fn OpenNvEncSession(d3d11_device: *mut c_void, out_encoder: *mut *mut c_void) -> i32;
     fn InitEncoder(
         encoder: *mut c_void,
@@ -34,6 +38,13 @@ extern "C" {
         pitch: u32,
     ) -> i32;
     fn UpdateCursorPosition(x: i32, y: i32, visible: i32);
+}
+
+/// Pass the log file path (UTF-16, null-terminated) to the C++ shim so that
+/// `ShimLog()` writes to the same `nova.log` as the Rust side.  Call this
+/// immediately after `debug::init_debug_logger()`, before `Encoder::new()`.
+pub fn init_shim_log(log_path_wide: *const u16) {
+    unsafe { InitShimLog(log_path_wide); }
 }
 
 /// Upload a new cursor shape (DXGI MONOCHROME/COLOR/MASKED_COLOR raw shape
