@@ -477,7 +477,19 @@ pub async fn run() -> Result<()> {
                     // Derive codec from /launch videoFormat BEFORE rebind so the
                     // encoder is recreated at the right codec (H264/HEVC/AV1) for
                     // this session, not the CLI startup default.
-                    let negotiated_codec = encoder::Codec::from_video_format(video_format);
+                    let negotiated_codec = {
+                        let raw = encoder::Codec::from_video_format(video_format);
+                        // HDR10 requires HEVC Main10 — H.264 has no HDR10 profile.
+                        // videoFormat=0 (not specified) defaults to H264, but if the
+                        // client also set hdrMode=1 the codec must be HEVC or the VDD
+                        // FP16 surface feeds the wrong VP path and NVENC encodes garbage.
+                        if hdr_req && raw == encoder::Codec::H264 {
+                            println!("🎨 HDR requested at pre-activation — overriding H.264 → HEVC Main10 (H.264 has no HDR10 profile)");
+                            encoder::Codec::Hevc
+                        } else {
+                            raw
+                        }
+                    };
                     if negotiated_codec != enc.config.codec {
                         println!("🎥 Codec selected by client: {} (videoFormat={:#x}) — switching encoder",
                             negotiated_codec.as_str(), video_format);
@@ -601,13 +613,31 @@ pub async fn run() -> Result<()> {
                         // set by moonlight-common-c based on (client caps ∩ server
                         // ServerCodecModeSupport) and is the authoritative codec for
                         // the wire stream regardless of protocol version.
-                        let negotiated_codec = if client.video_format != 0 {
-                            encoder::Codec::from_video_format(client.video_format)
-                        } else {
-                            match client.bit_stream_format {
-                                1 => encoder::Codec::Hevc,
-                                2 => encoder::Codec::Av1,
-                                _ => encoder::Codec::H264,
+                        let negotiated_codec = {
+                            let raw = if client.video_format != 0 {
+                                encoder::Codec::from_video_format(client.video_format)
+                            } else {
+                                match client.bit_stream_format {
+                                    1 => encoder::Codec::Hevc,
+                                    2 => encoder::Codec::Av1,
+                                    _ => encoder::Codec::H264,
+                                }
+                            };
+                            // HDR10 requires HEVC Main10. If HDR was requested (either via
+                            // /launch hdrMode=1 or confirmed by the client's ANNOUNCE
+                            // dynamicRangeMode=1) but codec negotiation landed on H.264,
+                            // override to HEVC. H.264 has no HDR10/Main10 profile — sending
+                            // P010 FP16-sourced frames to an H.264 encoder produces corrupt
+                            // output and a guaranteed 10-second watchdog timeout on the client.
+                            if (client.hdr_requested || client.dynamic_range_mode == 1)
+                                && raw == encoder::Codec::H264
+                            {
+                                println!("🎨 HDR active — overriding H.264 → HEVC Main10 \
+                                    (videoFormat={:#x} bitStreamFormat={} dynamicRangeMode={})",
+                                    client.video_format, client.bit_stream_format, client.dynamic_range_mode);
+                                encoder::Codec::Hevc
+                            } else {
+                                raw
                             }
                         };
                         let bsf_name = match client.bit_stream_format { 1=>"HEVC", 2=>"AV1", _=>"H264" };

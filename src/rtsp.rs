@@ -372,12 +372,21 @@ fn handle_message(
     let response = match method.as_str() {
         "OPTIONS"  => resp_options(cseq),
         "DESCRIBE" => {
-            // /launch sets hdr_requested before RTSP begins, so we can already
-            // tell the client which decoder surface type to allocate.
+            // Use both hdr_requested (/launch hdrMode=1) AND dynamic_range_mode
+            // (persisted from a previous ANNOUNCE in reconnect scenarios) so the
+            // DESCRIBE surface-allocation hint is always accurate.
+            //
+            // hdr_requested: set by /launch before RTSP starts — primary source.
+            // dynamic_range_mode: persists from a prior ANNOUNCE in the same
+            //   client_info slot; covers reconnect paths where /launch isn't
+            //   re-issued but the client still expects an HDR decoder surface.
             let is_hdr = client_info.lock().unwrap()
                 .as_ref()
-                .map(|info| info.hdr_requested)
+                .map(|info| info.hdr_requested || info.dynamic_range_mode == 1)
                 .unwrap_or(false);
+            if is_hdr {
+                println!("   ↳ DESCRIBE: advertising dynamicRangeMode=1 (HDR10 decoder surface)");
+            }
             resp_describe(cseq, is_hdr)
         }
         "SETUP" => {

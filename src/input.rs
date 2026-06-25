@@ -226,24 +226,112 @@ fn manager() -> &'static Mutex<Option<GamepadManager>> {
     MANAGER.get_or_init(|| Mutex::new(None))
 }
 
-/// Connect to ViGEmBus for a new streaming session. Safe to call even if
-/// ViGEmBus isn't installed — logs a warning and leaves gamepad passthrough
-/// disabled for the session rather than failing the stream.
+/// Pinned ViGEmBus release used by the auto-installer. Locked to v1.22.0.0 —
+/// the last stable release compatible with vigem-client 0.3.x. Update when
+/// bumping the vigem-client crate version.
+const VIGEMBUS_MSI_URL: &str =
+    "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0.0/ViGEmBusSetup_x64.msi";
+
+/// Downloads and silently installs the ViGEmBus kernel driver MSI.
+/// Nova runs with `requireAdministrator` in its manifest, so the spawned
+/// `msiexec` child process inherits the elevated token — no UAC prompt.
+/// The MSI is downloaded to the system TEMP directory and removed after install.
+fn auto_install_vigembus() -> Result<(), String> {
+    let msi_path = std::env::temp_dir().join("ViGEmBusSetup_x64.msi");
+
+    let ps_download = format!(
+        "$ProgressPreference='SilentlyContinue'; \
+         Invoke-WebRequest -Uri '{url}' -OutFile '{out}' -UseBasicParsing",
+        url = VIGEMBUS_MSI_URL,
+        out = msi_path.display(),
+    );
+    println!("📦 Downloading ViGEmBus from {VIGEMBUS_MSI_URL}");
+    let dl = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_download])
+        .status()
+        .map_err(|e| format!("PowerShell spawn failed: {e}"))?;
+    if !dl.success() {
+        return Err(format!("ViGEmBus download failed (powershell exit {:?})", dl.code()));
+    }
+    if !msi_path.exists() {
+        return Err(format!("MSI not found at {} after download", msi_path.display()));
+    }
+
+    println!("🔧 Installing ViGEmBus silently (msiexec /qn /norestart)…");
+    let install = std::process::Command::new("msiexec")
+        .args(["/i", &msi_path.to_string_lossy(), "/qn", "/norestart"])
+        .status()
+        .map_err(|e| format!("msiexec spawn failed: {e}"))?;
+
+    let _ = std::fs::remove_file(&msi_path);
+
+    if install.success() {
+        println!("✅ ViGEmBus installed successfully");
+        Ok(())
+    } else {
+        Err(format!(
+            "msiexec exited {:?} — try installing manually from https://github.com/nefarius/ViGEmBus/releases",
+            install.code()
+        ))
+    }
+}
+
+/// Connect to ViGEmBus for a new streaming session.
+///
+/// On `BusNotFound` (driver not installed), spawns a background thread to
+/// download and silently install the official ViGEmBus MSI. The current
+/// session proceeds without gamepad support; controller passthrough is
+/// available automatically on the next client connection. This keeps the
+/// streaming startup path non-blocking — the download (≈3 MB) and MSI
+/// install run entirely off the capture / network threads.
 pub fn start_session() {
-    let mut guard = manager().lock().unwrap();
-    if guard.is_some() {
-        return;
-    }
-    match GamepadManager::connect() {
-        Ok(m) => {
-            println!("🎮 ViGEm: connected to ViGEmBus — gamepad passthrough enabled");
-            *guard = Some(m);
+    {
+        let mut guard = manager().lock().unwrap();
+        if guard.is_some() {
+            return;
         }
-        Err(e) => {
-            println!("⚠️  ViGEm: could not connect to ViGEmBus ({:?}) — gamepad passthrough disabled. \
-                Install the ViGEmBus driver (https://github.com/ViGEm/ViGEmBus) to enable split-seat controller support.", e);
+        match GamepadManager::connect() {
+            Ok(m) => {
+                println!("🎮 ViGEm: connected to ViGEmBus — gamepad passthrough enabled");
+                *guard = Some(m);
+                return;
+            }
+            Err(vigem_client::Error::BusNotFound) => {
+                println!("⚠️  ViGEm: ViGEmBus driver not found — \
+                    launching background installer (gamepad passthrough \
+                    will be active on the next client connection)");
+                // guard is intentionally dropped here so the background
+                // thread can re-acquire it after the install completes.
+            }
+            Err(e) => {
+                println!("⚠️  ViGEm: could not connect to ViGEmBus ({e:?}) — gamepad passthrough disabled. \
+                    Install the ViGEmBus driver (https://github.com/ViGEm/ViGEmBus) to enable split-seat controller support.");
+                return;
+            }
         }
-    }
+    } // lock released before background thread starts
+
+    std::thread::spawn(|| {
+        match auto_install_vigembus() {
+            Ok(()) => {
+                // Brief settle: the ViGEmBus kernel service starts
+                // asynchronously after the MSI completes.
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let mut guard = manager().lock().unwrap();
+                if guard.is_none() {
+                    match GamepadManager::connect() {
+                        Ok(m) => {
+                            println!("🎮 ViGEm: connected after auto-install — \
+                                gamepad passthrough ready for next session");
+                            *guard = Some(m);
+                        }
+                        Err(e) => println!("⚠️  ViGEm: still could not connect after install ({e:?})"),
+                    }
+                }
+            }
+            Err(e) => println!("⚠️  ViGEmBus auto-install failed: {e}"),
+        }
+    });
 }
 
 /// Unplug any virtual controllers and drop the ViGEmBus connection at the
