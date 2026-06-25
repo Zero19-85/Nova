@@ -1424,12 +1424,25 @@ impl VirtualDisplay {
 
         let mut error: Option<String> = None;
 
-        // Disable Advanced Color before restoring topology — the VDD is still
-        // the active primary here, so the target id is still valid. After
-        // restore_topology the path is gone and the call would fail.
-        if let Err(e) = self.set_active_display_hdr(false) {
-            // Non-fatal: log and continue; it only matters if HDR was enabled.
-            println!("⚠️  Could not disable Advanced Color on stream end: {e}");
+        // Force-disable Advanced Color unconditionally before restoring topology.
+        // Must happen while the VDD is still the active primary — after
+        // restore_topology the CCD path is deactivated and find_target_for_device_name
+        // returns an error. The idempotency guard in set_active_display_hdr is
+        // deliberately bypassed here: Windows auto-enables Advanced Color when
+        // the VDD devnode comes online (HDRPlus=true in EDID), so the guarded path
+        // may believe it is "already disabled" while the display pipeline is still
+        // in FP16 mode. Calling set_advanced_color_raw directly guarantees that
+        // the VDD reverts to BGRA8 SDR regardless of cached state.
+        if let Some(device_name) = self.active_device_name.as_deref() {
+            match Self::find_target_for_device_name(device_name) {
+                Ok((adapter_id, target_id)) => {
+                    match Self::set_advanced_color_raw(adapter_id, target_id, false) {
+                        Ok(()) => println!("🎨 Advanced Color force-disabled — VDD returning to SDR baseline"),
+                        Err(e) => println!("⚠️  Advanced Color force-disable on teardown ({device_name}): {e}"),
+                    }
+                }
+                Err(e) => println!("⚠️  Advanced Color teardown: cannot locate VDD target ({e}) — continuing"),
+            }
         }
 
         if let Some(saved) = self.saved_topology.take() {

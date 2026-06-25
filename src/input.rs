@@ -210,6 +210,16 @@ impl GamepadManager {
     }
 }
 
+impl Drop for GamepadManager {
+    fn drop(&mut self) {
+        // Safety net for any code path that drops GamepadManager without calling
+        // unplug_all() explicitly — e.g. a panic between start_session and
+        // stop_session. unplug_all() is idempotent (checks slot.plugged) so
+        // calling it here after an explicit stop_session is a no-op.
+        self.unplug_all();
+    }
+}
+
 static MANAGER: OnceLock<Mutex<Option<GamepadManager>>> = OnceLock::new();
 
 fn manager() -> &'static Mutex<Option<GamepadManager>> {
