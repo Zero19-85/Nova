@@ -1201,11 +1201,76 @@ impl VirtualDisplay {
             println!("⚠️  Root\\MttVDD enabled but never appeared in GDI enumeration — cannot isolate it at boot");
             return;
         };
-        match Self::ccd_deactivate_vdd_path(virtual_device) {
-            Ok(true)  => println!("✅ {virtual_device} already dormant at boot — no isolation needed"),
-            Ok(false) => println!("🕶️  {virtual_device} removed from active CCD topology — dormant until a stream activates it"),
-            Err(e)    => println!("⚠️  Failed to isolate {virtual_device} at boot: {e}"),
+        // Preferred path: deactivate VDD AND restore physical primary position
+        // in a single SetDisplayConfig call. On a fresh install (devcon just
+        // activated the driver) Windows may assign the VDD to (0,0) and displace
+        // the physical monitor to (1920,0). ccd_deactivate_vdd_path only clears
+        // the ACTIVE flag — without also zeroing the physical source position the
+        // physical monitor stays at the non-zero offset and GDI treats it as
+        // non-primary, causing the "primary becomes secondary on install" bug.
+        match Self::ccd_isolate_vdd_and_restore_primary(virtual_device) {
+            Ok(()) => println!("🖥️  {virtual_device} dormant — physical display(s) restored to primary position"),
+            Err(e) => {
+                println!("⚠️  Atomic VDD isolate+restore failed ({e}) — falling back to deactivate-only");
+                match Self::ccd_deactivate_vdd_path(virtual_device) {
+                    Ok(true)  => println!("✅ {virtual_device} already dormant at boot"),
+                    Ok(false) => println!("🕶️  {virtual_device} removed from active CCD topology"),
+                    Err(e2)   => println!("⚠️  ccd_deactivate_vdd_path also failed: {e2}"),
+                }
+            }
         }
+    }
+
+    /// Deactivates the VDD's CCD path AND zeros the source-mode position of
+    /// every remaining active physical path back to `(0,0)` in a single
+    /// `SetDisplayConfig` call.
+    ///
+    /// [`ccd_deactivate_vdd_path`] only clears `DISPLAYCONFIG_PATH_ACTIVE` on
+    /// the VDD entry. When Windows auto-promotes the VDD to `(0,0)` on devnode
+    /// enable it simultaneously displaces the physical monitor to a non-zero
+    /// position. Clearing the VDD flag without restoring the physical position
+    /// leaves the host monitor stranded — GDI no longer recognises it as primary
+    /// because no active source sits at the desktop origin.
+    ///
+    /// Using `SDC_ALLOW_CHANGES` lets Windows resolve any source-mode overlap
+    /// produced by zeroing (relevant when multiple physical monitors are active)
+    /// while still honouring the intent of restoring the primary to `(0,0)`.
+    fn ccd_isolate_vdd_and_restore_primary(virtual_device: &str) -> Result<(), String> {
+        let (mut paths, mut modes) = Self::query_all_topology()?;
+
+        for path in &mut paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+
+            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if idx >= modes.len() || modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                continue;
+            }
+
+            let is_vdd = Self::gdi_device_name_for_source(
+                path.sourceInfo.adapterId,
+                path.sourceInfo.id,
+            )
+            .is_some_and(|n| n.eq_ignore_ascii_case(virtual_device));
+
+            if is_vdd {
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+            } else {
+                // Return physical source to the desktop origin so GDI recognises
+                // it as the primary display. For single-monitor setups this is
+                // always correct; for multi-monitor, SDC_ALLOW_CHANGES separates
+                // any resulting overlap automatically.
+                modes[idx].Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
+            }
+        }
+
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if status != 0 {
+            return Err(format!("SetDisplayConfig(isolate_vdd + restore_primary) error {status}"));
+        }
+        Ok(())
     }
 
     /// Clears `DISPLAYCONFIG_PATH_ACTIVE` on every active CCD path whose
