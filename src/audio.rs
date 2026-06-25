@@ -182,6 +182,25 @@ fn start_capture_thread(
                 GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
             };
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+            // Register with the Windows Multimedia Class Scheduler Service
+            // "Pro Audio" task — matches Apollo/Sunshine (avrt.h).  MMCSS
+            // elevates scheduler quantum and protects the thread from
+            // background-priority preemption without REALTIME privilege.
+            // Declared locally: windows-rs 0.58 exposes AvSetMmThreadCharacteristicsW
+            // in Win32_Media_Audio but the sub-binding isn't in scope here.
+            extern "system" {
+                fn AvSetMmThreadCharacteristicsW(
+                    task_name: *const u16,
+                    task_index: *mut u32,
+                ) -> *mut std::ffi::c_void;
+            }
+            let task_name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+            let mut task_index: u32 = 0;
+            let mmcss = AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index);
+            if mmcss.is_null() {
+                eprintln!("⚠️  Audio: MMCSS Pro Audio registration failed (avrt.dll missing?)");
+            }
         }
         // ~1 s of audio at worst-case 48 kHz, 2 ch, 32-bit float
         let mut buf = vec![0u8; 48_000 * 2 * 4];

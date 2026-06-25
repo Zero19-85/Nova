@@ -105,6 +105,11 @@ static std::atomic<bool>    g_force_idr{false};
 static NV_ENC_INITIALIZE_PARAMS g_initParams = {};
 static NV_ENC_CONFIG            g_encConfig  = {};
 static int                      g_encoderFps = 60;
+// Cached per-session frame dimensions set once in InitColorConversion.
+// Eliminates the per-frame COM GetDesc() round-trip in the EncodeFrame hot path.
+static UINT        g_encWidth   = 0;
+static UINT        g_encHeight  = 0;
+static DXGI_FORMAT g_captureFmt = DXGI_FORMAT_UNKNOWN;
 
 // ==================== HDR GLOBALS ====================
 static int                    g_encoderCodec     = 0;    // 0=H264, 1=HEVC, 2=AV1
@@ -112,6 +117,11 @@ static bool                   g_isHdr            = false;
 static MASTERING_DISPLAY_INFO g_masteringDisplay  = {};
 static CONTENT_LIGHT_LEVEL    g_contentLightLevel = {};
 static bool                   g_hdrMetadataReady  = false;
+// nova.toml [hdr] luminance overrides (set by SetHdrMetadata before InitEncoder).
+// BT.2020 primaries are standard constants; only the panel luminance varies.
+static uint16_t g_hdrMaxLuminanceNits = 1000;  // mastering display max nit
+static uint16_t g_hdrMaxCllNits       = 1000;  // MaxCLL
+static uint16_t g_hdrMaxFallNits      = 400;   // MaxFALL
 
 // Raw HEVC SEI byte payloads built by BuildHdrSeiPayloads() and injected via
 // NV_ENC_PIC_PARAMS_HEVC::seiPayloadArray on every forced IDR. This replicates
@@ -789,26 +799,44 @@ static void BuildHdrSeiPayloads() {
     g_hdrSeiPayloads[1] = { 4, 144, g_cllSeiBytes };
 }
 
-// Fills g_masteringDisplay / g_contentLightLevel with session-constant BT.2020 / 1000-nit
-// values, then serialises them to SEI bytes via BuildHdrSeiPayloads().
+// Fills g_masteringDisplay / g_contentLightLevel from standard BT.2020 primaries
+// (constant) + nova.toml [hdr] luminance parameters (operator-tunable via
+// SetHdrMetadata), then serialises to SEI bytes via BuildHdrSeiPayloads().
 static void BuildHdrMetadata() {
-    // BT.2020 primaries in units of 1/50000 (HEVC D.2.28, G/B/R order):
-    g_masteringDisplay.g          = { 8500, 39850 }; // G(0.170, 0.797)
-    g_masteringDisplay.b          = { 6550,  2300 }; // B(0.131, 0.046)
+    // BT.2020 primaries in units of 1/50000 (HEVC D.2.28, G/B/R order).
+    // These are defined by the standard — they never vary between panels.
+    g_masteringDisplay.g          = { 8500,  39850 }; // G(0.170, 0.797)
+    g_masteringDisplay.b          = { 6550,   2300 }; // B(0.131, 0.046)
     g_masteringDisplay.r          = { 35400, 14600 }; // R(0.708, 0.292)
     g_masteringDisplay.whitePoint = { 15635, 16450 }; // D65(0.3127, 0.3290)
-    g_masteringDisplay.maxLuma    = 10000000;          // 1000 nit × 10000
-    g_masteringDisplay.minLuma    = 500;               // 0.05 nit × 10000
-    // Content Light Level (HEVC D.2.35 / AV1 6.7.3):
-    g_contentLightLevel.maxContentLightLevel    = 1000; // MaxCLL  = 1000 nit
-    g_contentLightLevel.maxPicAverageLightLevel = 400;  // MaxFALL = 400 nit
+    g_masteringDisplay.minLuma    = 500;               // 0.05 nit × 10000 (typ. OLED floor)
+    // Panel-specific luminance from nova.toml [hdr]: default 1000 nit.
+    g_masteringDisplay.maxLuma    = (uint32_t)g_hdrMaxLuminanceNits * 10000;
+    // Content Light Level (HEVC D.2.35): tunable for the content being streamed.
+    g_contentLightLevel.maxContentLightLevel    = g_hdrMaxCllNits;
+    g_contentLightLevel.maxPicAverageLightLevel = g_hdrMaxFallNits;
     g_hdrMetadataReady = true;
     BuildHdrSeiPayloads();
 }
 
+// Called from Rust (encoder::set_hdr_metadata) right after loading nova.toml,
+// before the first InitEncoder.  Safe to call even when no encoder is active.
+extern "C" __declspec(dllexport) void SetHdrMetadata(
+    uint32_t max_luminance_nits, uint32_t max_cll_nits, uint32_t max_fall_nits)
+{
+    g_hdrMaxLuminanceNits = (uint16_t)max_luminance_nits;
+    g_hdrMaxCllNits       = (uint16_t)max_cll_nits;
+    g_hdrMaxFallNits      = (uint16_t)max_fall_nits;
+    ShimLog("[Shim] HDR metadata: maxLuma=%u nit  MaxCLL=%u nit  MaxFALL=%u nit\n",
+        max_luminance_nits, max_cll_nits, max_fall_nits);
+}
+
 // ==================== INIT COLOR CONVERSION ====================
 extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, int width, int height, bool is_hdr, int fps) {
-    g_isHdr = is_hdr;
+    g_isHdr      = is_hdr;
+    g_encWidth   = (UINT)width;
+    g_encHeight  = (UINT)height;
+    g_captureFmt = is_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
     if (!device || !g_context) {
         ShimLog("❌ InitColorConversion: device=%p context=%p — null pointer (Session 0 D3D11 failure?)\n",
             device, g_context);
@@ -1272,16 +1300,17 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // static desktop hides this (old/new pixels match); moving content
     // (cursor, text, scrolling) doesn't — visible as the smearing/ghosting
     // that only self-heals at the next IDR.
-    D3D11_TEXTURE2D_DESC frameDesc = {};
-    dxgiFrame->GetDesc(&frameDesc);
-    // HDR path uses R16G16B16A16_FLOAT (linear scRGB from WGC).
-    // WGC only supports BGRA8 (SDR) or FP16 (HDR) pool formats.
-    DXGI_FORMAT captureFmt = g_isHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                     : DXGI_FORMAT_B8G8R8A8_UNORM;
-    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
+    // Use dimensions cached in InitColorConversion — avoids a per-frame COM
+    // GetDesc() round-trip on the hot encode path. Resolution can only change
+    // on a rebind (which calls InitColorConversion again), so the cache is
+    // always current for the session.
+    const UINT        fw         = g_encWidth;
+    const UINT        fh         = g_encHeight;
+    const DXGI_FORMAT captureFmt = g_captureFmt;
+    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)fw, (int)fh, D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
-    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
+    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)fw, (int)fh, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
 
@@ -1317,8 +1346,6 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // last cursor draw on it, "stamping" a permanent trail of cursor images.
     g_context->CopyResource(g_compositeTex, g_cleanBgTex);
 
-    ID3D11Texture2D* vpSourceTexture = g_compositeTex;
-
     // Composite the cursor onto g_compositeTex before NV12 conversion
     // (Sunshine's approach: blend into an intermediate render-targetable
     // surface, since the DXGI duplication texture may not support that bind).
@@ -1347,7 +1374,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         }
         ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
-        const float W = (float)frameDesc.Width, H = (float)frameDesc.Height;
+        const float W = (float)fw, H = (float)fh;
 
         // Unbind any lingering RTV (cursor overlay).
         ID3D11RenderTargetView* nullRTV = nullptr;
@@ -1397,9 +1424,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         }
         ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
-        D3D11_TEXTURE2D_DESC frameInfo = {};
-        vpSourceTexture->GetDesc(&frameInfo);
-        const float W = (float)frameInfo.Width, H = (float)frameInfo.Height;
+        const float W = (float)fw, H = (float)fh;
 
         // Unbind any lingering RTV (cursor overlay) before setting new ones.
         ID3D11RenderTargetView* nullRTV = nullptr;
@@ -1573,5 +1598,8 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     g_hdrMetadataReady = false;
     g_encoderCodec     = 0;
     g_encoderFps       = 60;
+    g_encWidth         = 0;
+    g_encHeight        = 0;
+    g_captureFmt       = DXGI_FORMAT_UNKNOWN;
     return 0;
 }

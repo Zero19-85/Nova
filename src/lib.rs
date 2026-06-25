@@ -14,6 +14,7 @@ mod virtual_display;
 
 use clap::Parser;
 use encoder::{Encoder, EncoderConfig};
+use socket2;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::Result;
@@ -114,8 +115,43 @@ pub async fn run() -> Result<()> {
         use windows::Win32::System::Threading::{
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
         };
+        // TIME_CRITICAL priority is the primary scheduling mechanism:
+        // prevents preemption by normal user-mode threads and gives
+        // the OS scheduler a strong hint to keep us on a performance core.
+        // (SetIdealProcessor is omitted — it's advisory only and not
+        // available through windows-rs's thunk layer without extra glue.)
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
+
+    // ── Disable Windows Efficiency Mode throttling ────────────────────────────
+    // On Windows 10 1709+ (and Windows 11), the OS can park streaming threads
+    // on efficiency (low-power) cores or reduce CPU clock under "background
+    // power throttling". SetProcessInformation(ProcessPowerThrottling) with
+    // StateMask=0 (disable) guarantees foreground/HighQoS scheduling for the
+    // entire nova-server process, matching a "Games" process category.
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, SetProcessInformation,
+            PROCESS_INFORMATION_CLASS,
+        };
+        #[repr(C)]
+        struct ProcessPowerThrottlingState {
+            version:      u32, // = 1  (PROCESS_POWER_THROTTLING_CURRENT_VERSION)
+            control_mask: u32, // = 0x1 (PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+            state_mask:   u32, // = 0   disable throttling → HighPerformance
+        }
+        let mut pt = ProcessPowerThrottlingState {
+            version: 1, control_mask: 0x1, state_mask: 0,
+        };
+        // ProcessPowerThrottling = 4 in PROCESS_INFORMATION_CLASS
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_INFORMATION_CLASS(4),
+            std::ptr::addr_of_mut!(pt).cast(),
+            std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+        );
+    }
+    println!("⚡ Process power throttling disabled (foreground performance mode)");
 
     // ── File logging: must be first so all subsequent println! go to nova.log ─
     debug::init_debug_logger();
@@ -152,6 +188,13 @@ pub async fn run() -> Result<()> {
     let tray_tx = Arc::new(tray_tx);
     // Load nova.toml first; CLI args override individual fields.
     let cfg  = config::NovaConfig::load();
+    // Push HDR luminance parameters to the shim immediately after config load,
+    // before the first Encoder::new() call that invokes BuildHdrMetadata().
+    encoder::set_hdr_metadata(
+        cfg.hdr.max_luminance_nits,
+        cfg.hdr.max_cll_nits,
+        cfg.hdr.max_fall_nits,
+    );
     let args = Args::parse();
     let width   = args.width  .unwrap_or(cfg.stream.width);
     let height  = args.height .unwrap_or(cfg.stream.height);
@@ -181,6 +224,12 @@ pub async fn run() -> Result<()> {
         println!("✨ nova.toml: enable_hdr=true — HDR10 will activate for HEVC sessions regardless of VDD capability query");
     }
 
+    // When the desktop is static, NVENC stays idle except for one IDR keep-alive
+    // pulse per this interval. Moonlight's watchdog timeout is several seconds;
+    // 1 s is a comfortable margin. Apollo encodes at a ~12 fps minimum fill rate;
+    // we skip encoding entirely and fire a single IDR — matching Sunshine's 0%
+    // Video Encode utilization signature on a static screen.
+    const IDR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
 
@@ -290,9 +339,16 @@ pub async fn run() -> Result<()> {
 
     // Audio port (48000) — the AudioStreamer thread learns the client's
     // address from its pings and sends Opus RTP back on this socket.
-    let audio_socket = std::net::UdpSocket::bind("0.0.0.0:48000")
-        .expect("Failed to bind audio socket on 48000");
-    audio_socket.set_nonblocking(true).expect("set_nonblocking on audio socket");
+    let audio_socket = {
+        let raw = socket2::Socket::from(
+            std::net::UdpSocket::bind("0.0.0.0:48000")
+                .expect("Failed to bind audio socket on 48000"),
+        );
+        // DSCP EF (0xB8) — same low-latency tag as the video socket.
+        let _ = raw.set_tos(0xB8_u32);
+        raw.set_nonblocking(true).expect("set_nonblocking on audio socket");
+        std::net::UdpSocket::from(raw)
+    };
     let mut audio_streamer: Option<audio::AudioStreamer> = None;
 
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
@@ -959,9 +1015,10 @@ pub async fn run() -> Result<()> {
             }
             None => {
                 timeout_streak += 1;
-                if timeout_streak <= 3 || timeout_streak % 10 == 0 {
-                    println!("⏳ WGC: no new frame on {}x{} — streak {timeout_streak}",
-                        capturer.width, capturer.height);
+                // Suppress per-frame log spam: first hit and then every ~5 s at 60 fps.
+                // Suppress entirely when not streaming (nobody cares about idle WGC state).
+                if client_connected && (timeout_streak == 1 || timeout_streak % 300 == 0) {
+                    println!("⏳ WGC: static desktop (streak {})", timeout_streak);
                 }
 
                 // ── Damage generator (tick-tock jiggle) ──────────────────────
@@ -987,22 +1044,24 @@ pub async fn run() -> Result<()> {
 
                 // ── Encoder gate ──────────────────────────────────────────────
                 // No NVENC calls until WGC has delivered its first real frame.
-                // Before that point cached_texture() is None (cleared on rebind)
-                // and passing a null/stale pointer to encode_frame returns 0
-                // bytes. Once has_frame() flips true, cached re-submission is
-                // safe and maintains the 120-fps stream on a static desktop.
-                //
-                // The outer next_frame_time pacing (top of loop) already provides
-                // the correct sleep duration for both paths. A separate 1ms sleep
-                // here was previously adding up to 1ms of extra jitter to every
-                // static-desktop re-submission — removed.
                 if !capturer.has_frame() {
                     continue;
                 }
 
-                if last_frame_sent.elapsed() >= frame_interval {
+                // Static-frame gate: when the desktop is unchanged, NVENC stays
+                // hardware-idle → 0% Video Encode utilization, matching
+                // Apollo/Sunshine's idle signature.
+                //
+                // IDR keep-alive: after IDR_KEEPALIVE_INTERVAL of silence, force
+                // one keyframe onto the wire so Moonlight's watchdog doesn't
+                // interpret the pause as a network drop or connection timeout.
+                if client_connected && video_learned
+                    && last_frame_sent.elapsed() >= IDR_KEEPALIVE_INTERVAL
+                {
+                    enc.request_idr();
                     texture_to_encode = capturer.cached_texture().cloned();
                 }
+                // else: static desktop with active stream — NVENC stays idle.
             }
             // No ACCESS_LOST arm: WGC absorbs display mode transitions
             // (including the FP16 Advanced Color switch) internally.

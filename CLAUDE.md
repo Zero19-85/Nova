@@ -15,9 +15,42 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 10 complete — VDD Safety, Performance & Congestion Control (2026-06-25)
+## Current Phase: Phase 11 complete — Elite Pipeline Polish & Idle Efficiency (2026-06-25)
 
-All previous phases (1–9) confirmed working. Phase 10 adds hardware-level VDD lifecycle management, NVENC quality fixes, congestion control, thread prioritisation, and the NovaServerBoot Task Scheduler registration.
+All previous phases (1–10) confirmed working. Phase 11 delivers static-desktop Video Encode flatline (0% GPU utilisation matching Apollo/Sunshine), per-frame heap elimination in the RTP hot path, MMCSS audio scheduling, process power-throttling exemption, DSCP EF socket tagging, dynamic HDR luminance config, and thin-LTO binary hardening.
+
+### Phase 11 changes (2026-06-25):
+
+**Static-frame gate + IDR keep-alive (`src/lib.rs`):**
+- `None =>` WGC branch no longer re-submits cached texture to NVENC every frame interval. NVENC hardware-idle on a static desktop → **0% Video Encode** in Task Manager, matching Apollo/Sunshine's flatline signature.
+- `IDR_KEEPALIVE_INTERVAL = 1000 ms`: when the screen has been static, one forced IDR pulse per second keeps Moonlight's connection watchdog alive without engaging the encode engine.
+- Gate: `client_connected && video_learned` — no encoding while no client is receiving.
+- WGC `None` log spam reduced to first occurrence + every 300 frames (~5 s).
+
+**`shim.cpp` hot-loop GetDesc() elimination:**
+- `g_encWidth` / `g_encHeight` / `g_captureFmt` cached once in `InitColorConversion`, reset in `CleanupEncoder`. Eliminates per-frame COM `GetDesc()` round-trip from `EncodeFrame`. Removed the now-unused `vpSourceTexture` local.
+
+**RTP shard-pool pre-allocation (`src/rtp.rs`):**
+- `stream_buf: Vec<u8>` and `shard_pool: Vec<Vec<u8>>` added to `RtpSender` struct. Grow to session high-watermark and are reused/zeroed every frame. Eliminates ~36 `Vec::new()` + dealloc cycles per frame at 60–120 Hz.
+- `send_packet` converted from method to free function to allow clean split-borrow access to `socket` and `shard_pool` simultaneously.
+- Socket SO_SNDBUF raised from 4 MB to 8 MB (covers worst-case 4K IDR burst).
+
+**MMCSS Pro Audio (`src/audio.rs`):**
+- `AvSetMmThreadCharacteristicsW("Pro Audio")` registered on the WASAPI loopback capture thread immediately after `SetThreadPriority(TIME_CRITICAL)`. Matches Apollo/Sunshine. Elevates scheduler quantum and protects the audio thread from background preemption without REALTIME privilege.
+
+**Process power-throttling exemption (`src/lib.rs`):**
+- `SetProcessInformation(ProcessPowerThrottling, {ControlMask=1, StateMask=0})` at startup. Disables Windows 11 Efficiency Mode for the nova-server process — prevents E-core scheduling and CPU power-capping during active streaming.
+
+**DSCP EF socket tagging (`src/rtp.rs`, `src/lib.rs`):**
+- `socket2::set_tos(0xB8)` (DSCP EF = 101110 00, Expedited Forwarding) applied to both the video RTP UDP socket (port 47998) and the audio UDP socket (port 48000). Best-effort prioritisation honoured by DSCP-aware managed switches and Windows QoS Group Policy rules.
+
+**Dynamic HDR luminance from `nova.toml` (`src/config.rs`, `src/encoder.rs`, `shim/shim.cpp`):**
+- New `[hdr]` table in `nova.toml`: `max_luminance_nits` (default 1000), `max_cll_nits` (default 1000), `max_fall_nits` (default 400). BT.2020 primaries are standard constants; only luminance varies per panel.
+- `encoder::set_hdr_metadata()` → `SetHdrMetadata()` FFI → `BuildHdrMetadata()` uses globals. Call injected in `lib.rs` immediately after `NovaConfig::load()`, before the first `Encoder::new()`.
+- Operators can now tune HDR SEI to match their TV's actual spec (HDR600 / HDR1000 / HDR2000).
+
+**Cargo release profile (`Cargo.toml`):**
+- `[profile.release]`: `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`. Thin LTO gives ~90% of fat-LTO runtime benefit with ~10% of the link-time cost. Binary: **7.76 MB** exe + **0.08 MB** DLL.
 
 ---
 

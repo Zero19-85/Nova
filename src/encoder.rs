@@ -46,6 +46,11 @@ extern "C" {
     /// any other shim function so that D3D11/NVENC init errors are captured.
     fn InitShimLog(log_path: *const u16);
 
+    /// Override the HDR10 HEVC SEI luminance parameters (type 137 MDCV + type 144
+    /// CLL/FALL).  Call once after loading nova.toml, before the first
+    /// InitEncoder.  BT.2020 primaries are always the standard constants.
+    fn SetHdrMetadata(max_luminance_nits: u32, max_cll_nits: u32, max_fall_nits: u32);
+
     fn OpenNvEncSession(d3d11_device: *mut c_void, out_encoder: *mut *mut c_void) -> i32;
     fn InitEncoder(
         encoder: *mut c_void,
@@ -76,6 +81,19 @@ extern "C" {
 /// immediately after `debug::init_debug_logger()`, before `Encoder::new()`.
 pub fn init_shim_log(log_path_wide: *const u16) {
     unsafe { InitShimLog(log_path_wide); }
+}
+
+/// Push nova.toml [hdr] luminance parameters to the shim before the first
+/// InitEncoder call.  BT.2020 primaries are standard constants and are not
+/// configurable; only the panel-specific luminance/CLL/FALL values vary.
+pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nits: u16) {
+    unsafe {
+        SetHdrMetadata(
+            max_luminance_nits as u32,
+            max_cll_nits       as u32,
+            max_fall_nits      as u32,
+        );
+    }
 }
 
 /// Thread-safe IDR trigger callable from any thread (e.g. the control-stream

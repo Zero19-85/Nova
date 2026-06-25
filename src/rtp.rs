@@ -40,6 +40,21 @@ const DEFAULT_MIN_PARITY_SHARDS: usize = 2;
 // frame budget (e.g. 150µs at 120fps vs 300µs at 60fps).
 const PACE_BATCH_PACKETS: usize = 10;
 
+/// Send one UDP datagram, retrying on `WouldBlock` instead of silently
+/// dropping it. Free function (not a method) so callers can pass `&socket`
+/// and a shard slice simultaneously without borrow-checker conflicts.
+fn send_packet(socket: &UdpSocket, pkt: &[u8], target: SocketAddr) {
+    loop {
+        match socket.send_to(pkt, target) {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 /// Busy-wait for sub-millisecond pacing gaps. `thread::sleep` is unusable
 /// here: Windows sleep granularity is 1-15ms, which would stretch a 45-packet
 /// IDR over tens of milliseconds and wreck 60fps frame pacing.
@@ -76,6 +91,13 @@ pub struct RtpSender {
     stat_parity_pkts: u32,
     stat_bytes: u64,
     stat_window_start: Instant,
+    /// Persistent frame payload buffer — reused every frame to eliminate the
+    /// per-call Vec heap allocation (frame_header ++ encoded_data).
+    stream_buf: Vec<u8>,
+    /// Persistent shard pool — grows to the high-watermark shard count (≈ 36
+    /// for a typical 4K IDR at 20% FEC) and is reused/zeroed every frame,
+    /// eliminating ~36 Vec alloc/dealloc cycles per frame at 60–120 Hz.
+    shard_pool: Vec<Vec<u8>>,
 }
 
 impl RtpSender {
@@ -84,7 +106,15 @@ impl RtpSender {
         // Give the OS headroom for the ~25-packet bursts sent per frame so a
         // momentary full send buffer blocks (and retries) rather than drops.
         let sock2 = socket2::Socket::from(socket);
-        sock2.set_send_buffer_size(4 * 1024 * 1024)?;
+        // 8 MB: covers a worst-case 4K IDR burst (~6 MB at uncapped bitrate)
+        // plus 2 MB headroom so a full-buffer back-pressure stalls instead of drops.
+        sock2.set_send_buffer_size(8 * 1024 * 1024)?;
+        // DSCP EF (0xB8 = 101110_00) — Expedited Forwarding: marks video UDP
+        // datagrams as low-latency minimum-delay traffic. Best-effort on Windows
+        // (honoured by DSCP-aware managed switches and QoS Group Policies).
+        // Apollo/Sunshine use qwave.dll QOSAddSocketToFlow for hard guarantees;
+        // IP_TOS is the portable fallback that covers most LAN gaming routers.
+        let _ = sock2.set_tos(0xB8_u32);
         let socket: UdpSocket = sock2.into();
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -104,6 +134,8 @@ impl RtpSender {
             stat_parity_pkts: 0,
             stat_bytes: 0,
             stat_window_start: Instant::now(),
+            stream_buf: Vec::new(),
+            shard_pool: Vec::new(),
         })
     }
 
@@ -158,21 +190,6 @@ impl RtpSender {
         self.frame_index     = 0;
     }
 
-    /// Send one UDP datagram, retrying on `WouldBlock` instead of silently
-    /// dropping it. The non-blocking socket's send buffer can fill during a
-    /// burst of ~25 packets per frame; dropping any of them corrupts the
-    /// current frame and smears into subsequent P-frames until the next IDR.
-    fn send_packet(&self, pkt: &[u8], target: SocketAddr) {
-        loop {
-            match self.socket.send_to(pkt, target) {
-                Ok(_) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::yield_now();
-                }
-                Err(_) => return,
-            }
-        }
-    }
 
     /// Send a complete H.264 Annex-B frame using the GameStream NV_VIDEO_PACKET wire format.
     ///
@@ -233,19 +250,34 @@ impl RtpSender {
         frame_hdr[3] = frame_type;
         frame_hdr[4..6].copy_from_slice(&last_payload_len.to_le_bytes());
 
-        let mut stream_buf = Vec::with_capacity(stream_len);
-        stream_buf.extend_from_slice(&frame_hdr);
-        stream_buf.extend_from_slice(data);
+        // Reuse persistent stream buffer — eliminates per-frame Vec heap alloc.
+        self.stream_buf.clear();
+        self.stream_buf.reserve(stream_len);
+        self.stream_buf.extend_from_slice(&frame_hdr);
+        self.stream_buf.extend_from_slice(data);
 
-        // ── Build data shards as full BLOCK_SIZE packets ──────────────────────
+        // ── Build data shards using persistent pool ───────────────────────────
         // The RTP header (bytes 0..16) and fecInfo (28..32) stay ZERO until
         // after parity is computed: Sunshine computes parity with those fields
         // zeroed and writes them afterwards, and moonlight-common-c regenerates
         // them on FEC-recovered packets. The NV_VIDEO_PACKET fields written
         // here ARE covered by parity, so recovery restores them.
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
+        //
+        // Grow pool to high watermark; zero-fill all shards in use this frame.
+        // Avoids ~36 Vec alloc/dealloc cycles per frame at 60–120 Hz.
+        while self.shard_pool.len() < total_shards {
+            self.shard_pool.push(vec![0u8; block_size]);
+        }
+        for shard in self.shard_pool[..total_shards].iter_mut() {
+            if shard.len() != block_size { shard.resize(block_size, 0); }
+            shard.fill(0);
+        }
+
+        // Fill data shards — split borrow: stream_buf and shard_pool are
+        // separate struct fields so the compiler allows concurrent access.
+        let stream_buf = &self.stream_buf;
         for x in 0..data_shards {
-            let mut shard = vec![0u8; block_size];
+            let shard = &mut self.shard_pool[x];
 
             // NV_VIDEO_PACKET (bytes 16..32, little-endian)
             let spi = self.packet_counter.wrapping_add(x as u32) << 8;
@@ -262,21 +294,17 @@ impl RtpSender {
             let end   = (start + payload_per_packet).min(stream_len);
             shard[HEADERS_SIZE..HEADERS_SIZE + (end - start)]
                 .copy_from_slice(&stream_buf[start..end]);
-            shards.push(shard);
         }
 
         // ── Reed-Solomon parity shards ───────────────────────────────────────
         if parity_shards > 0 {
-            for _ in 0..parity_shards {
-                shards.push(vec![0u8; block_size]);
-            }
             let rs = self.fec_cache
                 .entry((data_shards, parity_shards))
                 .or_insert_with(|| {
                     ReedSolomon::new(data_shards, parity_shards)
                         .expect("shard counts validated against GF(2^8) limit")
                 });
-            rs.encode(&mut shards).expect("all shards are block_size");
+            rs.encode(&mut self.shard_pool[..total_shards]).expect("all shards are block_size");
         }
 
         // ── Pacing gap — scaled to fps so overhead fits the frame budget ────
@@ -288,7 +316,10 @@ impl RtpSender {
         let pace_gap = Duration::from_micros(pace_gap_us);
 
         // ── Finalize per-packet fields and send (data + parity) ─────────────
-        for (x, shard) in shards.iter_mut().enumerate() {
+        // Split borrow: socket and shard_pool are separate fields.
+        let socket = &self.socket;
+        for x in 0..total_shards {
+            let shard = &mut self.shard_pool[x];
             // RTP header — X bit set (Sunshine's FLAG_EXTENSION) → 4B reserved
             shard[0] = 0x80 | 0x10; // V=2, P=0, X=1, CC=0
             shard[1] = 0;           // no packetType/marker on video
@@ -307,7 +338,7 @@ impl RtpSender {
             shard[20..24].copy_from_slice(&self.frame_index.to_le_bytes());
             shard[27] = 0; // multiFecBlocks — single FEC block (block 0 of 1)
 
-            self.send_packet(shard, target);
+            send_packet(socket, shard, target);
 
             // Inter-batch pacing gap.
             if (x + 1) % PACE_BATCH_PACKETS == 0 && x + 1 < total_shards {

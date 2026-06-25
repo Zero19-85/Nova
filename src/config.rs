@@ -9,6 +9,7 @@ pub struct NovaConfig {
     pub stream:  StreamConfig,
     pub audio:   AudioConfig,
     pub network: NetworkConfig,
+    pub hdr:     HdrConfig,
 }
 
 // ── Sub-tables ────────────────────────────────────────────────────────────────
@@ -55,6 +56,20 @@ pub struct NetworkConfig {
     pub fec_percentage: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct HdrConfig {
+    /// HEVC SEI type 137 (Mastering Display Colour Volume) — max panel luminance in nits.
+    /// Standard HDR600 = 600, HDR1000 = 1000, HDR2000 = 2000. Default 1000.
+    pub max_luminance_nits: u16,
+    /// HEVC SEI type 144 (Content Light Level) MaxCLL — brightest single pixel across
+    /// the entire stream, in nits. Tune to your content's measured peak. Default 1000.
+    pub max_cll_nits: u16,
+    /// HEVC SEI type 144 MaxFALL — maximum frame-average light level, in nits.
+    /// Typically 100–400 nit for graded HDR content. Default 400.
+    pub max_fall_nits: u16,
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 impl Default for NovaConfig {
@@ -63,7 +78,14 @@ impl Default for NovaConfig {
             stream:  StreamConfig::default(),
             audio:   AudioConfig::default(),
             network: NetworkConfig::default(),
+            hdr:     HdrConfig::default(),
         }
+    }
+}
+
+impl Default for HdrConfig {
+    fn default() -> Self {
+        Self { max_luminance_nits: 1000, max_cll_nits: 1000, max_fall_nits: 400 }
     }
 }
 
@@ -119,6 +141,13 @@ endpoint_override = ""  # Windows audio endpoint friendly name or GUID;
 
 [network]
 fec_percentage = 20     # Reed-Solomon FEC parity % (0 = disabled)
+
+[hdr]
+# HDR10 HEVC SEI luminance parameters — tune to your TV's spec sheet.
+# BT.2020 primaries are standard constants and are not configurable.
+max_luminance_nits = 1000   # panel peak brightness (HDR600=600, HDR1000=1000, HDR2000=2000)
+max_cll_nits       = 1000   # MaxCLL: brightest pixel in the stream (nit)
+max_fall_nits      = 400    # MaxFALL: max frame-average light level (nit)
 "#;
 
 impl NovaConfig {
