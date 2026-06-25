@@ -444,15 +444,24 @@ pub async fn run() -> Result<()> {
                         println!("⚠️  Virtual display deactivation: {e}");
                     }
                     enc.config.is_hdr = false;
-                    if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
-                        break;
-                    }
                     frame_interval  = startup_frame_interval;
                     next_frame_time = Instant::now();
+                    // Clear cancelled flag BEFORE the rebind attempt so this
+                    // block cannot re-fire on the next loop iteration regardless
+                    // of whether the rebind succeeds.
                     if let Ok(mut guard) = client_info.lock() {
                         if let Some(info) = guard.as_mut() {
                             info.cancelled = false;
                         }
+                    }
+                    // Rebind to the physical primary. If the display state is
+                    // still settling after a topology-restore failure (error 87),
+                    // this may fail with E_INVALIDARG. Do NOT break the loop —
+                    // the server stays alive and the capturer recovers via WGC's
+                    // internal ACCESS_LOST handling or the next
+                    // activate_for_stream rebind when a new client connects.
+                    if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc, None, None) {
+                        eprintln!("⚠️  Capture rebind after deferred cancel failed ({e}) — staying in idle loop");
                     }
                 }
             }

@@ -131,11 +131,19 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_DEVICE_INFO_TYPE,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-    DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_PATH_INFO, SET_DISPLAY_CONFIG_FLAGS,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
     QDC_DATABASE_CURRENT, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES,
     SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
+
+// SDC_FORCE_MODE_ENUMERATION = 0x00001000 (wingdi.h) — not re-exported by
+// windows-rs 0.58's Win32_Devices_Display, so defined locally at its standard value.
+// Forces SetDisplayConfig to re-interrogate all connected GPU outputs and rebuild
+// the display topology from scratch; used as a last-resort fallback when
+// SDC_USE_SUPPLIED_DISPLAY_CONFIG fails with ERROR_INVALID_PARAMETER (87) because
+// the saved snapshot is stale after a 4K/HDR session teardown race.
+const SDC_FORCE_MODE_ENUMERATION: SET_DISPLAY_CONFIG_FLAGS = SET_DISPLAY_CONFIG_FLAGS(0x0000_1000);
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CM_PROB_DISABLED, CR_SUCCESS,
     SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
@@ -1520,6 +1528,13 @@ impl VirtualDisplay {
             }
         }
 
+        // Settle: let DWM commit the restored CCD path coordinates before the
+        // VDD devnode disappears from the hardware tree. Removing the devnode
+        // while SetDisplayConfig's internal path evaluation is still in flight
+        // causes a race where the path entry is invalidated mid-transaction,
+        // which is the root cause of Error 87 on subsequent topology queries.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
         // Hardware-disable the devnode after topology is restored.
         // Physical paths are already active again at this point, so disabling
         // the VDD devnode here is safe — there is no active display that
@@ -2423,6 +2438,30 @@ impl VirtualDisplay {
                     p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0, modes.len()
                 );
             }
+
+            // Error 87 (ERROR_INVALID_PARAMETER) means the saved snapshot is stale —
+            // the display pipeline changed mid-session (e.g. HDR toggle, devnode
+            // cycle, or display driver reset) and mode indices no longer match.
+            // Fall back to SDC_FORCE_MODE_ENUMERATION: Windows re-interrogates every
+            // connected GPU output from scratch and rebuilds the topology to match
+            // whatever is physically present, restoring the physical primary without
+            // needing valid saved path/mode data.
+            if status == 87 {
+                println!("🔄 Error 87 — saved topology stale; forcing SDC_FORCE_MODE_ENUMERATION reset");
+                let fallback_status = unsafe {
+                    SetDisplayConfig(
+                        None::<&[DISPLAYCONFIG_PATH_INFO]>,
+                        None::<&[DISPLAYCONFIG_MODE_INFO]>,
+                        SDC_APPLY | SDC_FORCE_MODE_ENUMERATION,
+                    )
+                };
+                if fallback_status == 0 {
+                    println!("✅ SDC_FORCE_MODE_ENUMERATION succeeded — displays reset to PnP defaults");
+                    return Ok(());
+                }
+                println!("⚠️  SDC_FORCE_MODE_ENUMERATION also failed (error {fallback_status}) — display may need manual reset");
+            }
+
             return Err(format!("SetDisplayConfig failed to restore the saved display topology (error {status})"));
         }
 
