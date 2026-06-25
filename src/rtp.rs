@@ -77,6 +77,13 @@ pub struct RtpSender {
     /// Per-frame counter stored in NV_VIDEO_PACKET.frameIndex
     frame_index: u32,
     fps: u32,
+    /// True when the active session uses HEVC or AV1. Controls NAL unit
+    /// parsing in `detect_frame_type` / `list_nal_types`: HEVC uses a 2-byte
+    /// NAL header where `nal_unit_type = (first_byte >> 1) & 0x3F`, versus
+    /// H.264's `first_byte & 0x1F`. Incorrect parsing produces all-P-frame
+    /// classifications even for IDR/VPS/SPS NALUs → Moonlight never gets a
+    /// decodable keyframe → 10-second watchdog timeout.
+    is_hevc: bool,
     /// Negotiated packet size (from ANNOUNCE) — wire datagram = this + 16.
     packet_size: usize,
     /// FEC parity percentage; 0 disables FEC (matrix-compat A/B knob).
@@ -129,6 +136,7 @@ impl RtpSender {
             fec_percentage: DEFAULT_FEC_PERCENTAGE,
             min_parity_shards: DEFAULT_MIN_PARITY_SHARDS,
             fec_cache: HashMap::new(),
+            is_hevc: false,
             stat_frames: 0,
             stat_data_pkts: 0,
             stat_parity_pkts: 0,
@@ -164,6 +172,13 @@ impl RtpSender {
         self.fps = fps.max(1);
     }
 
+    /// Set the codec for NAL unit parsing. Must be called at session start
+    /// after the codec is confirmed from the ANNOUNCE SDP so `detect_frame_type`
+    /// uses the correct NAL header layout (HEVC 2-byte vs H.264 1-byte).
+    pub fn set_codec(&mut self, is_hevc: bool) {
+        self.is_hevc = is_hevc;
+    }
+
     /// Apply per-session stream parameters. `packet_size` must be the client's
     /// negotiated x-nv-video[0].packetSize; `fec_percentage` 0 disables FEC.
     pub fn configure(&mut self, packet_size: usize, fec_percentage: usize, min_parity_shards: usize) {
@@ -188,6 +203,7 @@ impl RtpSender {
         self.timestamp       = 0;
         self.packet_counter  = 0;
         self.frame_index     = 0;
+        self.is_hevc         = false;
     }
 
 
@@ -207,7 +223,7 @@ impl RtpSender {
         if data.is_empty() { return; }
         let Some(target) = self.target else { return };
 
-        let frame_type = detect_frame_type(data);
+        let frame_type = detect_frame_type(data, self.is_hevc);
         let block_size         = self.packet_size + MAX_RTP_HEADER_SIZE;
         let payload_per_packet = block_size - HEADERS_SIZE;
 
@@ -236,7 +252,7 @@ impl RtpSender {
         let total_shards = data_shards + parity_shards;
 
         if self.frame_index < 10 {
-            let nal_names: Vec<&str> = list_nal_types(data).iter().map(|t| nal_type_name(*t)).collect();
+            let nal_names: Vec<&str> = list_nal_types(data, self.is_hevc).iter().map(|t| nal_type_name(*t, self.is_hevc)).collect();
             println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs={:?}",
                 self.frame_index, data.len(), data_shards, parity_shards, frame_type, nal_names);
         }
@@ -371,27 +387,52 @@ impl RtpSender {
     }
 }
 
-/// Human-readable name for an H.264 NAL unit type. Debug helper only.
-fn nal_type_name(t: u8) -> &'static str {
-    match t {
-        1 => "P",
-        5 => "IDR",
-        6 => "SEI",
-        7 => "SPS",
-        8 => "PPS",
-        9 => "AUD",
-        _ => "OTHER",
+/// Human-readable NAL unit type name. `is_hevc` selects the HEVC or H.264 table.
+fn nal_type_name(t: u8, is_hevc: bool) -> &'static str {
+    if is_hevc {
+        // HEVC nal_unit_type (ITU-T H.265 Table 7-1)
+        match t {
+            0 | 1  => "TRAIL",
+            19     => "IDR_W_RADL",
+            20     => "IDR_N_LP",
+            21     => "CRA",
+            32     => "VPS",
+            33     => "SPS",
+            34     => "PPS",
+            35     => "AUD",
+            39     => "SEI_PREFIX",
+            40     => "SEI_SUFFIX",
+            _      => "OTHER",
+        }
+    } else {
+        // H.264 nal_unit_type (ITU-T H.264 Table 7-1)
+        match t {
+            1 => "P",
+            5 => "IDR",
+            6 => "SEI",
+            7 => "SPS",
+            8 => "PPS",
+            9 => "AUD",
+            _ => "OTHER",
+        }
     }
 }
 
-/// List the NAL unit type (low 5 bits of the header byte) for every NAL unit
-/// found in an Annex-B access unit, in order. Debug helper only.
-fn list_nal_types(data: &[u8]) -> Vec<u8> {
+/// List the NAL unit type for every Annex-B NAL unit in `data`, in order.
+/// For H.264: `data[i+3] & 0x1F` (low 5 bits of the 1-byte NAL header).
+/// For HEVC: `(data[i+3] >> 1) & 0x3F` (bits [6:1] of the first byte of the
+/// 2-byte NAL header — `forbidden_zero_bit | nal_unit_type[5:0]`).
+fn list_nal_types(data: &[u8], is_hevc: bool) -> Vec<u8> {
     let mut types = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            types.push(data[i + 3] & 0x1F);
+            let t = if is_hevc {
+                (data[i + 3] >> 1) & 0x3F
+            } else {
+                data[i + 3] & 0x1F
+            };
+            types.push(t);
             i += 4;
         } else {
             i += 1;
@@ -400,19 +441,31 @@ fn list_nal_types(data: &[u8]) -> Vec<u8> {
     types
 }
 
-/// Scan every NAL unit in an Annex-B H.264 access unit and classify the
-/// frame: if any NAL is SPS (type 7) or an IDR slice (type 5), this is a
-/// keyframe. NVENC often prefixes the first frame with an AUD (type 9)
-/// before SPS/PPS/IDR, so we can't just look at the first NAL.
-/// Returned value goes in byte 3 of the NV_VIDEO_PACKET frame header
-/// (1 = P-frame, 2 = IDR frame).
-pub(crate) fn detect_frame_type(data: &[u8]) -> u8 {
+/// Scan every Annex-B NAL unit and return 2 (IDR/keyframe) or 1 (P-frame).
+///
+/// H.264: SPS (type 7) or IDR slice (type 5) → keyframe.
+/// HEVC:  VPS (32), IDR_W_RADL (19), IDR_N_LP (20), or CRA (21) → keyframe.
+///
+/// NVENC with `NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS`
+/// prefixes an IDR with AUD + VPS + SPS + PPS (HEVC) or AUD + SPS + PPS (H.264)
+/// before the slice NAL, so we must scan all NALs rather than just the first.
+/// The returned value goes in byte 3 of the NV_VIDEO_PACKET frame header.
+pub(crate) fn detect_frame_type(data: &[u8], is_hevc: bool) -> u8 {
     let mut i = 0;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            let nal_type = data[i + 3] & 0x1F;
-            if nal_type == 7 || nal_type == 5 {
-                return 2;
+            if is_hevc {
+                let nal_type = (data[i + 3] >> 1) & 0x3F;
+                // VPS(32), IDR_W_RADL(19), IDR_N_LP(20), CRA(21)
+                if nal_type == 32 || nal_type == 19 || nal_type == 20 || nal_type == 21 {
+                    return 2;
+                }
+            } else {
+                let nal_type = data[i + 3] & 0x1F;
+                // SPS(7) or IDR slice(5)
+                if nal_type == 7 || nal_type == 5 {
+                    return 2;
+                }
             }
             i += 4;
         } else {

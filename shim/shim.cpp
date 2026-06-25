@@ -1462,7 +1462,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     std::vector<NvEncOutputFrame> vPacket;
     if (g_force_idr.exchange(false)) {
         NV_ENC_PIC_PARAMS picParams = {};
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        // NV_ENC_PIC_FLAG_FORCEIDR alone generates the IDR slice but does NOT
+        // guarantee inline SPS/PPS/VPS headers unless the codec config set
+        // repeatSPSPPS=1 for a *periodic* IDR. For on-demand IDRs triggered by
+        // RequestIdrFrame(), NV_ENC_PIC_FLAG_OUTPUT_SPSPPS must be combined so
+        // the decoder receives the parameter-set NALUs in the same packet and
+        // can initialize immediately — without it the client sees an IDR with no
+        // SPS and refuses to render, producing the 10-second watchdog timeout.
+        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
         if (g_isHdr && g_hdrMetadataReady && g_encoderCodec == 1) {
             // Manual byte-packed SEI injection matching FFmpeg/Apollo/Sunshine:
             // MDCV (type 137, 24 bytes big-endian) + MaxCLL (type 144, 4 bytes).

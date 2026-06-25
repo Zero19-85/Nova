@@ -353,6 +353,15 @@ fn handle_message(
             let drm_name = if info.dynamic_range_mode == 1 { "HDR10" } else { "SDR" };
             println!("   ↳ ANNOUNCE codec: bitStreamFormat={} ({}) dynamicRangeMode={} ({}) clientSupportHevc={}",
                 info.bit_stream_format, bsf_name, info.dynamic_range_mode, drm_name, client_hevc);
+            // Log the authoritative HDR decision. dynamicRangeMode=0 with hdr_requested=true
+            // means the client (e.g. Xbox Moonlight 1.18.0) cannot do HEVC/HDR10 — Nova will
+            // revert the VDD to SDR and stream H264 regardless of /launch hdrMode.
+            if info.hdr_requested && info.dynamic_range_mode == 0 {
+                println!("   ⚠️  ANNOUNCE: client declined HDR (dynamicRangeMode=0) despite /launch hdrMode=1 \
+                    — will revert VDD to SDR and stream H264 (client lacks HEVC/HDR10 decoder)");
+            } else if info.dynamic_range_mode == 1 {
+                println!("   ✅ ANNOUNCE: client confirmed HDR (dynamicRangeMode=1) — HEVC Main10 pipeline active");
+            }
             println!("   ↳ ANNOUNCE audio: encryption={} packetDuration={:?}ms",
                 info.audio_encryption, pkt_dur);
             println!("   ↳ ANNOUNCE: packetSize={:?} maxFPS={:?} viewport={:?}x{:?} minFec={:?} bitrateKbps={:?}",

@@ -950,7 +950,12 @@ async fn handle_request(
                     // reset the flag is carried over from the previous ClientInfo via take(),
                     // the Xbox never receives the packet, and the TV stays in SDR mode →
                     // "whitewash" on every reconnect.
-                    info.hdr_mode_sent = false;
+                    info.hdr_mode_sent    = false;
+                    // Reset ANNOUNCE-sourced fields so stale values from a previous
+                    // session cannot leak into the new one's codec/HDR decisions.
+                    // The authoritative values arrive in the client's ANNOUNCE SDP.
+                    info.dynamic_range_mode = 0;
+                    info.bit_stream_format  = 0;
                 }
                 *guard = Some(info);
             }

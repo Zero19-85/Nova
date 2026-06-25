@@ -477,19 +477,11 @@ pub async fn run() -> Result<()> {
                     // Derive codec from /launch videoFormat BEFORE rebind so the
                     // encoder is recreated at the right codec (H264/HEVC/AV1) for
                     // this session, not the CLI startup default.
-                    let negotiated_codec = {
-                        let raw = encoder::Codec::from_video_format(video_format);
-                        // HDR10 requires HEVC Main10 — H.264 has no HDR10 profile.
-                        // videoFormat=0 (not specified) defaults to H264, but if the
-                        // client also set hdrMode=1 the codec must be HEVC or the VDD
-                        // FP16 surface feeds the wrong VP path and NVENC encodes garbage.
-                        if hdr_req && raw == encoder::Codec::H264 {
-                            println!("🎨 HDR requested at pre-activation — overriding H.264 → HEVC Main10 (H.264 has no HDR10 profile)");
-                            encoder::Codec::Hevc
-                        } else {
-                            raw
-                        }
-                    };
+                    // NOTE: do NOT force HEVC here even when hdrMode=1 — the ANNOUNCE
+                    // SDP (dynamic_range_mode) hasn't arrived yet and is the authoritative
+                    // gate. Forcing HEVC at pre-activation produces an H264 client (e.g.
+                    // Xbox Moonlight 1.18.0) receiving an HEVC stream it can't decode.
+                    let negotiated_codec = encoder::Codec::from_video_format(video_format);
                     if negotiated_codec != enc.config.codec {
                         println!("🎥 Codec selected by client: {} (videoFormat={:#x}) — switching encoder",
                             negotiated_codec.as_str(), video_format);
@@ -623,18 +615,22 @@ pub async fn run() -> Result<()> {
                                     _ => encoder::Codec::H264,
                                 }
                             };
-                            // HDR10 requires HEVC Main10. If HDR was requested (either via
-                            // /launch hdrMode=1 or confirmed by the client's ANNOUNCE
-                            // dynamicRangeMode=1) but codec negotiation landed on H.264,
-                            // override to HEVC. H.264 has no HDR10/Main10 profile — sending
-                            // P010 FP16-sourced frames to an H.264 encoder produces corrupt
-                            // output and a guaranteed 10-second watchdog timeout on the client.
-                            if (client.hdr_requested || client.dynamic_range_mode == 1)
-                                && raw == encoder::Codec::H264
-                            {
-                                println!("🎨 HDR active — overriding H.264 → HEVC Main10 \
-                                    (videoFormat={:#x} bitStreamFormat={} dynamicRangeMode={})",
-                                    client.video_format, client.bit_stream_format, client.dynamic_range_mode);
+                            // HDR10 requires HEVC Main10. Override to HEVC ONLY when
+                            // dynamic_range_mode == 1 (client confirmed HDR in its ANNOUNCE)
+                            // or enable_hdr=true in nova.toml (operator override).
+                            // DO NOT use hdr_requested alone — it reflects what the USER asked
+                            // for but not what the client can actually decode. Clients that
+                            // cannot do HDR (e.g. Xbox Moonlight 1.18.0) send dynamicRangeMode:0
+                            // in their ANNOUNCE; forcing HEVC on them produces a guaranteed
+                            // 10-second watchdog timeout since they have no HEVC decoder.
+                            let client_confirmed_hdr = client.dynamic_range_mode == 1
+                                || cfg.stream.enable_hdr;
+                            if client_confirmed_hdr && raw == encoder::Codec::H264 {
+                                println!("🎨 ANNOUNCE confirmed HDR (dynamicRangeMode={}) — \
+                                    overriding H.264 → HEVC Main10 \
+                                    (videoFormat={:#x} bitStreamFormat={})",
+                                    client.dynamic_range_mode, client.video_format,
+                                    client.bit_stream_format);
                                 encoder::Codec::Hevc
                             } else {
                                 raw
@@ -694,21 +690,34 @@ pub async fn run() -> Result<()> {
                             input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
                         }
 
-                        // HDR10 pipeline: gate on /launch hdrMode=1 (client.hdr_requested).
-                        // Xbox Moonlight 1.18.0 (corever=1) always sends dynamicRangeMode=0
-                        // in the ANNOUNCE regardless of user HDR setting, so dynamicRangeMode
-                        // cannot be used as the gate for old clients.
-                        //
-                        // Two-step activation:
-                        //   1. Enable Windows Advanced Color on the VDD via
-                        //      DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE) so DXGI
-                        //      switches its frame buffer to R16G16B16A16_FLOAT (linear scRGB).
-                        //      This triggers DXGI_ERROR_ACCESS_LOST; the capture loop's
-                        //      ACCESS_LOST rebind re-creates the duplication handle in HDR mode.
-                        //   2. Recreate NVENC as HEVC Main10 with P010 buffer format so the
-                        //      shim's FP16→P010 VP path has a matching output surface.
+                        // HDR10 pipeline activation gate:
+                        //   - dynamic_range_mode == 1: client ANNOUNCE confirmed HDR. This is
+                        //     the authoritative source. Xbox Moonlight 1.18.0 sends 0 here
+                        //     (no HEVC/HDR10 support) — it must receive H264/SDR.
+                        //   - cfg.stream.enable_hdr: operator override in nova.toml bypasses
+                        //     the client negotiation (useful when the EDID query is slow).
+                        //   - hdr_requested alone is NOT sufficient: it reflects the user's
+                        //     intent but not the client's decoder capability.
+                        let client_confirmed_hdr = client.dynamic_range_mode == 1
+                            || cfg.stream.enable_hdr;
+
+                        // Revert: if pre-activation enabled FP16 on the VDD but the client
+                        // declined HDR in ANNOUNCE (dynamicRangeMode=0), we must switch back
+                        // to BGRA8/SDR now. The H.264 SDR encoder's shim uses BGRA8 as the
+                        // capture source format; feeding it FP16 frames causes CopyResource
+                        // format mismatches that produce garbage or zero-byte output.
+                        if client.hdr_requested && !client_confirmed_hdr && vd.active_device_name().is_some() {
+                            println!("⚠️  Client declined HDR (ANNOUNCE dynamicRangeMode=0) — \
+                                reverting VDD to SDR/BGRA8 (H.264 cannot process FP16 frames)");
+                            let _ = vd.set_active_display_hdr(false);
+                            if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc,
+                                vd.active_device_name(), Some((client.width, client.height))) {
+                                eprintln!("⚠️  SDR rebind after HDR revert: {e}");
+                            }
+                        }
+
                         let hdr_ok = cfg.stream.enable_hdr || vd.is_advanced_color_supported();
-                        if client.hdr_requested && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr
+                        if client_confirmed_hdr && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr
                             && hdr_ok
                         {
                             // Advanced Color was enabled in pre-activation (during the
@@ -819,6 +828,8 @@ pub async fn run() -> Result<()> {
                         }
 
                         rtp_sender.set_fps(session_fps.max(1));
+                        rtp_sender.set_codec(enc.config.codec == encoder::Codec::Hevc
+                            || enc.config.codec == encoder::Codec::Av1);
                         let negotiated_interval = Duration::from_secs_f64(1.0 / session_fps.max(1) as f64);
                         if negotiated_interval != frame_interval {
                             frame_interval = negotiated_interval;
@@ -1143,7 +1154,9 @@ pub async fn run() -> Result<()> {
 
                 if video_learned {
                     let data = &out_buffer[..packet_size as usize];
-                    let kind = if rtp::detect_frame_type(data) == 2 { "IDR" } else { "P" };
+                    let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc
+                        || enc.config.codec == encoder::Codec::Av1;
+                    let kind = if rtp::detect_frame_type(data, is_hevc_enc) == 2 { "IDR" } else { "P" };
                     println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, kind);
                     rtp_sender.send_frame(data);
                 }
