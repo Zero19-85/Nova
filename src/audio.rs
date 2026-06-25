@@ -177,6 +177,12 @@ fn start_capture_thread(
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
 
     let handle = thread::spawn(move || {
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
         // ~1 s of audio at worst-case 48 kHz, 2 ch, 32-bit float
         let mut buf = vec![0u8; 48_000 * 2 * 4];
         while !stop.load(Ordering::Relaxed) {
@@ -242,6 +248,12 @@ impl AudioStreamer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
         let handle = thread::spawn(move || {
+            unsafe {
+                use windows::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                };
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            }
             audio_send_loop(socket, rikey, rikeyid, encrypt, packet_duration_ms, host_audio, stop_flag);
         });
         Self { stop, handle: Some(handle) }

@@ -347,6 +347,13 @@ static ID3D11Texture2D*          g_cleanBgTex    = nullptr;
 static ID3D11Texture2D*          g_compositeTex  = nullptr;
 static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
 
+// Cached SRV on g_compositeTex — built once when g_compositeTex is (re)created
+// and reused every frame by both the HDR and SDR YUV shader passes. Eliminates
+// the per-frame CreateShaderResourceView GPU allocation that was causing stutter
+// at 60–120 Hz. Invalidated whenever g_compositeTex changes (resize/format switch).
+static ID3D11ShaderResourceView* g_compositeSRV    = nullptr;
+static ID3D11Texture2D*          g_compositeSrvTex = nullptr;
+
 // GPU fence used to block EncodeFrame() until the CopyResource of the DXGI
 // duplication surface into g_cleanBgTex has actually finished on the GPU
 // (see EncodeFrame for why this matters).
@@ -1168,18 +1175,19 @@ extern "C" __declspec(dllexport) int InitEncoder(
             // frame still only references one frame back (numRefL0).
             h264.maxNumRefFrames   = 5;
             h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_1;
-            h264.enableFillerDataInsertion = 0;
+            // Filler data keeps CBR byte-accurate on static frames: NVENC pads
+            // easy (low-motion) frames to the full bit budget rather than
+            // under-spending and then over-correcting — eliminating the QP
+            // oscillation that manifests as "pulsing" text.
+            h264.enableFillerDataInsertion = 1;
             h264.h264VUIParameters = vuiParams;
-            // Continuous intra refresh: with CBR + infinite GOP (no periodic
-            // IDR — see above), this is what actually self-heals dropped or
-            // corrupted reference data. Every intraRefreshPeriod frames, NVENC
-            // starts cycling the whole frame through intra-coded macroblocks,
-            // completing the cycle over the next intraRefreshCnt frames — an
-            // IDR-less "rolling keyframe" that fits the single-frame VBV
-            // instead of spiking it like a full IDR would.
+            // Continuous intra refresh: period == cnt means a new refresh cycle
+            // starts the instant the previous one ends — every frame carries some
+            // intra MBs, the entire frame is refreshed every second (at 60fps).
+            // No "off" gap between cycles, so text snaps crisp without pulsing.
             h264.enableIntraRefresh = 1;
-            h264.intraRefreshPeriod = 30;
-            h264.intraRefreshCnt    = 10;
+            h264.intraRefreshPeriod = fps;
+            h264.intraRefreshCnt    = fps;
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
             encodeConfig.profileGUID = is_hdr ? NV_ENC_HEVC_PROFILE_MAIN10_GUID
                                               : NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -1196,7 +1204,8 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.sliceModeData        = 1;
             hevc.maxNumRefFramesInDPB = 5;
             hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
-            hevc.enableFillerDataInsertion = 0;
+            // Same filler-data rationale as H264: prevents CBR QP oscillation on static frames.
+            hevc.enableFillerDataInsertion = 1;
             hevc.hevcVUIParameters    = vuiParams;
             if (is_hdr) {
                 // Belt-and-suspenders: explicitly stamp HDR10 VUI as raw integer
@@ -1212,8 +1221,8 @@ extern "C" __declspec(dllexport) int InitEncoder(
                 hevc.hevcVUIParameters.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
             }
             hevc.enableIntraRefresh = 1;
-            hevc.intraRefreshPeriod = 30;
-            hevc.intraRefreshCnt    = 10;
+            hevc.intraRefreshPeriod = fps;
+            hevc.intraRefreshCnt    = fps;
         }
 
         ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
@@ -1275,6 +1284,17 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)frameDesc.Width, (int)frameDesc.Height, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
+
+    // Rebuild the cached SRV when g_compositeTex was (re)created (resize or format switch).
+    if (g_compositeSrvTex != g_compositeTex) {
+        if (g_compositeSRV) { g_compositeSRV->Release(); g_compositeSRV = nullptr; }
+        if (FAILED(g_device->CreateShaderResourceView(g_compositeTex, nullptr, &g_compositeSRV))) {
+            ShimLog("❌ Failed to create cached SRV on composite tex\n");
+            return 0;
+        }
+        g_compositeSrvTex = g_compositeTex;
+    }
+
     if (!g_copyFence) {
         D3D11_QUERY_DESC qdesc = {};
         qdesc.Query = D3D11_QUERY_EVENT;
@@ -1321,12 +1341,11 @@ extern "C" __declspec(dllexport) int EncodeFrame(
             return 0;
         }
 
-        // Per-frame SRV on the FP16 composite texture.
-        ID3D11ShaderResourceView* srcSRV = nullptr;
-        if (FAILED(g_device->CreateShaderResourceView(g_compositeTex, nullptr, &srcSRV))) {
-            ShimLog("❌ HDR: CreateShaderResourceView on FP16 composite failed\n");
+        if (!g_compositeSRV) {
+            ShimLog("❌ HDR: composite SRV not ready\n");
             return 0;
         }
+        ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
         const float W = (float)frameDesc.Width, H = (float)frameDesc.Height;
 
@@ -1354,13 +1373,13 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->PSSetShader(g_hdrUVPS, nullptr, 0);
         g_context->Draw(3, 0);
 
-        // Unbind before CopyResource — RTV/SRV hazard.
+        // Unbind before encode — RTV/SRV hazard.
         g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
         ID3D11ShaderResourceView* nullSRV = nullptr;
         g_context->PSSetShaderResources(0, 1, &nullSRV);
         g_context->VSSetShader(nullptr, nullptr, 0);
         g_context->PSSetShader(nullptr, nullptr, 0);
-        srcSRV->Release();
+        // srcSRV is the cached g_compositeSRV — do NOT Release here.
 
         // No CopyResource — we drew directly into the NVENC P010 input texture.
     } else {
@@ -1372,12 +1391,11 @@ extern "C" __declspec(dllexport) int EncodeFrame(
             return 0;
         }
 
-        // Create an SRV on the BGRA8 composite texture for the pixel shaders to sample.
-        ID3D11ShaderResourceView* srcSRV = nullptr;
-        if (FAILED(g_device->CreateShaderResourceView(vpSourceTexture, nullptr, &srcSRV))) {
-            ShimLog("⚠️  SDR: CreateShaderResourceView failed — frame dropped\n");
+        if (!g_compositeSRV) {
+            ShimLog("⚠️  SDR: composite SRV not ready — frame dropped\n");
             return 0;
         }
+        ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
         D3D11_TEXTURE2D_DESC frameInfo = {};
         vpSourceTexture->GetDesc(&frameInfo);
@@ -1413,7 +1431,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->PSSetShaderResources(0, 1, &nullSRV);
         g_context->VSSetShader(nullptr, nullptr, 0);
         g_context->PSSetShader(nullptr, nullptr, 0);
-        srcSRV->Release();
+        // srcSRV is the cached g_compositeSRV — do NOT Release here.
     }
 
     std::vector<NvEncOutputFrame> vPacket;
@@ -1500,6 +1518,8 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_cursorXorSRV)      { g_cursorXorSRV->Release();      g_cursorXorSRV      = nullptr; }
     if (g_cursorXorTex)      { g_cursorXorTex->Release();      g_cursorXorTex      = nullptr; }
     if (g_cleanBgTex)        { g_cleanBgTex->Release();        g_cleanBgTex        = nullptr; }
+    if (g_compositeSRV)      { g_compositeSRV->Release();      g_compositeSRV      = nullptr; }
+    g_compositeSrvTex = nullptr;
     if (g_compositeRTV)      { g_compositeRTV->Release();      g_compositeRTV      = nullptr; }
     if (g_compositeTex)      { g_compositeTex->Release();      g_compositeTex      = nullptr; }
     if (g_copyFence)         { g_copyFence->Release();         g_copyFence         = nullptr; }

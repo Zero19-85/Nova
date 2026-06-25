@@ -1,20 +1,27 @@
 // Nova Server — elevated tray-resident application.
 //
 // Deployment model (Task Scheduler, NOT Windows Service):
-//   --install    → registers a "On Logon / Highest Privileges" scheduled task,
-//                  cleans up any old SCM service, and runs the Ghost Protocol
+//   --install    → registers a "NovaServerBoot" At-Logon / Highest-Privileges
+//                  scheduled task, migrates/removes any old task names, cleans
+//                  up any SCM service remnant, and runs the Ghost Protocol
 //                  (removes stale nova_shim.dll copies from System32/SysWOW64).
-//   --uninstall  → removes the scheduled task and kills any running instance.
+//   --uninstall  → removes the task and kills any running instance.
 //   (no flag)    → normal tray run; called by the scheduled task on logon.
 //
 // Why not a Windows Service?
 //   Services run in Session 0 (isolated from the interactive desktop).
 //   DXGI Desktop Duplication, the D3D11 Video Processor, and Windows Graphics
 //   Capture ALL require the interactive session (Session 1+).  In Session 0
-//   they return E_ACCESSDENIED and the encoder writes uninitialized texture
+//   they return E_ACCESSDENIED — the encoder writes uninitialized texture
 //   data → "half-green / half-smeared" stream corruption.
-//   A scheduled task launched On Logon runs in the user's own session with
-//   the same elevated token the UAC manifest requests, solving both problems.
+//
+// Why Task XML instead of schtasks /create flags?
+//   `schtasks /create` without an explicit /ru resolves ambiguously on some
+//   Windows 11 builds and can default to SYSTEM (Session 0).  The XML path
+//   lets us set <LogonType>InteractiveToken</LogonType> — the exact COM-level
+//   flag that forces the task into the user's interactive session — plus
+//   <UserId> scoped to the installing account and a 5-second startup delay
+//   so DWM/WGC have time to initialise before Nova binds its capture session.
 
 #![windows_subsystem = "windows"]
 
@@ -76,19 +83,36 @@ fn main() {
 
         _ => {
             // Normal run — launched by the scheduled task on logon, or manually.
-            // (Also handles any stray --run-service invocations from old installs
-            // by simply running the server, which is harmless.)
-            tokio::runtime::Runtime::new()
-                .expect("tokio runtime")
-                .block_on(nova_server::run())
-                .expect("nova_server::run failed");
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            match rt.block_on(nova_server::run()) {
+                Ok(()) => {}
+                Err(e) => {
+                    // run() returns Err when a critical resource is unavailable
+                    // (no GPU, no display, WGC unsupported, etc.). Log to nova.log
+                    // (stdout is already redirected there by init_debug_logger) and
+                    // exit with code 1 — a clean failure, not a panic (exit 101).
+                    println!("❌ Nova exited with error: {e:?}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
 
-// ── Scheduled-Task install ────────────────────────────────────────────────────
+// ── Task identity ─────────────────────────────────────────────────────────────
 
-const TASK_NAME: &str = "Nova Game Streaming";
+/// The canonical scheduled-task name registered by --install.
+const TASK_NAME: &str = "NovaServerBoot";
+
+/// Legacy names from previous install strategies.  Swept during both --install
+/// (to avoid leaving a defunct ghost task) and --uninstall (belt-and-suspenders).
+const TASK_NAMES_LEGACY: &[&str] = &[
+    "Nova Game Streaming",
+    "NovaServer",
+    "Nova Server",
+];
+
+// ── Scheduled-task install ────────────────────────────────────────────────────
 
 fn install_task() -> Result<(), String> {
     let exe = std::env::current_exe()
@@ -103,48 +127,159 @@ fn install_task() -> Result<(), String> {
     ghost_protocol_purge_dll();
 
     // ── Retire the old SCM service (if present) ───────────────────────────────
-    // Silently ignore errors — the service simply may not exist.
     println!("🔧 Cleaning up any old NovaServer SCM service...");
-    let _ = run_silent("sc",    &["stop",   "NovaServer"]);
-    let _ = run_silent("sc",    &["delete", "NovaServer"]);
+    let _ = run_hidden("sc", &["stop",   "NovaServer"]);
+    let _ = run_hidden("sc", &["delete", "NovaServer"]);
 
-    // ── Kill any running Nova instance so the new task starts fresh ───────────
+    // ── Sweep legacy task names ───────────────────────────────────────────────
+    // Removes stale entries from prior install strategies so Task Scheduler
+    // stays clean and there is no ambiguity about which entry fires on logon.
+    println!("🔧 Removing any prior task registrations...");
+    for old_name in TASK_NAMES_LEGACY {
+        let _ = run_hidden("schtasks", &["/delete", "/tn", old_name, "/f"]);
+    }
+
+    // ── Kill any running Nova instance ────────────────────────────────────────
     println!("🔧 Stopping any running Nova instance...");
-    let _ = run_silent("taskkill", &["/F", "/IM", "nova-server.exe"]);
+    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe"]);
 
-    // ── Register the Scheduled Task ───────────────────────────────────────────
-    //   /sc ONLOGON   — trigger: fires when the current user logs on
-    //   /rl HIGHEST   — run level: requests the elevated token (skips per-session UAC)
-    //   /f            — force overwrite if the task already exists
-    //   No /ru        — runs as the interactive user who called --install
-    println!("📋 Registering scheduled task '{}'...", TASK_NAME);
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/create",
-            "/tn",  TASK_NAME,
-            "/tr",  &format!("\"{}\"", exe_str),
-            "/sc",  "ONLOGON",
-            "/rl",  "HIGHEST",
-            "/f",
-        ])
-        .status()
-        .map_err(|e| format!("Failed to run schtasks: {e}"))?;
+    // ── Register NovaServerBoot via Task XML ──────────────────────────────────
+    println!("📋 Registering scheduled task '{TASK_NAME}'...");
+    register_task_xml(TASK_NAME, &exe_str)?;
+
+    println!("✅ Scheduled task '{TASK_NAME}' registered.");
+    println!("   Trigger : At Logon — current user only, 5-second startup delay");
+    println!("   Session : InteractiveToken (Session 1+, full DWM/WGC access)");
+    println!("   Level   : HighestAvailable (elevated token; no UAC prompt at boot)");
+    println!("   Nova will start automatically next time you log on.");
+    println!("   Uninstall: nova-server.exe --uninstall");
+    Ok(())
+}
+
+/// Builds a Task Scheduler XML definition and registers it via `schtasks /create /xml`.
+///
+/// Using XML rather than `/sc /rl` flags gives us:
+///   • `<LogonType>InteractiveToken</LogonType>` — the exact COM-level bit that
+///     forces the task into the logged-on user's interactive session (Session 1+),
+///     preventing the ambiguous-SYSTEM fallback that causes Session 0 binding.
+///   • `<RunLevel>HighestAvailable</RunLevel>` — request the elevated token for
+///     accounts in the Administrators group; no-op for standard accounts.
+///   • `<UserId>` scoped to the installing account — trigger fires only for this
+///     user, not any user, so a shared PC doesn't launch Nova on every logon.
+///   • `<Delay>PT5S</Delay>` — 5-second grace period for DWM/WGC to settle
+///     before Nova attempts to open a capture session.
+///   • `<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>` — prevents
+///     duplicate Nova processes if the task fires more than once.
+///   • `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>` — no automatic timeout;
+///     Nova is a long-running tray process and must not be killed by the scheduler.
+fn register_task_xml(task_name: &str, exe_path: &str) -> Result<(), String> {
+    // Resolve the current user as DOMAIN\Username (works for local, MS-account,
+    // and domain accounts — matches what Task Scheduler expects in <UserId>).
+    let username   = std::env::var("USERNAME")
+        .unwrap_or_else(|_| "User".to_string());
+    let userdomain = std::env::var("USERDOMAIN")
+        .unwrap_or_else(|_| std::env::var("COMPUTERNAME").unwrap_or_else(|_| ".".to_string()));
+    let full_user = format!("{userdomain}\\{username}");
+
+    // Escape XML special characters in path and user strings.
+    let safe_exe  = xml_escape(exe_path);
+    let safe_user = xml_escape(&full_user);
+
+    let xml = format!(r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Nova Game Streaming — auto-start at user logon</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{safe_user}</UserId>
+      <Delay>PT5S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{safe_user}</UserId>
+      <!-- InteractiveToken: runs inside the user's interactive session (Session 1+).
+           This is the flag that prevents Session 0 binding and gives the process
+           access to the DWM compositor, WGC, and the D3D11 Video Processor. -->
+      <LogonType>InteractiveToken</LogonType>
+      <!-- HighestAvailable: request the elevated admin token when available.
+           Needed for VDD devnode manipulation and ViGEmBus injection. -->
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <!-- PT0S = no execution time limit; Nova is a long-running tray process. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{safe_exe}</Command>
+    </Exec>
+  </Actions>
+</Task>"#);
+
+    // schtasks /create /xml requires UTF-16 LE with BOM.
+    let utf16: Vec<u16> = xml.encode_utf16().collect();
+    let mut bytes = Vec::with_capacity(2 + utf16.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]); // BOM
+    for unit in &utf16 {
+        bytes.push((*unit & 0xFF) as u8);
+        bytes.push((*unit >> 8)   as u8);
+    }
+
+    let tmp_path = std::env::temp_dir().join("nova_task_reg.xml");
+    std::fs::write(&tmp_path, &bytes)
+        .map_err(|e| format!("Failed to write task XML to temp file: {e}"))?;
+
+    let tmp_str = tmp_path.to_string_lossy().into_owned();
+    let status = run_hidden("schtasks", &[
+        "/create",
+        "/tn",  task_name,
+        "/xml", &tmp_str,
+        "/f",
+    ]).map_err(|e| format!("Failed to run schtasks: {e}"))?;
+
+    // Clean up regardless of success.
+    let _ = std::fs::remove_file(&tmp_path);
 
     if !status.success() {
         return Err(format!(
-            "schtasks /create exited with code {:?}. \
+            "schtasks /create /xml exited with code {:?}. \
              Check nova.log for details. \
-             Ensure the installer is running with Administrator rights.",
+             Ensure --install is invoked with Administrator rights.",
             status.code()
         ));
     }
 
-    println!("✅ Scheduled task '{}' registered.", TASK_NAME);
-    println!("   Trigger : On Logon");
-    println!("   Level   : Highest Privileges (no UAC prompt on startup)");
-    println!("   Nova will start automatically next time you log on.");
-    println!("   Uninstall: nova-server.exe --uninstall");
+    println!("   Registered for user: {full_user}");
     Ok(())
+}
+
+/// Escapes the five XML predefined entities in a string.
+fn xml_escape(s: &str) -> String {
+    s.replace('&',  "&amp;")
+     .replace('<',  "&lt;")
+     .replace('>',  "&gt;")
+     .replace('"',  "&quot;")
+     .replace('\'', "&apos;")
 }
 
 // ── Ghost Protocol ─────────────────────────────────────────────────────────────
@@ -155,11 +290,9 @@ fn install_task() -> Result<(), String> {
 fn ghost_protocol_purge_dll() {
     let win_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let candidates = [
-        format!(r"{}\System32\nova_shim.dll",  win_root),
-        format!(r"{}\SysWOW64\nova_shim.dll",  win_root),
-        // Belt-and-suspenders: also check the legacy SYSTEM path that old
-        // schtasks / service installs occasionally wrote to.
-        format!(r"{}\nova_shim.dll",            win_root),
+        format!(r"{win_root}\System32\nova_shim.dll"),
+        format!(r"{win_root}\SysWOW64\nova_shim.dll"),
+        format!(r"{win_root}\nova_shim.dll"),
     ];
 
     println!("👻 Ghost Protocol: scanning for stale nova_shim.dll copies...");
@@ -169,8 +302,8 @@ fn ghost_protocol_purge_dll() {
         if p.exists() {
             found = true;
             match std::fs::remove_file(p) {
-                Ok(()) => println!("   🗑  Deleted: {}", path_str),
-                Err(e) => println!("   ⚠️  Could not delete {} — {}", path_str, e),
+                Ok(()) => println!("   🗑  Deleted: {path_str}"),
+                Err(e) => println!("   ⚠️  Could not delete {path_str} — {e}"),
             }
         }
     }
@@ -179,41 +312,44 @@ fn ghost_protocol_purge_dll() {
     }
 }
 
-// ── Scheduled-Task uninstall ──────────────────────────────────────────────────
+// ── Scheduled-task uninstall ──────────────────────────────────────────────────
 
 fn uninstall_task() -> Result<(), String> {
     // Kill the running instance first so Inno Setup can delete the files.
     println!("🔧 Stopping Nova...");
-    let _ = run_silent("taskkill", &["/F", "/IM", "nova-server.exe"]);
+    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe"]);
 
-    // Remove the scheduled task.  schtasks exits 1 if the task doesn't exist —
-    // that's fine, so we only error on codes > 1.
-    println!("📋 Removing scheduled task '{}'...", TASK_NAME);
-    let status = std::process::Command::new("schtasks")
-        .args(["/delete", "/tn", TASK_NAME, "/f"])
-        .status()
-        .map_err(|e| format!("Failed to run schtasks: {e}"))?;
+    // Remove the canonical task name.
+    println!("📋 Removing scheduled task '{TASK_NAME}'...");
+    let _ = run_hidden("schtasks", &["/delete", "/tn", TASK_NAME, "/f"]);
 
-    let code = status.code().unwrap_or(0);
-    if !status.success() && code != 1 {
-        // code 1 = task not found; anything else is a real error
-        println!("⚠️  schtasks /delete returned code {} — task may already be gone.", code);
+    // Sweep all legacy names — belt-and-suspenders for partial / failed installs.
+    for old_name in TASK_NAMES_LEGACY {
+        let _ = run_hidden("schtasks", &["/delete", "/tn", old_name, "/f"]);
     }
 
-    // Also clean up any old SCM service that might still be lingering.
-    let _ = run_silent("sc", &["stop",   "NovaServer"]);
-    let _ = run_silent("sc", &["delete", "NovaServer"]);
+    // Clean up any lingering SCM service from an even older install strategy.
+    let _ = run_hidden("sc", &["stop",   "NovaServer"]);
+    let _ = run_hidden("sc", &["delete", "NovaServer"]);
 
     println!("✅ Nova uninstalled.");
-    println!("   The scheduled task has been removed.");
-    println!("   Log file (nova.log) is kept for reference.");
+    println!("   Scheduled task removed; log file (nova.log) kept for reference.");
     Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Run a command silently (inheriting the redirected log file as stdout/stderr).
-/// Returns the exit status; callers decide whether to care about it.
-fn run_silent(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
-    std::process::Command::new(program).args(args).status()
+/// Run a command without creating a visible console window.
+///
+/// `nova-server.exe` is compiled with `#![windows_subsystem = "windows"]`, so
+/// it has no console of its own.  Without `CREATE_NO_WINDOW`, Windows creates a
+/// new console window for every console-subsystem child process (schtasks, sc,
+/// taskkill, powershell) — visible as brief black flashes during install.
+fn run_hidden(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
 }

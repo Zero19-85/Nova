@@ -264,13 +264,14 @@ fn handle_control_message(
             crate::encoder::request_idr_global();
         }
         // Loss stats arrive every ~50ms; payload[0] (i32 LE) is the loss count
-        // since the last report. Only log when the client actually lost
-        // something — this is the live signal that FEC is being exercised.
+        // since the last report. Signal congestion control on non-zero loss so
+        // the main loop can reduce the CBR target before the link falls over.
         PT_LOSS_STATS => {
             if data.len() >= 8 {
                 let lost = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 if lost > 0 {
-                    println!("🎮 Loss stats: client lost {} packet(s) since last report", lost);
+                    println!("🎮 Loss stats: client lost {} packet(s) — signalling bitrate reduction", lost);
+                    crate::encoder::signal_congestion_reduction();
                 }
             }
         }

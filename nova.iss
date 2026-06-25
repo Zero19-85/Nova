@@ -140,14 +140,18 @@ Filename: "{#VDDDevcon}"; \
     StatusMsg: "Installing Virtual Display Driver (ARM64)..."; \
     Check: IsARM64
 
-; ── 2. Register the Nova ONLOGON scheduled task ───────────────────────────────
-; --install also runs the Ghost Protocol (removes any stale nova_shim.dll from
-; System32/SysWOW64) and retires any old NovaServer SCM service left over from
-; a previous install strategy.
+; ── 2. Register the NovaServerBoot scheduled task ────────────────────────────
+; --install performs four operations in one shot:
+;   a) Ghost Protocol — removes stale nova_shim.dll from System32/SysWOW64
+;   b) SCM cleanup    — removes any old "NovaServer" Windows Service entry
+;   c) Task migration — deletes legacy task names ("Nova Game Streaming", etc.)
+;   d) Task creation  — registers "NovaServerBoot" via schtasks /create /xml
+;      with <LogonType>InteractiveToken</LogonType> and <RunLevel>HighestAvailable
+;      so it runs in the user's interactive session (Session 1+), not Session 0.
 Filename: "{app}\{#AppExe}"; \
     Parameters: "--install"; \
     Flags: runhidden waituntilterminated; \
-    StatusMsg: "Registering Nova startup task..."
+    StatusMsg: "Registering NovaServerBoot startup task..."
 
 ; ── 3. Launch Nova for this session ───────────────────────────────────────────
 ; nowait so the installer exits immediately; runhidden because Nova is a

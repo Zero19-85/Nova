@@ -142,18 +142,49 @@ impl WgcCapturer {
     /// `DesktopCapturer::new_excluding`). Always starts in SDR mode; the
     /// caller upgrades to HDR via `rebind(..., is_hdr=true, ...)` once the
     /// client negotiates HEVC Main10.
+    ///
+    /// Re-resolves the HMONITOR on every retry attempt. After `ensure_enabled_at_boot`
+    /// cycles the VDD devnode (disable → enable), Windows briefly reassigns all
+    /// HMONITORs as part of the topology refresh. Resolving the handle once and
+    /// then retrying `CreateForMonitor` with the stale value always fails —
+    /// the inner `open_session` loop only guards against a momentarily-busy
+    /// compositor, not a fully invalidated handle. Re-resolving each time lets
+    /// the physical monitor's new handle land before we bind the WGC session.
     pub fn new_excluding(exclude: Option<&str>) -> Result<Self> {
         unsafe { let _ = RoInitialize(RO_INIT_MULTITHREADED); }
 
-        let hmonitor = match exclude {
-            Some(ex) => Self::first_monitor_excluding(ex)
-                            .unwrap_or_else(Self::primary_hmonitor),
-            None     => Self::primary_hmonitor(),
-        };
-
         let device     = Self::create_d3d11_device()?;
         let wrt_device = Self::wrap_d3d11_device(&device)?;
-        Self::open_session(device, wrt_device, hmonitor, false)
+
+        // E_INVALIDARG (0x80070057) from CreateForMonitor means the HMONITOR is
+        // not (yet) valid — the VDD cycle or a CCD topology change is still settling.
+        const E_INVALIDARG: windows::core::HRESULT =
+            windows::core::HRESULT(0x80070057_u32 as i32);
+
+        let mut last_err: Option<windows::core::Error> = None;
+        for attempt in 0..10u32 {
+            // Re-resolve on every attempt — the HMONITOR may change between tries.
+            let hmonitor = match exclude {
+                Some(ex) => Self::first_monitor_excluding(ex)
+                                .unwrap_or_else(Self::primary_hmonitor),
+                None     => Self::primary_hmonitor(),
+            };
+
+            match Self::open_session(device.clone(), wrt_device.clone(), hmonitor, false) {
+                Ok(s) => return Ok(s),
+                Err(e) if e.code() == E_INVALIDARG && attempt < 9 => {
+                    println!(
+                        "⚠️  WGC: physical monitor HMONITOR invalid after VDD topology change \
+                         (attempt {}/10) — re-resolving in 500 ms",
+                        attempt + 1
+                    );
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     /// Re-targets capture to `gdi_device_name` (or the physical primary when

@@ -105,6 +105,18 @@ fn rebind_capture_and_encoder(
 }
 
 pub async fn run() -> Result<()> {
+    // Elevate this thread (capture / encode / RTP-send path) to TIME_CRITICAL
+    // priority so Windows scheduler doesn't preempt it for background tasks.
+    // This is the same OS thread that drives the frame loop; since tokio's work-
+    // stealing runtime may migrate async tasks, this grants the initial worker
+    // thread the elevated priority — adequate for the mostly-synchronous hot path.
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+
     // ── File logging: must be first so all subsequent println! go to nova.log ─
     debug::init_debug_logger();
 
@@ -191,7 +203,11 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let mut capturer = capture::WgcCapturer::new_excluding(virtual_device_name.as_deref()).expect("Failed to start WGC capture");
+    let mut capturer = capture::WgcCapturer::new_excluding(virtual_device_name.as_deref())
+        .map_err(|e| {
+            println!("❌ Failed to start WGC capture — no usable display found: {e:?}");
+            e
+        })?;
     input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
 
     // The WGC frame pool captures at the monitor's native resolution, which may
@@ -215,7 +231,12 @@ pub async fn run() -> Result<()> {
             is_hdr:       false, // upgraded per-session when client negotiates HEVC Main10/HDR
         },
     )
-    .expect("Failed to initialize NVENC encoder");
+    .map_err(|e| {
+        println!("❌ Failed to initialize NVENC encoder: {e}");
+        // Encoder::new returns String errors; convert to a windows::core::Error
+        // so run() can propagate via ? (run() returns windows::core::Result<()>).
+        windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
+    })?;
 
     let client_info = Arc::new(Mutex::new(None::<rtsp::ClientInfo>));
 
@@ -279,6 +300,10 @@ pub async fn run() -> Result<()> {
     let mut video_learned    = false;
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
+    // Congestion control: the session's negotiated bitrate ceiling and bookkeeping
+    // for the reduce→ramp-back cycle. Written at session start, reset on disconnect.
+    let mut congestion_stable_kbps: u32 = 0;
+    let mut congestion_last_event = Instant::now() - Duration::from_secs(30);
     // Per-second encoder output rate — catches rate-control regressions
     // locally (works without any client connected), e.g. CBR overshooting
     // what the link/client can take.
@@ -740,6 +765,9 @@ pub async fn run() -> Result<()> {
                             println!("📊 Retargeting encoder to client bitrate: {} Kbps @ {} fps",
                                 client.bitrate_kbps, session_fps);
                             encoder::reconfigure_bitrate(client.bitrate_kbps, session_fps);
+                            encoder::set_stream_bitrate_kbps(client.bitrate_kbps as i32);
+                            congestion_stable_kbps = client.bitrate_kbps;
+                            congestion_last_event  = Instant::now() - Duration::from_secs(30);
                             // Mirror negotiated values into enc.config so any
                             // mid-session rebind (resolution/device change) inherits
                             // the session fps (may be capped below client.fps for H264)
@@ -792,8 +820,10 @@ pub async fn run() -> Result<()> {
                 input::stop_session();
                 frame_interval  = startup_frame_interval;
                 next_frame_time = Instant::now();
-                client_connected = false;
-                video_learned    = false;
+                client_connected    = false;
+                video_learned       = false;
+                congestion_stable_kbps = 0;
+                encoder::set_stream_bitrate_kbps(0);
 
                 // ── Scorched-earth encoder teardown ──────────────────────────
                 // Always destroy the full C++ NVENC/D3D11/VP/RTV pipeline on
@@ -877,6 +907,38 @@ pub async fn run() -> Result<()> {
             }
         }
 
+        // ── Congestion control ────────────────────────────────────────────────
+        // PT_LOSS_STATS from the control thread atomically sets a pending
+        // reduced bitrate (via signal_congestion_reduction). We apply it here
+        // (on the main thread) with a 2-second cooldown to prevent thrashing,
+        // then ramp back up by 10% every 5 seconds once the link stabilises.
+        if client_connected && congestion_stable_kbps > 0 {
+            if let Some(reduced) = encoder::take_congestion_bitrate() {
+                if congestion_last_event.elapsed() >= Duration::from_secs(2) {
+                    let fps = enc.config.fps as u32;
+                    encoder::reconfigure_bitrate(reduced, fps);
+                    encoder::set_stream_bitrate_kbps(reduced as i32);
+                    congestion_last_event = Instant::now();
+                    println!("📉 Congestion: bitrate → {} Kbps ({}% of {} Kbps ceiling)",
+                        reduced,
+                        reduced * 100 / congestion_stable_kbps,
+                        congestion_stable_kbps);
+                }
+            } else {
+                let cur = encoder::get_stream_bitrate_kbps() as u32;
+                if cur > 0 && cur < congestion_stable_kbps
+                    && congestion_last_event.elapsed() >= Duration::from_secs(5)
+                {
+                    let ramped = (cur + cur / 10).min(congestion_stable_kbps);
+                    let fps = enc.config.fps as u32;
+                    encoder::reconfigure_bitrate(ramped, fps);
+                    encoder::set_stream_bitrate_kbps(ramped as i32);
+                    congestion_last_event = Instant::now();
+                    println!("📈 Congestion: ramped bitrate → {} Kbps (+10%)", ramped);
+                }
+            }
+        }
+
         // Texture to feed the encoder this iteration — either a freshly captured
         // WGC frame, or (when the desktop is unchanged) a re-submission of the
         // last cached frame to keep the stream alive on a static desktop.
@@ -923,14 +985,17 @@ pub async fn run() -> Result<()> {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_millis(1)).await;
-
                 // ── Encoder gate ──────────────────────────────────────────────
                 // No NVENC calls until WGC has delivered its first real frame.
                 // Before that point cached_texture() is None (cleared on rebind)
                 // and passing a null/stale pointer to encode_frame returns 0
                 // bytes. Once has_frame() flips true, cached re-submission is
                 // safe and maintains the 120-fps stream on a static desktop.
+                //
+                // The outer next_frame_time pacing (top of loop) already provides
+                // the correct sleep duration for both paths. A separate 1ms sleep
+                // here was previously adding up to 1ms of extra jitter to every
+                // static-desktop re-submission — removed.
                 if !capturer.has_frame() {
                     continue;
                 }

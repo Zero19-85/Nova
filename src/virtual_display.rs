@@ -1089,30 +1089,43 @@ impl VirtualDisplay {
             Err(e)    => println!("⚠️  Could not patch HDRPlus in vdd_settings.xml: {e}"),
         }
 
+        // Cycle the devnode once so MttVDD re-reads the freshly-written
+        // vdd_settings.xml (IddCx only picks up the XML on (re)start).
         if self.is_enabled() {
-            // configure_mode only edits vdd_settings.xml/VDDPATH; MttVDD's
-            // IddCx adapter re-reads those only on devnode (re)start (see
-            // configure_mode's doc comment). An instance left enabled since a
-            // previous run may be advertising a stale mode/refresh-rate
-            // table, which makes force_resolution fail with
-            // DISP_CHANGE_BADMODE later when a stream requests a resolution
-            // that was only just added to the file. Cycle once, here, before
-            // capture::DesktopCapturer::new() (called by run(), after this
-            // returns) binds to anything — settling now, with no client
-            // connected and no capture pipeline yet, avoids the rebind race
-            // that ruled out cycling inside activate_for_stream on every
-            // session start (see run()'s "Enable Root\\MttVDD ONCE" comment).
-            println!("✅ Root\\MttVDD already enabled — cycling to refresh its mode table");
+            println!("✅ Root\\MttVDD already enabled — cycling to refresh mode table");
             self.set_enabled(false)?;
-            self.set_enabled(true)?;
-        } else {
-            self.set_enabled(true)?;
         }
+        self.set_enabled(true)?;
 
+        // While the devnode is briefly live, grab its GDI device name and
+        // deactivate its CCD path. This updates the topology database so
+        // Windows won't auto-promote the VDD to primary if a prior session
+        // crashed and left it as the active primary in the CCD database.
         let virtual_device = Self::wait_for_virtual_display_device_name();
         Self::isolate_virtual_display_at_boot(virtual_device.as_deref());
 
-        Ok(virtual_device)
+        // Hardware-level disable: the devnode is now fully dormant.
+        //
+        // Why this beats CCD-parking alone:
+        //   A CCD-parked (but still enabled) devnode remains visible to the
+        //   PnP enumerator, DXGI, and the firmware display registry. On a
+        //   graphics-stack crash the OS re-reads those structures at the next
+        //   boot and can still hand the VDD the $GDI_PRIMARY flag before any
+        //   Nova code has a chance to run.
+        //   A SetupAPI-disabled devnode (CM_PROB_DISABLED) is invisible to all
+        //   of those paths — Windows cannot promote it to primary regardless of
+        //   what the CCD database says.
+        //
+        // Intentionally runs AFTER isolate_virtual_display_at_boot so the CCD
+        // database is consistent ("VDD inactive") before the devnode disappears.
+        self.set_enabled(false)
+            .unwrap_or_else(|e| println!("⚠️  Could not hardware-disable VDD at boot (non-fatal): {e}"));
+        println!("🕶️  Root\\MttVDD devnode hardware-disabled at boot — will enable on client connect only");
+
+        // Return None: VDD is disabled and absent from GDI enumeration.
+        // lib.rs passes this to WgcCapturer::new_excluding(None) so the WGC
+        // capturer binds the physical primary with no VDD exclusion needed.
+        Ok(None)
     }
 
     // -------------------------------------------------------------
@@ -1304,23 +1317,42 @@ impl VirtualDisplay {
         let saved_topology = Self::query_database_topology()?;
         println!("📸 Saved current display topology from the CCD database ({} path(s))", saved_topology.0.len());
 
+        // configure_mode must run BEFORE enabling the devnode so MttVDD reads
+        // the correct vdd_settings.xml on startup (IddCx reads it at start time).
         self.configure_mode(width, height, refresh_hz)?;
+
+        // On-demand hardware enable — the devnode was left disabled at boot by
+        // ensure_enabled_at_boot. Enabling here gives DXGI/CCD a live IddCx
+        // adapter exactly when the stream needs it and for no longer.
+        if !self.is_enabled() {
+            self.set_enabled(true)?;
+        }
 
         let virtual_device = Self::wait_for_virtual_display_device_name()
             .ok_or_else(|| "timed out waiting for the virtual display to appear in GDI enumeration".to_string())?;
 
-        // isolate_virtual_display_at_boot() parks the VDD at 0×0 by staging
-        // CDS_NORESET and then committing with a global apply. A display
-        // parked at 0×0 is considered disconnected by Windows — it no longer
-        // appears in QDC_ONLY_ACTIVE_PATHS and ChangeDisplaySettingsExW
-        // returns DISP_CHANGE_FAILED (-1) for it, even for modes that ARE in
-        // the driver's table. To bring it back, use SetDisplayConfig(
-        // SDC_TOPOLOGY_EXTEND) first: this asks Windows to extend the desktop
-        // to include all connected outputs (including the VDD), using its
-        // database-stored mode for each. Once the VDD is "live" at its last
-        // valid mode (typically 1080p), force_resolution can retarget it to
-        // the client-requested resolution/refresh.
-        println!("🔌 Re-activating VDD from dormant 0×0 state via SDC_TOPOLOGY_EXTEND...");
+        // ── Topology guard: prevent primary-display hijack on enable ──────────
+        // When the devnode comes online Windows consults the CCD database to
+        // determine where the new output belongs. If a prior crashed session
+        // left the VDD as the stored primary, Windows may hand it the
+        // DISPLAYCONFIG_PATH_ACTIVE flag with position (0,0) before any Nova
+        // code runs — causing a black screen on the physical monitor.
+        //
+        // Calling ccd_deactivate_vdd_path immediately after the devnode
+        // appears in GDI ensures the VDD path is explicitly NOT active in the
+        // CCD topology. The physical GPU paths keep their DISPLAYCONFIG_PATH_ACTIVE
+        // flags and remain at (0,0). The subsequent SDC_TOPOLOGY_EXTEND then
+        // re-adds the VDD as a *secondary* (not primary) display.
+        match Self::ccd_deactivate_vdd_path(&virtual_device) {
+            Ok(true)  => {} // already inactive — no primary steal occurred
+            Ok(false) => println!("🛡️  Topology guard: cleared VDD from active CCD path on enable — physical primary retained"),
+            Err(e)    => println!("⚠️  Topology guard ccd_deactivate_vdd_path: {e} — proceeding"),
+        }
+
+        // The devnode is now hardware-enabled but CCD-inactive. Use
+        // SDC_TOPOLOGY_EXTEND to add the VDD to the desktop as a secondary
+        // display (not primary) so force_resolution can target it.
+        println!("🔌 Extending desktop topology to include VDD via SDC_TOPOLOGY_EXTEND...");
         let ext_status = unsafe {
             SetDisplayConfig(
                 None::<&[DISPLAYCONFIG_PATH_INFO]>,
@@ -1404,6 +1436,21 @@ impl VirtualDisplay {
                     error = Some(e);
                 }
             }
+        }
+
+        // Hardware-disable the devnode after topology is restored.
+        // Physical paths are already active again at this point, so disabling
+        // the VDD devnode here is safe — there is no active display that
+        // references it. The disable ensures the VDD is hardware-dormant for
+        // the idle period between sessions and survives a crash: if the
+        // process is killed before this line runs, ensure_enabled_at_boot on
+        // the next reboot will cycle the devnode and re-run
+        // isolate_virtual_display_at_boot, repairing the CCD database entry.
+        if let Err(e) = self.set_enabled(false) {
+            println!("⚠️  Could not hardware-disable VDD devnode on stream end: {e}");
+            error.get_or_insert(e);
+        } else {
+            println!("🕶️  Root\\MttVDD devnode hardware-disabled — dormant until next client connect");
         }
 
         if let Some(endpoint) = self.saved_audio_endpoint.take() {

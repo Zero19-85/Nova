@@ -1,5 +1,45 @@
 use std::ffi::{c_void, CString};
+use std::sync::atomic::{AtomicI32, Ordering};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+
+// ── Congestion-control state ─────────────────────────────────────────────────
+// STREAM_BITRATE_KBPS: the active CBR target for the current session.
+// Written by lib.rs on session start / reconfigure; read by control.rs when
+// computing a congestion-triggered reduction.
+static STREAM_BITRATE_KBPS: AtomicI32 = AtomicI32::new(0);
+
+// CONGESTION_BITRATE_KBPS: pending bitrate set by the control thread on
+// PT_LOSS_STATS. -1 = no pending change. compare_exchange consolidates rapid
+// loss reports into a single reduction; the main loop calls take_congestion_bitrate()
+// to claim it and then applies the reconfigure.
+static CONGESTION_BITRATE_KBPS: AtomicI32 = AtomicI32::new(-1);
+
+pub fn set_stream_bitrate_kbps(kbps: i32) {
+    STREAM_BITRATE_KBPS.store(kbps, Ordering::Relaxed);
+}
+
+pub fn get_stream_bitrate_kbps() -> i32 {
+    STREAM_BITRATE_KBPS.load(Ordering::Relaxed)
+}
+
+/// Called from the control thread on PT_LOSS_STATS. Signals a 20% bitrate cut;
+/// compare_exchange ensures multiple rapid loss reports collapse to one signal.
+pub fn signal_congestion_reduction() {
+    let cur = STREAM_BITRATE_KBPS.load(Ordering::Relaxed);
+    if cur > 0 {
+        let reduced = (cur * 4 / 5).max(1000); // floor at 1 Mbps
+        let _ = CONGESTION_BITRATE_KBPS.compare_exchange(
+            -1, reduced, Ordering::Relaxed, Ordering::Relaxed,
+        );
+    }
+}
+
+/// Main loop: atomically claim and return any pending congestion bitrate (Kbps).
+/// Returns None when no signal is pending; clears the signal on return.
+pub fn take_congestion_bitrate() -> Option<u32> {
+    let v = CONGESTION_BITRATE_KBPS.swap(-1, Ordering::Relaxed);
+    if v >= 0 { Some(v as u32) } else { None }
+}
 
 extern "C" {
     /// Tell the C++ shim where to write its log output.  Must be called before
