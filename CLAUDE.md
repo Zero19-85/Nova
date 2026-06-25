@@ -15,9 +15,9 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 9 complete — Production Alpha (2026-06-23)
+## Current Phase: Phase 10 complete — VDD Safety, Performance & Congestion Control (2026-06-25)
 
-All previous phases (1–8) confirmed working. Phase 9 resolved every known deployment, performance, and reliability issue. Installer is production-ready.
+All previous phases (1–9) confirmed working. Phase 10 adds hardware-level VDD lifecycle management, NVENC quality fixes, congestion control, thread prioritisation, and the NovaServerBoot Task Scheduler registration.
 
 ---
 
@@ -25,7 +25,7 @@ All previous phases (1–8) confirmed working. Phase 9 resolved every known depl
 - Pairing (RSA/AES-ECB). **Critical:** `plaincert` must hex-encode the **PEM** bytes (not DER).
 - RTSP handshake (port 48010), ENet control (UDP 47999), H.264 RTP + RS-FEC (UDP 47998), WASAPI→Opus audio (UDP 48000), mouse/keyboard/gamepad input, cursor compositing.
 - **Universal VDD (all apps):** every Moonlight app routes through the Virtual Display Driver. Controlled by `nova.toml → headless_for_all_apps` (default `true`). Set `false` to restrict headless mode to App 5 only.
-- **VDD boots dormant:** `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE)` removes the VDD path from the active CCD topology at boot. Physical monitors are never disturbed until a stream activates the VDD. The legacy `ChangeDisplaySettingsExW(0×0)` approach was replaced because MttVDD rejects 0×0 with `DISP_CHANGE_BADMODE`.
+- **VDD hardware-disabled at boot (Phase 10):** `DICS_DISABLE` via SetupAPI leaves the devnode `CM_PROB_DISABLED` — invisible to DXGI, CCD, and PnP. Cannot steal primary on a graphics-stack crash or Safe Mode reboot. `activate_for_stream` calls `DICS_ENABLE` on client connect; `deactivate_after_stream` calls `DICS_DISABLE` on disconnect. `ensure_enabled_at_boot` cycles the devnode once to flush `vdd_settings.xml`, then disables it. CCD guard (`ccd_deactivate_vdd_path`) fires immediately after the devnode appears in GDI to prevent arrival-order primary hijack before `set_primary_display` runs.
 - **Dynamic monitor naming:** after `activate_for_stream`, `SetupDiSetDeviceRegistryPropertyW(SPDRP_FRIENDLYNAME)` renames the VDD devnode to the connected client's paired name (e.g. "Xbox"), visible in Device Manager and Display Settings.
 - **HDR10 pipeline:** WGC FP16 scRGB → typed-RTV pixel shaders → P010 BT.2020 PQ → HEVC Main10 NVENC. SEI (MDCV type 137 + MaxCLL type 144) injected manually via `seiPayloadArray`. VUI: BT.2020 / SMPTE ST 2084 / NCL / full-range.
 - **Known limit:** Xbox Moonlight 1.18.0 reports `x-nv-clientSupportHevc:0`; H.264 decoder crashes at 4K@120fps (Level 5.2). Use 1080p@60fps or 1080p@120fps on Xbox.
@@ -67,10 +67,10 @@ All previous phases (1–8) confirmed working. Phase 9 resolved every known depl
 - `headless_for_all_apps = false` — only App 5 activates headless; other apps stream the physical primary.
 - `app_launcher::uses_virtual_display(app_id, headless_for_all)` implements the gate in both the pre-activation and connect-time paths.
 
-**Installer — `nova.iss` (Inno Setup):**
+**Installer — `nova.iss` (Inno Setup) + `nova-server.exe --install`:**
 - `nova.iss` at project root. Bundles `nova-server.exe`, `nova_shim.dll`, and the full `VirtualDisplayDriver\` package.
-- **`[Run]` step 1:** `devcon.exe install MttVDD.inf Root\MttVDD` — runs under the installer's live admin token, no UAC child-process suppression. `WorkingDir` set to the INF directory so Windows PnP can resolve `MttVDD.dll` and `mttvdd.cat`.
-- **`[Run]` step 2:** `nova-server.exe --install` — registers the ONLOGON scheduled task.
+- **`[Run]` step 1:** `devcon.exe install MttVDD.inf Root\MttVDD` — runs under the installer's live admin token. `WorkingDir` set to the INF directory so Windows PnP resolves `MttVDD.dll` and `mttvdd.cat`.
+- **`[Run]` step 2:** `nova-server.exe --install` — registers the **`NovaServerBoot`** scheduled task via `schtasks /create /xml` with `<LogonType>InteractiveToken</LogonType>` + `<RunLevel>HighestAvailable</RunLevel>` + 5-second startup delay. Task runs in Session 1+ (never Session 0). Migrates/removes legacy task names. All child processes use `CREATE_NO_WINDOW`.
 - **`[Run]` step 3:** `nova-server.exe` — launches Nova for this session.
 - Build pre-requisite: copy `C:\VDD.Control.25.7.23\` → `<project root>\VirtualDisplayDriver\` before compiling the installer.
 - Architecture-aware: x64 and ARM64 paths handled via `Check: IsARM64`.
@@ -110,7 +110,33 @@ Copy-Item -Recurse "C:\VDD.Control.25.7.23" ".\VirtualDisplayDriver"
 
 ---
 
-### Phase 10 candidates:
+### Phase 10 fixes (2026-06-25):
+
+**VDD On-Demand Lifecycle:**
+- `ensure_enabled_at_boot`: cycles devnode to flush XML, calls `isolate_virtual_display_at_boot` (CCD DB consistent), then `DICS_DISABLE` — fully hardware-dormant. Returns `None` so WGC capturer binds physical primary.
+- `activate_for_stream`: `DICS_ENABLE` before `wait_for_virtual_display_device_name`; immediate `ccd_deactivate_vdd_path` guard after GDI name acquired — prevents arrival-order primary steal; `SDC_TOPOLOGY_EXTEND` re-adds VDD as secondary only.
+- `deactivate_after_stream`: `DICS_DISABLE` after `restore_topology` — devnode hardware-dormant between sessions.
+- `VirtualDisplay::drop()` calls `deactivate_after_stream()` (existing) → also disables devnode on graceful shutdown.
+
+**NVENC Quality Fixes (shim.cpp):**
+- Cached `g_compositeSRV` — per-frame `CreateShaderResourceView` alloc eliminated from hot loop.
+- `enableFillerDataInsertion=1` for H264+HEVC — prevents CBR QP oscillation on static frames ("pulsing text").
+- `intraRefreshPeriod=fps, intraRefreshCnt=fps` — continuous rolling refresh; no off-gap between cycles.
+
+**Congestion Control (encoder.rs / control.rs / lib.rs):**
+- `STREAM_BITRATE_KBPS` + `CONGESTION_BITRATE_KBPS` atomics; `signal_congestion_reduction()` fires on `PT_LOSS_STATS` loss>0.
+- Main loop: 2s cooldown, 20% cut on loss, 10%/5s ramp-back. `set_stream_bitrate_kbps()` tracks current CBR target.
+
+**Thread Priority (lib.rs / audio.rs):**
+- `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)` on capture/encode thread + both audio threads.
+
+**WGC Stale-HMONITOR Fix (capture.rs):**
+- `new_excluding()` outer retry re-resolves HMONITOR on each attempt — fixes E_INVALIDARG after VDD devnode topology cycle at boot.
+
+**Crash-to-exit Hardening (lib.rs / nova-server.rs):**
+- WGC and NVENC init failures now propagate via `?` instead of `.expect()` panic — `run()` returns `Err`, main exits with code 1.
+
+### Phase 11 candidates:
 - HDR10 colour verification on Android Moonlight (HEVC Main10 + TV)
 - AV1 end-to-end test (advertised in `ServerCodecModeSupport`, shim implemented, not yet confirmed live)
 - Xbox HEVC: currently reports `x-nv-clientSupportHevc:0` in v1.18.0 — investigate
