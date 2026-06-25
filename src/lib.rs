@@ -224,12 +224,14 @@ pub async fn run() -> Result<()> {
         println!("✨ nova.toml: enable_hdr=true — HDR10 will activate for HEVC sessions regardless of VDD capability query");
     }
 
-    // When the desktop is static, NVENC stays idle except for one IDR keep-alive
-    // pulse per this interval. Moonlight's watchdog timeout is several seconds;
-    // 1 s is a comfortable margin. Apollo encodes at a ~12 fps minimum fill rate;
-    // we skip encoding entirely and fire a single IDR — matching Sunshine's 0%
-    // Video Encode utilization signature on a static screen.
-    const IDR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
+    // When the desktop is static, NVENC stays idle except for a P-frame keep-alive
+    // pulse per this interval to satisfy Moonlight's watchdog. We do NOT force an
+    // IDR here — IDRs cause a full macroblock refresh which appears as a visible
+    // sharpness pop / shimmer on flat text at 1 s cadence. A P-frame (cached
+    // texture, no keyframe flag) keeps the stream alive without any visible artifact.
+    // 5 s is well inside Moonlight's watchdog timeout (~30 s) and matches
+    // Apollo/Sunshine's idle encoding cadence on a static desktop.
+    const IDR_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(5000);
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
 
@@ -502,7 +504,13 @@ pub async fn run() -> Result<()> {
                                     // reflect HDRPlus=true after a devnode cycle.
                                     let hdr_ok = cfg.stream.enable_hdr || vd.is_advanced_color_supported();
                                     if hdr_ok {
-                                        if let Err(e) = vd.set_active_display_hdr(true) {
+                                        // Force a full SDR→HDR cycle rather than a guarded enable.
+                                        // On devnode re-enable (HDRPlus=true in EDID) Windows may
+                                        // auto-enable Advanced Color, so the idempotent
+                                        // set_active_display_hdr(true) would see "already enabled"
+                                        // and skip — leaving stale MDCV/MaxCLL SEI from the
+                                        // previous session and causing washed-out colours on reconnect.
+                                        if let Err(e) = vd.force_hdr_reconnect_cycle() {
                                             println!("⚠️  Advanced Color pre-activation failed: {e}");
                                         } else {
                                             println!("⏳ Waiting for VDD to settle in HDR/FP16 mode...");
@@ -1052,13 +1060,14 @@ pub async fn run() -> Result<()> {
                 // hardware-idle → 0% Video Encode utilization, matching
                 // Apollo/Sunshine's idle signature.
                 //
-                // IDR keep-alive: after IDR_KEEPALIVE_INTERVAL of silence, force
-                // one keyframe onto the wire so Moonlight's watchdog doesn't
-                // interpret the pause as a network drop or connection timeout.
+                // P-frame keep-alive: after IDR_KEEPALIVE_INTERVAL of silence,
+                // submit the cached frame as a standard P-frame to satisfy
+                // Moonlight's watchdog. No IDR forced here — forcing a keyframe
+                // every second produces a visible sharpness pop ("shimmer") on
+                // flat text. P-frames are visually transparent on a static desktop.
                 if client_connected && video_learned
                     && last_frame_sent.elapsed() >= IDR_KEEPALIVE_INTERVAL
                 {
-                    enc.request_idr();
                     texture_to_encode = capturer.cached_texture().cloned();
                 }
                 // else: static desktop with active stream — NVENC stays idle.

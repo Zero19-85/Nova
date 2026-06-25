@@ -1369,18 +1369,22 @@ impl VirtualDisplay {
         Self::force_resolution(&virtual_device, width, height, refresh_hz);
         Self::wait_for_display_resolution(&virtual_device, width, height);
 
-        Self::set_primary_display(&virtual_device)?;
-        println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) is now the desktop primary");
-
-        match Self::deactivate_other_paths(&virtual_device) {
-            Ok(()) => println!("🕶️  Physical display path(s) detached — {virtual_device} is now the only active display"),
-            Err(e) => println!("⚠️  Failed to fully detach the physical display path(s): {e} — continuing with {virtual_device} as primary"),
+        // Atomic primary promotion + physical path deactivation in a single
+        // SetDisplayConfig call. A two-step sequence (set_primary_display then
+        // deactivate_other_paths) creates a window where the VDD is the active
+        // primary but physical monitors are still in the topology — UAC prompts
+        // and window focus land on the headless VDD canvas during that gap.
+        // The combined call collapses both mutations into one transaction, so
+        // the physical monitors are never simultaneously "primary" and "active"
+        // while the VDD owns position (0,0).
+        match Self::set_primary_and_deactivate_others(&virtual_device) {
+            Ok(()) => println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) atomically set as primary — physical paths deactivated (true headless)"),
+            Err(e) => println!("⚠️  Atomic headless transition failed: {e} — stream may not be fully isolated"),
         }
 
-        // Re-snap the resolution: SDC_ALLOW_CHANGES in set_primary_display/
-        // deactivate_other_paths can silently select a different mode (often
-        // the 800x600 failsafe) even though configure_mode already wrote the
-        // correct entry into vdd_settings.xml.
+        // Re-snap the resolution: SDC_ALLOW_CHANGES in set_primary_and_deactivate_others
+        // can silently select a different mode (often the 800x600 failsafe) even
+        // though configure_mode already wrote the correct entry into vdd_settings.xml.
         Self::force_resolution(&virtual_device, width, height, refresh_hz);
 
         // Wait for the mode to stabilise so the DXGI rebind below sees the
@@ -1611,8 +1615,6 @@ impl VirtualDisplay {
         let device_name = self.active_device_name.as_deref()
             .ok_or_else(|| "VDD not active — cannot set Advanced Color".to_string())?;
 
-        // Walk the active CCD paths to find the one whose source GDI device name
-        // matches our VDD, then grab its target adapterId + id for the set-info call.
         let (adapter_id, target_id) = Self::find_target_for_device_name(device_name)
             .map_err(|e| format!("Cannot locate VDD target for Advanced Color: {e}"))?;
 
@@ -1631,14 +1633,70 @@ impl VirtualDisplay {
             }
         }
 
+        Self::set_advanced_color_raw(adapter_id, target_id, enable).map(|()| {
+            println!("🎨 Advanced Color (HDR) {} on {device_name}",
+                if enable { "enabled → DXGI will provide FP16 scRGB frames" }
+                else      { "disabled → DXGI back to BGRA8 SDR" });
+        }).map_err(|e| {
+            let msg = format!(
+                "DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE={}) on {device_name} failed: {e}",
+                enable as u8
+            );
+            println!("⚠️  {msg}");
+            msg
+        })
+    }
+
+    /// Forces a complete Advanced Color state cycle (SDR → HDR), bypassing the
+    /// idempotency guard in [`set_active_display_hdr`].
+    ///
+    /// When the VDD devnode is re-enabled after a session (`HDRPlus=true` in
+    /// the EDID), Windows auto-enables Advanced Color before any Nova code runs.
+    /// A subsequent `set_active_display_hdr(true)` then hits the idempotency
+    /// guard ("already enabled"), skips the SET call, and the MDCV/MaxCLL SEI
+    /// metadata from the previous session is never refreshed — resulting in
+    /// washed-out colours on Xbox reconnect.
+    ///
+    /// This method sends `SET_ADVANCED_COLOR_STATE=0` unconditionally, waits for
+    /// the display to settle in SDR, then sends `SET_ADVANCED_COLOR_STATE=1` —
+    /// guaranteeing a pristine MDCV/MaxCLL push regardless of the cached state.
+    pub fn force_hdr_reconnect_cycle(&self) -> Result<(), String> {
+        let device_name = self.active_device_name.as_deref()
+            .ok_or_else(|| "VDD not active — cannot cycle Advanced Color".to_string())?;
+
+        let (adapter_id, target_id) = Self::find_target_for_device_name(device_name)
+            .map_err(|e| format!("HDR reconnect cycle: cannot locate VDD target: {e}"))?;
+
+        // Force-disable regardless of reported state — clears Windows' cached
+        // Advanced Color envelope from any previous session.
+        let _ = Self::set_advanced_color_raw(adapter_id, target_id, false);
+        println!("🔄 HDR reconnect: forced Advanced Color OFF (SDR flush) on {device_name}");
+
+        // Allow the display pipeline to settle before re-enabling.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Force-enable — triggers a fresh MDCV/MaxCLL SEI sequence.
+        Self::set_advanced_color_raw(adapter_id, target_id, true).map_err(|e| {
+            format!("HDR reconnect: Advanced Color re-enable failed on {device_name}: {e}")
+        })?;
+        println!("🔄 HDR reconnect: Advanced Color force-re-enabled on {device_name} — fresh HDR10 metadata");
+
+        Ok(())
+    }
+
+    /// Sends `DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE)` for the
+    /// given (adapterId, targetId) with no idempotency guard. Shared by
+    /// [`set_active_display_hdr`] (guarded path) and
+    /// [`force_hdr_reconnect_cycle`] (bypass path).
+    fn set_advanced_color_raw(adapter_id: LUID, target_id: u32, enable: bool) -> Result<(), String> {
         // DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE layout (wingdi.h):
         //   DISPLAYCONFIG_DEVICE_INFO_HEADER  header;
         //   union { struct { UINT32 enableAdvancedColor:1; UINT32 reserved:31; }; UINT32 value; };
-        // DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE = 10 (not 9 which is the GET variant).
+        // Type 10 = SET variant (type 9 = GET variant).
         #[repr(C)]
         struct SetAdvancedColorState {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
-            value:  u32,  // bit 0 = enableAdvancedColor, bits 1-31 = reserved
+            value:  u32,
         }
         let req = SetAdvancedColorState {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -1647,29 +1705,15 @@ impl VirtualDisplay {
                 adapterId: adapter_id,
                 id:        target_id,
             },
-            value: if enable { 1 } else { 0 },
+            value: u32::from(enable),
         };
-
-        // DisplayConfigSetDeviceInfo returns LONG (i32) — 0 on success.
         let ret = unsafe {
             DisplayConfigSetDeviceInfo(
                 &req.header as *const DISPLAYCONFIG_DEVICE_INFO_HEADER,
             )
         };
-
-        if ret == 0 {
-            println!("🎨 Advanced Color (HDR) {} on {device_name}",
-                if enable { "enabled → DXGI will provide FP16 scRGB frames" }
-                else      { "disabled → DXGI back to BGRA8 SDR" });
-            Ok(())
-        } else {
-            let msg = format!(
-                "DisplayConfigSetDeviceInfo(SET_ADVANCED_COLOR_STATE={}) on {device_name} \
-                 failed: error {ret}",
-                enable as u8
-            );
-            println!("⚠️  {msg}");
-            Err(msg)
+        if ret == 0 { Ok(()) } else {
+            Err(format!("SET_ADVANCED_COLOR_STATE={} error {ret}", enable as u8))
         }
     }
 
@@ -1970,6 +2014,7 @@ impl VirtualDisplay {
 
     /// Queries the active CCD display topology: one [`DISPLAYCONFIG_PATH_INFO`]
     /// per active path plus the backing source/target mode info array.
+    #[allow(dead_code)]
     fn query_active_topology() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
         Self::query_topology(QDC_ONLY_ACTIVE_PATHS)
     }
@@ -2025,6 +2070,7 @@ impl VirtualDisplay {
         Some(String::from_utf16_lossy(&request.viewGdiDeviceName).trim_end_matches('\0').to_string())
     }
 
+    #[allow(dead_code)]
     /// Makes the display identified by GDI device name `device_name` the new
     /// desktop primary, using the modern CCD topology API
     /// (`QueryDisplayConfig`/`SetDisplayConfig`) rather than the legacy
@@ -2102,6 +2148,7 @@ impl VirtualDisplay {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// "True headless": clears `DISPLAYCONFIG_PATH_ACTIVE` on every currently
     /// active CCD path except the one whose source resolves to
     /// `virtual_device`, then commits via `SetDisplayConfig`.
@@ -2149,6 +2196,65 @@ impl VirtualDisplay {
         let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
         if status != 0 {
             return Err(format!("SetDisplayConfig failed to deactivate other display paths (error {status})"));
+        }
+
+        Ok(())
+    }
+
+    /// Atomically promotes `device_name` to the desktop primary **and** clears
+    /// `DISPLAYCONFIG_PATH_ACTIVE` on every other path in a single
+    /// `SetDisplayConfig` call.
+    ///
+    /// The two-step sequence (`set_primary_display` then `deactivate_other_paths`)
+    /// created a race window where the VDD held position (0,0) while physical
+    /// monitors were still active — UAC prompts and window-manager focus events
+    /// landed on the headless canvas during that gap. Collapsing both mutations
+    /// into one transaction eliminates that window.
+    ///
+    /// Uses `QDC_ALL_PATHS` so inactive paths remain present in the applied
+    /// array (required by `SDC_USE_SUPPLIED_DISPLAY_CONFIG`). Mode indices are
+    /// valid for currently-active paths; inactive paths are left untouched.
+    fn set_primary_and_deactivate_others(device_name: &str) -> Result<(), String> {
+        let (mut paths, mut modes) = Self::query_all_topology()?;
+
+        let mut found_virtual = false;
+
+        for path in &mut paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+
+            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if idx >= modes.len() || modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                continue;
+            }
+
+            let is_virtual = Self::gdi_device_name_for_source(
+                path.sourceInfo.adapterId,
+                path.sourceInfo.id,
+            )
+            .is_some_and(|n| n.eq_ignore_ascii_case(device_name));
+
+            if is_virtual {
+                // Place VDD at the desktop origin — GDI's definition of "primary".
+                modes[idx].Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
+                found_virtual = true;
+            } else {
+                // Deactivate every other active path in the same call.
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+            }
+        }
+
+        if !found_virtual {
+            return Err(format!("{device_name} not found among active CCD paths — cannot promote to primary"));
+        }
+
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if status != 0 {
+            return Err(format!(
+                "SetDisplayConfig failed to atomically set {device_name} as primary and deactivate other paths (error {status})"
+            ));
         }
 
         Ok(())
