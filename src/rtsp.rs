@@ -343,7 +343,19 @@ fn handle_message(
             if let Some(v) = bitrate      { info.bitrate_kbps = v; }
             if let Some(v) = pkt_dur      { info.audio_packet_duration = v; }
             if let Some(v) = bit_stream_fmt { info.bit_stream_format = v; }
-            if let Some(v) = dynamic_range  { info.dynamic_range_mode = v; }
+            // dynamicRangeMode: if explicitly present in the ANNOUNCE, use it as-is.
+            // If ABSENT (not 0 — just missing from the SDP), infer HDR when /launch
+            // requested it AND the client confirmed HEVC (bitStreamFormat=1). Only HEVC
+            // carries HDR10/Main10; an absent field with HEVC+hdrMode=1 is a reliable
+            // proxy. If the client explicitly sent dynamicRangeMode:0 (Xbox), that hard
+            // decline is preserved unchanged — absent ≠ declined.
+            if let Some(v) = dynamic_range {
+                info.dynamic_range_mode = v;
+            } else if info.hdr_requested && bit_stream_fmt == Some(1) {
+                info.dynamic_range_mode = 1;
+                println!("   ↳ ANNOUNCE: dynamicRangeMode absent — inferred HDR10 \
+                    (hdrMode=1 + bitStreamFormat=HEVC)");
+            }
             // Sunshine rtsp.cpp:982-987 — legacy nv flag 0x20 or Sunshine
             // extension bit 0x1 both mean "encrypt audio".
             info.audio_encryption = (feat_flags & 0x20) != 0 || (enc_enabled & 0x1) != 0;

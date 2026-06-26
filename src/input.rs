@@ -239,8 +239,13 @@ const VIGEMBUS_MSI_URL: &str =
 fn auto_install_vigembus() -> Result<(), String> {
     let msi_path = std::env::temp_dir().join("ViGEmBusSetup_x64.msi");
 
+    // PowerShell 5.1 (Windows default) negotiates TLS 1.0 by default.
+    // GitHub enforces TLS 1.2+ and drops TLS 1.0 connections with
+    // "The connection was closed unexpectedly". Explicitly set TLS 1.2
+    // before Invoke-WebRequest so the download succeeds on stock Windows.
     let ps_download = format!(
-        "$ProgressPreference='SilentlyContinue'; \
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+         $ProgressPreference='SilentlyContinue'; \
          Invoke-WebRequest -Uri '{url}' -OutFile '{out}' -UseBasicParsing",
         url = VIGEMBUS_MSI_URL,
         out = msi_path.display(),
