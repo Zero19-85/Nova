@@ -1434,8 +1434,39 @@ impl VirtualDisplay {
             )
         };
         if ext_status == 0 {
-            println!("✅ VDD re-added to the extended desktop — waiting for topology to settle...");
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            // SDC_TOPOLOGY_EXTEND adds the VDD to the desktop asynchronously.
+            // DWM commits the mode to the EnumDisplaySettingsW registry slot
+            // on its own schedule — until that happens, ChangeDisplaySettingsExW
+            // returns DISP_CHANGE_FAILED (-1) and gdi_device_name_for_source
+            // cannot see the VDD in QDC_ALL_PATHS active entries.
+            // A fixed 500 ms sleep is insufficient after a fresh driver install
+            // or after the system has been idle. Spin-poll EnumDisplaySettingsW
+            // until it returns a non-zero size (up to 5 s), which reliably
+            // indicates the mode slot is live and force_resolution will succeed.
+            let name_w: Vec<u16> = virtual_device.encode_utf16().chain(std::iter::once(0)).collect();
+            let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut settled = false;
+            loop {
+                let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+                let ok = unsafe {
+                    EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
+                };
+                if ok && dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 {
+                    println!("✅ VDD mode initialized at {}x{} — proceeding with force_resolution",
+                        dm.dmPelsWidth, dm.dmPelsHeight);
+                    settled = true;
+                    break;
+                }
+                if std::time::Instant::now() >= settle_deadline {
+                    println!("⚠️  VDD mode still 0x0 after 5 s — force_resolution will likely fail (driver not ready)");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if !settled {
+                // Give the topology one more fixed interval if polling timed out.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
         } else {
             println!("⚠️  SDC_TOPOLOGY_EXTEND failed (error {ext_status}) — force_resolution may not work on a disconnected VDD");
         }
@@ -1443,17 +1474,30 @@ impl VirtualDisplay {
         Self::wait_for_display_resolution(&virtual_device, width, height);
 
         // Atomic primary promotion + physical path deactivation in a single
-        // SetDisplayConfig call. A two-step sequence (set_primary_display then
-        // deactivate_other_paths) creates a window where the VDD is the active
-        // primary but physical monitors are still in the topology — UAC prompts
-        // and window focus land on the headless VDD canvas during that gap.
-        // The combined call collapses both mutations into one transaction, so
-        // the physical monitors are never simultaneously "primary" and "active"
-        // while the VDD owns position (0,0).
-        match Self::set_primary_and_deactivate_others(&virtual_device) {
-            Ok(()) => println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) atomically set as primary — physical paths deactivated (true headless)"),
-            Err(e) => println!("⚠️  Atomic headless transition failed: {e} — stream may not be fully isolated"),
-        }
+        // SetDisplayConfig call. If the VDD is not yet visible in the active
+        // CCD paths (e.g. topology commit still in flight), retry once after
+        // a 1 s settle — the same window that blocked force_resolution above.
+        let headless_ok = match Self::set_primary_and_deactivate_others(&virtual_device) {
+            Ok(()) => {
+                println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) atomically set as primary — physical paths deactivated (true headless)");
+                true
+            }
+            Err(e) => {
+                println!("⚠️  Atomic headless transition failed: {e} — retrying after 1 s");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                match Self::set_primary_and_deactivate_others(&virtual_device) {
+                    Ok(()) => {
+                        println!("🖥️  {virtual_device} ({width}x{height}@{refresh_hz}Hz) set as primary (retry succeeded)");
+                        true
+                    }
+                    Err(e2) => {
+                        println!("⚠️  Atomic headless transition still failed after retry: {e2} — stream may not be fully isolated");
+                        false
+                    }
+                }
+            }
+        };
+        let _ = headless_ok; // non-fatal — stream continues even if headless isolation failed
 
         // Re-snap the resolution: SDC_ALLOW_CHANGES in set_primary_and_deactivate_others
         // can silently select a different mode (often the 800x600 failsafe) even
