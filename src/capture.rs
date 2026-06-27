@@ -241,12 +241,43 @@ impl WgcCapturer {
 
         // Build the new session — keep the same D3D11 device throughout the
         // process lifetime (always adapter 0 / primary GPU).
-        let new = Self::open_session(
-            self.device.clone(),
-            self.wrt_device.clone(),
-            hmonitor,
-            is_hdr,
-        )?;
+        //
+        // Re-resolve the HMONITOR on every retry, mirroring new_excluding().
+        // After deactivate_after_stream / activate_for_stream the CCD topology
+        // changes and Windows reassigns HMONITOR handle values — the handle we
+        // resolved before the expected_size wait is potentially stale by the
+        // time open_session runs. Retrying open_session with the same stale
+        // handle produces 10 consecutive E_INVALIDARG failures and never recovers.
+        // Re-resolving each iteration lets the physical primary's new handle
+        // settle in before we attempt CreateForMonitor.
+        const E_INVALIDARG_REBIND: windows::core::HRESULT =
+            windows::core::HRESULT(0x80070057_u32 as i32);
+        let new = {
+            let mut last_err: Option<windows::core::Error> = None;
+            let mut found:    Option<WgcCapturer>          = None;
+            for attempt in 0..10u32 {
+                let h = gdi_device_name
+                    .and_then(Self::hmonitor_from_device_name)
+                    .unwrap_or_else(Self::primary_hmonitor);
+                match Self::open_session(self.device.clone(), self.wrt_device.clone(), h, is_hdr) {
+                    Ok(s) => { found = Some(s); break; }
+                    Err(e) if e.code() == E_INVALIDARG_REBIND && attempt < 9 => {
+                        println!(
+                            "⚠️  WGC rebind: HMONITOR invalid after topology change \
+                             (attempt {}/10) — re-resolving in 500 ms",
+                            attempt + 1
+                        );
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            match found {
+                Some(s) => s,
+                None    => return Err(last_err.unwrap()),
+            }
+        };
 
         let resized = new.width != self.width || new.height != self.height;
 
