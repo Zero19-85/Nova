@@ -15,7 +15,25 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 11 complete — Elite Pipeline Polish & Idle Efficiency (2026-06-25)
+## Current Phase: Phase 12 complete — IddCx CCD-Native VDD Resolution Fix (2026-07-02)
+
+All previous phases (1–11) confirmed working. Phase 12 fixes VDD resolution not snapping to client-requested dimensions when using the MttVDD IddCx driver (resolution was stuck at native 2560×1440 regardless of Moonlight's requested mode).
+
+### Phase 12 changes (2026-07-02):
+
+**CCD-native VDD resolution (`src/virtual_display.rs`):**
+- **Root cause:** MttVDD is an IddCx driver. `ChangeDisplaySettingsExW` always returns `DISP_CHANGE_FAILED (-1)` on IddCx; `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` always returns 0×0. All legacy GDI mode-set APIs are no-ops against IddCx.
+- **`force_resolution` rewritten** to use `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` + `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE)`. Modifies `DISPLAYCONFIG_SOURCE_MODE.width/height` and `DISPLAYCONFIG_PATH_TARGET_INFO.refreshRate` in-place before committing. Apollo-pattern refresh rate formula: `{Numerator: refresh_hz * 1000, Denominator: 1000}`.
+- **`wait_for_display_resolution` rewritten** to poll `query_ccd_source_size` (CCD) instead of `EnumDisplaySettingsW` (broken for IddCx). Times out after 3 s, proceeds anyway with a warning.
+- **`query_ccd_source_size` new helper:** scans `QDC_ONLY_ACTIVE_PATHS` for the named GDI device, matches the source mode entry by adapter LUID + source ID, returns `(width, height)`.
+- **SDC_TOPOLOGY_EXTEND settle loop fixed:** was polling `EnumDisplaySettingsW` (always 0×0 on IddCx). Now polls `find_vdd_attached_to_desktop()` (`DISPLAY_DEVICE_ATTACHED_TO_DESKTOP` flag via `EnumDisplayDevicesW`) — set by DWM exactly when the device is live in the active topology.
+- **GDI imports moved to `#[cfg(test)]`:** `ChangeDisplaySettingsExW`, `EnumDisplaySettingsW`, `CDS_*`, `DEVMODEW`, `ENUM_CURRENT_SETTINGS` — no longer used in production code path. Zero unused-import warnings.
+- **Confirmed working** (2026-07-02): VDD snaps to 1280×720@60Hz, NVENC rebinds at 720p, HEVC stream at 7.5 Mbps client-negotiated, video loads in Moonlight without "reduce bitrate" error.
+
+**Known remaining issues:**
+- `ccd_isolate_vdd_and_restore_primary error 87` on disconnect (non-fatal; falls back to deactivate-only). IddCx adapter may not be found in `QDC_ALL_PATHS` with `DISPLAYCONFIG_PATH_ACTIVE` after stream ends.
+
+---
 
 All previous phases (1–10) confirmed working. Phase 11 delivers static-desktop Video Encode flatline (0% GPU utilisation matching Apollo/Sunshine), per-frame heap elimination in the RTP hot path, MMCSS audio scheduling, process power-throttling exemption, DSCP EF socket tagging, dynamic HDR luminance config, and thin-LTO binary hardening.
 

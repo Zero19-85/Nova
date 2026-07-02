@@ -116,15 +116,13 @@ use std::process::Command;
 
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND, LUID, POINTL};
+use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+#[cfg(test)]
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL,
-    CDS_RESET, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL,
-    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    ChangeDisplaySettingsExW, EnumDisplaySettingsW,
+    CDS_NORESET, CDS_TYPE, CDS_UPDATEREGISTRY,
+    DEVMODEW, DISPLAY_DEVICE_PRIMARY_DEVICE, ENUM_CURRENT_SETTINGS,
 };
-#[cfg(test)]
-use windows::Win32::Graphics::Gdi::{CDS_NORESET, CDS_TYPE};
-#[cfg(test)]
-use windows::Win32::Graphics::Gdi::DISPLAY_DEVICE_PRIMARY_DEVICE;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
     GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
@@ -1401,7 +1399,7 @@ impl VirtualDisplay {
             self.set_enabled(true)?;
         }
 
-        let virtual_device = Self::wait_for_virtual_display_device_name()
+        let mut virtual_device = Self::wait_for_virtual_display_device_name()
             .ok_or_else(|| "timed out waiting for the virtual display to appear in GDI enumeration".to_string())?;
 
         // ── Topology guard: prevent primary-display hijack on enable ──────────
@@ -1435,37 +1433,35 @@ impl VirtualDisplay {
         };
         if ext_status == 0 {
             // SDC_TOPOLOGY_EXTEND adds the VDD to the desktop asynchronously.
-            // DWM commits the mode to the EnumDisplaySettingsW registry slot
-            // on its own schedule — until that happens, ChangeDisplaySettingsExW
-            // returns DISP_CHANGE_FAILED (-1) and gdi_device_name_for_source
-            // cannot see the VDD in QDC_ALL_PATHS active entries.
-            // A fixed 500 ms sleep is insufficient after a fresh driver install
-            // or after the system has been idle. Spin-poll EnumDisplaySettingsW
-            // until it returns a non-zero size (up to 5 s), which reliably
-            // indicates the mode slot is live and force_resolution will succeed.
-            let name_w: Vec<u16> = virtual_device.encode_utf16().chain(std::iter::once(0)).collect();
-            let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut settled = false;
+            // DWM may assign it a NEW GDI display number (e.g. DISPLAY17 instead
+            // of DISPLAY15 from the boot-time enable). Polling EnumDisplaySettingsW
+            // on the old name therefore always returns 0×0.
+            //
+            // Fix: spin-poll EnumDisplayDevicesW for an MttVDD entry whose
+            // StateFlags has DISPLAY_DEVICE_ATTACHED_TO_DESKTOP (0x1) set.
+            // That flag is set by DWM exactly when the device is committed to
+            // the active desktop and is ready for ChangeDisplaySettingsExW.
+            // Capture the device name from that entry — it's the CURRENT GDI
+            // name after the EXTEND, which may differ from `virtual_device`.
+            let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut settled_name: Option<String> = None;
             loop {
-                let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
-                let ok = unsafe {
-                    EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
-                };
-                if ok && dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 {
-                    println!("✅ VDD mode initialized at {}x{} — proceeding with force_resolution",
-                        dm.dmPelsWidth, dm.dmPelsHeight);
-                    settled = true;
+                if let Some(name) = Self::find_vdd_attached_to_desktop() {
+                    println!("✅ VDD attached to desktop as {} — proceeding with force_resolution", name);
+                    settled_name = Some(name);
                     break;
                 }
                 if std::time::Instant::now() >= settle_deadline {
-                    println!("⚠️  VDD mode still 0x0 after 5 s — force_resolution will likely fail (driver not ready)");
+                    println!("⚠️  VDD not attached to desktop after 10 s — falling back to {virtual_device}");
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            if !settled {
-                // Give the topology one more fixed interval if polling timed out.
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Some(ref new_name) = settled_name {
+                if *new_name != virtual_device {
+                    println!("🔄 VDD GDI name changed: {virtual_device} → {new_name}");
+                }
+                virtual_device = new_name.clone();
             }
         } else {
             println!("⚠️  SDC_TOPOLOGY_EXTEND failed (error {ext_status}) — force_resolution may not work on a disconnected VDD");
@@ -1869,46 +1865,31 @@ impl VirtualDisplay {
         }
     }
 
-    /// Polls [`find_virtual_display_device_name`] for up to ~2 seconds,
-    /// since GDI's display enumeration can lag the devnode-arrival event
-    /// (`WM_DISPLAYCHANGE`) by a frame or two right after [`set_enabled`]
-    /// returns.
-    /// Blocking poll: re-applying the CCD topology
-    /// ([`set_primary_display`]/[`deactivate_other_paths`], just above) makes
-    /// Windows momentarily drop the IDD to a failsafe 800x600 mode before it
-    /// picks up the `vdd_settings.xml` mode [`configure_mode`] wrote — the
-    /// DXGI rebind that follows `activate_for_stream`'s return would
-    /// otherwise see `DesktopCoordinates` for 800x600 and lock the encoder at
-    /// the wrong resolution until the next topology change.
+    /// Polls until the CCD source mode for `device_name` reports `width`×`height`,
+    /// or times out after 3 seconds.
     ///
-    /// Polls `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` for `device_name`
-    /// every 100ms for up to 3 seconds, returning as soon as it reports
-    /// `width`x`height`. Does NOT return early on timeout-without-match —
-    /// logs the last-seen mode and proceeds anyway, so a stuck IDD is visible
-    /// in the log instead of silently producing a wrong-sized stream.
+    /// IddCx virtual displays (MttVDD) return 0×0 from
+    /// `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` — the legacy GDI path
+    /// has no visibility into IddCx modes. [`force_resolution`]'s
+    /// `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)` call commits the
+    /// new size to the CCD database immediately, so [`query_ccd_source_size`]
+    /// usually returns the correct size on the first poll.
     fn wait_for_display_resolution(device_name: &str, width: u32, height: u32) {
-        let name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
         const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3000);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
         let deadline = std::time::Instant::now() + TIMEOUT;
         let mut last_seen = (0u32, 0u32);
         loop {
-            let mut mode = DEVMODEW {
-                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-                ..Default::default()
-            };
-            let ok = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() };
-            if ok {
-                last_seen = (mode.dmPelsWidth, mode.dmPelsHeight);
+            if let Some((w, h)) = Self::query_ccd_source_size(device_name) {
+                last_seen = (w, h);
                 if last_seen == (width, height) {
-                    println!("✅ {device_name} stabilized at {width}x{height} — proceeding with DXGI rebind");
+                    println!("✅ {device_name} CCD source confirmed {width}×{height} — proceeding with DXGI rebind");
                     return;
                 }
             }
             if std::time::Instant::now() >= deadline {
                 println!(
-                    "⚠️  {device_name} still reporting {}x{} after {}ms (wanted {width}x{height}) — proceeding anyway, DXGI rebind may need another pass",
+                    "⚠️  {device_name} CCD source still {}×{} after {}ms (wanted {width}×{height}) — proceeding anyway",
                     last_seen.0, last_seen.1, TIMEOUT.as_millis()
                 );
                 return;
@@ -1917,86 +1898,175 @@ impl VirtualDisplay {
         }
     }
 
-    /// Phase 5.2, directive 2: explicitly snaps `device_name`'s active mode
-    /// to `width`x`height`@`refresh_hz` via the legacy
-    /// `ChangeDisplaySettingsExW`/`DEVMODEW` API.
+    /// Returns the CCD `(width, height)` of the active source mode for
+    /// `device_name`, or `None` if the display isn't in the active topology.
     ///
-    /// CCD's `SetDisplayConfig` (used by [`set_primary_display`] and
-    /// [`deactivate_other_paths`], called just before this in
-    /// [`activate_for_stream`]) only routes which paths are active and where
-    /// their sources sit on the desktop — it has no effect on which of a
-    /// target's advertised modes is "current". Left alone, the virtual
-    /// display can stay parked on its 800x600 failsafe mode indefinitely
-    /// while CCD-wise it's already the active primary.
-    ///
-    /// This doesn't invent a new mode: [`configure_mode`] already wrote
-    /// `width`x`height`@`refresh_hz` into `vdd_settings.xml` and the devnode
-    /// has been enabled since boot, so the driver already advertises this
-    /// exact mode as one `ChangeDisplaySettingsExW` can select — this call
-    /// just picks it.
-    ///
-    /// Reads the current `DEVMODEW` via `EnumDisplaySettingsW
-    /// (ENUM_CURRENT_SETTINGS)` first and overwrites only
-    /// `dmPelsWidth`/`dmPelsHeight`/`dmDisplayFrequency` (via `dmFields =
-    /// DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY`), leaving every
-    /// other field (color depth, position, orientation, ...) as Windows
-    /// reported it.
-    ///
-    /// Uses `CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_RESET`. `CDS_UPDATEREGISTRY`
-    /// persists the mode to the registry as well as applying it.
-    /// `CDS_GLOBAL` writes that registry change for all users rather than
-    /// just the current session — relevant since Nova runs headless/as a
-    /// service, not an interactive user session. `CDS_RESET` is the critical
-    /// addition for the "stuck at 800x600" symptom: without it, Windows can
-    /// decide the requested mode is "equivalent enough" to the current one
-    /// and silently skip applying it, even though `ChangeDisplaySettingsExW`
-    /// still returns `DISP_CHANGE_SUCCESSFUL`. `CDS_RESET` forces the mode
-    /// change to be applied immediately and unconditionally. Elsewhere in
-    /// this module, `CDS_SET_PRIMARY`-class calls are documented as returning
-    /// `DISP_CHANGE_FAILED` outright on this driver stack even as a true
-    /// no-op (see `set_primary_noop_diagnostic`); this call's `dmFields`
-    /// (size/refresh, not position/primary) differ enough that it may not hit
-    /// the same rejection, but the `DISP_CHANGE` result is logged either way
-    /// so a rejection is visible. [`wait_for_display_resolution`], called
-    /// right after this, is the other signal — if it times out without ever
-    /// seeing `width`x`height`, this call was rejected or ineffective.
-    ///
-    /// Best-effort: logs success or failure and never returns an error;
-    /// [`activate_for_stream`] proceeds to [`wait_for_display_resolution`]
-    /// regardless.
-    fn force_resolution(device_name: &str, width: u32, height: u32, refresh_hz: u32) {
-        let name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let mut mode = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            ..Default::default()
-        };
-        let _ = unsafe { EnumDisplaySettingsW(PCWSTR(name_w.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) };
-
-        mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-        mode.dmPelsWidth = width;
-        mode.dmPelsHeight = height;
-        mode.dmDisplayFrequency = refresh_hz;
-        // Defensive, see isolate_virtual_display_at_boot. NOTE: -2 below is
-        // DISP_CHANGE_BADMODE ("mode not supported"), not BADPARAM — if this
-        // still fails, width x height @ refresh_hz isn't in the driver's
-        // currently-loaded mode table (see activate_for_stream step 2).
-        mode.dmDriverExtra = 0;
-
-        let result = unsafe {
-            ChangeDisplaySettingsExW(
-                PCWSTR(name_w.as_ptr()),
-                Some(&mode),
-                HWND(std::ptr::null_mut()),
-                CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_RESET,
+    /// Uses `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` + a
+    /// `DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME` lookup to match by GDI
+    /// name, then reads the `DISPLAYCONFIG_SOURCE_MODE` width/height from the
+    /// mode array. Works for IddCx adapters (MttVDD) where
+    /// `EnumDisplaySettingsW` always reports 0×0.
+    fn query_ccd_source_size(device_name: &str) -> Option<(u32, u32)> {
+        unsafe {
+            let mut n_paths: u32 = 0;
+            let mut n_modes: u32 = 0;
+            if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_paths, &mut n_modes).0 != 0 {
+                return None;
+            }
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); n_paths as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); n_modes as usize];
+            let mut out_paths = n_paths;
+            let mut out_modes = n_modes;
+            if QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut out_paths, paths.as_mut_ptr(),
+                &mut out_modes, modes.as_mut_ptr(),
                 None,
-            )
-        };
+            ).0 != 0 {
+                return None;
+            }
+            paths.truncate(out_paths as usize);
+            modes.truncate(out_modes as usize);
 
-        if result == DISP_CHANGE_SUCCESSFUL {
-            println!("🔧 {device_name} resolution snapped to {width}x{height}@{refresh_hz}Hz (DISP_CHANGE_SUCCESSFUL)");
-        } else {
-            println!("⚠️  ChangeDisplaySettingsExW failed to snap {device_name} to {width}x{height}@{refresh_hz}Hz (DISP_CHANGE {})", result.0);
+            for i in 0..paths.len() {
+                let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
+                src.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: paths[i].sourceInfo.adapterId,
+                    id: paths[i].sourceInfo.id,
+                };
+                if DisplayConfigGetDeviceInfo(&mut src.header as *mut _ as *mut _) != 0 {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&src.viewGdiDeviceName);
+                if !name.trim_end_matches('\0').eq_ignore_ascii_case(device_name) {
+                    continue;
+                }
+                let adapter_id = paths[i].sourceInfo.adapterId;
+                let source_id  = paths[i].sourceInfo.id;
+                for j in 0..modes.len() {
+                    if modes[j].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                        && modes[j].adapterId.HighPart == adapter_id.HighPart
+                        && modes[j].adapterId.LowPart  == adapter_id.LowPart
+                        && modes[j].id == source_id
+                    {
+                        let sm = &modes[j].Anonymous.sourceMode;
+                        return Some((sm.width, sm.height));
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    /// Snaps `device_name`'s CCD source mode to `width`×`height`@`refresh_hz`
+    /// using `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` +
+    /// `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)`.
+    ///
+    /// MttVDD is an IddCx virtual display driver — `ChangeDisplaySettingsExW`
+    /// always returns `DISP_CHANGE_FAILED (-1)` on it because IddCx devices
+    /// don't expose a legacy GDI mode slot. `EnumDisplaySettingsW` likewise
+    /// returns 0×0 for the current settings. The CCD path (mirroring Apollo's
+    /// `changeDisplaySettings2`) bypasses both limitations:
+    ///
+    ///   1. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` — get the live set of
+    ///      active paths and their source/target mode arrays.
+    ///   2. Find the path whose `viewGdiDeviceName` matches `device_name`.
+    ///   3. Find the `DISPLAYCONFIG_SOURCE_MODE` entry for that path by
+    ///      matching `adapterId` + `id` in the mode array.
+    ///   4. Overwrite `sourceMode.width` / `sourceMode.height` and
+    ///      `targetInfo.refreshRate = {refresh_hz × 1000, 1000}` (rational Hz).
+    ///   5. `SetDisplayConfig(SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+    ///      SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES)`.
+    ///
+    /// Best-effort: logs success or failure and never returns an error.
+    fn force_resolution(device_name: &str, width: u32, height: u32, refresh_hz: u32) {
+        unsafe {
+            let mut n_paths: u32 = 0;
+            let mut n_modes: u32 = 0;
+            let err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_paths, &mut n_modes);
+            if err.0 != 0 {
+                println!("⚠️  force_resolution: GetDisplayConfigBufferSizes error {}", err.0);
+                return;
+            }
+
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); n_paths as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); n_modes as usize];
+            let mut out_paths = n_paths;
+            let mut out_modes  = n_modes;
+            let err = QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut out_paths, paths.as_mut_ptr(),
+                &mut out_modes, modes.as_mut_ptr(),
+                None,
+            );
+            if err.0 != 0 {
+                println!("⚠️  force_resolution: QueryDisplayConfig error {}", err.0);
+                return;
+            }
+            paths.truncate(out_paths as usize);
+            modes.truncate(out_modes as usize);
+
+            // Walk active paths looking for the one whose GDI name is device_name.
+            'outer: for i in 0..paths.len() {
+                let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
+                src.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: paths[i].sourceInfo.adapterId,
+                    id:        paths[i].sourceInfo.id,
+                };
+                if DisplayConfigGetDeviceInfo(&mut src.header as *mut _ as *mut _) != 0 {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&src.viewGdiDeviceName);
+                if !name.trim_end_matches('\0').eq_ignore_ascii_case(device_name) {
+                    continue;
+                }
+
+                // Found the right path — locate its source-mode entry by (adapterId, id).
+                let adapter_id = paths[i].sourceInfo.adapterId;
+                let source_id  = paths[i].sourceInfo.id;
+                for j in 0..modes.len() {
+                    if modes[j].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                        continue;
+                    }
+                    if modes[j].adapterId.HighPart != adapter_id.HighPart
+                        || modes[j].adapterId.LowPart != adapter_id.LowPart
+                        || modes[j].id != source_id
+                    {
+                        continue;
+                    }
+
+                    let cur_w = modes[j].Anonymous.sourceMode.width;
+                    let cur_h = modes[j].Anonymous.sourceMode.height;
+                    println!(
+                        "🔧 CCD: {device_name} source {cur_w}×{cur_h} → {width}×{height}@{refresh_hz}Hz"
+                    );
+                    modes[j].Anonymous.sourceMode.width  = width;
+                    modes[j].Anonymous.sourceMode.height = height;
+
+                    // Apollo pattern: {refresh_rate_mHz, 1000} — mHz = Hz × 1000
+                    paths[i].targetInfo.refreshRate.Numerator   = refresh_hz * 1000;
+                    paths[i].targetInfo.refreshRate.Denominator = 1000;
+
+                    let status = SetDisplayConfig(
+                        Some(&paths),
+                        Some(&modes),
+                        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                    );
+                    if status == 0 {
+                        println!("✅ {device_name} CCD mode set to {width}×{height}@{refresh_hz}Hz");
+                    } else {
+                        println!("⚠️  force_resolution: SetDisplayConfig error {status}");
+                    }
+                    break 'outer;
+                }
+                // Path found but no matching source-mode entry in the array.
+                println!("⚠️  force_resolution: source mode for {device_name} not found in CCD mode array");
+                break;
+            }
         }
     }
 
@@ -2034,6 +2104,45 @@ impl VirtualDisplay {
                     return Some(String::from_utf16_lossy(&device.DeviceName).trim_end_matches('\0').to_string());
                 }
 
+                index += 1;
+            }
+        }
+    }
+
+    /// Finds the GDI device name of the VDD monitor **that is currently
+    /// attached to the desktop** (i.e. `DISPLAY_DEVICE_ATTACHED_TO_DESKTOP`
+    /// is set in its `StateFlags`).
+    ///
+    /// Called after `SDC_TOPOLOGY_EXTEND` to capture the post-EXTEND name.
+    /// The VDD's GDI index can change between the boot-time enable and the
+    /// on-demand enable (e.g. `\\.\DISPLAY15` → `\\.\DISPLAY17`) because
+    /// Windows re-assigns display numbers based on adapter enumeration order.
+    /// Waiting until `ATTACHED_TO_DESKTOP` is set gives both a reliable
+    /// "DWM has committed the topology" signal and the correct current name.
+    ///
+    /// `DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x0000_0001` (wingdi.h).
+    fn find_vdd_attached_to_desktop() -> Option<String> {
+        const ATTACHED: u32 = 0x0000_0001;
+        unsafe {
+            let mut index = 0u32;
+            loop {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0).as_bool() {
+                    return None;
+                }
+                let device_id = String::from_utf16_lossy(&device.DeviceID);
+                if device_id.to_uppercase().contains("MTTVDD")
+                    && device.StateFlags & ATTACHED != 0
+                {
+                    return Some(
+                        String::from_utf16_lossy(&device.DeviceName)
+                            .trim_end_matches('\0')
+                            .to_string(),
+                    );
+                }
                 index += 1;
             }
         }
