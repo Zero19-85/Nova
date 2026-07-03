@@ -74,7 +74,14 @@ pub struct RtpSender {
     target: Option<SocketAddr>,
     /// Global packet counter — shifted into NV_VIDEO_PACKET.streamPacketIndex
     packet_counter: u32,
-    /// Per-frame counter stored in NV_VIDEO_PACKET.frameIndex
+    /// Per-frame counter stored in NV_VIDEO_PACKET.frameIndex. MUST start at 1:
+    /// moonlight-common-c initializes `nextFrameNumber = 1` and discards any
+    /// packet with `isBefore32(frameIndex, nextFrameNumber)` — a frame 0 (our
+    /// forced session-start IDR) is silently dropped, and the client only
+    /// re-requests an IDR after it also loses a packet mid-frame
+    /// (`waitingForNextSuccessfulFrame`). On a loss-free link that recovery
+    /// never fires → eternal black screen → 10 s ML_ERROR_NO_VIDEO_FRAME
+    /// ("reduce your bitrate" dialog). Sunshine starts at 1 (video.cpp frame_nr).
     frame_index: u32,
     fps: u32,
     /// True when the active session uses HEVC or AV1. Controls NAL unit
@@ -130,7 +137,7 @@ impl RtpSender {
             timestamp: 0,
             target: None,
             packet_counter: 0,
-            frame_index: 0,
+            frame_index: 1, // Moonlight discards frame 0 — see field doc
             fps: 60,
             packet_size: DEFAULT_PACKET_SIZE,
             fec_percentage: DEFAULT_FEC_PERCENTAGE,
@@ -202,7 +209,7 @@ impl RtpSender {
         self.sequence_number = 0;
         self.timestamp       = 0;
         self.packet_counter  = 0;
-        self.frame_index     = 0;
+        self.frame_index     = 1; // Moonlight discards frame 0 — see field doc
         self.is_hevc         = false;
     }
 
@@ -521,6 +528,63 @@ mod tests {
             new.local_addr().unwrap().port(),
             "reconnect must latch the NEW client port, not a stale buffered ping"
         );
+    }
+
+    /// Receive every datagram of one sent frame (data + parity shards).
+    /// send_frame is synchronous, so after it returns everything is in the
+    /// loopback receive buffer within the read timeout.
+    fn recv_frame_datagrams(sock: &UdpSocket) -> Vec<Vec<u8>> {
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(250))).unwrap();
+        let mut pkts = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = sock.recv_from(&mut buf) {
+            pkts.push(buf[..n].to_vec());
+        }
+        pkts
+    }
+
+    /// NV_VIDEO_PACKET.frameIndex of a video datagram (bytes 20..24, LE).
+    fn frame_index_of(pkt: &[u8]) -> u32 {
+        u32::from_le_bytes([pkt[20], pkt[21], pkt[22], pkt[23]])
+    }
+
+    /// The first transmitted frame MUST carry NV_VIDEO_PACKET.frameIndex == 1.
+    /// moonlight-common-c initializes `nextFrameNumber = 1` and discards any
+    /// frame 0 as stale; on a loss-free link the client never re-requests an
+    /// IDR (`waitingForNextSuccessfulFrame` stays false), so a frame-0 opening
+    /// IDR = permanent black screen + ML_ERROR_NO_VIDEO_FRAME ("reduce your
+    /// bitrate") after 10 s. Sunshine starts at frame_nr = 1.
+    #[test]
+    fn first_frame_carries_frame_index_1_and_reset_restarts_at_1() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        ping(&client, dst, 1);
+        sender.try_learn_target().expect("learn client");
+
+        // Minimal H.264 Annex-B IDR payload (00 00 01 65 ...).
+        let mut frame = vec![0u8, 0, 1, 0x65];
+        frame.extend_from_slice(&[0xAA; 64]);
+
+        sender.send_frame(&frame);
+        let pkts = recv_frame_datagrams(&client);
+        assert!(!pkts.is_empty(), "no datagrams received for frame 1");
+        assert_eq!(frame_index_of(&pkts[0]), 1, "first frame must be index 1, not 0");
+        assert_eq!(pkts[0][24] & FLAG_SOF, FLAG_SOF, "first data shard must carry SOF");
+
+        sender.send_frame(&frame);
+        let pkts = recv_frame_datagrams(&client);
+        assert_eq!(frame_index_of(&pkts[0]), 2, "second frame must be index 2");
+
+        // A new session must restart at 1 — the client's depacketizer is
+        // reinitialized per connection and expects frame 1 again.
+        sender.reset();
+        ping(&client, dst, 1);
+        sender.try_learn_target().expect("re-learn client after reset");
+        sender.send_frame(&frame);
+        let pkts = recv_frame_datagrams(&client);
+        assert_eq!(frame_index_of(&pkts[0]), 1, "post-reset first frame must be index 1");
     }
 
     /// Draining must keep the most recent sender when pings from an old and a

@@ -120,8 +120,8 @@ use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW,
-    CDS_NORESET, CDS_TYPE, CDS_UPDATEREGISTRY,
-    DEVMODEW, DISPLAY_DEVICE_PRIMARY_DEVICE, ENUM_CURRENT_SETTINGS,
+    CDS_NORESET, CDS_SET_PRIMARY, CDS_TYPE, CDS_UPDATEREGISTRY,
+    DEVMODEW, DISPLAY_DEVICE_PRIMARY_DEVICE, DM_POSITION, ENUM_CURRENT_SETTINGS,
 };
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
