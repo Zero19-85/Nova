@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +24,12 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
     let mut host: enet::Host<UdpSocket> = match enet::Host::new(
         socket,
         enet::HostSettings {
-            peer_limit: 1,
+            // 2, not 1: quitting Moonlight on Xbox never sends an ENet
+            // disconnect, so the dead session's peer occupies its slot until
+            // its 10-30 s timeout. The second slot lets a /resume's control
+            // connection land IMMEDIATELY; the zombie is then evicted on the
+            // Connect event instead of blocking the reconnect.
+            peer_limit: 2,
             channel_limit: 1,
             ..Default::default()
         },
@@ -35,19 +41,48 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
         }
     };
 
+    // PeerID → ClientInfo.session_generation stamped at connect time. A
+    // Disconnect may only end the session when its stamp still matches the
+    // current generation — see handle_event.
+    let mut peer_generation: HashMap<enet::PeerID, u64> = HashMap::new();
+
     loop {
         loop {
-            match host.service() {
-                Ok(Some(event)) => handle_event(event, &client_info),
+            let evict_others = match host.service() {
+                Ok(Some(event)) => handle_event(event, &client_info, &mut peer_generation),
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("⚠️  Control stream socket error: {:?}", e);
                     break;
                 }
+            };
+            // A new session's peer connected: forcibly reset every OTHER peer —
+            // they are zombies from superseded sessions. reset() frees the slot
+            // immediately and emits no Disconnect event, so the eviction can
+            // never be mistaken for the live session ending.
+            if let Some(keep) = evict_others {
+                let stale: Vec<(enet::PeerID, String)> = host
+                    .connected_peers()
+                    .filter(|p| p.id() != keep)
+                    .map(|p| (p.id(), p.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string())))
+                    .collect();
+                for (id, addr) in stale {
+                    println!("🎮 Control stream: evicting stale peer {} (superseded by new control connection)", addr);
+                    host.peer_mut(id).reset();
+                    peer_generation.remove(&id);
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(4));
     }
+}
+
+/// Current session generation — bumped by every /launch and /resume before
+/// the client opens its control connection.
+fn current_session_generation(client_info: &Arc<Mutex<Option<ClientInfo>>>) -> u64 {
+    client_info.lock().ok()
+        .and_then(|g| g.as_ref().map(|i| i.session_generation))
+        .unwrap_or(0)
 }
 
 // Control message types (Sunshine stream.cpp packetTypes[]).
@@ -320,15 +355,41 @@ fn handle_control_message(
     }
 }
 
-fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<ClientInfo>>>) {
+/// Handle one ENet event. Returns `Some(peer_id)` when a peer connected —
+/// the caller then evicts every other peer (zombies of superseded sessions).
+fn handle_event(
+    event: enet::Event<UdpSocket>,
+    client_info: &Arc<Mutex<Option<ClientInfo>>>,
+    peer_generation: &mut HashMap<enet::PeerID, u64>,
+) -> Option<enet::PeerID> {
     match event {
         enet::Event::Connect { peer, .. } => {
             let addr = peer.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string());
-            println!("🎮 Control stream: peer connected from {}", addr);
-            let _ = client_info;
+            // Stamp the peer with the generation current at connect time.
+            // /launch and /resume bump the generation before the client opens
+            // its control connection, so this peer belongs to the newest
+            // session; any older peer still connected is a zombie.
+            let generation = current_session_generation(client_info);
+            peer_generation.insert(peer.id(), generation);
+            println!("🎮 Control stream: peer connected from {} (session {})", addr, generation);
+            Some(peer.id())
         }
         enet::Event::Disconnect { peer, .. } => {
             let addr = peer.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string());
+            let stamped = peer_generation.remove(&peer.id());
+            let current = current_session_generation(client_info);
+            // Only the CURRENT session's peer may end the session. A zombie
+            // peer from a superseded session (Xbox quits Moonlight without an
+            // ENet disconnect) times out 10-30 s later — often right on top of
+            // the /resume that replaced it. Ending the session then would tear
+            // down the freshly resumed stream and kick the client back out.
+            if stamped != Some(current) {
+                println!("🎮 Control stream: stale peer {} (session {} ≠ current {}) disconnected — ignoring",
+                    addr,
+                    stamped.map(|g| g.to_string()).unwrap_or_else(|| "?".to_string()),
+                    current);
+                return None;
+            }
             println!("🎮 Control stream: peer {} disconnected", addr);
             // The control stream dying means the client is gone, whether or not
             // an RTSP TEARDOWN ever arrived (abrupt exit, network drop). End the
@@ -342,9 +403,11 @@ fn handle_event(event: enet::Event<UdpSocket>, client_info: &Arc<Mutex<Option<Cl
                     }
                 }
             }
+            None
         }
         enet::Event::Receive { peer, channel_id, packet, .. } => {
             handle_control_message(channel_id, packet.data(), client_info, peer);
+            None
         }
     }
 }

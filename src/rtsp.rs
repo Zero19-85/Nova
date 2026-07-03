@@ -77,6 +77,14 @@ pub struct ClientInfo {
     /// (teardown VDD, restore host topology) from a natural network disconnect
     /// (suspend: keep VDD alive so /resume can reconnect without flicker).
     pub cancelled: bool,
+    /// Monotonic session counter — bumped by every /launch and /resume in
+    /// pairing.rs. The control thread stamps each connecting ENet peer with
+    /// the generation current at connect time and ignores Disconnect events
+    /// whose stamp no longer matches. Quitting Moonlight on Xbox never sends
+    /// an ENet disconnect, so the old peer lingers until its 10–30 s timeout
+    /// fires — without the stamp, that timeout lands mid-/resume and tears
+    /// down the freshly started session (client kicked back to the app list).
+    pub session_generation: u64,
     /// True after the 0x010e HDR mode control packet has been sent this session.
     /// Apollo sends this once at stream start; Nova sends it on the first
     /// PT_PERIODIC_PING (encoder is running by then). Without it, Moonlight

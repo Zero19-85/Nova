@@ -937,25 +937,40 @@ async fn handle_request(
                 info.video_format  = video_format;
                 info.hdr_requested = hdr_requested;
                 info.device_name   = session_device_name;
+                // Both /launch and /resume begin a NEW streaming session (fresh
+                // rikey, fresh control connection, fresh ANNOUNCE), so bump the
+                // session generation — the control thread uses it to tell this
+                // session's ENet peer apart from a zombie peer of the previous
+                // session (quitting Moonlight on Xbox never sends an ENet
+                // disconnect; the zombie lingers until its 10-30 s timeout).
+                info.session_generation = info.session_generation.wrapping_add(1);
+                // Arm the session: streaming starts at RTSP PLAY. If the previous
+                // session is still nominally connected (zombie), clearing this now
+                // makes the capture loop suspend it immediately and latch THIS
+                // session cleanly at PLAY. Without it /resume never re-runs the
+                // session start (new rikey, codec renegotiation, audio restart) —
+                // the client waits on a dead session and is kicked back to the
+                // app list after its 7-second timeout.
+                info.streaming_active = false;
+                info.cancelled        = false; // clear any leftover cancel from the previous session
+                // CRITICAL: reset so the control thread re-sends the 0x010e HDR mode
+                // packet on the first PT_PERIODIC_PING of the NEW session.  Without this
+                // reset the flag is carried over from the previous ClientInfo via take(),
+                // the Xbox never receives the packet, and the TV stays in SDR mode →
+                // "whitewash" on every reconnect (applies to /resume the same as /launch).
+                info.hdr_mode_sent    = false;
+                // Reset ANNOUNCE-sourced fields so stale values from a previous
+                // session cannot leak into the new one's codec/HDR decisions.
+                // The authoritative values arrive in the client's ANNOUNCE SDP.
+                info.dynamic_range_mode = 0;
+                info.bit_stream_format  = 0;
                 // /launch starts a fresh session — reset activation state so the
                 // capture loop's pre-activation pass runs the VDD/CCD switch
                 // during the handshake gap. /resume reattaches to an already-
                 // active VDD: leaving activated=true skips re-activation and
                 // avoids a topology flicker on reconnect.
                 if path == "/launch" {
-                    info.activated     = false;
-                    info.cancelled     = false; // clear any leftover cancel from the previous session
-                    // CRITICAL: reset so the control thread re-sends the 0x010e HDR mode
-                    // packet on the first PT_PERIODIC_PING of the NEW session.  Without this
-                    // reset the flag is carried over from the previous ClientInfo via take(),
-                    // the Xbox never receives the packet, and the TV stays in SDR mode →
-                    // "whitewash" on every reconnect.
-                    info.hdr_mode_sent    = false;
-                    // Reset ANNOUNCE-sourced fields so stale values from a previous
-                    // session cannot leak into the new one's codec/HDR decisions.
-                    // The authoritative values arrive in the client's ANNOUNCE SDP.
-                    info.dynamic_range_mode = 0;
-                    info.bit_stream_format  = 0;
+                    info.activated = false;
                 }
                 *guard = Some(info);
             }

@@ -15,7 +15,32 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 12 complete — IddCx CCD-Native VDD Resolution Fix (2026-07-02)
+## Current Phase: Phase 13 — RTP frameIndex Fix + Zombie-Proof /resume (2026-07-03)
+
+Phase 13 fixes (a) the "black screen → ~10 s → Moonlight says reduce your bitrate" failure that became 100% reproducible with the release build on a clean network — **confirmed fixed, streaming works** — and (b) /resume kicking the client back to the app list when Moonlight was quit without disconnecting (Xbox behavior).
+
+### Phase 13 changes (2026-07-03):
+
+**Zombie-proof /resume (`src/control.rs`, `src/pairing.rs`, `src/rtsp.rs`):**
+- **Symptom:** quit Moonlight on Xbox mid-stream (no ENet disconnect is ever sent), reopen, tap Resume on app 5 → full RTSP handshake succeeds but the client waits on a dead session and bails back to the app list after ~7 s. Quit-app + relaunch worked; resume never did.
+- **Root cause (two layers, from the 7/3 log):**
+  1. The old session's ENet control peer lingers as a zombie until its 10–30 s timeout, which lands right after the /resume PLAY; `handle_event`'s Disconnect arm indiscriminately set `streaming_active=false`, tearing down the freshly resumed session. With `peer_limit: 1` the new control connection also couldn't even land until the zombie died.
+  2. Deeper: /resume never restarted the session state machine at all — lib.rs's session-start block is gated on `!client_connected`, which was still true from the zombie session, so the new rikey/codec/audio were never applied ("Moonlight connected" never fired).
+- **Fix:**
+  - `ClientInfo.session_generation: u64` — bumped by every /launch **and** /resume (pairing.rs).
+  - /launch and /resume now both arm the session with `streaming_active=false` (until PLAY) and reset `cancelled`/`hdr_mode_sent`/`dynamic_range_mode`/`bit_stream_format`. The capture loop therefore suspends a still-connected zombie session immediately and latches the new session cleanly at PLAY — new rikey, codec renegotiation, audio restart all run. Only /launch resets `activated` (resume reattaches to the live VDD with no topology flicker).
+  - control.rs: `peer_limit: 2` so the resume's control connection lands instantly beside the zombie; every Connect stamps the peer with the current session generation and evicts all other peers via `Peer::reset()` (immediate slot free, no Disconnect event); the Disconnect arm ignores any peer whose stamp ≠ current generation ("stale peer — ignoring") — only the live session's peer can end the session.
+- Also fixes the latent launch-over-zombie bug where pre-activation was skipped because `streaming_active` was still true from the dead session.
+
+**RTP frameIndex must start at 1 (`src/rtp.rs`):**
+- **Symptom:** full handshake succeeds, HEVC frames flow at the negotiated bitrate, but the client renders nothing, sends zero loss-stats and zero IDR re-requests, and terminates after ~10 s with `ML_ERROR_NO_VIDEO_FRAME` ("Your network connection isn't performing well. Reduce your video bitrate…").
+- **Root cause:** `RtpSender.frame_index` started at 0. moonlight-common-c (`VideoDepacketizer.c`) initializes `nextFrameNumber = 1` and discards any packet with `isBefore32(frameIndex, nextFrameNumber)` — so Nova's session-start forced IDR (frame 0) was **always** discarded by every Moonlight client. Subsequent P-frames are dropped ("Waiting for IDR frame"), and the client only calls `LiRequestIdrFrame()` when `waitingForNextSuccessfulFrame` is also set — which requires a mid-frame packet loss. On a loss-free link the recovery never fires → permanent black screen.
+- **Why it ever "worked":** every previously working session (incl. the Phase 12 validation on 7/2) started only because early WiFi packet loss tripped the client's recovery IDR request (visible in the 7/2 debug log as a second "client requested IDR frame" ~350 ms in). The slower debug-build pacing made loss likely; the release build's clean delivery removed the loss and exposed the bug deterministically.
+- **Fix:** `frame_index` starts at 1 in `RtpSender::new()` and `reset()` — Sunshine parity (`video.cpp: int frame_nr = 1`). Regression test `first_frame_carries_frame_index_1_and_reset_restarts_at_1` locks the wire format (first frame = index 1, restarts at 1 after session reset).
+- Also fixed: `#[cfg(test)]` GDI import list was missing `CDS_SET_PRIMARY` + `DM_POSITION` — `cargo test` had been broken since the Phase 12 import cleanup.
+- **Status: CONFIRMED WORKING 2026-07-03** — user reports streaming works perfectly (Xbox 4K@120 H264/SDR and Android 720p HEVC sessions in the log).
+
+## Phase 12 complete — IddCx CCD-Native VDD Resolution Fix (2026-07-02)
 
 All previous phases (1–11) confirmed working. Phase 12 fixes VDD resolution not snapping to client-requested dimensions when using the MttVDD IddCx driver (resolution was stuck at native 2560×1440 regardless of Moonlight's requested mode).
 
