@@ -15,9 +15,17 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 13 — RTP frameIndex Fix + Zombie-Proof /resume (2026-07-03)
+## Current Phase: Phase 13.2 — Boot VDD isolation error-87 fix (2026-07-05)
 
 Phase 13 fixes (a) the "black screen → ~10 s → Moonlight says reduce your bitrate" failure that became 100% reproducible with the release build on a clean network — **confirmed fixed, streaming works** — and (b) /resume kicking the client back to the app list when Moonlight was quit without disconnecting (Xbox behavior).
+
+### Phase 13.2 — Boot VDD isolation "error 87" fix (2026-07-05):
+
+**Symptom:** on a fresh install / first boot Nova took over the physical desktop and ran headless immediately, before App 5 was ever launched (blank host screen; you could still pair blind over Moonlight). The boot log showed `Atomic VDD isolate+restore failed (… error 87) — falling back to deactivate-only` immediately followed by `ccd_deactivate_vdd_path also failed (… error 87)` — so the VDD was never removed from the active topology at boot and stayed the primary display.
+
+**Root cause:** when the CCD database has the persisted "true headless" topology saved from a previous stream (VDD primary, physical paths inactive — the state an unclean shutdown mid-stream leaves behind), the devnode-enable at boot restores THAT topology, making the VDD the only active display. Both `ccd_isolate_vdd_and_restore_primary` and `ccd_deactivate_vdd_path` then tried to deactivate the VDD's path while it was the *sole* active path → a supplied config with zero active displays, which `SetDisplayConfig` rejects with `ERROR_INVALID_PARAMETER` (87). They also queried `QDC_ALL_PATHS`, whose per-(source×target)-permutation entries are independently 87-prone.
+
+**Fix (`src/virtual_display.rs`):** both isolate helpers now query `QDC_ONLY_ACTIVE_PATHS` (the exact committed topology — round-trips reliably, same as `force_resolution`), and when the VDD is detected as the only active display they first re-light the physical outputs via new `extend_topology_and_wait_for_physical` (`SDC_TOPOLOGY_EXTEND`, then poll `query_active_topology` until a non-VDD active path appears, re-resolving the VDD's possibly-renumbered GDI name via `find_vdd_attached_to_desktop`), then deactivate the VDD path on the fresh topology and `SDC_SAVE_TO_DATABASE` the healed "physical primary, VDD inactive" state so the next boot starts clean. New `path_is_device` helper dedups the GDI-name match. **Confirmed 2026-07-05:** boot log now shows `\\.\DISPLAY9 dormant — physical display(s) restored to primary position`, no error 87, physical `\\.\DISPLAY1` remains primary at (0,0); VDD only activates on App 5.
 
 ### Phase 13.1 — Install & driver preflight (2026-07-05):
 
@@ -70,7 +78,7 @@ All previous phases (1–11) confirmed working. Phase 12 fixes VDD resolution no
 - **Confirmed working** (2026-07-02): VDD snaps to 1280×720@60Hz, NVENC rebinds at 720p, HEVC stream at 7.5 Mbps client-negotiated, video loads in Moonlight without "reduce bitrate" error.
 
 **Known remaining issues:**
-- `ccd_isolate_vdd_and_restore_primary error 87` on disconnect (non-fatal; falls back to deactivate-only). IddCx adapter may not be found in `QDC_ALL_PATHS` with `DISPLAYCONFIG_PATH_ACTIVE` after stream ends.
+- ~~`ccd_isolate_vdd_and_restore_primary error 87`~~ — **fixed in Phase 13.2** (2026-07-05). Root cause was querying `QDC_ALL_PATHS` and trying to deactivate the VDD while it was the sole active display; both isolate paths now use `QDC_ONLY_ACTIVE_PATHS` and re-light physical outputs via `SDC_TOPOLOGY_EXTEND` first. See the Phase 13.2 section at the top.
 
 ---
 

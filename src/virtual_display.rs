@@ -1227,6 +1227,57 @@ impl VirtualDisplay {
         }
     }
 
+    /// True when `path`'s source resolves (via GDI name) to `device`.
+    fn path_is_device(path: &DISPLAYCONFIG_PATH_INFO, device: &str) -> bool {
+        Self::gdi_device_name_for_source(path.sourceInfo.adapterId, path.sourceInfo.id)
+            .is_some_and(|n| n.eq_ignore_ascii_case(device))
+    }
+
+    /// Re-lights the physical display path(s) via `SDC_TOPOLOGY_EXTEND` and
+    /// waits until at least one active non-VDD path appears in the committed
+    /// topology. Returns the VDD's **current** GDI name — DWM may assign the
+    /// VDD a new display number during the extend (same rename behaviour as
+    /// in [`activate_for_stream`]'s settle loop), so callers must match
+    /// against the returned name, not the one they passed in.
+    ///
+    /// Needed when the CCD database restored the persisted "true headless"
+    /// topology (VDD primary, physical paths inactive) on devnode arrival —
+    /// the state a crash or unclean shutdown mid-stream leaves behind. A
+    /// repair cannot simply deactivate the VDD path from there: a supplied
+    /// config with zero active displays is rejected with
+    /// `ERROR_INVALID_PARAMETER`/87 (the historic "isolate+restore error 87").
+    fn extend_topology_and_wait_for_physical(virtual_device: &str) -> Result<String, String> {
+        println!("🔌 Physical display paths inactive (headless topology restored from CCD database) — re-lighting via SDC_TOPOLOGY_EXTEND");
+        let status = unsafe {
+            SetDisplayConfig(
+                None::<&[DISPLAYCONFIG_PATH_INFO]>,
+                None::<&[DISPLAYCONFIG_MODE_INFO]>,
+                SDC_APPLY | SDC_TOPOLOGY_EXTEND,
+            )
+        };
+        if status != 0 {
+            return Err(format!("SetDisplayConfig(SDC_TOPOLOGY_EXTEND) error {status}"));
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // The extend may renumber the VDD's GDI device — re-resolve it by
+            // its MttVDD identity rather than trusting the caller's name.
+            let vdd_now = Self::find_vdd_attached_to_desktop()
+                .unwrap_or_else(|| virtual_device.to_string());
+            if let Ok((paths, _)) = Self::query_active_topology() {
+                if paths.iter().any(|p| !Self::path_is_device(p, &vdd_now)) {
+                    println!("✅ Physical display path active again (VDD currently {vdd_now})");
+                    return Ok(vdd_now);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("physical display path did not activate within 5 s of SDC_TOPOLOGY_EXTEND".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Deactivates the VDD's CCD path AND zeros the source-mode position of
     /// every remaining active physical path back to `(0,0)` in a single
     /// `SetDisplayConfig` call.
@@ -1238,37 +1289,59 @@ impl VirtualDisplay {
     /// leaves the host monitor stranded — GDI no longer recognises it as primary
     /// because no active source sits at the desktop origin.
     ///
+    /// Queries `QDC_ONLY_ACTIVE_PATHS`, not `QDC_ALL_PATHS`: the all-paths
+    /// array carries one entry per (source × target) permutation plus stale
+    /// entries right after a devnode cycle, both of which trip
+    /// `SetDisplayConfig`'s validation (`ERROR_INVALID_PARAMETER`/87 — see
+    /// [`restore_topology`]'s doc for the permutation trap). The active-paths
+    /// array is exactly the committed topology and round-trips reliably
+    /// (same pattern as [`force_resolution`]).
+    ///
+    /// When the VDD is the ONLY active display (the database restored the
+    /// saved headless topology on devnode arrival), the physical paths are
+    /// first re-lit via [`extend_topology_and_wait_for_physical`] — without
+    /// that, deactivating the VDD would supply a zero-active-path config,
+    /// which is exactly the long-standing boot/disconnect "error 87".
+    ///
     /// Using `SDC_ALLOW_CHANGES` lets Windows resolve any source-mode overlap
     /// produced by zeroing (relevant when multiple physical monitors are active)
     /// while still honouring the intent of restoring the primary to `(0,0)`.
+    /// `SDC_SAVE_TO_DATABASE` deliberately persists the healed "physical
+    /// primary, VDD inactive" state, overwriting the poisoned headless entry
+    /// so the next devnode arrival doesn't blank the desktop again.
     fn ccd_isolate_vdd_and_restore_primary(virtual_device: &str) -> Result<(), String> {
-        let (mut paths, mut modes) = Self::query_all_topology()?;
+        let mut vdd_name = virtual_device.to_string();
+        let (mut paths, mut modes) = Self::query_active_topology()?;
 
+        if !paths.iter().any(|p| Self::path_is_device(p, &vdd_name)) {
+            return Ok(()); // VDD not in the active topology — already dormant
+        }
+
+        if !paths.iter().any(|p| !Self::path_is_device(p, &vdd_name)) {
+            vdd_name = Self::extend_topology_and_wait_for_physical(&vdd_name)?;
+            let fresh = Self::query_active_topology()?;
+            paths = fresh.0;
+            modes = fresh.1;
+        }
+
+        let mut found_physical = false;
         for path in &mut paths {
-            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
-                continue;
-            }
-
-            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
-            if idx >= modes.len() || modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-                continue;
-            }
-
-            let is_vdd = Self::gdi_device_name_for_source(
-                path.sourceInfo.adapterId,
-                path.sourceInfo.id,
-            )
-            .is_some_and(|n| n.eq_ignore_ascii_case(virtual_device));
-
-            if is_vdd {
+            if Self::path_is_device(path, &vdd_name) {
                 path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
-            } else {
-                // Return physical source to the desktop origin so GDI recognises
-                // it as the primary display. For single-monitor setups this is
-                // always correct; for multi-monitor, SDC_ALLOW_CHANGES separates
-                // any resulting overlap automatically.
+                continue;
+            }
+            found_physical = true;
+            // Return physical source to the desktop origin so GDI recognises
+            // it as the primary display. For single-monitor setups this is
+            // always correct; for multi-monitor, SDC_ALLOW_CHANGES separates
+            // any resulting overlap automatically.
+            let idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if idx < modes.len() && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
                 modes[idx].Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
             }
+        }
+        if !found_physical {
+            return Err("no active physical display path — refusing to apply an empty topology".to_string());
         }
 
         let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
@@ -1285,44 +1358,54 @@ impl VirtualDisplay {
     /// Windows does not auto-promote the virtual monitor to primary on the
     /// next reboot.
     ///
-    /// This is the exact inverse of [`deactivate_other_paths`] — that function
-    /// kills the physical paths and keeps the VDD active; this one kills the
-    /// VDD path and keeps everything else active.  Both use the same
-    /// `QDC_ALL_PATHS` + `SDC_USE_SUPPLIED_DISPLAY_CONFIG` pattern that is
-    /// proven to round-trip on this driver stack.
+    /// Queries `QDC_ONLY_ACTIVE_PATHS` (see
+    /// [`ccd_isolate_vdd_and_restore_primary`] for why `QDC_ALL_PATHS` arrays
+    /// are 87-prone), and — when the VDD turns out to be the ONLY active
+    /// display (database restored the saved headless topology on devnode
+    /// arrival) — re-lights the physical paths via
+    /// [`extend_topology_and_wait_for_physical`] first, then retries on the
+    /// fresh topology. Deactivating the sole active display would otherwise
+    /// supply a zero-active-path config → `ERROR_INVALID_PARAMETER`/87.
     ///
     /// Returns `Ok(true)` when the VDD was already inactive (no-op),
     /// `Ok(false)` when it was found and successfully deactivated.
     fn ccd_deactivate_vdd_path(virtual_device: &str) -> Result<bool, String> {
-        let (mut paths, modes) = Self::query_all_topology()?;
+        let mut vdd_name = virtual_device.to_string();
 
-        let mut found = false;
-        for path in &mut paths {
-            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
-                continue; // already inactive — leave it alone
+        for attempt in 0..2 {
+            let (mut paths, modes) = Self::query_active_topology()?;
+
+            let mut found = false;
+            let mut physical_active = false;
+            for path in &mut paths {
+                if Self::path_is_device(path, &vdd_name) {
+                    path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+                    found = true;
+                } else {
+                    physical_active = true;
+                }
             }
-            let is_vdd = Self::gdi_device_name_for_source(
-                path.sourceInfo.adapterId,
-                path.sourceInfo.id,
-            )
-            .is_some_and(|name| name.eq_ignore_ascii_case(virtual_device));
 
-            if is_vdd {
-                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
-                found = true;
+            if !found {
+                return Ok(true); // VDD not in active topology — already dormant
             }
-        }
 
-        if !found {
-            return Ok(true); // VDD not in active topology — already dormant
-        }
+            if !physical_active {
+                if attempt == 1 {
+                    return Err("physical display path still inactive after SDC_TOPOLOGY_EXTEND".to_string());
+                }
+                vdd_name = Self::extend_topology_and_wait_for_physical(&vdd_name)?;
+                continue; // retry against the freshly-extended topology
+            }
 
-        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
-        let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
-        if status != 0 {
-            return Err(format!("SetDisplayConfig could not deactivate VDD CCD path (error {status})"));
+            let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+            let status = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+            if status != 0 {
+                return Err(format!("SetDisplayConfig could not deactivate VDD CCD path (error {status})"));
+            }
+            return Ok(false);
         }
-        Ok(false)
+        unreachable!("loop always returns within two attempts")
     }
 
     // -------------------------------------------------------------
