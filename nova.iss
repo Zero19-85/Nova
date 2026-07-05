@@ -158,8 +158,17 @@ Filename: "{app}\{#AppExe}"; \
 ; tray-resident process with no console window.
 ; postinstall + skipifsilent shows a "Launch Nova now" checkbox on the finish
 ; page but skips it during silent (/SILENT or /VERYSILENT) deployments.
+;
+; runascurrentuser is CRITICAL here: postinstall entries otherwise run as the
+; ORIGINAL unelevated user (Inno de-elevates them by design). Nova requires an
+; elevated token for the VDD devnode enable (SetupAPI DICS_ENABLE) and HDR10
+; Advanced Color switching — launched unelevated, those fail silently and the
+; stream shows a black screen with no virtual monitor and no HDR. The setup
+; process already holds an interactive admin token (PrivilegesRequired=admin);
+; this flag passes it straight to Nova, matching the elevation the
+; NovaServerBoot task provides at every subsequent logon.
 Filename: "{app}\{#AppExe}"; \
-    Flags: nowait runhidden postinstall skipifsilent; \
+    Flags: nowait runhidden postinstall skipifsilent runascurrentuser; \
     Description: "Launch {#AppName} now"
 
 

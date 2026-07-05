@@ -169,6 +169,44 @@ pub async fn run() -> Result<()> {
     // D3D11 failure — this line makes the root cause visible immediately.
     debug::log_shim_dll_path();
 
+    // ── Privilege preflight ───────────────────────────────────────────────────
+    // Nova needs an elevated token for the VDD lifecycle (SetupAPI
+    // DICS_ENABLE/DISABLE on Root\MttVDD) and HDR10 Advanced Color switching.
+    // The embedded manifest requests requireAdministrator, so an unelevated
+    // start should be impossible — but a stale unmanifested build, or a
+    // launcher that strips elevation (an Inno Setup postinstall [Run] entry
+    // without runascurrentuser executes as the ORIGINAL unelevated user),
+    // otherwise fails silently: no virtual monitor, no HDR, black stream.
+    // Make that failure loud in the log AND on screen.
+    if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
+        println!("🛡️  Elevated token confirmed — VDD lifecycle + HDR10 control available");
+    } else {
+        println!("❌ NOT ELEVATED — virtual display activation and HDR10 switching WILL fail. \
+            Start Nova as administrator (the NovaServerBoot task and the installer's \
+            'Launch Nova now' step both do this automatically).");
+        // Warn on-screen from a background thread so an unattended start
+        // (pairing/serverinfo still work unelevated) isn't blocked forever.
+        std::thread::spawn(|| unsafe {
+            use windows::core::w;
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+            };
+            MessageBoxW(
+                HWND(std::ptr::null_mut()),
+                w!("Nova is running without administrator privileges.\n\nThe virtual display (and HDR10) cannot be activated without elevation, so streams will show a black screen.\n\nClose Nova and start it as administrator — or reinstall, so the NovaServerBoot task launches it elevated at every logon."),
+                w!("Nova — Administrator Required"),
+                MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        });
+    }
+
+    // ── ViGEmBus preflight ────────────────────────────────────────────────────
+    // Detects a missing virtual Xbox 360 controller driver and offers a
+    // one-click download+install. Background thread — never blocks startup;
+    // video/audio/mouse/keyboard don't depend on it.
+    input::check_vigem_driver_at_startup();
+
     // If a previous run was killed/closed without restoring the default audio
     // device, fix that up before anything else (host would otherwise stay
     // silent with no client connected).

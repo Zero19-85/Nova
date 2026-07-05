@@ -695,6 +695,115 @@ pub fn send_win_f11() {
     send_key_event(VK_LWIN, true);
 }
 
+// ─── ViGEmBus driver startup check ────────────────────────────────────────────
+
+/// Pinned official ViGEmBus release — the virtual Xbox 360 controller bus
+/// driver that gamepad passthrough plugs into. v1.22.0 is the final release
+/// (the project is in maintenance mode); GitHub release-asset URLs are
+/// permanent, so pinning is safe.
+const VIGEMBUS_SETUP_URL: &str =
+    "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe";
+const VIGEMBUS_RELEASES_URL: &str = "https://github.com/nefarius/ViGEmBus/releases/latest";
+
+/// Marker written next to the exe when the user declines the install prompt.
+/// Nova auto-starts at every logon via the NovaServerBoot task, so without
+/// the marker the prompt would nag on every boot. Delete it to be asked again.
+const VIGEM_DECLINED_MARKER: &str = "vigem_install_declined.flag";
+
+/// Startup probe for the ViGEmBus driver (virtual Xbox 360 controller bus).
+/// Runs on a background thread — a missing driver must not delay pairing or
+/// streaming startup; only gamepad passthrough depends on it. When absent,
+/// offers to download and run the official installer. `GamepadManager`
+/// connects per-session, so a mid-run install takes effect on the next
+/// stream without restarting Nova.
+pub fn check_vigem_driver_at_startup() {
+    std::thread::spawn(|| match Client::connect() {
+        Ok(_) => println!("🎮 ViGEmBus driver present — virtual Xbox 360 controller passthrough ready"),
+        Err(e) => {
+            println!("⚠️  ViGEmBus driver not detected ({e:?}) — gamepad passthrough unavailable");
+            offer_vigem_install();
+        }
+    });
+}
+
+fn vigem_declined_marker_path() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join(VIGEM_DECLINED_MARKER))
+}
+
+/// Yes/No prompt on the host's screen, mirroring the RetroArch installer
+/// consent flow in app_launcher.rs. Declining writes the marker file so the
+/// prompt is one-time; the missing driver is still logged on every start.
+fn offer_vigem_install() {
+    use windows::core::w;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+
+    let marker = vigem_declined_marker_path();
+    if marker.as_ref().map_or(false, |m| m.exists()) {
+        println!("   ↳ install prompt suppressed ({VIGEM_DECLINED_MARKER} present — delete it to be asked again)");
+        return;
+    }
+
+    let result = unsafe {
+        MessageBoxW(
+            HWND(std::ptr::null_mut()),
+            w!("Controller passthrough needs the ViGEmBus driver (virtual Xbox 360 controller), which is not installed.\n\nVideo, audio, mouse and keyboard streaming are unaffected.\n\nDownload and install ViGEmBus now?"),
+            w!("Nova — Gamepad Driver"),
+            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+    if result != IDYES {
+        println!("   ↳ ViGEmBus install declined — writing {VIGEM_DECLINED_MARKER} (delete it to be asked again)");
+        if let Some(m) = marker {
+            let _ = std::fs::write(m, "Delete this file to re-enable Nova's ViGEmBus install prompt.\r\n");
+        }
+        return;
+    }
+    download_and_run_vigem_setup();
+}
+
+/// Download the pinned installer to %TEMP% (same Invoke-WebRequest pattern as
+/// the RetroArch bootstrap in app_launcher.rs) and run it interactively — it
+/// is a signed driver installer with its own wizard, and silent-install flags
+/// vary between versions, so the user clicks through it. Falls back to
+/// opening the releases page in the browser on any failure.
+fn download_and_run_vigem_setup() {
+    let setup_path = std::env::temp_dir().join("ViGEmBus_Setup.exe");
+    println!("⬇️  Downloading ViGEmBus 1.22.0 → {}", setup_path.display());
+
+    let download_ps = format!(
+        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{out}'",
+        url = VIGEMBUS_SETUP_URL,
+        out = setup_path.display(),
+    );
+    let downloaded = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &download_ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && setup_path.exists();
+
+    if !downloaded {
+        println!("⚠️  ViGEmBus download failed — opening the releases page in the default browser");
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", VIGEMBUS_RELEASES_URL])
+            .spawn();
+        return;
+    }
+
+    println!("🚀 Running ViGEmBus installer...");
+    match std::process::Command::new(&setup_path).status() {
+        Ok(status) if status.success() => match Client::connect() {
+            Ok(_) => println!("✅ ViGEmBus installed — gamepad passthrough active from the next session"),
+            Err(e) => println!("⚠️  ViGEmBus installed but the bus is not reachable yet ({e:?}) — a reboot may be required"),
+        },
+        Ok(status) => println!("⚠️  ViGEmBus installer exited with code {:?}", status.code()),
+        Err(e) => println!("⚠️  Failed to launch ViGEmBus installer: {}", e),
+    }
+}
+
 /// NV_KEYBOARD_PACKET body (after the 8-byte NV_INPUT_HEADER):
 ///   keyAction : u8     @8   unused — press/release is already determined by
 ///                            the NV_INPUT_HEADER magic (KEY_DOWN/UP_EVENT_MAGIC)

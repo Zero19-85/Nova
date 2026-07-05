@@ -19,6 +19,20 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 
 Phase 13 fixes (a) the "black screen → ~10 s → Moonlight says reduce your bitrate" failure that became 100% reproducible with the release build on a clean network — **confirmed fixed, streaming works** — and (b) /resume kicking the client back to the app list when Moonlight was quit without disconnecting (Xbox behavior).
 
+### Phase 13.1 — Install & driver preflight (2026-07-05):
+
+**Installer elevation fix (`nova.iss`):**
+- **Root cause of "auto-runs without admin":** the final "Launch Nova now" `[Run]` entry used `postinstall` without `runascurrentuser` — Inno Setup deliberately runs postinstall entries as the ORIGINAL unelevated user. Unelevated, the VDD devnode enable (SetupAPI `DICS_ENABLE`) and HDR10 Advanced Color switching fail silently → no virtual monitor, no HDR, black stream. The HDR10-on-VDD auto-enable itself was already implemented (pre-activation + connect-time `set_active_display_hdr(true)` when the client's ANNOUNCE confirms `dynamicRangeMode=1`) — it was the missing elevation that broke it on installed copies.
+- **Fix:** `runascurrentuser` added to that entry — Nova now inherits the installer's interactive admin token, matching the elevation the `NovaServerBoot` task provides at every logon. (The manifest embedded via build.rs already declares `requireAdministrator`; RT_MANIFEST is compiled into the exe by rc.exe, so manual launches also elevate.)
+
+**Elevation guard (`src/lib.rs`):**
+- Startup preflight logs "🛡️ Elevated token confirmed" or a loud ❌ + on-screen MessageBox (background thread, non-blocking) when running unelevated — an unelevated start can otherwise only fail silently with a black screen. Uses `IsUserAnAdmin()` (Win32_UI_Shell, already a dependency).
+
+**ViGEmBus (virtual Xbox 360 controller) preflight (`src/input.rs`, `src/lib.rs`):**
+- `input::check_vigem_driver_at_startup()` — background thread probes `vigem_client::Client::connect()`. If the driver is missing: Yes/No MessageBox offering to download + run the official installer (pinned `ViGEmBus_1.22.0_x64_x86_arm64.exe` from nefarius/ViGEmBus GitHub releases, via the same PowerShell `Invoke-WebRequest` pattern as the RetroArch bootstrap). Download failure falls back to opening the releases page in the browser.
+- Declining writes `vigem_install_declined.flag` next to the exe so the logon-autostart doesn't nag every boot (delete the flag to be asked again). The missing driver is still logged each start.
+- `GamepadManager` connects per-session, so a mid-run install works on the next stream without restarting Nova.
+
 ### Phase 13 changes (2026-07-03):
 
 **Zombie-proof /resume (`src/control.rs`, `src/pairing.rs`, `src/rtsp.rs`):**
