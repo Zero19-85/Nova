@@ -23,7 +23,10 @@ nova_cert.pem
 nova_key.der
 nova_cert.version
 nova_paired.txt
+nova_paired.json
 nova_debug.log
+nova.log
+nova-service.log
 
 # IDE / Editor
 .vscode/

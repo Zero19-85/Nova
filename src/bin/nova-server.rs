@@ -81,20 +81,88 @@ fn main() {
             }
         }
 
-        _ => {
-            // Normal run — launched by the scheduled task on logon, or manually.
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            match rt.block_on(nova_server::run()) {
-                Ok(()) => {}
+        // ── SYSTEM launcher service (Phase 15.2c) ─────────────────────────────
+        // The service runs as LocalSystem and spawns the host (the no-arg mode
+        // above) into the interactive console session with an elevated token.
+        // Deployment is not switched to it yet — these are opt-in.
+        Some("--service") => {
+            // Invoked by the SCM. Blocks in the dispatcher until the service
+            // stops. Its OWN log file (nova-service.log) — never nova.log, which
+            // the spawned host owns; a shared file would leave the host unable to
+            // open its log (sharing) and its startup errors invisible.
+            nova_server::debug::init_service_logger();
+            if let Err(e) = nova_server::service::run_service_dispatcher() {
+                println!("❌ Service dispatcher failed: {e}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+
+        Some("--install-service") => {
+            nova_server::debug::init_debug_logger();
+            println!("=== Nova Service Install ===");
+            // Same stale-DLL cleanup the task installer does — a copy of
+            // nova_shim.dll left in System32/SysWOW64 shadows the real one.
+            ghost_protocol_purge_dll();
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Remove the scheduled task as part of install so the service and
+            // task can never both spawn a host.
+            let remove_task = || {
+                let _ = uninstall_task();
+            };
+            match nova_server::service::install_service(&exe, remove_task) {
+                Ok(()) => std::process::exit(0),
                 Err(e) => {
-                    // run() returns Err when a critical resource is unavailable
-                    // (no GPU, no display, WGC unsupported, etc.). Log to nova.log
-                    // (stdout is already redirected there by init_debug_logger) and
-                    // exit with code 1 — a clean failure, not a panic (exit 101).
-                    println!("❌ Nova exited with error: {e:?}");
+                    println!("❌ Service install failed: {e}");
                     std::process::exit(1);
                 }
             }
+        }
+
+        Some("--uninstall-service") => {
+            nova_server::debug::init_debug_logger();
+            println!("=== Nova Service Uninstall ===");
+            match nova_server::service::uninstall_service() {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    println!("❌ Service uninstall failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Host launched by the service WITH a SYSTEM impersonation token handle
+        // (`--system-token <n>`). The handle was inherited at the same numeric
+        // value; stash it (the DDA capture thread assumes it for secure-desktop
+        // capture), then run the host exactly like the normal no-arg path.
+        Some("--system-token") => {
+            if let Some(raw) = args.get(2).and_then(|s| s.parse::<isize>().ok()) {
+                nova_server::service::set_system_impersonation_token(raw);
+            }
+            run_host();
+        }
+
+        _ => {
+            // Normal run — launched by the scheduled task on logon, or manually.
+            run_host();
+        }
+    }
+}
+
+/// Runs the host (tokio runtime + `nova_server::run()`), exiting 1 on a clean
+/// startup failure. Shared by the no-arg launch and the `--system-token` launch.
+fn run_host() -> ! {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    match rt.block_on(nova_server::run()) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            // run() returns Err when a critical resource is unavailable (no GPU,
+            // no display, WGC unsupported, etc.). Log to nova.log (stdout is
+            // already redirected there) and exit 1 — a clean failure, not a panic.
+            println!("❌ Nova exited with error: {e:?}");
+            std::process::exit(1);
         }
     }
 }
@@ -140,8 +208,9 @@ fn install_task() -> Result<(), String> {
     }
 
     // ── Kill any running Nova instance ────────────────────────────────────────
-    println!("🔧 Stopping any running Nova instance...");
-    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe"]);
+    // Excludes THIS process — a blanket taskkill would terminate the installer.
+    println!("🔧 Stopping any other running Nova instance...");
+    kill_other_nova_instances();
 
     // ── Register NovaServerBoot via Task XML ──────────────────────────────────
     println!("📋 Registering scheduled task '{TASK_NAME}'...");
@@ -316,8 +385,9 @@ fn ghost_protocol_purge_dll() {
 
 fn uninstall_task() -> Result<(), String> {
     // Kill the running instance first so Inno Setup can delete the files.
+    // Excludes THIS process (uninstall_task is also called from --install-service).
     println!("🔧 Stopping Nova...");
-    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe"]);
+    kill_other_nova_instances();
 
     // Remove the canonical task name.
     println!("📋 Removing scheduled task '{TASK_NAME}'...");
@@ -338,6 +408,16 @@ fn uninstall_task() -> Result<(), String> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Force-terminate any OTHER running `nova-server.exe` — but never this
+/// process. `--install`, `--uninstall`, and `--install-service` all run inside
+/// a `nova-server.exe`, so a blanket `taskkill /F /IM nova-server.exe` would
+/// terminate the very process doing the install (observed: the install self-
+/// killed before `CreateServiceW`). The `PID ne <self>` filter excludes us.
+fn kill_other_nova_instances() {
+    let filter = format!("PID ne {}", std::process::id());
+    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe", "/FI", &filter]);
+}
 
 /// Run a command without creating a visible console window.
 ///

@@ -76,6 +76,20 @@ windows = { version = "0.58", features = [
     # File logger: CreateFileW for the log file, SetStdHandle to redirect println!
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # Desktop-switch detection (Phase 15.1b, capture/desktop_switch.rs):
+    # SetWinEventHook/UnhookWinEvent for EVENT_SYSTEM_DESKTOPSWITCH…
+    "Win32_UI_Accessibility",
+    # …and OpenInputDesktop/GetUserObjectInformationW to name the input desktop
+    "Win32_System_StationsAndDesktops",
+    # SYSTEM launcher service (Phase 15.2c, service.rs):
+    #   SCM plumbing (StartServiceCtrlDispatcherW / RegisterServiceCtrlHandlerExW /
+    #   SetServiceStatus / CreateServiceW / OpenSCManagerW …)
+    "Win32_System_Services",
+    #   WTSGetActiveConsoleSessionId / WTSQueryUserToken — resolve the console
+    #   user's token so the host can be spawned into the interactive session
+    "Win32_System_RemoteDesktop",
+    #   CreateEnvironmentBlock — give the spawned host the user's environment
+    "Win32_System_Environment",
 ] }
 # System tray icon + native right-click context menu (handles all Win32 quirks
 # — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).
@@ -86,6 +100,9 @@ rsa = "0.9.10"
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"
 rustls-pki-types = "1.14.1"
+# Already in the tree via rustls — direct dep only for EndEntityCert::verify_signature,
+# which checks the client's RSA signature over the pairing secret (Apollo crypto::verify256).
+rustls-webpki = { version = "0.103", features = ["aws-lc-rs"] }
 
 [build-dependencies]
 cc = "1.0"

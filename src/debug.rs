@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_ALWAYS,
 };
 use windows::Win32::System::Console::{
@@ -37,6 +37,16 @@ fn exe_dir() -> PathBuf {
 
 pub fn log_path() -> PathBuf {
     exe_dir().join("nova.log")
+}
+
+/// The launcher **service** logs to its own file. Critical: the service holds
+/// its log handle open for its whole life, and the host it spawns opens ITS
+/// log at startup. If both targeted `nova.log`, the host's open would collide
+/// with the service's (even with FILE_SHARE_WRITE the two would interleave
+/// unreadably). Separate files keep each process's log clean and, more
+/// importantly, guarantee the host can always open its own.
+pub fn service_log_path() -> PathBuf {
+    exe_dir().join("nova-service.log")
 }
 
 /// Log path encoded as a null-terminated UTF-16 string for the C shim.
@@ -57,20 +67,32 @@ pub fn log_path_wide() -> Vec<u16> {
 /// anywhere in the Rust code — including on spawned threads — write to the
 /// log file instead of the (absent) console.
 pub fn init_debug_logger() {
-    let path = log_path();
+    init_logger_to(log_path());
+}
 
+/// Logger init for the launcher **service** (`--service`). Uses a separate file
+/// ([`service_log_path`]) so it never collides with the host's `nova.log`.
+pub fn init_service_logger() {
+    init_logger_to(service_log_path());
+}
+
+fn init_logger_to(path: PathBuf) {
     // Ensure parent directory exists (it should — exe is already there).
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
 
-    // Open in append mode so multiple service restarts accumulate in one file.
-    // FILE_SHARE_READ lets an external viewer (`tail -f`) read the log live.
+    // Open in append mode so multiple restarts accumulate in one file.
+    // FILE_SHARE_READ | FILE_SHARE_WRITE: READ lets an external viewer
+    // (`tail -f`) follow the log live; WRITE means opening the file can never
+    // sharing-violation just because another Nova process (service ↔ host, or
+    // a lingering instance) still has it open — the open always succeeds so a
+    // process is never left silently logless.
     let handle: windows::core::Result<HANDLE> = unsafe {
         CreateFileW(
             &windows::core::HSTRING::from(path.as_os_str()),
             0x0004u32, // FILE_APPEND_DATA — CreateFileW takes raw u32, not FILE_ACCESS_RIGHTS
-            FILE_SHARE_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,

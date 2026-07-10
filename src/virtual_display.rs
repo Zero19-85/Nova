@@ -93,11 +93,10 @@
 //! disable need `Win32_Devices_DeviceAndDriverInstallation` +
 //! `Win32_Devices_Properties` (for `CM_Get_DevNode_Status`). The CCD topology
 //! calls (`QueryDisplayConfig`/`SetDisplayConfig`/`DisplayConfigGetDeviceInfo`)
-//! need `Win32_Devices_Display`. The audio-endpoint cache/restore in
-//! [`VirtualDisplay::activate_for_stream`]/[`VirtualDisplay::deactivate_after_stream`]
-//! needs `Win32_Media_Audio` (`IMMDeviceEnumerator`/`IMMDevice`) on top of the
-//! existing `Win32_System_Com`. All of the above are present in `Cargo.toml`.
-//! No new crates required — flagging per repo rule #1.
+//! need `Win32_Devices_Display`. All of the above are present in `Cargo.toml`.
+//! No new crates required — flagging per repo rule #1. (The audio-endpoint
+//! cache/restore that used `Win32_Media_Audio`/`Win32_System_Com` here moved
+//! to `crate::audio` in Phase 15.1 — single-owner endpoint lifecycle.)
 //!
 //! ## Primary-display switching: CCD, not legacy GDI
 //!
@@ -147,13 +146,10 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiSetClassInstallParamsW,
     SetupDiSetDeviceRegistryPropertyW,
-    DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIGCF_PRESENT,
-    GUID_DEVCLASS_DISPLAY, HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
+    DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REMOVE, DIGCF_PRESENT,
+    DI_REMOVEDEVICE_GLOBAL, GUID_DEVCLASS_DISPLAY, GUID_DEVCLASS_MONITOR, HDEVINFO,
+    SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS, SP_REMOVEDEVICE_PARAMS,
     SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID,
-};
-use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
@@ -161,16 +157,13 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 
-// `SetDefaultAudioDevice` from the C++ audio shim (`shim/audio_shim.cpp`) —
-// sets `device_id` as the default render endpoint for all three roles
-// (console/multimedia/communications) via the undocumented `IPolicyConfig`
-// COM interface. Re-declared here (same symbol `audio.rs` binds) so
-// `VirtualDisplay::deactivate_after_stream` can force-restore the audio
-// endpoint it cached in `VirtualDisplay::activate_for_stream`, independent
-// of `audio.rs`'s own `SinkGuard` restore path.
-extern "C" {
-    fn SetDefaultAudioDevice(device_id: *const u16) -> i32;
-}
+// NOTE (Phase 15.1): this module no longer touches the default audio endpoint.
+// It used to cache/restore it (`saved_audio_endpoint`) in parallel with
+// `audio.rs`'s SinkGuard — two independent owners of one device, which could
+// cache the virtual sink as the "real" endpoint and restore the system TO the
+// sink (host stuck silent). `crate::audio` is now the single owner
+// (`arm_endpoint_restore` / `emergency_restore_default_endpoint`); the display
+// module only sequences its calls (see `emergency_restore_for_shutdown`).
 
 /// Upstream project (for `ensure_installed`'s download step). Kept as a
 /// constant so the release asset can be bumped without touching logic.
@@ -213,6 +206,91 @@ const VDD_REGISTRY_VALUE: &str = "VDDPATH";
 /// standard value. Used by [`VirtualDisplay::deactivate_other_paths`] and
 /// [`VirtualDisplay::restore_topology`] to flip paths active/inactive.
 const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+
+/// Hardware ID of the *monitor child devnode* MttVDD creates each time the
+/// adapter devnode is enabled (EDID vendor "MTT", product 0x1337) — verified
+/// on this dev box via `Get-PnpDeviceProperty DEVPKEY_Device_HardwareIds` →
+/// `MONITOR\MTT1337`. Every devnode enable/disable cycle can leave the
+/// previous monitor instance behind as a non-present ("phantom") devnode;
+/// [`VirtualDisplay::cleanup_phantom_monitors`] removes those so Device
+/// Manager doesn't accumulate one ghost "Generic Monitor" per session.
+const VDD_MONITOR_HWID: &str = "MONITOR\\MTT1337";
+
+/// Everything a dying process needs to put the desktop back on the physical
+/// monitor(s), captured by [`VirtualDisplay::activate_for_stream`] and
+/// consumed either by the normal [`VirtualDisplay::deactivate_after_stream`]
+/// path or by [`emergency_restore_for_shutdown`] when the OS is tearing the
+/// process down (console close, logoff, shutdown, WM_ENDSESSION).
+struct EmergencySnapshot {
+    topology: (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>),
+    /// GDI name of the active virtual display (`\\.\DISPLAYn`).
+    device_name: String,
+}
+
+/// Armed while a virtual-display session is active; disarmed on normal
+/// deactivation. `take()` is the claim: whichever path (normal teardown or
+/// emergency handler) takes it first performs the restore, the other no-ops.
+static EMERGENCY_SNAPSHOT: std::sync::Mutex<Option<EmergencySnapshot>> =
+    std::sync::Mutex::new(None);
+
+/// Set once [`emergency_restore_for_shutdown`] has actually restored the
+/// topology, so a subsequently-running `deactivate_after_stream` (the tokio
+/// signal path also fires on shutdown) skips the display/audio mutations
+/// instead of re-applying them against an already-restored desktop.
+static EMERGENCY_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Synchronous, blocking display-state recovery for process-death paths.
+///
+/// Called from the console control handler (CTRL_CLOSE/LOGOFF/SHUTDOWN) and
+/// the session-monitor window's WM_ENDSESSION arm (see `shutdown.rs`) — the
+/// same pattern Apollo uses (`lifetime::exit_sunshine(0, false)` blocks the
+/// handler thread until the display_device deinit guard has restored the
+/// topology). Windows terminates the process the moment those handlers
+/// return, so this MUST complete before returning; every step is synchronous.
+///
+/// Idempotent and thread-safe: the first caller claims the snapshot, later
+/// callers (or the normal teardown racing it) find `None` and return
+/// immediately.
+pub fn emergency_restore_for_shutdown() {
+    let Some(snap) = EMERGENCY_SNAPSHOT.lock().unwrap().take() else {
+        // No active virtual-display session — but a NON-VDD stream may still
+        // have the sink swap engaged (audio state is armed independently of the
+        // display snapshot). The restore is claim-once and a quiet no-op when
+        // nothing is armed.
+        crate::audio::emergency_restore_default_endpoint();
+        return;
+    };
+    EMERGENCY_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    println!("🚨 Emergency display restore — process is being terminated mid-stream");
+
+    // 1. Physical topology back first (the user-visible part). restore_topology
+    //    falls back to SDC_FORCE_MODE_ENUMERATION on error 87, which rebuilds
+    //    the topology from what is physically connected — exactly right here.
+    match VirtualDisplay::restore_topology(&snap.topology, Some(&snap.device_name)) {
+        Ok(()) => println!("🖥️  Emergency: physical display topology restored"),
+        Err(e) => println!("⚠️  Emergency topology restore: {e}"),
+    }
+
+    // Let DWM commit the path change before the devnode disappears — same
+    // settle deactivate_after_stream uses to avoid the error-87 race.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    // 2. Hardware-disable the VDD devnode so the next boot cannot resurrect
+    //    the headless topology from the CCD database.
+    match VirtualDisplay::set_enabled_native(false) {
+        Ok(true) => println!("🕶️  Emergency: Root\\MttVDD devnode disabled"),
+        Ok(false) => println!("⚠️  Emergency: Root\\MttVDD devnode not found"),
+        Err(e) => println!("⚠️  Emergency devnode disable: {e}"),
+    }
+
+    // 3. Default audio endpoint back to the real speakers — claim-once through
+    //    the single owner in audio.rs (whichever of this path or the normal
+    //    stop runs first performs the restore; the other no-ops).
+    crate::audio::emergency_restore_default_endpoint();
+
+    println!("✅ Emergency restore complete — safe to terminate");
+}
 
 /// Snapshot of the physical display that was primary before Nova switched to
 /// the virtual one. Used only by the `#[ignore]`d CCD/GDI diagnostics below —
@@ -273,22 +351,24 @@ pub struct VirtualDisplay {
     /// so a transient post-CCD-apply 800x600 dip (see
     /// [`wait_for_display_resolution`]) gets retried instead of latched onto.
     active_resolution: Option<(u32, u32)>,
-
-    /// Default audio render endpoint (device id string, NUL-terminated
-    /// UTF-16), cached by `activate_for_stream` via `IMMDeviceEnumerator`
-    /// *before* anything (display topology or audio sink) is mutated.
-    /// Consumed by `deactivate_after_stream` to force the system back to the
-    /// real speakers via `SetDefaultAudioDevice`, bypassing whatever Windows
-    /// guesses once the virtual display's own audio endpoint has appeared.
-    saved_audio_endpoint: Option<Vec<u16>>,
 }
 
 impl VirtualDisplay {
     pub fn new() -> Self {
+        // ALWAYS anchored to the exe's own directory — never the CWD. When
+        // launched by Task Scheduler / SCM the CWD is C:\Windows\System32, so
+        // any relative path here would silently point the driver search at
+        // System32. The relative fallback below only fires if the OS cannot
+        // even report our own exe path (effectively never) — and it screams
+        // in the log if it does.
         let install_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("VirtualDisplayDriver")))
-            .unwrap_or_else(|| PathBuf::from("VirtualDisplayDriver"));
+            .unwrap_or_else(|| {
+                eprintln!("❌ current_exe() failed — falling back to CWD-relative 'VirtualDisplayDriver' \
+                    (WILL be wrong under Task Scheduler/SCM, where CWD=System32)");
+                PathBuf::from("VirtualDisplayDriver")
+            });
 
         Self {
             install_dir,
@@ -296,7 +376,6 @@ impl VirtualDisplay {
             saved_topology: None,
             active_device_name: None,
             active_resolution: None,
-            saved_audio_endpoint: None,
         }
     }
 
@@ -405,6 +484,66 @@ impl VirtualDisplay {
         u16s.split(|&c| c == 0)
             .filter(|s| !s.is_empty())
             .any(|s| String::from_utf16_lossy(s).eq_ignore_ascii_case(target))
+    }
+
+    /// One-shot environment dump for VDD mount failures. Printed whenever the
+    /// virtual display cannot be enabled/found so the installed `nova.log`
+    /// shows exactly WHICH prerequisite is missing (devnode absent because the
+    /// installer's devcon step failed, driver package files missing next to
+    /// the exe, VDDPATH registry unset, unelevated token, …) instead of a
+    /// single silent one-liner.
+    pub fn log_vdd_diagnostics(&self) {
+        println!("🔎 ── VDD environment diagnostics ─────────────────────────");
+        match std::env::current_exe() {
+            Ok(p) => println!("   exe             : {}", p.display()),
+            Err(e) => println!("   exe             : ❌ current_exe() failed: {e}"),
+        }
+        println!("   cwd             : {}  (informational — Nova never uses relative paths)",
+            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".into()));
+        println!("   install_dir     : {}{}", self.install_dir.display(),
+            if self.install_dir.is_dir() { "" } else { "  ❌ DIRECTORY MISSING" });
+
+        let devcon = Self::find_file(&self.install_dir, "devcon.exe", 6);
+        match &devcon {
+            Some(p) => println!("   devcon.exe      : ✅ {}", p.display()),
+            None => println!("   devcon.exe      : ❌ not found under install_dir (driver package not deployed?)"),
+        }
+        let inf = Self::find_file_where(&self.install_dir, VDD_INF_NAME, 6, &Self::inf_matches_host_arch);
+        match &inf {
+            Some(p) => println!("   MttVDD.inf      : ✅ {} (host arch)", p.display()),
+            None => println!("   MttVDD.inf      : ❌ no host-arch INF under install_dir"),
+        }
+        let settings = self.vdd_settings_path();
+        println!("   vdd_settings.xml: {}  {}", settings.display(),
+            if settings.exists() { "✅" } else { "❌ MISSING" });
+        match Self::read_vddpath_registry() {
+            Some(p) => println!("   VDDPATH (HKLM)  : {}", p.display()),
+            None => println!("   VDDPATH (HKLM)  : ❌ not set — MttVDD.dll will fall back to C:\\VirtualDisplayDriver"),
+        }
+        println!("   elevated        : {}",
+            if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() { "✅ yes" }
+            else { "❌ NO — SetupAPI enable/disable will fail (start via NovaServerBoot task or 'Run as administrator')" });
+
+        match Self::find_devnode() {
+            Some(devinst) => unsafe {
+                let mut status = CM_DEVNODE_STATUS_FLAGS(0);
+                let mut problem = CM_PROB(0);
+                if CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) == CR_SUCCESS {
+                    let state = match problem {
+                        p if p == CM_PROB(0) => "running".to_string(),
+                        CM_PROB_DISABLED => "disabled (normal dormant state — enable should succeed)".to_string(),
+                        p => format!("problem code {} — check Device Manager", p.0),
+                    };
+                    println!("   Root\\MttVDD     : ✅ devnode present, {}", state);
+                } else {
+                    println!("   Root\\MttVDD     : ⚠️ devnode enumerated but CM status query failed");
+                }
+            },
+            None => println!("   Root\\MttVDD     : ❌ DEVNODE NOT PRESENT — the driver was never installed on \
+                this machine. The Inno installer's 'devcon install' [Run] step failed or was skipped \
+                (check %TEMP%\\Setup Log*.txt on this machine), and Nova's own bootstrap could not repair it."),
+        }
+        println!("🔎 ───────────────────────────────────────────────────────");
     }
 
     // -------------------------------------------------------------
@@ -1037,6 +1176,103 @@ impl VirtualDisplay {
         }
     }
 
+    /// Removes non-present ("phantom") MttVDD *monitor* devnodes.
+    ///
+    /// Every `DICS_ENABLE` of the `Root\MttVDD` adapter makes Windows PnP
+    /// instantiate a fresh monitor child (`MONITOR\MTT1337`); the disable at
+    /// stream end leaves that instance behind as a hidden non-present device.
+    /// Left alone they stack up — one ghost "Generic Monitor" per session —
+    /// polluting Device Manager and the display database. Apollo avoids this
+    /// because its SudoVDA driver destroys the virtual monitor object itself
+    /// on session end; with MttVDD the equivalent is removing the phantom
+    /// devnode via SetupAPI (`DIF_REMOVE`, the `devcon removePhantoms` dance).
+    ///
+    /// Scope-limited on purpose: only devices whose hardware ID is exactly
+    /// [`VDD_MONITOR_HWID`] AND whose devnode is not currently present are
+    /// touched — physical monitors' phantom entries (which Windows keeps for
+    /// per-monitor settings persistence) are never removed.
+    ///
+    /// Returns the number of devnodes removed.
+    fn cleanup_phantom_monitors() -> Result<u32, String> {
+        unsafe {
+            // No DIGCF_PRESENT: enumerate ALL monitor-class devices, including
+            // non-present ones — that's where the ghosts live.
+            let hdevinfo = SetupDiGetClassDevsW(
+                Some(&GUID_DEVCLASS_MONITOR),
+                PCWSTR::null(),
+                None,
+                windows::Win32::Devices::DeviceAndDriverInstallation::SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+            )
+            .map_err(|e| format!("SetupDiGetClassDevs(monitor class): {e}"))?;
+
+            let mut removed = 0u32;
+            let mut index = 0u32;
+            loop {
+                let mut devinfo_data = SP_DEVINFO_DATA {
+                    cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                    ..Default::default()
+                };
+                if SetupDiEnumDeviceInfo(hdevinfo, index, &mut devinfo_data).is_err() {
+                    break; // ERROR_NO_MORE_ITEMS
+                }
+                index += 1;
+
+                // Hardware ID must be the VDD monitor (REG_MULTI_SZ).
+                let mut buf = [0u8; 1024];
+                let mut required = 0u32;
+                if SetupDiGetDeviceRegistryPropertyW(
+                    hdevinfo,
+                    &devinfo_data,
+                    SPDRP_HARDWAREID,
+                    None,
+                    Some(&mut buf),
+                    Some(&mut required),
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                if !Self::multi_sz_contains(&buf, VDD_MONITOR_HWID) {
+                    continue;
+                }
+
+                // Present devnodes answer CM_Get_DevNode_Status with CR_SUCCESS;
+                // phantoms fail (CR_NO_SUCH_DEVINST). Only phantoms are removed —
+                // a live session's monitor is left untouched.
+                let mut status = CM_DEVNODE_STATUS_FLAGS(0);
+                let mut problem = CM_PROB(0);
+                let cr = CM_Get_DevNode_Status(&mut status, &mut problem, devinfo_data.DevInst, 0);
+                if cr == CR_SUCCESS {
+                    continue;
+                }
+
+                let mut params = SP_REMOVEDEVICE_PARAMS {
+                    ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+                        cbSize: std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32,
+                        InstallFunction: DIF_REMOVE,
+                    },
+                    Scope: DI_REMOVEDEVICE_GLOBAL,
+                    HwProfile: 0,
+                };
+                let result = SetupDiSetClassInstallParamsW(
+                    hdevinfo,
+                    Some(&devinfo_data),
+                    Some(&mut params.ClassInstallHeader as *mut SP_CLASSINSTALL_HEADER as *const SP_CLASSINSTALL_HEADER),
+                    std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
+                )
+                .and_then(|()| SetupDiCallClassInstaller(DIF_REMOVE, hdevinfo, Some(&devinfo_data)));
+
+                match result {
+                    Ok(()) => removed += 1,
+                    Err(e) => println!("⚠️  Could not remove phantom VDD monitor devnode: {e}"),
+                }
+            }
+
+            let _ = SetupDiDestroyDeviceInfoList(hdevinfo);
+            Ok(removed)
+        }
+    }
+
     /// Brings `Root\MttVDD` up once, at process startup, and leaves it
     /// enabled for the server's entire lifetime.
     ///
@@ -1127,6 +1363,15 @@ impl VirtualDisplay {
         self.set_enabled(false)
             .unwrap_or_else(|e| println!("⚠️  Could not hardware-disable VDD at boot (non-fatal): {e}"));
         println!("🕶️  Root\\MttVDD devnode hardware-disabled at boot — will enable on client connect only");
+
+        // Sweep phantom VDD monitor devnodes left by the boot cycle above and
+        // by any sessions that never reached deactivate_after_stream (crash,
+        // taskkill /F) — keeps the device tree at zero ghosts every boot.
+        match Self::cleanup_phantom_monitors() {
+            Ok(0) => {}
+            Ok(n) => println!("🧹 Boot sweep: removed {n} phantom virtual-monitor devnode(s)"),
+            Err(e) => println!("⚠️  Boot phantom-monitor sweep: {e}"),
+        }
 
         // Return None: VDD is disabled and absent from GDI enumeration.
         // lib.rs passes this to WgcCapturer::new_excluding(None) so the WGC
@@ -1417,10 +1662,12 @@ impl VirtualDisplay {
     /// re-hook, which lives outside this module).
     ///
     /// Steps:
-    ///   0. [`cache_default_audio_endpoint`] → `self.saved_audio_endpoint` —
-    ///      done FIRST, before any display or audio mutation, so the cached
-    ///      id is the *real* host speaker regardless of what the topology
-    ///      swap below does to the default-device guess.
+    ///   0. (moved out — Phase 15.1) The pre-stream default audio endpoint is
+    ///      captured by `crate::audio::arm_endpoint_restore()`, which the
+    ///      CALLER (lib.rs) invokes before this function, so the armed id is
+    ///      the *real* host speaker regardless of what the topology swap
+    ///      below does to the default-device guess. This module no longer
+    ///      touches audio state.
     ///   1. [`query_database_topology`] → local `saved_topology` — a snapshot
     ///      of the CCD database's full current paths/modes (including
     ///      inactive ones, e.g. the dormant virtual-display path left by
@@ -1462,12 +1709,6 @@ impl VirtualDisplay {
     ///   6. [`wait_for_display_resolution`], then `self.saved_topology` /
     ///      `self.active_device_name` / `self.active = true`.
     pub fn activate_for_stream(&mut self, width: u32, height: u32, refresh_hz: u32) -> Result<(), String> {
-        self.saved_audio_endpoint = Self::cache_default_audio_endpoint();
-        match &self.saved_audio_endpoint {
-            Some(_) => println!("🔊 Cached current default audio endpoint before mutating display/audio state"),
-            None => println!("⚠️  Could not query the current default audio endpoint — restore-on-disconnect will be skipped"),
-        }
-
         let saved_topology = Self::query_database_topology()?;
         println!("📸 Saved current display topology from the CCD database ({} path(s))", saved_topology.0.len());
 
@@ -1479,11 +1720,18 @@ impl VirtualDisplay {
         // ensure_enabled_at_boot. Enabling here gives DXGI/CCD a live IddCx
         // adapter exactly when the stream needs it and for no longer.
         if !self.is_enabled() {
-            self.set_enabled(true)?;
+            if let Err(e) = self.set_enabled(true) {
+                println!("❌ VDD ENABLE FAILED — cannot start the virtual display: {e}");
+                self.log_vdd_diagnostics();
+                return Err(e);
+            }
         }
 
-        let mut virtual_device = Self::wait_for_virtual_display_device_name()
-            .ok_or_else(|| "timed out waiting for the virtual display to appear in GDI enumeration".to_string())?;
+        let Some(mut virtual_device) = Self::wait_for_virtual_display_device_name() else {
+            println!("❌ VDD enabled but never appeared in GDI enumeration — driver loaded without creating a display");
+            self.log_vdd_diagnostics();
+            return Err("timed out waiting for the virtual display to appear in GDI enumeration".to_string());
+        };
 
         // ── Topology guard: prevent primary-display hijack on enable ──────────
         // When the devnode comes online Windows consults the CCD database to
@@ -1587,6 +1835,16 @@ impl VirtualDisplay {
         // correct DesktopCoordinates rather than a transient resolution.
         Self::wait_for_display_resolution(&virtual_device, width, height);
 
+        // Arm the process-death safety net: if Nova is terminated from here on
+        // (console close, logoff, OS shutdown, WM_ENDSESSION), the shutdown
+        // hooks call emergency_restore_for_shutdown() which re-applies this
+        // exact snapshot synchronously before the process is allowed to die.
+        *EMERGENCY_SNAPSHOT.lock().unwrap() = Some(EmergencySnapshot {
+            topology: saved_topology.clone(),
+            device_name: virtual_device.clone(),
+        });
+        EMERGENCY_FIRED.store(false, std::sync::atomic::Ordering::SeqCst);
+
         self.saved_topology = Some(saved_topology);
         self.active_device_name = Some(virtual_device);
         self.active_resolution = Some((width, height));
@@ -1606,15 +1864,33 @@ impl VirtualDisplay {
     ///      doing beforehand (see [`restore_topology`] doc comment).
     ///      `Root\MttVDD` itself stays enabled — [`ensure_enabled_at_boot`]
     ///      made enable/disable a boot-time-only operation.
-    ///   2. Force the default audio playback device back to
-    ///      `self.saved_audio_endpoint` via `SetDefaultAudioDevice` —
-    ///      explicit restore to the speaker GUID cached *before* launch,
-    ///      rather than letting Windows guess (which lands on the NVIDIA HDMI
-    ///      endpoint once the virtual display's audio device has appeared).
-    ///   3. Clear `saved_topology` / `active_device_name` /
-    ///      `saved_audio_endpoint`, `self.active = false`.
+    ///   2. (moved out — Phase 15.1) The default audio endpoint restore is
+    ///      owned by `crate::audio` (claim-once via the manager's
+    ///      `stop_and_release`, which lib.rs runs when the session ends,
+    ///      BEFORE this deactivation) — restoring to the endpoint armed
+    ///      *before* launch rather than letting Windows guess (which lands on
+    ///      the NVIDIA HDMI endpoint once the virtual display's audio device
+    ///      has appeared).
+    ///   3. Clear `saved_topology` / `active_device_name`,
+    ///      `self.active = false`.
     pub fn deactivate_after_stream(&mut self) -> Result<(), String> {
         if !self.active {
+            return Ok(());
+        }
+
+        // Disarm the process-death safety net. If emergency_restore_for_shutdown
+        // already claimed the snapshot AND performed the restore (we are on the
+        // graceful teardown path of a shutdown the emergency handler beat us
+        // to), skip the display/audio mutations — re-applying them against the
+        // already-restored desktop would only churn the topology during the
+        // OS's shutdown time budget.
+        let claimed = EMERGENCY_SNAPSHOT.lock().unwrap().take();
+        if claimed.is_none() && EMERGENCY_FIRED.load(std::sync::atomic::Ordering::SeqCst) {
+            println!("🖥️  Emergency restore already ran — skipping duplicate teardown");
+            self.saved_topology = None;
+            self.active_device_name = None;
+            self.active_resolution = None;
+            self.active = false;
             return Ok(());
         }
 
@@ -1673,15 +1949,21 @@ impl VirtualDisplay {
             println!("🕶️  Root\\MttVDD devnode hardware-disabled — dormant until next client connect");
         }
 
-        if let Some(endpoint) = self.saved_audio_endpoint.take() {
-            if unsafe { SetDefaultAudioDevice(endpoint.as_ptr()) } == 0 {
-                println!("🔊 Default audio output forced back to the cached pre-stream speaker");
-            } else {
-                let e = "SetDefaultAudioDevice failed to restore the cached audio endpoint".to_string();
-                println!("⚠️  {e} — check Windows sound settings");
-                error.get_or_insert(e);
-            }
+        // The disable above turns this session's virtual monitor into a
+        // non-present ("phantom") monitor devnode. Remove it (and any left
+        // over from crashed sessions) so ghost "Generic Monitor (VDD by MTT)"
+        // entries don't stack up in Device Manager / the CCD database with
+        // every stream.
+        match Self::cleanup_phantom_monitors() {
+            Ok(0) => {}
+            Ok(n) => println!("🧹 Removed {n} phantom virtual-monitor devnode(s)"),
+            Err(e) => println!("⚠️  Phantom virtual-monitor cleanup: {e}"),
         }
+
+        // Audio endpoint restore: owned by crate::audio (Phase 15.1). lib.rs
+        // stops the audio session (which performs the claim-once restore)
+        // before deactivating the display, so by this point the default
+        // output is already back on the pre-stream speaker.
 
         self.active_device_name = None;
         self.active_resolution = None;
@@ -2064,6 +2346,25 @@ impl VirtualDisplay {
     ///      SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES)`.
     ///
     /// Best-effort: logs success or failure and never returns an error.
+    /// Actual refresh rate (Hz) the OS reports for the active path driving
+    /// `device_name` (`DISPLAYCONFIG_PATH_TARGET_INFO.refreshRate` after
+    /// commit). `None` if the device has no active path or the query fails.
+    fn query_ccd_target_refresh(device_name: &str) -> Option<f64> {
+        let (paths, _modes) = Self::query_active_topology().ok()?;
+        for path in &paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+            if !Self::path_is_device(path, device_name) {
+                continue;
+            }
+            let num = path.targetInfo.refreshRate.Numerator as f64;
+            let den = path.targetInfo.refreshRate.Denominator as f64;
+            return (num > 0.0 && den > 0.0).then(|| num / den);
+        }
+        None
+    }
+
     fn force_resolution(device_name: &str, width: u32, height: u32, refresh_hz: u32) {
         unsafe {
             let mut n_paths: u32 = 0;
@@ -2133,6 +2434,19 @@ impl VirtualDisplay {
                     // Apollo pattern: {refresh_rate_mHz, 1000} — mHz = Hz × 1000
                     paths[i].targetInfo.refreshRate.Numerator   = refresh_hz * 1000;
                     paths[i].targetInfo.refreshRate.Denominator = 1000;
+                    // CRITICAL: invalidate the path's target-mode index. The
+                    // existing target-mode entry still carries the OLD
+                    // videoSignalInfo (e.g. a 60 Hz vSyncFreq); with
+                    // SDC_ALLOW_CHANGES Windows resolves the conflict in favor
+                    // of the explicit target mode and SILENTLY keeps 60 Hz
+                    // while returning success (observed live 2026-07-06: VDD
+                    // stuck at 4K@60 for a 4K@120 session → client capped at
+                    // 60 fps). With the index invalid, SetDisplayConfig
+                    // derives a fresh target mode honoring
+                    // targetInfo.refreshRate — the same pattern Sunshine's
+                    // libdisplaydevice uses to change refresh rate.
+                    // (0xffffffff = DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+                    paths[i].targetInfo.Anonymous.modeInfoIdx = 0xffff_ffff;
 
                     let status = SetDisplayConfig(
                         Some(&paths),
@@ -2140,7 +2454,19 @@ impl VirtualDisplay {
                         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
                     );
                     if status == 0 {
-                        println!("✅ {device_name} CCD mode set to {width}×{height}@{refresh_hz}Hz");
+                        // Don't trust the success code for the refresh rate —
+                        // read back what the OS actually committed.
+                        match Self::query_ccd_target_refresh(device_name) {
+                            Some(actual) if (actual - refresh_hz as f64).abs() < 1.5 => {
+                                println!("✅ {device_name} CCD mode set to {width}×{height}@{refresh_hz}Hz (committed {actual:.0}Hz)");
+                            }
+                            Some(actual) => {
+                                println!("⚠️  {device_name} CCD size set to {width}×{height} but refresh committed at {actual:.0}Hz (requested {refresh_hz}Hz) — check vdd_settings.xml mode table");
+                            }
+                            None => {
+                                println!("✅ {device_name} CCD mode set to {width}×{height}@{refresh_hz}Hz (refresh read-back unavailable)");
+                            }
+                        }
                     } else {
                         println!("⚠️  force_resolution: SetDisplayConfig error {status}");
                     }
@@ -2704,39 +3030,6 @@ impl VirtualDisplay {
         Ok(())
     }
 
-    /// Queries the current default audio *render* (playback) endpoint via
-    /// native Core Audio (`IMMDeviceEnumerator::GetDefaultAudioEndpoint` +
-    /// `IMMDevice::GetId`), returning its device id string as a
-    /// NUL-terminated UTF-16 buffer ready to pass straight to
-    /// `SetDefaultAudioDevice`.
-    ///
-    /// Called by [`activate_for_stream`] *before* any display/audio mutation
-    /// — this is the "real" host speaker endpoint, independent of whatever
-    /// `audio.rs`'s `SinkGuard` later does (and independent of any
-    /// default-device change Windows makes once the virtual display's own
-    /// audio endpoint appears).
-    ///
-    /// Returns `None` (logged by the caller) if COM/Core Audio isn't
-    /// available — restoration is then skipped rather than failing the whole
-    /// activation.
-    fn cache_default_audio_endpoint() -> Option<Vec<u16>> {
-        unsafe {
-            // Ignore the result: COM may already be initialized (possibly
-            // with a different concurrency model) on this thread, which is
-            // fine — CoCreateInstance still works either way.
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
-            let id = device.GetId().ok()?;
-
-            let id_string = id.to_string().ok();
-            CoTaskMemFree(Some(id.0 as *const _));
-
-            let id_string = id_string?;
-            Some(id_string.encode_utf16().chain(std::iter::once(0)).collect())
-        }
-    }
 }
 
 impl Default for VirtualDisplay {

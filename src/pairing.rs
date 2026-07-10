@@ -16,7 +16,12 @@ use crate::rtsp;
 // TLS/HTTPS Imports
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, ServerConfig};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::client::danger::HandshakeSignatureValid;
+// Aliased: rcgen (server cert generation below) exports its own DistinguishedName.
+use rustls::DistinguishedName as TlsDistinguishedName;
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 
 // Crypto imports
 use aes::Aes128;
@@ -50,86 +55,134 @@ fn data_dir() -> std::path::PathBuf {
 fn data_file(name: &str) -> std::path::PathBuf { data_dir().join(name) }
 
 // ── JSON paired-device store ───────────────────────────────────────────────
-// Format: { "UNIQUEID": { "name": "Xbox" }, ... }
-// Written one entry per line for easy manual inspection and diff-friendly diffs.
-// No external crate required — the structure is fixed so hand-written
+// Format (one device per line, keyed by the SHA-256 fingerprint of the
+// client's TLS certificate, lowercase hex):
+//   { "<fingerprint>": { "name": "Xbox", "uniqueid": "0123456789ABCDEF", "cert": "<hex-PEM>" }, ... }
+//
+// The CERTIFICATE — not the uniqueid — is the device identity (Apollo/Sunshine
+// parity, nvhttp.cpp `cert_chain`). moonlight-qt and several derived clients
+// hardcode uniqueid to "0123456789ABCDEF", so every such client collides on
+// it; the client cert is generated per install and is globally unique. The
+// uniqueid is stored for logging only. `cert` is the hex-encoded PEM exactly
+// as Moonlight sent it in the `clientcert` pairing parameter.
+//
+// Written one entry per line for easy manual inspection and diff-friendly
+// diffs. No external crate required — the structure is fixed so hand-written
 // serialisation/deserialisation is sufficient.
 
-fn load_paired_json() -> HashMap<String, String> {
+/// One trusted (paired) Moonlight client, authenticated by its TLS cert.
+#[derive(Clone)]
+pub struct PairedClient {
+    pub name: String,
+    pub uniqueid: String,
+    /// Hex-encoded PEM exactly as received in the `clientcert` pairing param.
+    pub cert_pem_hex: String,
+}
+
+/// fingerprint (lowercase SHA-256 hex of the cert DER) → device record.
+/// Shared between the TLS accept loops (connection authorization) and the
+/// request handlers (pair/unpair mutations).
+type TrustedClients = Arc<Mutex<HashMap<String, PairedClient>>>;
+
+/// Identity attached to an HTTPS connection whose client certificate matched
+/// the trusted store — Nova's equivalent of Apollo's `get_verified_cert()`.
+#[derive(Clone)]
+struct VerifiedClient {
+    fingerprint: String,
+    name: String,
+}
+
+/// Extract a JSON string field (`"field": "value"`) from a single line,
+/// honouring backslash escapes inside the value.
+fn json_string_field(line: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{}\":", field);
+    let idx = line.find(&marker)?;
+    let after = line[idx + marker.len()..].trim_start();
+    let inner = after.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => {
+                match chars.next()? {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    other => out.push(other), // \" \\ and any pass-through
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn load_paired_json() -> HashMap<String, PairedClient> {
     let path = data_file(PAIRED_PATH);
-    let text  = match std::fs::read_to_string(&path) {
-        Ok(s)  => s,
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
+    parse_paired_json(&text)
+}
+
+fn parse_paired_json(text: &str) -> HashMap<String, PairedClient> {
     let mut map = HashMap::new();
     for line in text.lines() {
-        // Each data line looks like:   "UNIQUEID": { "name": "VALUE" },
         let line = line.trim().trim_end_matches(',');
         if !line.starts_with('"') { continue; }
-        // Extract uniqueid (first quoted token)
-        let inner = &line[1..]; // skip opening "
-        let id_end = match inner.find('"') { Some(i) => i, None => continue };
-        let id = &inner[..id_end];
-        // Extract name field from the rest of the line
-        let rest = &inner[id_end..];
-        let name_marker = "\"name\":";
-        let nm = match rest.find(name_marker) { Some(i) => i, None => continue };
-        let after = rest[nm + name_marker.len()..].trim_start();
-        if !after.starts_with('"') { continue; }
-        let val_inner = &after[1..];
-        let val_end   = match val_inner.find('"') { Some(i) => i, None => continue };
-        let name      = &val_inner[..val_end];
-        if !id.is_empty() {
-            map.insert(id.to_string(), name.to_string());
+        // Key = first quoted token (the cert fingerprint).
+        let inner = &line[1..];
+        let key_end = match inner.find('"') { Some(i) => i, None => continue };
+        let key = &inner[..key_end];
+        let rest = &inner[key_end..];
+        let name     = json_string_field(rest, "name").unwrap_or_default();
+        let uniqueid = json_string_field(rest, "uniqueid").unwrap_or_default();
+        let cert     = json_string_field(rest, "cert").unwrap_or_default();
+        if key.is_empty() { continue; }
+        if cert.is_empty() {
+            // Pre-Phase-14 entry: keyed by uniqueid, no certificate stored.
+            // Without a cert the device cannot be authenticated — the whole
+            // point of the per-client trust model — so it must re-pair.
+            println!("⚠️  nova_paired.json: legacy entry \"{}\" ({}) has no client certificate — dropped; re-pair this device", name, key);
+            continue;
         }
+        // Re-derive the fingerprint from the stored cert rather than trusting
+        // the key on disk — a hand-edited key can otherwise grant the wrong cert.
+        let Some(der) = client_cert_der_from_hex_pem(&cert) else {
+            println!("⚠️  nova_paired.json: entry \"{}\" has an unparseable certificate — dropped", name);
+            continue;
+        };
+        let fingerprint = cert_fingerprint_hex(&der);
+        if fingerprint != key {
+            println!("⚠️  nova_paired.json: fingerprint key mismatch for \"{}\" — using recomputed fingerprint", name);
+        }
+        map.insert(fingerprint, PairedClient { name, uniqueid, cert_pem_hex: cert });
     }
     map
 }
 
-fn save_paired_json(map: &HashMap<String, String>) {
-    let path = data_file(PAIRED_PATH);
+fn serialize_paired_json(map: &HashMap<String, PairedClient>) -> String {
     let mut out = String::from("{\n");
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by_key(|(k, _)| k.as_str());
-    for (i, (id, name)) in entries.iter().enumerate() {
-        let comma     = if i + 1 < entries.len() { "," } else { "" };
-        let name_esc  = name.replace('\\', "\\\\").replace('"', "\\\"");
-        out.push_str(&format!("  \"{}\": {{ \"name\": \"{}\" }}{}\n", id, name_esc, comma));
+    for (i, (fp, pc)) in entries.iter().enumerate() {
+        let comma = if i + 1 < entries.len() { "," } else { "" };
+        out.push_str(&format!(
+            "  \"{}\": {{ \"name\": \"{}\", \"uniqueid\": \"{}\", \"cert\": \"{}\" }}{}\n",
+            fp, json_escape(&pc.name), json_escape(&pc.uniqueid), pc.cert_pem_hex, comma
+        ));
     }
     out.push('}');
-    let _ = std::fs::write(&path, out);
+    out
 }
 
-/// Upsert a paired device record (uniqueid → name).
-fn persist_paired_client(client_id: &str, name: &str) {
-    let mut map = load_paired_json();
-    map.insert(client_id.to_string(), name.to_string());
-    save_paired_json(&map);
-}
-
-/// Remove a device record by uniqueid.
-fn remove_paired_client(client_id: &str) {
-    let mut map = load_paired_json();
-    map.remove(client_id);
-    save_paired_json(&map);
-}
-
-/// Load all persisted device records and mark them as paired in the sessions map.
-fn load_paired_clients(sessions: &PairSessions) {
-    let map = load_paired_json();
-    if map.is_empty() {
-        println!("📂 No paired-clients file at {} — starting fresh", data_file(PAIRED_PATH).display());
-        return;
-    }
-    let mut lock = sessions.lock().unwrap();
-    for id in map.keys() {
-        let entry = lock.entry(id.clone()).or_default();
-        entry.last_phase = "CLIENTPAIRINGSECRET".to_string();
-    }
-    println!("📂 Loaded {} paired client(s) from {}:", lock.len(), data_file(PAIRED_PATH).display());
-    for (id, name) in &map {
-        println!("   • {} → \"{}\"", id, name);
-    }
+fn save_paired_json(map: &HashMap<String, PairedClient>) {
+    let _ = std::fs::write(data_file(PAIRED_PATH), serialize_paired_json(map));
 }
 
 #[derive(Default)]
@@ -313,6 +366,143 @@ impl ServerCrypto {
     }
 }
 
+// ── Client-certificate helpers (per-device trust model) ─────────────────────
+
+/// Lowercase SHA-256 hex of a certificate's DER bytes — the trust-store key.
+fn cert_fingerprint_hex(der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(der);
+    hex::encode(hasher.finalize())
+}
+
+/// Minimal base64 decoder (standard alphabet, ignores whitespace/padding) —
+/// counterpart of [`der_to_pem`]'s encoder, so no extra dependency is needed.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in input.as_bytes() {
+        if matches!(c, b'\r' | b'\n' | b' ' | b'\t' | b'=') { continue; }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Moonlight sends its client certificate as hex-encoded PEM (`clientcert`
+/// pairing param). Decode hex → PEM text → DER bytes.
+fn client_cert_der_from_hex_pem(cert_hex: &str) -> Option<Vec<u8>> {
+    let pem_bytes = hex::decode(cert_hex.trim()).ok()?;
+    let pem = String::from_utf8(pem_bytes).ok()?;
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.contains("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    let der = base64_decode(&body)?;
+    (!der.is_empty()).then_some(der)
+}
+
+/// RSA PKCS#1 v1.5 / SHA-256 verification of `signature` over `message` with
+/// the public key from `cert_der` — Apollo's `crypto::verify256`. Used in the
+/// final pairing phase to prove the client owns the private key matching the
+/// certificate it sent in `getservercert` (MITM protection).
+fn verify_client_signature(cert_der: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    let cert = CertificateDer::from(cert_der.to_vec());
+    let Ok(ee) = webpki::EndEntityCert::try_from(&cert) else {
+        return false;
+    };
+    ee.verify_signature(webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA256, message, signature)
+        .is_ok()
+}
+
+/// TLS client-certificate policy for port 47984 — Apollo/Sunshine parity.
+///
+/// Mirrors Sunshine's OpenSSL setup (`SSL_VERIFY_PEER |
+/// SSL_VERIFY_FAIL_IF_NO_PEER_CERT` with a verify callback that returns 1):
+/// a client certificate is REQUIRED, but any cert is accepted at handshake
+/// time. Moonlight client certs are self-signed, so chain validation is
+/// meaningless — possession of the private key is what the TLS
+/// CertificateVerify signature proves (checked for real in
+/// `verify_tls12_signature` below; a cert without its key cannot complete
+/// the handshake). AUTHORIZATION happens after the handshake: the accept
+/// loop matches the peer cert's SHA-256 fingerprint against the trusted
+/// store and every request from an unmatched cert is answered 401.
+#[derive(Debug)]
+struct AcceptAnyClientCert {
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl AcceptAnyClientCert {
+    fn new() -> Self {
+        Self {
+            algs: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl ClientCertVerifier for AcceptAnyClientCert {
+    fn root_hint_subjects(&self) -> &[TlsDistinguishedName] {
+        // No CA hints: Moonlight certs are self-signed; an empty list tells
+        // the client "send whatever client cert you have".
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Sunshine: SSL_VERIFY_FAIL_IF_NO_PEER_CERT. A connection without a
+        // client cert can never be authorized, so fail it at the handshake.
+        true
+    }
+}
+
 fn derive_aes_key(salt: &str, pin: &str) -> [u8; 16] {
     let mut hasher = Sha256::new();
     let salt_bytes = hex::decode(salt).unwrap_or_default();
@@ -366,7 +556,21 @@ pub async fn start_pairing_server(
     // isn't built yet.
     let crypto = Arc::new(ServerCrypto::new(Some(host_ip.as_str())));
     let sessions: PairSessions = Arc::new(Mutex::new(HashMap::new()));
-    load_paired_clients(&sessions);
+
+    // Per-device trust store: cert fingerprint → paired device record.
+    // This — not any global flag — is what authorizes a client connection.
+    let trusted: TrustedClients = Arc::new(Mutex::new(load_paired_json()));
+    {
+        let lock = trusted.lock().unwrap();
+        if lock.is_empty() {
+            println!("📂 No paired clients in {} — devices must pair before streaming", data_file(PAIRED_PATH).display());
+        } else {
+            println!("📂 Loaded {} paired client(s) from {}:", lock.len(), data_file(PAIRED_PATH).display());
+            for (fp, pc) in lock.iter() {
+                println!("   • \"{}\" (uniqueid={}, cert sha256={}…)", pc.name, pc.uniqueid, &fp[..16.min(fp.len())]);
+            }
+        }
+    }
 
     // ── Phase 2: TLS config ───────────────────────────────────────────────────
     // Build from the cert that was just loaded/generated above. plaincert (sent
@@ -380,8 +584,12 @@ pub async fn start_pairing_server(
     // ALPN http/1.1: Qt 5.x sends ALPN ["h2","http/1.1"] by default; without an explicit
     // server ALPN response the HTTP/2 negotiation can silently abort the connection before
     // the cert is evaluated.
+    //
+    // Client certs are REQUIRED on 47984 (AcceptAnyClientCert, Sunshine's
+    // SSL_VERIFY_FAIL_IF_NO_PEER_CERT equivalent) — the accept loop below
+    // authorizes each connection against the trusted store.
     let mut tls_config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
         .with_single_cert(vec![cert], key)
         .expect("Failed to build TLS config");
     tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -402,6 +610,7 @@ pub async fn start_pairing_server(
     // --- SPAWN HTTPS LOOP ---
     let crypto_https = crypto.clone();
     let sessions_https = sessions.clone();
+    let trusted_https = trusted.clone();
     let ip_https = host_ip.clone();
     let id_https = server_id.clone();
     let mac_https = server_mac.clone();
@@ -419,6 +628,7 @@ pub async fn start_pairing_server(
             let mac_clone = mac_https.clone();
             let crypt = crypto_https.clone();
             let sess = sessions_https.clone();
+            let trust = trusted_https.clone();
             let ci = ci_https.clone();
             let tray = tray_https.clone();
             let gpin = pin_https.clone();
@@ -436,6 +646,39 @@ pub async fn start_pairing_server(
                         return;
                     },
                 };
+
+                // ── Per-connection authorization (Apollo's https_server.verify) ──
+                // The handshake proved the peer OWNS the private key for the
+                // cert it presented (CertificateVerify). Now check that this
+                // exact cert is one we paired with. verified=None ⇒ every
+                // request on this connection is answered 401.
+                let verified: Option<VerifiedClient> = {
+                    let (_, conn) = tls_stream.get_ref();
+                    let peer_fp = conn
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .map(|ee| cert_fingerprint_hex(ee.as_ref()));
+                    match peer_fp {
+                        Some(fp) => {
+                            let name = trust.lock().unwrap().get(&fp).map(|pc| pc.name.clone());
+                            match name {
+                                Some(name) => {
+                                    println!("🔓 [47984] {} verified — device \"{}\" (cert {}…)", peer, name, &fp[..16.min(fp.len())]);
+                                    Some(VerifiedClient { fingerprint: fp, name })
+                                }
+                                None => {
+                                    println!("⛔ [47984] {} presented an UNRECOGNIZED client cert ({}…) — denied", peer, &fp[..16.min(fp.len())]);
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            println!("⛔ [47984] {} sent no client cert — denied", peer);
+                            None
+                        }
+                    }
+                };
+
                 let io = TokioIo::new(tls_stream);
 
                 let _ = http1::Builder::new()
@@ -445,10 +688,12 @@ pub async fn start_pairing_server(
                         let mac = mac_clone.clone();
                         let crypt = crypt.clone();
                         let sess = sess.clone();
+                        let trust = trust.clone();
                         let ci = ci.clone();
                         let tray = tray.clone();
                         let gpin = gpin.clone();
-                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, ci, cms, tray, gpin).await }
+                        let verified = verified.clone();
+                        async move { handle_request(req, "[HTTPS]", ip, id, mac, crypt, sess, trust, verified, ci, cms, tray, gpin).await }
                     }))
                     .await;
             });
@@ -465,6 +710,7 @@ pub async fn start_pairing_server(
         let mac_clone = server_mac.clone();
         let crypto_clone = crypto.clone();
         let sessions_clone = sessions.clone();
+        let trusted_clone = trusted.clone();
         let ci_clone = client_info.clone();
         let tray_clone = tray_tx.clone();
         let pin_clone = global_pin.clone();
@@ -479,10 +725,12 @@ pub async fn start_pairing_server(
                     let mac = mac_clone.clone();
                     let crypt = crypto_clone.clone();
                     let sess = sessions_clone.clone();
+                    let trust = trusted_clone.clone();
                     let ci = ci_clone.clone();
                     let tray = tray_clone.clone();
                     let gpin = pin_clone.clone();
-                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, ci, cms, tray, gpin).await }
+                    // HTTP is never certificate-authenticated: verified=None.
+                    async move { handle_request(req, "[HTTP]", ip, id, mac, crypt, sess, trust, None, ci, cms, tray, gpin).await }
                 }))
                 .await;
         });
@@ -497,6 +745,8 @@ async fn handle_request(
     _server_mac: String,
     crypto: Arc<ServerCrypto>,
     sessions: PairSessions,
+    trusted: TrustedClients,
+    verified: Option<VerifiedClient>,
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     codec_mode_support: u32,
     tray_tx: Arc<std::sync::mpsc::SyncSender<crate::tray::TrayCmd>>,
@@ -514,15 +764,36 @@ async fn handle_request(
     let client_id = params.get("uniqueid").cloned().unwrap_or_default();
     let phrase = params.get("phrase").cloned().unwrap_or_default();
 
-    let is_paired = {
-        let lock = sessions.lock().unwrap();
-        if let Some(sess) = lock.get(&client_id) { sess.last_phase == "CLIENTPAIRINGSECRET" } else { false }
-    };
-    let pair_status = if is_paired { 1 } else { 0 };
+    // ── Access control (Apollo/Sunshine parity) ──────────────────────────────
+    // HTTPS (47984): EVERY request requires the connection's client cert to
+    // have matched the trusted store — Apollo answers 401 otherwise
+    // ("on_verify_failed"). Moonlight reacts by treating the host as unpaired
+    // and falling back to HTTP /serverinfo.
+    // HTTP (47989): unauthenticated transport — exists only for discovery
+    // (/serverinfo, limited fields), the pairing handshake (/pair), and /ping.
+    // Session-control endpoints are NOT reachable here.
+    let is_https = port_tag == "[HTTPS]";
+    if is_https && verified.is_none() {
+        println!("⛔ {} {} — client not authorized (cert verification failed) → 401", port_tag, path);
+        return Ok(make_unauthorized_response(path));
+    }
+    if !is_https && !matches!(path, "/serverinfo" | "/pair" | "/ping") {
+        println!("⛔ {} {} — endpoint requires the authenticated HTTPS channel → 404", port_tag, path);
+        let mut res = Response::new(Full::new(Bytes::from("Not Found")));
+        *res.status_mut() = StatusCode::NOT_FOUND;
+        return Ok(res);
+    }
+
+    // Paired ⇔ this connection's client cert matched the trusted store.
+    // (On HTTP this is always 0: Moonlight's HTTPS-serverinfo probe with its
+    // client cert is what confirms pairing, exactly as with GFE/Sunshine.)
+    let pair_status = if verified.is_some() { 1 } else { 0 };
 
     match path {
         "/serverinfo" => {
-            let (current_game, server_state) = {
+            // Busy/current-game state is only disclosed on the authenticated
+            // channel (Apollo: `if constexpr (std::is_same_v<SunshineHTTPS, T>)`).
+            let (current_game, server_state) = if verified.is_some() {
                 let guard = client_info.lock().unwrap();
                 if let Some(ref info) = *guard {
                     if info.app_id != 0 {
@@ -533,6 +804,8 @@ async fn handle_request(
                 } else {
                     (0u32, "SUNSHINE_SERVER_FREE")
                 }
+            } else {
+                (0u32, "SUNSHINE_SERVER_FREE")
             };
             println!("📊 {} /serverinfo — id={} pair={} game={}", port_tag,
                 if client_id.is_empty() { "anon" } else { &client_id },
@@ -552,9 +825,10 @@ async fn handle_request(
                     r#"<mac>00:11:22:33:44:55</mac>"#,
                     r#"<LocalIP>{}</LocalIP>"#,
                     r#"<ExternalIP>{}</ExternalIP>"#,
-                    // H264 (1) + HEVC Main8 (2) + HEVC Main10 (256) = 259.
-                    // Bit 256 = SCM_HEVC_MAIN10; without it moonlight-common-c
-                    // never sets dynamicRangeMode:1 in ANNOUNCE, blocking HDR10.
+                    // SCM bits (moonlight-common-c Limelight.h): H264=0x1,
+                    // HEVC Main8=0x100, HEVC Main10=0x200. Without 0x200
+                    // moonlight-common-c never sets dynamicRangeMode:1 in
+                    // ANNOUNCE, blocking HDR10.
                     // The encoder uses dynamicRangeMode from ANNOUNCE (not /launch
                     // hdrMode) as the authoritative HDR gate to avoid encoding HDR
                     // when the display is still in SDR mode.
@@ -596,13 +870,25 @@ async fn handle_request(
 
             if phrase == "getservercert" || params.contains_key("getservercert") {
                 let salt = params.get("salt").cloned().unwrap_or_default();
+                // The client certificate is the device identity Nova pins at
+                // the end of the handshake — without it the device could never
+                // be authorized on 47984, so reject up front (Apollo fails the
+                // same way at clientpairingsecret with "Invalid client
+                // certificate"; failing early gives the user a clearer error).
+                let Some(client_cert_hex) = params.get("clientcert").cloned() else {
+                    println!("⚠️  getservercert without clientcert param — cannot pair this client");
+                    return Ok(make_error_response("Missing client certificate"));
+                };
                 {
+                    // getservercert STARTS a pairing attempt: always begin from
+                    // a fresh session so state from an aborted attempt can't
+                    // leak into this one.
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
+                    *session = PairSession::default();
                     session.last_phase = "GETSERVERCERT".to_string();
-                    session.client_cert = params.get("clientcert").cloned();
+                    session.client_cert = Some(client_cert_hex);
                     session.salt = Some(salt.clone());
-                    session.aes_key = None;
                 }
 
                 // ── PIN collection happens HERE, during getservercert ─────────
@@ -672,6 +958,13 @@ async fn handle_request(
                 let (salt, pin) = {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
+                    // Phase-order enforcement (Apollo fail_pair): an attacker
+                    // must not be able to enter the handshake mid-way.
+                    if session.last_phase != "GETSERVERCERT" {
+                        lock.remove(&client_id);
+                        println!("⚠️  Out-of-order clientchallenge (expected after getservercert) — pairing aborted");
+                        return Ok(make_error_response("Out of order call to clientchallenge"));
+                    }
                     session.last_phase = "CLIENTCHALLENGE".to_string();
                     (session.salt.clone().unwrap_or_default(),
                      session.pin.clone().unwrap_or_default())
@@ -715,22 +1008,46 @@ async fn handle_request(
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
                     session.aes_key          = Some(aes_key);
-                    session.client_hash      = Some(decrypted);
                     session.server_secret    = Some(server_secret);
                     session.server_challenge = Some(server_challenge);
                     // session.name already set during getservercert — do not overwrite
+                    // (client_hash is captured in the serverchallengeresp phase —
+                    // it is the decrypted challenge RESPONSE, not this challenge.)
                 }
 
                 let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>{}</challengeresponse></root>"#, hex::encode_upper(encrypted_response));
                 Ok(make_xml_response(&body))
 
             } else if phrase == "serverchallengeresp" || server_challenge_resp.is_some() {
-                let server_secret = {
+                let (server_secret, aes_key) = {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
+                    if session.last_phase != "CLIENTCHALLENGE" {
+                        lock.remove(&client_id);
+                        println!("⚠️  Out-of-order serverchallengeresp (expected after clientchallenge) — pairing aborted");
+                        return Ok(make_error_response("Out of order call to serverchallengeresp"));
+                    }
                     session.last_phase = "SERVERCHALLENGERESP".to_string();
-                    session.server_secret.clone().unwrap_or_default()
+                    (session.server_secret.clone().unwrap_or_default(),
+                     session.aes_key)
                 };
+
+                // The encrypted payload is the client's hash of
+                // (serverchallenge ‖ client-cert-signature ‖ client-secret).
+                // Store it — the clientpairingsecret phase recomputes the hash
+                // from the actual values and compares (Apollo `sess.clienthash`,
+                // "if hash not correct, probably MITM").
+                let client_hash = aes_key.map(|key| {
+                    let resp_hex = server_challenge_resp.clone().unwrap_or_default();
+                    let resp_bytes = hex::decode(&resp_hex).unwrap_or_default();
+                    aes_ecb_decrypt(&key, &resp_bytes)
+                });
+                {
+                    let mut lock = sessions.lock().unwrap();
+                    if let Some(session) = lock.get_mut(&client_id) {
+                        session.client_hash = client_hash;
+                    }
+                }
 
                 let key_pair = RsaKeyPair::from_pkcs8(&crypto.private_key_der).unwrap();
                 let mut sig_buf = vec![0u8; key_pair.public().modulus_len()];
@@ -744,23 +1061,101 @@ async fn handle_request(
                 Ok(make_xml_response(&body))
 
             } else if phrase == "clientpairingsecret" || client_pairing_secret.is_some() {
-                let device_name = {
+                let (device_name, server_challenge, client_hash, client_cert_hex) = {
                     let mut lock = sessions.lock().unwrap();
                     let session = lock.entry(client_id.clone()).or_default();
+                    if session.last_phase != "SERVERCHALLENGERESP" {
+                        lock.remove(&client_id);
+                        println!("⚠️  Out-of-order clientpairingsecret (expected after serverchallengeresp) — pairing aborted");
+                        return Ok(make_error_response("Out of order call to clientpairingsecret"));
+                    }
                     session.last_phase = "CLIENTPAIRINGSECRET".to_string();
-                    session.name.clone()
-                        .unwrap_or_else(|| format!("Device-{}", &client_id[..4.min(client_id.len())]))
+                    (session.name.clone()
+                        .unwrap_or_else(|| format!("Device-{}", &client_id[..4.min(client_id.len())])),
+                     session.server_challenge.clone().unwrap_or_default(),
+                     session.client_hash.clone().unwrap_or_default(),
+                     session.client_cert.clone().unwrap_or_default())
                 };
-                persist_paired_client(&client_id, &device_name);
-                println!("🎉 Phase 4: Handshake Complete! \"{}\" is paired (saved to {}).",
-                    device_name, PAIRED_PATH);
+                // The session is finished after this phase whatever the outcome.
+                sessions.lock().unwrap().remove(&client_id);
+
+                // clientpairingsecret = 16-byte client secret ‖ RSA signature
+                // of that secret by the client's certificate key.
+                let blob = hex::decode(client_pairing_secret.unwrap_or_default()).unwrap_or_default();
+                if blob.len() <= 16 {
+                    println!("⚠️  Client pairing secret too short — pairing aborted");
+                    return Ok(make_error_response("Client pairing secret too short"));
+                }
+                let (secret, signature) = blob.split_at(16);
+
+                let Some(cert_der) = client_cert_der_from_hex_pem(&client_cert_hex) else {
+                    println!("⚠️  Invalid client certificate — pairing aborted");
+                    return Ok(make_error_response("Invalid client certificate"));
+                };
+                if cert_der.len() < 256 {
+                    println!("⚠️  Client certificate too small for an RSA-2048 signature — pairing aborted");
+                    return Ok(make_error_response("Invalid client certificate"));
+                }
+
+                // Check 1 (Apollo same_hash): the hash the client committed to
+                // in serverchallengeresp must equal SHA-256(serverchallenge ‖
+                // client-cert-signature ‖ secret). A PIN-guessing MITM that
+                // re-signed with a different cert fails here.
+                let cert_signature = &cert_der[cert_der.len() - 256..];
+                let mut data = Vec::with_capacity(server_challenge.len() + 256 + 16);
+                data.extend_from_slice(&server_challenge);
+                data.extend_from_slice(cert_signature);
+                data.extend_from_slice(secret);
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                let expected_hash = hasher.finalize().to_vec();
+                let same_hash = !client_hash.is_empty()
+                    && expected_hash.len() == client_hash.len()
+                    && expected_hash == client_hash;
+
+                // Check 2 (Apollo verify256): the secret must be signed by the
+                // private key of the cert the client sent — proves the pairing
+                // peer actually owns the certificate Nova is about to trust.
+                let signature_ok = verify_client_signature(&cert_der, secret, signature);
+
+                if !(same_hash && signature_ok) {
+                    println!("❌ Pairing REJECTED for \"{}\" (hash match: {}, cert signature: {}) — wrong PIN or MITM",
+                        device_name, same_hash, signature_ok);
+                    let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>0</paired></root>"#;
+                    return Ok(make_xml_response(body));
+                }
+
+                // Pin THIS certificate as the device's identity. From now on,
+                // only a TLS connection presenting (and proving ownership of)
+                // this exact cert is authorized as this device.
+                let fingerprint = cert_fingerprint_hex(&cert_der);
+                {
+                    let mut lock = trusted.lock().unwrap();
+                    lock.insert(fingerprint.clone(), PairedClient {
+                        name: device_name.clone(),
+                        uniqueid: client_id.clone(),
+                        cert_pem_hex: client_cert_hex,
+                    });
+                    save_paired_json(&lock);
+                }
+                println!("🎉 Phase 4: Handshake Complete! \"{}\" is paired (cert {}…, saved to {}).",
+                    device_name, &fingerprint[..16], PAIRED_PATH);
                 let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
                 Ok(make_xml_response(body))
 
             } else if phrase == "pairchallenge" {
-                println!("🔄 Phase 5: pairchallenge | Moonlight verifying pairing state...");
-                let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
-                Ok(make_xml_response(body))
+                // Moonlight's post-pairing probe over HTTPS: succeeds only when
+                // the connection's client cert matched the trusted store. Over
+                // HTTP (never authenticated) this must NOT claim paired=1.
+                if verified.is_some() {
+                    println!("🔄 Phase 5: pairchallenge — client cert verified, pairing confirmed");
+                    let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
+                    Ok(make_xml_response(body))
+                } else {
+                    println!("⚠️  pairchallenge over unauthenticated channel — paired=0");
+                    let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>0</paired></root>"#;
+                    Ok(make_xml_response(body))
+                }
 
             } else {
                 Ok(make_error_response("Unknown pairing request"))
@@ -768,9 +1163,18 @@ async fn handle_request(
         }
 
         "/unpair" => {
-            println!("🧹 Moonlight requested /unpair for {}", client_id);
+            // HTTPS-only (the HTTP gate above 404s it): removes the REQUESTING
+            // device's own trust entry, identified by its verified cert — an
+            // unauthenticated caller must not be able to unpair other devices
+            // by guessing uniqueids (they're shared across moonlight-qt builds).
+            let v = verified.as_ref().expect("HTTPS gate guarantees verified");
+            println!("🧹 /unpair — removing \"{}\" (cert {}…)", v.name, &v.fingerprint[..16]);
             sessions.lock().unwrap().remove(&client_id);
-            remove_paired_client(&client_id);
+            {
+                let mut lock = trusted.lock().unwrap();
+                lock.remove(&v.fingerprint);
+                save_paired_json(&lock);
+            }
             let body = r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"#;
             Ok(make_xml_response(body))
         }
@@ -902,25 +1306,18 @@ async fn handle_request(
                     Encoder will stay at its current codec until ANNOUNCE is parsed.");
             }
 
-            // Resolve the paired device's friendly name from nova_paired.json using
-            // the `uniqueid` Moonlight includes in every authenticated request.
-            // Falls back to a short hex prefix of the uniqueid so the rename always
-            // produces a non-empty, human-readable label.
+            // Device identity comes from the connection's VERIFIED client
+            // certificate — never from the uniqueid param. moonlight-qt and
+            // derived clients hardcode uniqueid to "0123456789ABCDEF", so a
+            // uniqueid lookup returns whichever device paired last (the old
+            // "every monitor is named after the first device" bug). The cert
+            // is unique per client install, so this name is always the one
+            // entered when THIS device paired.
+            let v = verified.as_ref().expect("HTTPS gate guarantees verified");
+            let session_device_name = v.name.clone();
             let client_uniqueid = params.get("uniqueid").map(|s| s.as_str()).unwrap_or("");
-            let session_device_name = if client_uniqueid.is_empty() {
-                String::new()
-            } else {
-                load_paired_json()
-                    .get(client_uniqueid)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let prefix = &client_uniqueid[..client_uniqueid.len().min(8)];
-                        format!("Client-{}", prefix)
-                    })
-            };
-            if !session_device_name.is_empty() {
-                println!("🏷️  Device: \"{}\" (uniqueid={})", session_device_name, client_uniqueid);
-            }
+            println!("🏷️  Device: \"{}\" (cert {}…, uniqueid={})",
+                session_device_name, &v.fingerprint[..16], client_uniqueid);
 
             // Store session info — RTSP DESCRIBE reads width/height/fps from here.
             // Setting app_id causes /serverinfo to return currentgame=N (BUSY state),
@@ -1019,10 +1416,93 @@ fn make_xml_response(body: &str) -> Response<Full<Bytes>> {
     res
 }
 
+/// Apollo's `on_verify_failed` body: HTTP 401 + XML status so Moonlight shows
+/// "not authorized / re-pair" instead of a protocol error.
+fn make_unauthorized_response(path: &str) -> Response<Full<Bytes>> {
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><root status_code="401" query="{}" status_message="The client is not authorized. Certificate verification failed."><paired>0</paired></root>"#,
+        path
+    );
+    let mut res = Response::new(Full::new(Bytes::from(body)));
+    *res.status_mut() = StatusCode::UNAUTHORIZED;
+    res.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+    res
+}
+
 fn make_error_response(msg: &str) -> Response<Full<Bytes>> {
     let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><root status_code="400" status_message="{}"><paired>0</paired></root>"#, msg);
     let mut res = Response::new(Full::new(Bytes::from(body)));
     *res.status_mut() = StatusCode::BAD_REQUEST;
     res.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
     res
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// base64_decode must invert der_to_pem's encoder for arbitrary binary
+    /// (the pair that carries client certs through nova_paired.json).
+    #[test]
+    fn base64_roundtrip_inverts_pem_encoder() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let pem = der_to_pem(&data);
+        let body: String = pem.lines().filter(|l| !l.contains("-----")).collect();
+        assert_eq!(base64_decode(&body).expect("decode"), data);
+
+        // Non-multiple-of-3 lengths exercise both padding branches.
+        for len in [0usize, 1, 2, 3, 4, 5] {
+            let d = &data[..len];
+            let pem = der_to_pem(d);
+            let body: String = pem.lines().filter(|l| !l.contains("-----")).collect();
+            assert_eq!(base64_decode(&body).as_deref(), Some(d));
+        }
+    }
+
+    /// Hex-PEM (the wire format of Moonlight's `clientcert` param) must decode
+    /// to the exact DER bytes, and the fingerprint must be stable.
+    #[test]
+    fn client_cert_hex_pem_decodes_to_der() {
+        let fake_der: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let pem = der_to_pem(&fake_der);
+        let hex_pem = hex::encode_upper(pem.as_bytes());
+        let decoded = client_cert_der_from_hex_pem(&hex_pem).expect("hex-PEM decode");
+        assert_eq!(decoded, fake_der);
+        assert_eq!(cert_fingerprint_hex(&decoded).len(), 64);
+    }
+
+    /// The trust store must round-trip devices keyed by fingerprint, drop
+    /// cert-less legacy entries, and heal a tampered fingerprint key.
+    #[test]
+    fn paired_store_roundtrip_and_legacy_migration() {
+        let fake_der: Vec<u8> = (0..300u32).map(|i| (i % 249) as u8).collect();
+        let cert_hex = hex::encode_upper(der_to_pem(&fake_der).as_bytes());
+        let fp = cert_fingerprint_hex(&fake_der);
+
+        let mut map = HashMap::new();
+        map.insert(fp.clone(), PairedClient {
+            name: "Living Room \"TV\"".to_string(), // exercises quote escaping
+            uniqueid: "0123456789ABCDEF".to_string(),
+            cert_pem_hex: cert_hex.clone(),
+        });
+        let text = serialize_paired_json(&map);
+        let loaded = parse_paired_json(&text);
+        assert_eq!(loaded.len(), 1);
+        let pc = loaded.get(&fp).expect("fingerprint key");
+        assert_eq!(pc.name, "Living Room \"TV\"");
+        assert_eq!(pc.uniqueid, "0123456789ABCDEF");
+        assert_eq!(pc.cert_pem_hex, cert_hex);
+
+        // Legacy (pre-cert) entry: must be dropped, not trusted.
+        let legacy = r#"{
+  "0123456789ABCDEF": { "name": "Xbox" }
+}"#;
+        assert!(parse_paired_json(legacy).is_empty());
+
+        // Tampered key: entry is re-keyed by the recomputed fingerprint, so a
+        // hand-edited key cannot grant a different cert someone else's trust.
+        let tampered = text.replace(&fp, &"0".repeat(64));
+        let healed = parse_paired_json(&tampered);
+        assert!(healed.contains_key(&fp));
+        assert!(!healed.contains_key(&"0".repeat(64)));
+    }
 }

@@ -68,6 +68,29 @@ SetupLogging=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 
+; ── [Tasks] — optional, user-selectable install choices ───────────────────────
+;
+; Secure-desktop UAC choice.
+;   By default Windows draws UAC elevation prompts on the SECURE desktop
+;   (WinSta0\Winlogon), which Nova's primary WGC capture backend cannot see —
+;   during a UAC prompt a remote operator gets a black screen at the exact
+;   moment they need to click "Yes". Nova's full fix is the DDA secure-desktop
+;   backend, but many remote-admin users (as with RDP / AnyDesk / TeamViewer)
+;   simply prefer to move the prompt onto the normal desktop so it streams like
+;   anything else.
+;
+;   This task is UNCHECKED by default — it is a deliberate security trade-off
+;   (the secure desktop defeats UAC-spoofing malware) and must be opted into.
+;   The [Registry] entry below is written only when this task is selected, and
+;   the value is removed on uninstall (Windows then reverts to its default =
+;   secure desktop on), so the choice is fully reversible.
+[Tasks]
+Name: "disablesecuredesktop"; \
+    Description: "Show UAC prompts on the normal desktop (lets Nova stream elevation prompts without a capture-backend switch)"; \
+    GroupDescription: "Remote administration"; \
+    Flags: unchecked
+
+
 ; ── [Files] ───────────────────────────────────────────────────────────────────
 [Files]
 ; ── Nova binaries ─────────────────────────────────────────────────────────────
@@ -95,6 +118,29 @@ Source: "{#SourcePath}VirtualDisplayDriver\*"; \
     Excludes: "VDD Control.exe,VDD Control.pdb"
 
 
+; ── [Registry] ────────────────────────────────────────────────────────────────
+;
+; PromptOnSecureDesktop = 0  — moves UAC prompts to the normal desktop so WGC can
+; capture them. Written ONLY when the "disablesecuredesktop" task is selected.
+;
+; Flags:
+;   uninsdeletevalue  — remove the value on uninstall. With the value gone,
+;                       Windows uses its built-in default (secure desktop ON),
+;                       so uninstalling cleanly restores stock UAC behaviour.
+;
+; This is HKLM machine policy, which is why the installer requires admin
+; (PrivilegesRequired=admin above). No reboot is needed; the change takes effect
+; at the next UAC prompt.
+[Registry]
+Root: HKLM; \
+    Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; \
+    ValueType: dword; \
+    ValueName: "PromptOnSecureDesktop"; \
+    ValueData: "0"; \
+    Tasks: disablesecuredesktop; \
+    Flags: uninsdeletevalue
+
+
 ; ── [Icons] ───────────────────────────────────────────────────────────────────
 ; Nova is headless (system tray only) — no Start menu shortcut needed.
 [Icons]
@@ -103,18 +149,27 @@ Source: "{#SourcePath}VirtualDisplayDriver\*"; \
 ; ── [Run] — installation steps in strict order ────────────────────────────────
 ;
 ;  Order matters:
-;   1. devcon install  — register Root\MttVDD in the device tree
-;   2. nova --install  — register the ONLOGON scheduled task
-;   3. nova (start)    — launch the server for this session
+;   1. devcon install        — register Root\MttVDD in the device tree
+;   2. nova --install-service — register the NovaService SYSTEM launcher
+;   3. sc start NovaService  — start it now (spawns the host for this session)
+;
+;  Deployment model (Phase 15.2c): Nova now ships as a LocalSystem launcher
+;  SERVICE ("NovaService") that spawns the interactive host into the active
+;  console session with a SYSTEM-derived elevated token. This is what gives the
+;  host the privilege to attach a capture thread to the secure desktop
+;  (WinSta0\Winlogon) for DDA capture of UAC / logon screens — a plain
+;  scheduled task cannot provide that token.
+;
+;  `nova --install-service` removes the legacy NovaServerBoot scheduled task as
+;  part of registration, so the two models never both spawn a host. The task
+;  path (`nova --install`) is retained in the binary as a DOCUMENTED FALLBACK
+;  for environments where a service is undesirable (run it manually instead of
+;  step 2/3), but it does NOT provide secure-desktop capture.
 ;
 ;  Why devcon runs HERE instead of inside Nova:
-;   When Nova launches via a scheduled task with the runhidden flag, Windows
-;   may suppress child-process UAC elevation even when the parent token is
-;   already elevated — the child's escalation request has no desktop to
-;   display a prompt on, so it silently fails. The Inno Setup process holds
-;   a genuine interactive-admin token and can pass it to child processes
-;   directly: devcon.exe inherits it, installs the driver, and exits —
-;   no UAC dialog, no silent failure.
+;   The Inno Setup process holds a genuine interactive-admin token and can pass
+;   it to child processes directly: devcon.exe inherits it, installs the driver,
+;   and exits — no UAC dialog, no silent failure.
 [Run]
 
 ; ── 1. Install the Virtual Display Driver (MttVDD) ────────────────────────────
@@ -140,54 +195,60 @@ Filename: "{#VDDDevcon}"; \
     StatusMsg: "Installing Virtual Display Driver (ARM64)..."; \
     Check: IsARM64
 
-; ── 2. Register the NovaServerBoot scheduled task ────────────────────────────
-; --install performs four operations in one shot:
+; ── 2. Register the NovaService SYSTEM launcher ──────────────────────────────
+; --install-service performs, in one shot:
 ;   a) Ghost Protocol — removes stale nova_shim.dll from System32/SysWOW64
-;   b) SCM cleanup    — removes any old "NovaServer" Windows Service entry
-;   c) Task migration — deletes legacy task names ("Nova Game Streaming", etc.)
-;   d) Task creation  — registers "NovaServerBoot" via schtasks /create /xml
-;      with <LogonType>InteractiveToken</LogonType> and <RunLevel>HighestAvailable
-;      so it runs in the user's interactive session (Session 1+), not Session 0.
+;   b) Task removal   — deletes NovaServerBoot + legacy task names (the service
+;                       and the task must never both spawn a host)
+;   c) Service create — registers "NovaService" as LocalSystem, AUTO_START,
+;                       binary path `"<exe>" --service`. If it already exists
+;                       (upgrade), the binary path is updated in place.
+; Runs with the installer's admin token (CreateServiceW needs admin).
+; NOTE: any previously-running NovaService/host was already stopped in the
+; [Code] PrepareToInstall hook below, BEFORE [Files] overwrote the exe/dll.
 Filename: "{app}\{#AppExe}"; \
-    Parameters: "--install"; \
+    Parameters: "--install-service"; \
     Flags: runhidden waituntilterminated; \
-    StatusMsg: "Registering NovaServerBoot startup task..."
+    StatusMsg: "Registering NovaService launcher..."
 
-; ── 3. Launch Nova for this session ───────────────────────────────────────────
-; nowait so the installer exits immediately; runhidden because Nova is a
-; tray-resident process with no console window.
-; postinstall + skipifsilent shows a "Launch Nova now" checkbox on the finish
-; page but skips it during silent (/SILENT or /VERYSILENT) deployments.
-;
-; runascurrentuser is CRITICAL here: postinstall entries otherwise run as the
-; ORIGINAL unelevated user (Inno de-elevates them by design). Nova requires an
-; elevated token for the VDD devnode enable (SetupAPI DICS_ENABLE) and HDR10
-; Advanced Color switching — launched unelevated, those fail silently and the
-; stream shows a black screen with no virtual monitor and no HDR. The setup
-; process already holds an interactive admin token (PrivilegesRequired=admin);
-; this flag passes it straight to Nova, matching the elevation the
-; NovaServerBoot task provides at every subsequent logon.
-Filename: "{app}\{#AppExe}"; \
-    Flags: nowait runhidden postinstall skipifsilent runascurrentuser; \
-    Description: "Launch {#AppName} now"
+; ── 3. Start the service now (spawns the host for this session) ───────────────
+; sc start returns as soon as NovaService reaches START_PENDING; the service's
+; worker then spawns the host into the active console session (this installer's
+; session) with the elevated user token — exercising the exact production path
+; rather than a one-off direct launch. waituntilterminated waits only for the
+; short-lived sc.exe, not for Nova. Not postinstall: this must run with the
+; installer's admin token (sc start needs admin), and postinstall entries are
+; de-elevated by Inno.
+Filename: "{sys}\sc.exe"; \
+    Parameters: "start NovaService"; \
+    Flags: runhidden waituntilterminated; \
+    StatusMsg: "Starting Nova..."
 
 
 ; ── [UninstallRun] ────────────────────────────────────────────────────────────
 [UninstallRun]
 
-; 1. Stop Nova and remove the scheduled task.
+; 1. Stop and remove the NovaService launcher (stops the service, which
+;    terminates the host it manages, then deletes the service). Idempotent.
+Filename: "{app}\{#AppExe}"; \
+    Parameters: "--uninstall-service"; \
+    Flags: runhidden waituntilterminated; \
+    RunOnceId: "NovaServiceUninstall"
+
+; 2. Remove the legacy scheduled task too (belt-and-suspenders — covers boxes
+;    upgraded from a task-based install, or ones that used the task fallback).
 Filename: "{app}\{#AppExe}"; \
     Parameters: "--uninstall"; \
     Flags: runhidden waituntilterminated; \
     RunOnceId: "NovaUninstall"
 
-; 2. Force-kill any remaining Nova process (belt-and-suspenders).
+; 3. Force-kill any remaining Nova process (belt-and-suspenders).
 Filename: "{sys}\taskkill.exe"; \
     Parameters: "/F /IM {#AppExe}"; \
     Flags: runhidden waituntilterminated; \
     RunOnceId: "NovaKill"
 
-; 3. Remove the Root\MttVDD device node.
+; 4. Remove the Root\MttVDD device node.
 ;    devcon "remove" is idempotent: exits 0 if the device is gone already.
 ;    Only remove on x64; ARM64 uninstall mirrors the same pattern.
 Filename: "{#VDDDevcon}"; \
@@ -203,3 +264,37 @@ Filename: "{#VDDDevcon}"; \
     Flags: runhidden waituntilterminated; \
     RunOnceId: "VDDRemoveARM"; \
     Check: IsARM64
+
+
+; ── [Code] ────────────────────────────────────────────────────────────────────
+[Code]
+
+// PrepareToInstall runs AFTER the wizard pages but BEFORE any file is copied —
+// the correct place to release locks on the files [Files] is about to
+// overwrite. On an upgrade the running NovaService holds nova-server.exe /
+// nova_shim.dll open; without stopping it first, the copy fails (or Inno shows
+// the "files in use / reboot required" prompt). We stop the service (which
+// terminates the host it manages) and belt-and-suspenders kill any stray host
+// and stop a legacy task-based instance too.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  // Stop the launcher service if present (idempotent — sc returns non-zero when
+  // the service doesn't exist or is already stopped; we ignore the code).
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop NovaService', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Legacy task-based install: end the task so its host lets go of the files.
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/end /tn NovaServerBoot', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Belt-and-suspenders: terminate any remaining host process.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM nova-server.exe', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Give the SCM/OS a moment to release the file handles before [Files] copies.
+  Sleep(1500);
+
+  Result := '';  // empty = proceed with installation
+end;

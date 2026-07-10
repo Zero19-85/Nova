@@ -9,10 +9,23 @@ mod input;
 mod pairing;
 mod rtp;
 mod rtsp;
+/// Secure-desktop UAC policy toggle — the opt-in complement to the DDA
+/// secure-desktop capture backend. Public so the installer/CLI and a future tray
+/// item can query and flip `PromptOnSecureDesktop`.
+pub mod secure_desktop;
+/// Thin SYSTEM launcher service (Phase 15.2c) — spawns the interactive host
+/// with a SYSTEM-derived elevated token. Public so the binary's `--service` /
+/// `--install-service` / `--uninstall-service` subcommands can reach it.
+pub mod service;
+mod shutdown;
 pub mod tray;
 mod virtual_display;
 
 use clap::Parser;
+// Trait for the capture manager's per-frame surface (width()/height()/origin()/
+// device()/try_get_frame()/rebind()) — the concrete backend behind it is the
+// manager's business (WGC normally, DDA during secure-desktop interludes).
+use capture::DesktopCapture;
 use encoder::{Encoder, EncoderConfig};
 use socket2;
 use std::sync::{Arc, Mutex};
@@ -49,15 +62,51 @@ fn get_local_ip() -> String {
     socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// Re-targets the WGC capturer to `target` (GDI device name, or `None` for
+/// Recreates the NVENC encoder to match the capturer's current dimensions
+/// (same device — the manager guarantees one D3D11 device for the process
+/// lifetime). Shared by the session-rebind path and the WGC↔DDA backend-swap
+/// path.
+fn recreate_encoder_for_capture(
+    capturer: &capture::DesktopManager,
+    enc: &mut Encoder,
+) -> std::result::Result<(), String> {
+    println!("🔁 Capture resolution/device changed — recreating NVENC encoder ({}x{})",
+        capturer.width(), capturer.height());
+    // Tear down the old encoder's shim-global NVENC/D3D state BEFORE creating
+    // the replacement — otherwise Encoder::new() below overwrites those
+    // globals with the new encoder's state, and *enc's old value being dropped
+    // (by the assignment further down) would destroy the brand-new encoder
+    // instead, leaving g_nvEncoder/g_device null.
+    enc.cleanup();
+    match Encoder::new(capturer.device(), EncoderConfig {
+        width:        capturer.width() as i32,
+        height:       capturer.height() as i32,
+        fps:          enc.config.fps,
+        bitrate_kbps: enc.config.bitrate_kbps,
+        codec:        enc.config.codec,
+        is_hdr:       enc.config.is_hdr,
+    }) {
+        Ok(new_enc) => {
+            *enc = new_enc;
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to recreate encoder after capture change: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Re-targets the capture manager to `target` (GDI device name, or `None` for
 /// the physical primary), recreating the encoder when the resolution changes.
-/// `is_hdr` sets the frame-pool pixel format: `R16G16B16A16Float` for HDR,
-/// `B8G8R8A8UIntNormalized` for SDR.
+/// `is_hdr` sets the frame format: FP16 for HDR, BGRA8 for SDR. The manager
+/// routes the rebind to whichever backend matches the current input desktop
+/// (sessions land on WGC; a live secure-desktop DDA interlude retargets DDA).
 ///
 /// Synchronous — WGC session creation and CCD calls block briefly; this is
 /// called while holding the `client_info` mutex where `.await` is unsound.
 fn rebind_capture_and_encoder(
-    capturer: &mut capture::WgcCapturer,
+    capturer: &mut capture::DesktopManager,
     enc: &mut Encoder,
     target: Option<&str>,
     expected_size: Option<(u32, u32)>,
@@ -65,28 +114,7 @@ fn rebind_capture_and_encoder(
     match capturer.rebind(target, enc.config.is_hdr, expected_size) {
         Ok(needs_new_encoder) => {
             if needs_new_encoder {
-                println!("🔁 Capture resolution/device changed — recreating NVENC encoder ({}x{})", capturer.width, capturer.height);
-                // Tear down the old encoder's shim-global NVENC/D3D state
-                // BEFORE creating the replacement — otherwise Encoder::new()
-                // below overwrites those globals with the new encoder's
-                // state, and *enc's old value being dropped (by the
-                // assignment further down) would destroy the brand-new
-                // encoder instead, leaving g_nvEncoder/g_device null.
-                enc.cleanup();
-                match Encoder::new(&capturer.device, EncoderConfig {
-                    width:        capturer.width as i32,
-                    height:       capturer.height as i32,
-                    fps:          enc.config.fps,
-                    bitrate_kbps: enc.config.bitrate_kbps,
-                    codec:        enc.config.codec,
-                    is_hdr:       enc.config.is_hdr,
-                }) {
-                    Ok(new_enc) => *enc = new_enc,
-                    Err(e) => {
-                        eprintln!("❌ Failed to recreate encoder after capture rebind: {e}");
-                        return Err(e);
-                    }
-                }
+                recreate_encoder_for_capture(capturer, enc)?;
             }
             // Keep input.rs's mouse-mapping rect in sync even when the
             // resolution didn't change — rebind() can move the captured
@@ -94,7 +122,8 @@ fn rebind_capture_and_encoder(
             // the Virtual Desktop output becoming primary at (0,0) while a
             // physical monitor that used to be primary shifts to a non-zero
             // origin).
-            input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
+            let (ox, oy) = capturer.origin();
+            input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
             Ok(())
         }
         Err(e) => {
@@ -212,6 +241,13 @@ pub async fn run() -> Result<()> {
     // silent with no client connected).
     audio::recover_stuck_sink();
 
+    // Desktop-switch detection (Phase 15.1b — observe + log only). Runs for
+    // the whole process lifetime; logs interactive↔secure desktop transitions
+    // (UAC prompts, logon screen) so live sessions confirm detection before
+    // Phase 2 wires the WGC→DDA backend swap to it. The handle must stay
+    // named-alive: `let _ =` would drop (and stop) it immediately.
+    let _desktop_switch_monitor = capture::desktop_switch::DesktopSwitchMonitor::spawn();
+
     // System tray: spawn before anything else so pairing PIN notifications
     // are visible from the moment the server is ready.
     // The watch channel is the graceful-shutdown bridge: the tray's "Quit"
@@ -233,7 +269,22 @@ pub async fn run() -> Result<()> {
         cfg.hdr.max_cll_nits,
         cfg.hdr.max_fall_nits,
     );
-    let args = Args::parse();
+    // Parse from a FILTERED arg list: the service launches the host with
+    // `--system-token <n>` (handled in bin/main before run()), which clap does
+    // not know about. Strip that flag and its value so clap doesn't abort.
+    let filtered_args = {
+        let mut out: Vec<std::ffi::OsString> = Vec::new();
+        let mut it = std::env::args_os();
+        while let Some(a) = it.next() {
+            if a == "--system-token" {
+                let _ = it.next(); // skip its value
+            } else {
+                out.push(a);
+            }
+        }
+        out
+    };
+    let args = Args::parse_from(filtered_args);
     let width   = args.width  .unwrap_or(cfg.stream.width);
     let height  = args.height .unwrap_or(cfg.stream.height);
     let bitrate = args.bitrate.unwrap_or(cfg.stream.bitrate_kbps);
@@ -248,14 +299,20 @@ pub async fn run() -> Result<()> {
     let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
 
-    // H264 (1) + HEVC/Main8 (2) + HEVC/Main10 (256) = 259.
-    // Bit 0x100 (256) = SCM_HEVC_MAIN10: signals to moonlight-common-c that
-    // the server can deliver 10-bit HDR10. Without this bit, clients set
-    // dynamicRangeMode:0 in ANNOUNCE even when the user enabled HDR.
+    // moonlight-common-c Limelight.h SCM bits: H264=0x1, HEVC(Main8)=0x100,
+    // HEVC_MAIN10=0x200 → 0x301 = 769.
+    //
+    // The old value 259 (0x103) was built on a wrong map (0x100 believed to be
+    // Main10): it advertised H264 + H264_HIGH8_444(0x2, unsupported) + HEVC
+    // Main8, and NO Main10 bit. moonlight-common-c only sets
+    // dynamicRangeMode:1 in ANNOUNCE when (client wants HDR) ∧ (server SCM has
+    // 0x200) — so every client, Xbox included, silently declined HDR
+    // (confirmed live 2026-07-06: /launch hdrMode=1 + clientSupportHevc:1 but
+    // ANNOUNCE dynamicRangeMode:0 against SCM=259).
     // Old-protocol clients (Xbox Moonlight 1.18.0, corever=1) read
     // sprop-parameter-sets=AAAAAU in DESCRIBE for HEVC capability and the
     // fps cap handles graceful degradation for H264 fallback scenarios.
-    let codec_mode_support: u32 = 259;
+    let codec_mode_support: u32 = 0x301;
     let startup_codec = encoder::Codec::from_str(&codec);
     println!("🎥 ServerCodecModeSupport={codec_mode_support} (H264+HEVC); startup encoder: {}", startup_codec.as_str());
     if cfg.stream.enable_hdr {
@@ -273,9 +330,10 @@ pub async fn run() -> Result<()> {
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
 
-    // Owns the virtual-display lifecycle for the whole process.
-    // activate_for_stream/deactivate_after_stream cache/restore the host's
-    // audio endpoint, so there's no separate audio bookkeeping elsewhere.
+    // Owns the virtual-display lifecycle for the whole process. Audio endpoint
+    // state is NOT this object's concern (Phase 15.1): crate::audio is the
+    // single owner — audio::arm_endpoint_restore() is called below before each
+    // activate_for_stream, and the AudioCaptureManager restores on stop.
     //
     // Enable Root\MttVDD ONCE, here, at boot, and leave it enabled for the
     // server's entire lifetime. The old code disabled/re-enabled the devnode
@@ -287,33 +345,42 @@ pub async fn run() -> Result<()> {
     let virtual_device_name = match vd.ensure_enabled_at_boot(width as u32, height as u32, fps) {
         Ok(name) => name,
         Err(e) => {
-            println!("⚠️  Failed to enable Root\\MttVDD at boot: {e} — Virtual Desktop sessions will be unavailable");
+            println!("❌ VDD BOOT PREFLIGHT FAILED: {e}");
+            println!("   Virtual-display sessions will mirror the physical desktop until this is fixed.");
+            vd.log_vdd_diagnostics();
             None
         }
     };
 
-    let mut capturer = capture::WgcCapturer::new_excluding(virtual_device_name.as_deref())
+    // DesktopManager owns the capture backend for the whole process: WGC
+    // normally, DDA while the secure desktop is up (maybe_swap_backend in the
+    // frame loop below). One D3D11 device for the process lifetime, shared
+    // with NVENC across every backend swap.
+    let mut capturer = capture::DesktopManager::new_wgc(virtual_device_name.as_deref())
         .map_err(|e| {
             println!("❌ Failed to start WGC capture — no usable display found: {e:?}");
             e
         })?;
-    input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
+    {
+        let (ox, oy) = capturer.origin();
+        input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+    }
 
     // The WGC frame pool captures at the monitor's native resolution, which may
     // not match nova.toml's width/height target. The encoder and D3D11 video
     // processor must be sized to the ACTUAL captured texture — a mismatch leaves
     // the VP blitting into a differently-sized output, producing black/garbage in
     // the bottom portion of every encoded frame.
-    if capturer.width as i32 != width || capturer.height as i32 != height {
+    if capturer.width() as i32 != width || capturer.height() as i32 != height {
         println!("⚠️  Monitor native resolution ({}x{}) differs from nova.toml target ({}x{}) — using native resolution for capture/encoder pipeline.",
-            capturer.width, capturer.height, width, height);
+            capturer.width(), capturer.height(), width, height);
     }
 
     let mut enc = Encoder::new(
-        &capturer.device,
+        capturer.device(),
         EncoderConfig {
-            width:        capturer.width as i32,
-            height:       capturer.height as i32,
+            width:        capturer.width() as i32,
+            height:       capturer.height() as i32,
             fps:          fps as i32,
             bitrate_kbps: bitrate,
             codec:        startup_codec,
@@ -377,7 +444,7 @@ pub async fn run() -> Result<()> {
     let mut rtp_sender = crate::rtp::RtpSender::new(47998)
         .expect("Failed to bind RTP socket on 47998");
 
-    // Audio port (48000) — the AudioStreamer thread learns the client's
+    // Audio port (48000) — the audio session's send thread learns the client's
     // address from its pings and sends Opus RTP back on this socket.
     let audio_socket = {
         let raw = socket2::Socket::from(
@@ -389,7 +456,11 @@ pub async fn run() -> Result<()> {
         raw.set_nonblocking(true).expect("set_nonblocking on audio socket");
         std::net::UdpSocket::from(raw)
     };
-    let mut audio_streamer: Option<audio::AudioStreamer> = None;
+    // Sole owner of the streaming audio lifecycle (sink swap, WASAPI capture,
+    // endpoint restore). start_for_stream/stop_and_release are driven by the
+    // session state machine below; the manager serializes sessions internally
+    // so a /resume can never overlap a zombie session's audio teardown.
+    let mut audio_manager = audio::AudioCaptureManager::new();
 
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
@@ -418,13 +489,22 @@ pub async fn run() -> Result<()> {
     // `signal::ctrl_c()` only ever fires for CTRL_C_EVENT. Closing the console
     // window, logging off, or a shutdown sends CTRL_CLOSE/LOGOFF/SHUTDOWN
     // instead — without these handlers the process is torn down without
-    // running Rust destructors, so AudioStreamer's Drop (which restores the
-    // default audio device away from the virtual sink) never runs and the
+    // running Rust destructors, so AudioCaptureManager's Drop (which restores
+    // the default audio device away from the virtual sink) never runs and the
     // host is left silent. recover_stuck_sink() at startup is the last-resort
     // backstop for paths even these handlers can't catch (e.g. taskkill /F).
     let mut ctrl_close = signal::windows::ctrl_close().expect("register ctrl_close handler");
     let mut ctrl_shutdown = signal::windows::ctrl_shutdown().expect("register ctrl_shutdown handler");
     let mut ctrl_logoff = signal::windows::ctrl_logoff().expect("register ctrl_logoff handler");
+
+    // Emergency display recovery for process-death paths (must come AFTER the
+    // tokio watchers above — console handlers run in LIFO order, and the
+    // synchronous CCD restore has to happen before tokio's handler parks the
+    // notification thread). The session-monitor window covers WM_ENDSESSION,
+    // which Windows can deliver (and then terminate us) without ever running
+    // the console handler chain because the tray thread owns windows.
+    shutdown::install_console_hook();
+    shutdown::spawn_session_monitor();
 
     println!("▶️  Capture loop running — press Ctrl+C to stop");
 
@@ -453,6 +533,13 @@ pub async fn run() -> Result<()> {
                 }
                 _ = shutdown_rx.changed() => {
                     println!("\n🛑 Tray exit — shutting down ({} frames encoded)", frames_encoded);
+                    // Under the service deployment, the host is respawned on exit
+                    // by design — so a user "Quit" must also stop the service, or
+                    // it just relaunches. Request the stop now (before teardown)
+                    // so the service's worker won't respawn us; the service then
+                    // grace-waits for this graceful teardown to finish. No-op when
+                    // not launched by the service.
+                    crate::service::request_service_stop();
                     break;
                 }
             }
@@ -530,6 +617,11 @@ pub async fn run() -> Result<()> {
                     let vdd_ok = if app_launcher::uses_virtual_display(app_id, cfg.stream.headless_for_all_apps) {
                         println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
                             if hdr_req { " HDR10" } else { "" });
+                        // Capture the restore target BEFORE the VDD flip: once the
+                        // virtual display is primary, Windows may auto-switch the
+                        // default endpoint to its HDMI audio device — arming after
+                        // that would restore to the wrong endpoint at session end.
+                        audio::arm_endpoint_restore();
                         match vd.activate_for_stream(width, height, fps) {
                             Ok(()) => {
                                 // Rename the virtual monitor so Display Settings and Device
@@ -575,7 +667,8 @@ pub async fn run() -> Result<()> {
                                             // to SDR, feeding wrong data to the NVENC HDR pipeline.
                                             match capturer.rebind(vd.active_device_name(), true, Some((width, height))) {
                                                 Ok(_) => {
-                                                    input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
+                                                    let (ox, oy) = capturer.origin();
+                                                    input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
                                                     println!("✅ WGC frame pool recreated in FP16 — VDD in HDR/Advanced Color mode");
                                                 }
                                                 Err(e) => eprintln!("⚠️  WGC FP16 rebind failed: {e} — HDR frames may be tone-mapped to SDR"),
@@ -711,9 +804,9 @@ pub async fn run() -> Result<()> {
                             // same mode) returns needs_new_encoder=false — the H264
                             // encoder would keep running. Force recreation here directly.
                             enc.cleanup();
-                            match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
-                                width:        capturer.width as i32,
-                                height:       capturer.height as i32,
+                            match encoder::Encoder::new(capturer.device(), encoder::EncoderConfig {
+                                width:        capturer.width() as i32,
+                                height:       capturer.height() as i32,
                                 fps:          enc.config.fps,
                                 bitrate_kbps: enc.config.bitrate_kbps,
                                 codec:        negotiated_codec,
@@ -725,7 +818,8 @@ pub async fn run() -> Result<()> {
                                     break;
                                 }
                             }
-                            input::set_active_capture_rect(capturer.origin_x, capturer.origin_y, capturer.width, capturer.height);
+                            let (ox, oy) = capturer.origin();
+                            input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
                         }
 
                         // HDR10 pipeline activation gate:
@@ -767,9 +861,9 @@ pub async fn run() -> Result<()> {
                             println!("🎨 HEVC Main10/HDR10 encoder active (hdrMode=1, VDD in FP16 mode)");
                             enc.config.is_hdr = true;
                             enc.cleanup();
-                            match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
-                                width:        capturer.width as i32,
-                                height:       capturer.height as i32,
+                            match encoder::Encoder::new(capturer.device(), encoder::EncoderConfig {
+                                width:        capturer.width() as i32,
+                                height:       capturer.height() as i32,
                                 fps:          enc.config.fps,
                                 bitrate_kbps: enc.config.bitrate_kbps,
                                 codec:        enc.config.codec,
@@ -792,9 +886,12 @@ pub async fn run() -> Result<()> {
 
                         // Resolution / FPS / HDR summary — the single most
                         // useful line for diagnosing stream failures.
+                        // NOTE: print the LIVE codec, not enc_name — enc_name was
+                        // captured before the ANNOUNCE-driven codec switch above and
+                        // showed "h264" for sessions that were actually HEVC.
                         println!("📐 Encoder: {}x{}@{}fps {}{}  |  Client requested: {}x{}@{}fps{}",
                             enc.config.width, enc.config.height, enc.config.fps,
-                            enc_name,
+                            enc.config.codec.as_str(),
                             if enc.config.is_hdr { "/HDR10" } else { "" },
                             client.width, client.height, client.fps,
                             if client.hdr_requested { " HDR" } else { "" });
@@ -803,9 +900,9 @@ pub async fn run() -> Result<()> {
                         // above during the /launch -> PLAY gap. Fall back to
                         // doing it here if that somehow hasn't run yet (e.g.
                         // PLAY arrived before the first idle-loop tick).
-                        // activate_for_stream caches the host's current audio
-                        // endpoint first — must happen before AudioStreamer
-                        // below changes the default device.
+                        // audio::arm_endpoint_restore() must run before the
+                        // VDD flip AND before start_for_stream below changes
+                        // the default device (single-owner endpoint state).
                         if client.activated {
                             // VDD topology is already up from pre-activation.
                             // Force WGC + NVENC recreation to match the session's
@@ -822,6 +919,7 @@ pub async fn run() -> Result<()> {
                         } else if app_launcher::uses_virtual_display(client.app_id, cfg.stream.headless_for_all_apps) {
                             // Pre-activation didn't run (PLAY arrived before the first idle-loop tick).
                             // Activate the VDD now, then rename the virtual monitor.
+                            audio::arm_endpoint_restore();
                             match vd.activate_for_stream(client.width, client.height, client.fps) {
                                 Ok(()) => {
                                     if !client.device_name.is_empty() {
@@ -899,11 +997,11 @@ pub async fn run() -> Result<()> {
                         // client chose its bitrate for the mode it requested. If
                         // native is larger, every bit is stretched over more
                         // pixels — shows up as uniform shimmer/soft blocking.
-                        let native_px = capturer.width as u64 * capturer.height as u64;
+                        let native_px = capturer.width() as u64 * capturer.height() as u64;
                         let client_px = client.width as u64 * client.height as u64;
                         if client_px > 0 && native_px > client_px {
                             println!("⚠️  Encoding {}x{} (native) but client requested {}x{} — bitrate is stretched {:.1}x thinner per pixel. Raise Moonlight's bitrate or match resolutions.",
-                                capturer.width, capturer.height, client.width, client.height,
+                                capturer.width(), capturer.height(), client.width, client.height,
                                 native_px as f64 / client_px as f64);
                         }
                         rtp_sender.configure(pkt_size, fec as usize, min_fec);
@@ -936,7 +1034,7 @@ pub async fn run() -> Result<()> {
                         } else {
                             5
                         };
-                        audio_streamer = Some(audio::AudioStreamer::start(
+                        audio_manager.start_for_stream(
                             audio_socket.try_clone().expect("clone audio socket"),
                             client.rikey,
                             client.rikeyid,
@@ -946,7 +1044,7 @@ pub async fn run() -> Result<()> {
                             // audio through a virtual sink, host speakers stay
                             // silent), true = also play on the host speakers.
                             client.host_audio,
-                        ));
+                        );
                         // Plug in the virtual Xbox 360 controller(s) for
                         // split-seat gamepad passthrough (input.rs).
                         input::start_session();
@@ -965,10 +1063,12 @@ pub async fn run() -> Result<()> {
                 .unwrap_or((false, false));
             if !still_active {
                 // Always: stop stream outputs and virtual input devices.
+                // stop_and_release also restores the pre-stream default audio
+                // endpoint (claim-once) — it must run BEFORE the VDD teardown
+                // below so the restore happens while the endpoint topology is
+                // still the in-stream one.
                 rtp_sender.reset();
-                if let Some(streamer) = audio_streamer.take() {
-                    streamer.stop();
-                }
+                audio_manager.stop_and_release();
                 input::stop_session();
                 frame_interval  = startup_frame_interval;
                 next_frame_time = Instant::now();
@@ -1023,9 +1123,9 @@ pub async fn run() -> Result<()> {
                 // state between sessions.  rebind_capture_and_encoder only recreates
                 // NVENC when the capture RESOLUTION changes, so an explicit rebuild
                 // is needed here regardless of whether the resolution changed.
-                match encoder::Encoder::new(&capturer.device, encoder::EncoderConfig {
-                    width:        capturer.width  as i32,
-                    height:       capturer.height as i32,
+                match encoder::Encoder::new(capturer.device(), encoder::EncoderConfig {
+                    width:        capturer.width()  as i32,
+                    height:       capturer.height() as i32,
                     fps:          enc.config.fps,
                     bitrate_kbps: enc.config.bitrate_kbps,
                     codec:        enc.config.codec,
@@ -1034,9 +1134,8 @@ pub async fn run() -> Result<()> {
                     Ok(new_enc) => enc = new_enc,
                     Err(e)      => eprintln!("❌ Failed to rebuild encoder after disconnect: {e}"),
                 }
-                input::set_active_capture_rect(
-                    capturer.origin_x, capturer.origin_y,
-                    capturer.width,    capturer.height);
+                let (ox, oy) = capturer.origin();
+                input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
             }
         }
 
@@ -1088,6 +1187,30 @@ pub async fn run() -> Result<()> {
                     congestion_last_event = Instant::now();
                     println!("📈 Congestion: ramped bitrate → {} Kbps (+10%)", ramped);
                 }
+            }
+        }
+
+        // ── Secure-desktop backend swap (Phase 15.2) ─────────────────────────
+        // Keep the capture backend matched to the input desktop: WGC normally,
+        // DDA while a UAC prompt / logon screen holds the secure desktop.
+        // Steady state this is two atomic loads. Only while streaming — an
+        // idle host has nobody watching, and WGC recovers by itself.
+        if client_connected {
+            if let Some(resized) = capturer.maybe_swap_backend() {
+                if resized {
+                    // Swap landed on a different-sized output (e.g. headless VDD
+                    // session falling back to the physical primary) — the encoder
+                    // must match the new capture dimensions.
+                    if recreate_encoder_for_capture(&capturer, &mut enc).is_err() {
+                        break;
+                    }
+                } else {
+                    // Same size, same device — new backend session needs a fresh
+                    // IDR so the client can decode from the first swapped frame.
+                    enc.request_idr();
+                }
+                let (ox, oy) = capturer.origin();
+                input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
             }
         }
 
@@ -1172,7 +1295,7 @@ pub async fn run() -> Result<()> {
             let packet_size = enc.encode_frame(&texture, &mut out_buffer);
 
             if packet_size == 0 {
-                println!("⚠️  encode_frame returned 0 bytes ({}x{})", capturer.width, capturer.height);
+                println!("⚠️  encode_frame returned 0 bytes ({}x{})", capturer.width(), capturer.height());
             }
 
             if packet_size > 0 {
@@ -1204,10 +1327,8 @@ pub async fn run() -> Result<()> {
 
     // Explicit stop (rather than relying on drop at function exit) so the
     // restore-default-audio-device log line is visible before we report done.
-    if let Some(streamer) = audio_streamer.take() {
-        println!("🔊 Restoring host audio output before exit...");
-        streamer.stop();
-    }
+    println!("🔊 Restoring host audio output before exit...");
+    audio_manager.stop_and_release();
 
     // Release the NVENC/D3D pipeline before tearing down the VDD. The encoder
     // holds D3D texture references on the VDD adapter; releasing them first

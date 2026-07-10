@@ -151,9 +151,26 @@ impl WgcCapturer {
     /// compositor, not a fully invalidated handle. Re-resolving each time lets
     /// the physical monitor's new handle land before we bind the WGC session.
     pub fn new_excluding(exclude: Option<&str>) -> Result<Self> {
+        let device = Self::create_d3d11_device()?;
+        Self::new_on_device(device, None, exclude, false)
+    }
+
+    /// Same as [`Self::new_excluding`] but binds to an EXISTING D3D11 device
+    /// instead of creating one — required for the WGC↔DDA backend swap
+    /// (Phase 15.2): the NVENC encoder holds the original device for the whole
+    /// process lifetime, so a WGC session recreated after a DDA interlude must
+    /// come back on that same device or the shim would receive foreign-device
+    /// textures. `target` (GDI device name) wins over `exclude` for monitor
+    /// selection; `is_hdr` picks the frame-pool format directly so the swap
+    /// can restore an HDR session without a second rebind.
+    pub fn new_on_device(
+        device: ID3D11Device,
+        target: Option<&str>,
+        exclude: Option<&str>,
+        is_hdr: bool,
+    ) -> Result<Self> {
         unsafe { let _ = RoInitialize(RO_INIT_MULTITHREADED); }
 
-        let device     = Self::create_d3d11_device()?;
         let wrt_device = Self::wrap_d3d11_device(&device)?;
 
         // E_INVALIDARG (0x80070057) from CreateForMonitor means the HMONITOR is
@@ -164,13 +181,15 @@ impl WgcCapturer {
         let mut last_err: Option<windows::core::Error> = None;
         for attempt in 0..10u32 {
             // Re-resolve on every attempt — the HMONITOR may change between tries.
-            let hmonitor = match exclude {
-                Some(ex) => Self::first_monitor_excluding(ex)
-                                .unwrap_or_else(Self::primary_hmonitor),
-                None     => Self::primary_hmonitor(),
+            let hmonitor = match (target, exclude) {
+                (Some(t), _) => Self::hmonitor_from_device_name(t)
+                                    .unwrap_or_else(Self::primary_hmonitor),
+                (None, Some(ex)) => Self::first_monitor_excluding(ex)
+                                    .unwrap_or_else(Self::primary_hmonitor),
+                (None, None) => Self::primary_hmonitor(),
             };
 
-            match Self::open_session(device.clone(), wrt_device.clone(), hmonitor, false) {
+            match Self::open_session(device.clone(), wrt_device.clone(), hmonitor, is_hdr) {
                 Ok(s) => return Ok(s),
                 Err(e) if e.code() == E_INVALIDARG && attempt < 9 => {
                     println!(
@@ -468,6 +487,12 @@ impl WgcCapturer {
         // The shim cursor-compositing pipeline is left idle (no update_cursor_*
         // calls from the WGC loop), avoiding double compositing.
         session.SetIsCursorCaptureEnabled(true)?;
+        // Remove the yellow/orange capture border Windows draws around a
+        // captured surface, so normal streams look as clean as Sunshine.
+        // Best-effort: IsBorderRequired needs Windows 10 20348+/Win11; on older
+        // builds the call errors and we keep the default border rather than
+        // failing the whole capture session.
+        let _ = session.SetIsBorderRequired(false);
         session.StartCapture()?;
 
         println!("✅ WGC capture session started ({}x{} {})",
