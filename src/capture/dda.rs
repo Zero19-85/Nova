@@ -45,11 +45,13 @@
 //! per frame, but this backend only lives for the seconds a UAC prompt is up,
 //! and it keeps the WGC hot path and the encoder device single-threaded.
 //!
-//! ## Known limitation (documented, deliberate)
+//! ## Cursor
 //!
-//! DDA does not composite the cursor into frames (it arrives as separate
-//! pointer metadata). During a secure-desktop interlude the streamed cursor is
-//! invisible; mouse input still works. Cursor merge is possible later polish.
+//! DDA delivers the cursor as separate pointer metadata rather than compositing
+//! it into the frame. The capture thread reads the pointer position/visibility
+//! from `DXGI_OUTDUPL_FRAME_INFO` + the shape from `GetFramePointerShape` and
+//! blends it into each CPU frame (`blend_cursor`, all three shape types) so the
+//! secure-desktop stream shows the mouse cursor.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -71,7 +73,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows::Win32::System::StationsAndDesktops::{
@@ -421,11 +423,28 @@ unsafe fn setup_duplication(target: Option<&str>, is_hdr: bool) -> Result<Duplic
     Ok(DuplicationSession { dup, device, geometry })
 }
 
+/// Cached hardware-cursor shape from `GetFramePointerShape` (DDA delivers the
+/// cursor as separate pointer metadata, not composited into the frame).
+struct CursorShape {
+    bytes: Vec<u8>,
+    shape_type: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+
 unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
     // Staging texture is reused across frames, recreated only if the size/format
     // changes — kept local to this (capture) thread.
     let mut staging: Option<ID3D11Texture2D> = None;
     let mut staging_dims: Option<(u32, u32, DXGI_FORMAT)> = None;
+
+    // Cursor state, updated from the frame info / pointer-shape API and blended
+    // into every CPU frame so the secure-desktop stream shows the mouse cursor.
+    let mut cursor: Option<CursorShape> = None;
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+    let mut cursor_visible = false;
 
     while !shared.stop.load(Ordering::Acquire) {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -443,11 +462,47 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
             }
         }
 
+        // Position/visibility update (non-zero timestamp = the pointer moved).
+        if info.LastMouseUpdateTime != 0 {
+            cursor_visible = info.PointerPosition.Visible.as_bool();
+            cursor_x = info.PointerPosition.Position.x;
+            cursor_y = info.PointerPosition.Position.y;
+        }
+        // New cursor shape available — fetch and cache it.
+        if info.PointerShapeBufferSize > 0 {
+            let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
+            let mut required = 0u32;
+            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            if session
+                .dup
+                .GetFramePointerShape(
+                    info.PointerShapeBufferSize,
+                    buf.as_mut_ptr() as *mut _,
+                    &mut required,
+                    &mut shape_info,
+                )
+                .is_ok()
+            {
+                cursor = Some(CursorShape {
+                    bytes: buf,
+                    shape_type: shape_info.Type,
+                    width: shape_info.Width,
+                    height: shape_info.Height,
+                    pitch: shape_info.Pitch,
+                });
+            }
+        }
+
         if let Some(res) = resource.as_ref() {
             if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
-                if let Some(frame) =
+                if let Some(mut frame) =
                     copy_frame_to_cpu(&session.device, &tex, &mut staging, &mut staging_dims)
                 {
+                    if cursor_visible {
+                        if let Some(c) = &cursor {
+                            blend_cursor(&mut frame, c, cursor_x, cursor_y);
+                        }
+                    }
                     if let Ok(mut slot) = shared.frame.lock() {
                         *slot = Some(frame);
                     }
@@ -455,6 +510,114 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
             }
         }
         let _ = session.dup.ReleaseFrame();
+    }
+}
+
+/// Alpha-blend the hardware cursor into a captured BGRA8 frame at `(px, py)`.
+/// Handles the three DXGI pointer-shape types; a no-op for non-BGRA8 (e.g. FP16
+/// HDR) frames — the secure desktop is SDR in practice.
+fn blend_cursor(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
+    if frame.format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        return;
+    }
+    const MONOCHROME: u32 = 1;
+    const COLOR: u32 = 2;
+    const MASKED_COLOR: u32 = 4;
+
+    let (fw, fh) = (frame.width as i32, frame.height as i32);
+    let rp = frame.row_pitch as usize;
+    let cp = c.pitch as usize;
+
+    match c.shape_type {
+        COLOR | MASKED_COLOR => {
+            let (cw, ch) = (c.width as i32, c.height as i32);
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= fh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= fw {
+                        continue;
+                    }
+                    let s = cy as usize * cp + cx as usize * 4;
+                    let d = dy as usize * rp + dx as usize * 4;
+                    if s + 4 > c.bytes.len() || d + 4 > frame.bytes.len() {
+                        continue;
+                    }
+                    let (sb, sg, sr, sa) =
+                        (c.bytes[s], c.bytes[s + 1], c.bytes[s + 2], c.bytes[s + 3]);
+                    if c.shape_type == COLOR {
+                        let a = sa as u32;
+                        let blend = |dst: u8, src: u8| {
+                            ((src as u32 * a + dst as u32 * (255 - a)) / 255) as u8
+                        };
+                        frame.bytes[d] = blend(frame.bytes[d], sb);
+                        frame.bytes[d + 1] = blend(frame.bytes[d + 1], sg);
+                        frame.bytes[d + 2] = blend(frame.bytes[d + 2], sr);
+                    } else if sa == 0 {
+                        // MASKED_COLOR: alpha 0 ⇒ opaque copy.
+                        frame.bytes[d] = sb;
+                        frame.bytes[d + 1] = sg;
+                        frame.bytes[d + 2] = sr;
+                    } else {
+                        // alpha 0xFF ⇒ XOR with the destination.
+                        frame.bytes[d] ^= sb;
+                        frame.bytes[d + 1] ^= sg;
+                        frame.bytes[d + 2] ^= sr;
+                    }
+                }
+            }
+        }
+        MONOCHROME => {
+            // 1bpp; height is 2× actual: top = AND mask, bottom = XOR mask.
+            let ch = (c.height / 2) as i32;
+            let cw = c.width as i32;
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= fh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= fw {
+                        continue;
+                    }
+                    let and_i = cy as usize * cp + cx as usize / 8;
+                    let xor_i = (cy + ch) as usize * cp + cx as usize / 8;
+                    if xor_i >= c.bytes.len() {
+                        continue;
+                    }
+                    let bit = 7 - (cx % 8);
+                    let and_bit = (c.bytes[and_i] >> bit) & 1;
+                    let xor_bit = (c.bytes[xor_i] >> bit) & 1;
+                    let d = dy as usize * rp + dx as usize * 4;
+                    if d + 4 > frame.bytes.len() {
+                        continue;
+                    }
+                    match (and_bit, xor_bit) {
+                        (0, 0) => {
+                            frame.bytes[d] = 0;
+                            frame.bytes[d + 1] = 0;
+                            frame.bytes[d + 2] = 0;
+                        }
+                        (0, 1) => {
+                            frame.bytes[d] = 255;
+                            frame.bytes[d + 1] = 255;
+                            frame.bytes[d + 2] = 255;
+                        }
+                        (1, 0) => {} // transparent — leave the desktop pixel
+                        _ => {
+                            frame.bytes[d] ^= 0xFF;
+                            frame.bytes[d + 1] ^= 0xFF;
+                            frame.bytes[d + 2] ^= 0xFF;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
