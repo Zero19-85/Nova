@@ -1,5 +1,10 @@
 # 🚀 NOVA / ECHO: THE MASTER BLUEPRINT
 
+> **Historical document.** This is the original design blueprint, kept for reference.
+> The project has long since shipped past it — see [README.md](README.md) for current
+> status (Phase 15: HDR10, AV1, secure-desktop capture, SYSTEM service, lock-screen
+> streaming) and `CLAUDE.md` for the full engineering log.
+
 **Target Ecosystem:** High-Performance, Ultra-Low Footprint Game-Streaming (GameStream/Moonlight)  
 **Core Language:** 100% Native Rust Engine with bare-metal C++ Hardware Shims
 
