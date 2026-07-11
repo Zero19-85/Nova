@@ -37,8 +37,9 @@
 class NvEncoderD3D11 : public NvEncoder
 {
 public:
-    NvEncoderD3D11(ID3D11Device* pD3D11Device, uint32_t nWidth, uint32_t nHeight, NV_ENC_BUFFER_FORMAT eBufferFormat, 
-        uint32_t nExtraOutputDelay = 3, bool bMotionEstimationOnly = false,  bool bOPInVideoMemory = false);
+    NvEncoderD3D11(ID3D11Device* pD3D11Device, uint32_t nWidth, uint32_t nHeight, NV_ENC_BUFFER_FORMAT eBufferFormat,
+        uint32_t nExtraOutputDelay = 3, bool bMotionEstimationOnly = false,  bool bOPInVideoMemory = false,
+        bool bUseIVFContainer = true);
     virtual ~NvEncoderD3D11();
 
 protected:

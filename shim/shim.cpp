@@ -1121,7 +1121,15 @@ extern "C" __declspec(dllexport) int InitEncoder(
                "DXGI_FORMAT_%s texture\n",
                is_hdr ? "YUV420_10BIT" : "NV12", (unsigned)bufFmt,
                is_hdr ? "P010 (0x68)" : "NV12 (103)");
-        g_nvEncoder = new NvEncoderD3D11(g_device, width, height, bufFmt, 0);
+        // bUseIVFContainer=false: the SDK sample class wraps AV1 output in an
+        // IVF *file* container by default — a 32-byte "DKIF" file header on the
+        // first packet and a 12-byte size+PTS header before EVERY frame. Those
+        // bytes are not OBUs; Moonlight feeds the payload straight to the AV1
+        // decoder, which rejects every frame (black screen, endless IDR
+        // re-requests, bitrate-watchdog disconnect). H264/HEVC were unaffected
+        // because the wrapper only engages for NV_ENC_CODEC_AV1_GUID.
+        g_nvEncoder = new NvEncoderD3D11(g_device, width, height, bufFmt, 0,
+                                         false, false, /*bUseIVFContainer=*/false);
 
         g_initParams = NV_ENC_INITIALIZE_PARAMS{ NV_ENC_INITIALIZE_PARAMS_VER };
         g_encConfig  = NV_ENC_CONFIG{ NV_ENC_CONFIG_VER };
@@ -1273,6 +1281,11 @@ extern "C" __declspec(dllexport) int InitEncoder(
             av1.outputBitDepth         = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
             av1.maxNumRefFramesInDPB   = 5;
             av1.numFwdRefs             = NV_ENC_NUM_REF_FRAMES_1;
+            // level/tier stay at the preset default (autoselect) — Apollo parity;
+            // NVENC derives a correct seq_level_idx from resolution/fps/bitrate.
+            // 4:2:0 chroma siting: horizontally collocated with luma (0,0),
+            // between two vertical samples (Apollo sets the same).
+            av1.chromaSamplePosition   = 1;
             if (is_hdr) {
                 av1.colorPrimaries          = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
                 av1.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
