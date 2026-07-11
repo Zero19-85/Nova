@@ -91,6 +91,12 @@ pub struct RtpSender {
     /// classifications even for IDR/VPS/SPS NALUs → Moonlight never gets a
     /// decodable keyframe → 10-second watchdog timeout.
     is_hevc: bool,
+    /// True when the active session uses AV1. AV1 is NOT an Annex-B NAL stream —
+    /// it is a sequence of OBUs — so `detect_frame_type` parses OBUs (sequence
+    /// header ⇒ keyframe) instead of NAL units. The GameStream packetization
+    /// itself (NV_VIDEO_PACKET shards + FEC) is codec-agnostic, so only the
+    /// keyframe detection differs.
+    is_av1: bool,
     /// Negotiated packet size (from ANNOUNCE) — wire datagram = this + 16.
     packet_size: usize,
     /// FEC parity percentage; 0 disables FEC (matrix-compat A/B knob).
@@ -144,6 +150,7 @@ impl RtpSender {
             min_parity_shards: DEFAULT_MIN_PARITY_SHARDS,
             fec_cache: HashMap::new(),
             is_hevc: false,
+            is_av1: false,
             stat_frames: 0,
             stat_data_pkts: 0,
             stat_parity_pkts: 0,
@@ -179,11 +186,13 @@ impl RtpSender {
         self.fps = fps.max(1);
     }
 
-    /// Set the codec for NAL unit parsing. Must be called at session start
-    /// after the codec is confirmed from the ANNOUNCE SDP so `detect_frame_type`
-    /// uses the correct NAL header layout (HEVC 2-byte vs H.264 1-byte).
-    pub fn set_codec(&mut self, is_hevc: bool) {
+    /// Set the codec for frame-type detection. Must be called at session start
+    /// after the codec is confirmed so `detect_frame_type` uses the right layout:
+    /// AV1 OBUs, or HEVC 2-byte vs H.264 1-byte NAL headers. `is_av1` wins when
+    /// set (AV1 is not a NAL stream, so `is_hevc` is irrelevant then).
+    pub fn set_codec(&mut self, is_hevc: bool, is_av1: bool) {
         self.is_hevc = is_hevc;
+        self.is_av1 = is_av1;
     }
 
     /// Apply per-session stream parameters. `packet_size` must be the client's
@@ -211,6 +220,7 @@ impl RtpSender {
         self.packet_counter  = 0;
         self.frame_index     = 1; // Moonlight discards frame 0 — see field doc
         self.is_hevc         = false;
+        self.is_av1          = false;
     }
 
 
@@ -230,7 +240,7 @@ impl RtpSender {
         if data.is_empty() { return; }
         let Some(target) = self.target else { return };
 
-        let frame_type = detect_frame_type(data, self.is_hevc);
+        let frame_type = detect_frame_type(data, self.is_hevc, self.is_av1);
         let block_size         = self.packet_size + MAX_RTP_HEADER_SIZE;
         let payload_per_packet = block_size - HEADERS_SIZE;
 
@@ -259,9 +269,14 @@ impl RtpSender {
         let total_shards = data_shards + parity_shards;
 
         if self.frame_index < 10 {
-            let nal_names: Vec<&str> = list_nal_types(data, self.is_hevc).iter().map(|t| nal_type_name(*t, self.is_hevc)).collect();
-            println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs={:?}",
-                self.frame_index, data.len(), data_shards, parity_shards, frame_type, nal_names);
+            if self.is_av1 {
+                println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={} (AV1)",
+                    self.frame_index, data.len(), data_shards, parity_shards, frame_type);
+            } else {
+                let nal_names: Vec<&str> = list_nal_types(data, self.is_hevc).iter().map(|t| nal_type_name(*t, self.is_hevc)).collect();
+                println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs={:?}",
+                    self.frame_index, data.len(), data_shards, parity_shards, frame_type, nal_names);
+            }
         }
 
         // ── Frame header: first 8 bytes of the payload stream ────────────────
@@ -457,7 +472,10 @@ fn list_nal_types(data: &[u8], is_hevc: bool) -> Vec<u8> {
 /// prefixes an IDR with AUD + VPS + SPS + PPS (HEVC) or AUD + SPS + PPS (H.264)
 /// before the slice NAL, so we must scan all NALs rather than just the first.
 /// The returned value goes in byte 3 of the NV_VIDEO_PACKET frame header.
-pub(crate) fn detect_frame_type(data: &[u8], is_hevc: bool) -> u8 {
+pub(crate) fn detect_frame_type(data: &[u8], is_hevc: bool, is_av1: bool) -> u8 {
+    if is_av1 {
+        return if av1_is_keyframe(data) { 2 } else { 1 };
+    }
     let mut i = 0;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
@@ -480,6 +498,54 @@ pub(crate) fn detect_frame_type(data: &[u8], is_hevc: bool) -> u8 {
         }
     }
     1
+}
+
+/// AV1 keyframe detection over the low-overhead OBU bitstream NVENC emits.
+///
+/// A key frame's temporal unit carries an `OBU_SEQUENCE_HEADER` (type 1) — NVENC
+/// emits the sequence header only with key frames (the AV1 analogue of
+/// SPS/VPS-on-IDR), so its presence marks the keyframe. We walk OBUs by their
+/// `obu_size` LEB128 field (NVENC sets `obu_has_size_field`); if an OBU lacks a
+/// size field we can't advance past it, but the sequence header sits at the
+/// front of a key temporal unit so it is seen before that matters.
+fn av1_is_keyframe(data: &[u8]) -> bool {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    let mut i = 0usize;
+    while i < data.len() {
+        let hdr = data[i];
+        let obu_type = (hdr >> 3) & 0x0F;
+        let ext_flag = (hdr >> 2) & 1;
+        let has_size = (hdr >> 1) & 1;
+        i += 1;
+        if ext_flag == 1 {
+            i += 1; // temporal/spatial id byte
+        }
+        if obu_type == OBU_SEQUENCE_HEADER {
+            return true;
+        }
+        if has_size == 1 {
+            let (size, consumed) = read_leb128(&data[i..]);
+            i += consumed + size as usize;
+        } else {
+            break; // no size field — cannot walk further
+        }
+    }
+    false
+}
+
+/// Read an unsigned LEB128 (AV1 `leb128()`), returning `(value, bytes_read)`.
+fn read_leb128(data: &[u8]) -> (u64, usize) {
+    let mut value = 0u64;
+    let mut i = 0;
+    while i < data.len() && i < 8 {
+        let b = data[i];
+        value |= ((b & 0x7F) as u64) << (i * 7);
+        i += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    (value, i)
 }
 
 #[cfg(test)]
@@ -585,6 +651,20 @@ mod tests {
         sender.send_frame(&frame);
         let pkts = recv_frame_datagrams(&client);
         assert_eq!(frame_index_of(&pkts[0]), 1, "post-reset first frame must be index 1");
+    }
+
+    /// AV1 keyframe detection: an OBU stream containing a sequence header (type
+    /// 1) is an IDR (2); one without is a P-frame (1). Locks the OBU walk +
+    /// LEB128 size parsing that marks AV1 frames for Moonlight.
+    #[test]
+    fn av1_sequence_header_is_detected_as_idr() {
+        // temporal delimiter (type 2, size 0) + sequence header (type 1, size 4).
+        let key = [0x12, 0x00, 0x0A, 0x04, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(detect_frame_type(&key, false, true), 2, "seq header ⇒ IDR");
+
+        // temporal delimiter + frame OBU (type 6, size 3) — no sequence header.
+        let inter = [0x12, 0x00, 0x32, 0x03, 0xAA, 0xBB, 0xCC];
+        assert_eq!(detect_frame_type(&inter, false, true), 1, "no seq header ⇒ P");
     }
 
     /// Draining must keep the most recent sender when pings from an old and a

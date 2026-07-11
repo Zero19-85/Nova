@@ -312,9 +312,15 @@ pub async fn run() -> Result<()> {
     // Old-protocol clients (Xbox Moonlight 1.18.0, corever=1) read
     // sprop-parameter-sets=AAAAAU in DESCRIBE for HEVC capability and the
     // fps cap handles graceful degradation for H264 fallback scenarios.
-    let codec_mode_support: u32 = 0x301;
+    // SCM bits (moonlight-common-c Limelight.h VIDEO_FORMAT_*): H264=0x1,
+    // HEVC Main8=0x100, HEVC Main10=0x200, AV1 Main8=0x1000. 0x1301 advertises
+    // H264 + HEVC(Main8/Main10) + AV1(Main8). AV1 uses the same GameStream
+    // packetization as H264/HEVC; only rtp::detect_frame_type is codec-specific
+    // (it parses OBUs for AV1). AV1 Main10/HDR (0x2000) is not advertised yet —
+    // the shim's AV1 path is 8-bit and Codec::from_video_format only maps 0x1000.
+    let codec_mode_support: u32 = 0x1301;
     let startup_codec = encoder::Codec::from_str(&codec);
-    println!("🎥 ServerCodecModeSupport={codec_mode_support} (H264+HEVC); startup encoder: {}", startup_codec.as_str());
+    println!("🎥 ServerCodecModeSupport={codec_mode_support} (H264+HEVC+AV1); startup encoder: {}", startup_codec.as_str());
     if cfg.stream.enable_hdr {
         println!("✨ nova.toml: enable_hdr=true — HDR10 will activate for HEVC sessions regardless of VDD capability query");
     }
@@ -964,8 +970,10 @@ pub async fn run() -> Result<()> {
                         }
 
                         rtp_sender.set_fps(session_fps.max(1));
-                        rtp_sender.set_codec(enc.config.codec == encoder::Codec::Hevc
-                            || enc.config.codec == encoder::Codec::Av1);
+                        rtp_sender.set_codec(
+                            enc.config.codec == encoder::Codec::Hevc,
+                            enc.config.codec == encoder::Codec::Av1,
+                        );
                         let negotiated_interval = Duration::from_secs_f64(1.0 / session_fps.max(1) as f64);
                         if negotiated_interval != frame_interval {
                             frame_interval = negotiated_interval;
@@ -1315,9 +1323,9 @@ pub async fn run() -> Result<()> {
 
                 if video_learned {
                     let data = &out_buffer[..packet_size as usize];
-                    let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc
-                        || enc.config.codec == encoder::Codec::Av1;
-                    let kind = if rtp::detect_frame_type(data, is_hevc_enc) == 2 { "IDR" } else { "P" };
+                    let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc;
+                    let is_av1_enc = enc.config.codec == encoder::Codec::Av1;
+                    let kind = if rtp::detect_frame_type(data, is_hevc_enc, is_av1_enc) == 2 { "IDR" } else { "P" };
                     println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, kind);
                     rtp_sender.send_frame(data);
                 }
