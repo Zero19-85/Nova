@@ -1251,6 +1251,39 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.enableIntraRefresh = 1;
             hevc.intraRefreshPeriod = fps;
             hevc.intraRefreshCnt    = fps;
+        } else if (codecGuid == NV_ENC_CODEC_AV1_GUID) {
+            // AV1 had NO config block before — it ran on raw NVENC defaults,
+            // which produced an undecodable stream on the client (black screen
+            // even though frames encoded and IDRs were detected). These settings
+            // mirror the H264/HEVC blocks and Sunshine's proven AV1 config.
+            encodeConfig.profileGUID = NV_ENC_AV1_PROFILE_MAIN_GUID;
+            auto& av1 = encodeConfig.encodeCodecConfig.av1Config;
+            // Output the sequence header on every key frame — the AV1 analogue of
+            // repeatSPSPPS. The decoder needs it to initialise, and it's what
+            // rtp::av1_is_keyframe keys off for IDR marking.
+            av1.repeatSeqHdr           = 1;
+            av1.idrPeriod              = NVENC_INFINITE_GOPLENGTH; // on-demand IDR only
+            // Low-overhead OBU stream (obu_has_size_field) — NOT Annex-B. This is
+            // the format Moonlight's AV1 depacketizer/decoder expects; Annex-B
+            // (temporal-unit length prefixes) would fail to decode.
+            av1.outputAnnexBFormat     = 0;
+            av1.chromaFormatIDC        = 1; // 4:2:0
+            av1.enableBitstreamPadding = 1; // CBR filler on static frames (H264/HEVC parity)
+            av1.inputBitDepth          = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            av1.outputBitDepth         = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            av1.maxNumRefFramesInDPB   = 5;
+            av1.numFwdRefs             = NV_ENC_NUM_REF_FRAMES_1;
+            if (is_hdr) {
+                av1.colorPrimaries          = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+                av1.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+                av1.matrixCoefficients      = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+                av1.colorRange              = 1;
+            } else {
+                av1.colorPrimaries          = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                av1.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                av1.matrixCoefficients      = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                av1.colorRange              = 0;
+            }
         }
 
         ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
