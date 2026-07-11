@@ -513,10 +513,14 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
     }
 }
 
-/// Alpha-blend the hardware cursor into a captured BGRA8 frame at `(px, py)`.
-/// Handles the three DXGI pointer-shape types; a no-op for non-BGRA8 (e.g. FP16
-/// HDR) frames — the secure desktop is SDR in practice.
+/// Alpha-blend the hardware cursor into a captured frame at `(px, py)`. Handles
+/// the three DXGI pointer-shape types for both BGRA8 (SDR) and FP16 scRGB (HDR)
+/// frames — the HDR path is why the cursor was previously missing with HDR10.
 fn blend_cursor(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
+    if frame.format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        blend_cursor_fp16(frame, c, px, py);
+        return;
+    }
     if frame.format != DXGI_FORMAT_B8G8R8A8_UNORM {
         return;
     }
@@ -618,6 +622,168 @@ fn blend_cursor(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
             }
         }
         _ => {}
+    }
+}
+
+/// FP16 (scRGB, HDR) variant of [`blend_cursor`]. The cursor shape is 8-bit
+/// sRGB; convert it to linear and blend into the half-float channels. SDR white
+/// (sRGB 255) maps to scRGB 1.0, matching how DWM composites the SDR secure
+/// desktop, so the cursor sits at the same brightness as the screen behind it.
+fn blend_cursor_fp16(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
+    const MONOCHROME: u32 = 1;
+    const COLOR: u32 = 2;
+    const MASKED_COLOR: u32 = 4;
+
+    let (fw, fh) = (frame.width as i32, frame.height as i32);
+    let rp = frame.row_pitch as usize;
+    let cp = c.pitch as usize;
+
+    match c.shape_type {
+        COLOR | MASKED_COLOR => {
+            let (cw, ch) = (c.width as i32, c.height as i32);
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= fh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= fw {
+                        continue;
+                    }
+                    let s = cy as usize * cp + cx as usize * 4;
+                    let d = dy as usize * rp + dx as usize * 8;
+                    if s + 4 > c.bytes.len() || d + 8 > frame.bytes.len() {
+                        continue;
+                    }
+                    let (sb, sg, sr, sa) =
+                        (c.bytes[s], c.bytes[s + 1], c.bytes[s + 2], c.bytes[s + 3]);
+                    let (lr, lg, lb) =
+                        (srgb8_to_linear(sr), srgb8_to_linear(sg), srgb8_to_linear(sb));
+                    if c.shape_type == COLOR {
+                        blend_px_fp16(&mut frame.bytes, d, lr, lg, lb, sa as f32 / 255.0);
+                    } else if sa == 0 {
+                        blend_px_fp16(&mut frame.bytes, d, lr, lg, lb, 1.0);
+                    } else {
+                        invert_px_fp16(&mut frame.bytes, d);
+                    }
+                }
+            }
+        }
+        MONOCHROME => {
+            let ch = (c.height / 2) as i32;
+            let cw = c.width as i32;
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= fh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= fw {
+                        continue;
+                    }
+                    let and_i = cy as usize * cp + cx as usize / 8;
+                    let xor_i = (cy + ch) as usize * cp + cx as usize / 8;
+                    if xor_i >= c.bytes.len() {
+                        continue;
+                    }
+                    let bit = 7 - (cx % 8);
+                    let and_bit = (c.bytes[and_i] >> bit) & 1;
+                    let xor_bit = (c.bytes[xor_i] >> bit) & 1;
+                    let d = dy as usize * rp + dx as usize * 8;
+                    if d + 8 > frame.bytes.len() {
+                        continue;
+                    }
+                    match (and_bit, xor_bit) {
+                        (0, 0) => blend_px_fp16(&mut frame.bytes, d, 0.0, 0.0, 0.0, 1.0),
+                        (0, 1) => blend_px_fp16(&mut frame.bytes, d, 1.0, 1.0, 1.0, 1.0),
+                        (1, 0) => {} // transparent
+                        _ => invert_px_fp16(&mut frame.bytes, d),
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Alpha-blend a linear RGB colour into an FP16 pixel at byte offset `d`.
+fn blend_px_fp16(bytes: &mut [u8], d: usize, r: f32, g: f32, b: f32, a: f32) {
+    let dr = f16_to_f32(u16::from_le_bytes([bytes[d], bytes[d + 1]]));
+    let dg = f16_to_f32(u16::from_le_bytes([bytes[d + 2], bytes[d + 3]]));
+    let db = f16_to_f32(u16::from_le_bytes([bytes[d + 4], bytes[d + 5]]));
+    let nr = f32_to_f16(r * a + dr * (1.0 - a));
+    let ng = f32_to_f16(g * a + dg * (1.0 - a));
+    let nb = f32_to_f16(b * a + db * (1.0 - a));
+    bytes[d..d + 2].copy_from_slice(&nr.to_le_bytes());
+    bytes[d + 2..d + 4].copy_from_slice(&ng.to_le_bytes());
+    bytes[d + 4..d + 6].copy_from_slice(&nb.to_le_bytes());
+}
+
+/// Invert an FP16 pixel (approximates the GDI XOR/invert cursor operation).
+fn invert_px_fp16(bytes: &mut [u8], d: usize) {
+    for ch in 0..3 {
+        let o = d + ch * 2;
+        let v = f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+        let iv = f32_to_f16((1.0 - v).clamp(0.0, 1.0));
+        bytes[o..o + 2].copy_from_slice(&iv.to_le_bytes());
+    }
+}
+
+/// sRGB 8-bit → linear float (scRGB uses a linear transfer function).
+fn srgb8_to_linear(c: u8) -> f32 {
+    let s = c as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Minimal IEEE half → f32 (finite values; NaN/Inf collapse to finite here).
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) as u32 & 1;
+    let exp = (h >> 10) as u32 & 0x1f;
+    let mant = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            // subnormal — normalize into a float32 exponent
+            let mut e = exp as i32;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let exp32 = (e + (127 - 15)) as u32;
+            (sign << 31) | (exp32 << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) // treat Inf/NaN as large; clamped on write
+    } else {
+        ((sign << 31) | ((exp + (127 - 15)) << 23)) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Minimal f32 → IEEE half for the [0, 1]-ish range a cursor blend produces.
+/// Values are clamped to the representable half range; tiny values flush to 0.
+fn f32_to_f16(f: f32) -> u16 {
+    let f = f.clamp(0.0, 65504.0);
+    if f == 0.0 {
+        return 0;
+    }
+    let bits = f.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    if exp >= 0x1f {
+        0x7bff // max finite half
+    } else if exp <= 0 {
+        0 // below half's normal range — negligible for a cursor
+    } else {
+        ((exp as u16) << 10) | ((mant >> 13) as u16)
     }
 }
 
