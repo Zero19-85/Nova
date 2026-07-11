@@ -263,17 +263,65 @@ impl DesktopManager {
 
     /// Start on WGC excluding the virtual-display device named `exclude` — the
     /// same entry point `lib.rs` used with the bare `WgcCapturer`.
+    ///
+    /// **Pre-login fallback:** WGC's WinRT/broker infrastructure requires a
+    /// real interactive user session. When the service-launched host starts at
+    /// the logon screen (no user logged in yet), `WgcCapturer::new` fails with
+    /// `0x80070424` (ERROR_SERVICE_DOES_NOT_EXIST) and previously took the
+    /// whole host down — the service respawned it every 2 s and each restart's
+    /// VDD devnode cycle played the device connect/disconnect chime in an
+    /// endless loop. Instead we fall back to starting on DDA, which — via the
+    /// service-provided SYSTEM impersonation token — is exactly the backend
+    /// that CAN capture the Winlogon/logon desktop, so Moonlight can connect
+    /// at the lock screen and the user can type their PIN remotely (the whole
+    /// point of true headless). After login, `maybe_swap_backend` /
+    /// session `rebind` route the process back onto WGC as usual.
     pub fn new_wgc(exclude: Option<&str>) -> Result<Self> {
-        let wgc = WgcCapturer::new_excluding(exclude)?;
-        let device = wgc.device.clone();
-        Ok(Self {
-            backend: CaptureBackend::Wgc(wgc),
-            device,
-            target: None,
-            exclude: exclude.map(str::to_owned),
-            is_hdr: false,
-            swap_retry_after: None,
-        })
+        let wgc_err = match WgcCapturer::new_excluding(exclude) {
+            Ok(wgc) => {
+                let device = wgc.device.clone();
+                return Ok(Self {
+                    backend: CaptureBackend::Wgc(wgc),
+                    device,
+                    target: None,
+                    exclude: exclude.map(str::to_owned),
+                    is_hdr: false,
+                    swap_retry_after: None,
+                });
+            }
+            Err(e) => e,
+        };
+
+        println!(
+            "⚠️  WGC unavailable at startup ({wgc_err:?}) — likely pre-login \
+             (logon/lock screen). Falling back to DDA so the login UI is \
+             streamable; WGC takes over after login."
+        );
+        let device = WgcCapturer::create_d3d11_device()?;
+        match DdaCapturer::new(device.clone(), None, false) {
+            Ok(dda) => Ok(Self {
+                backend: CaptureBackend::Dda(dda),
+                device,
+                target: None,
+                exclude: exclude.map(str::to_owned),
+                is_hdr: false,
+                swap_retry_after: None,
+            }),
+            Err(dda_err) => {
+                println!(
+                    "❌ DDA startup fallback also failed: {dda_err:?} (no \
+                     --system-token from the service, or no output attached)"
+                );
+                // Surface the original WGC error — it names the primary failure.
+                Err(wgc_err)
+            }
+        }
+    }
+
+    /// Which backend is currently live — lets `lib.rs` run the idle
+    /// DDA→WGC heal without exposing the backend itself.
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend.kind()
     }
 
     /// Drive the backend to match the current input desktop. Called once per

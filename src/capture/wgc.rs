@@ -385,8 +385,10 @@ impl WgcCapturer {
 
     /// Creates the hardware D3D11 device (adapter 0 / primary GPU) that is
     /// shared between the WGC frame pool and the NVENC encoder for the entire
-    /// process lifetime.
-    fn create_d3d11_device() -> Result<ID3D11Device> {
+    /// process lifetime. `pub(crate)`: `DesktopManager` also uses it to build
+    /// the shared device when starting DDA-first (pre-login boot, where WGC
+    /// cannot initialize at all).
+    pub(crate) fn create_d3d11_device() -> Result<ID3D11Device> {
         unsafe {
             let mut device = None;
             D3D11CreateDevice(

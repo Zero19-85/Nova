@@ -380,6 +380,18 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
     let mut host: Option<HostProcess> = None;
     let handles = [stop, wake];
 
+    // Crash-loop damper. A host that dies within HEALTHY_UPTIME of its spawn
+    // is treated as crash-looping and each successive respawn is delayed
+    // (4 s, 8 s, 16 s, … capped at 60 s). Without this, a host that crashes
+    // during startup gets respawned every reconcile tick — and because every
+    // host start cycles the VDD devnode, a pre-login crash loop played the
+    // Windows device connect/disconnect chime endlessly (the "boot loop"
+    // sound). A host that stays up past HEALTHY_UPTIME resets the damper.
+    const HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut last_spawn: Option<std::time::Instant> = None;
+    let mut fast_exits: u32 = 0;
+    let mut respawn_not_before: Option<std::time::Instant> = None;
+
     loop {
         // Reconcile: ensure a host is running in the CURRENT console session.
         let session = unsafe { WTSGetActiveConsoleSessionId() };
@@ -388,22 +400,53 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                 None => true,
                 Some(h) if h.has_exited() => {
                     let _ = unsafe { CloseHandle(h.process) };
+                    match last_spawn {
+                        Some(t) if t.elapsed() < HEALTHY_UPTIME => {
+                            fast_exits += 1;
+                            let delay_s = (2u64 << fast_exits.min(5)).min(60);
+                            respawn_not_before = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(delay_s),
+                            );
+                            println!(
+                                "⚠️  Host exited {:.1}s after spawn (fast exit #{fast_exits}) — \
+                                 backing off {delay_s}s before respawn",
+                                t.elapsed().as_secs_f32()
+                            );
+                        }
+                        _ => {
+                            fast_exits = 0;
+                            respawn_not_before = None;
+                        }
+                    }
                     true
                 }
                 Some(h) if h.session_id != session => {
                     // Console moved to another session (fast user switch / RDP).
                     println!("🔄 Console session {} → {} — respawning host", h.session_id, session);
                     h.terminate();
+                    // A session change is a fresh environment — don't carry a
+                    // crash-loop backoff into it.
+                    fast_exits = 0;
+                    respawn_not_before = None;
                     true
                 }
                 Some(_) => false,
             };
+            let backoff_active = respawn_not_before
+                .is_some_and(|t| std::time::Instant::now() < t);
             if need_spawn {
+                // Drop the dead entry immediately — its handle is already
+                // closed; keeping it would re-wait/re-close a stale HANDLE on
+                // the next tick while a backoff delays the respawn.
                 host = None;
+            }
+            if need_spawn && !backoff_active {
                 match spawn_host_in_session(&exe, session) {
                     Ok(h) => {
                         println!("✅ Host spawned in session {session} (pid handle live)");
                         host = Some(h);
+                        last_spawn = Some(std::time::Instant::now());
                     }
                     Err(e) => {
                         // Transient at boot (no shell yet) or a real privilege

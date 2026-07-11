@@ -364,7 +364,7 @@ pub async fn run() -> Result<()> {
     // with NVENC across every backend swap.
     let mut capturer = capture::DesktopManager::new_wgc(virtual_device_name.as_deref())
         .map_err(|e| {
-            println!("❌ Failed to start WGC capture — no usable display found: {e:?}");
+            println!("❌ Failed to start desktop capture (WGC and DDA fallback): {e:?}");
             e
         })?;
     {
@@ -485,7 +485,14 @@ pub async fn run() -> Result<()> {
     // Congestion control: the session's negotiated bitrate ceiling and bookkeeping
     // for the reduce→ramp-back cycle. Written at session start, reset on disconnect.
     let mut congestion_stable_kbps: u32 = 0;
-    let mut congestion_last_event = Instant::now() - Duration::from_secs(30);
+    // checked_sub: Instant is QPC-since-boot on Windows — the service-launched
+    // host can start <30 s after power-on, where a plain subtraction underflows
+    // and panics ("overflow when subtracting duration from instant"), crash-
+    // looping the host pre-login. Falling back to now() merely delays the
+    // first congestion reduction by up to one cooldown.
+    let mut congestion_last_event = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .unwrap_or_else(Instant::now);
     // Per-second encoder output rate — catches rate-control regressions
     // locally (works without any client connected), e.g. CBR overshooting
     // what the link/client can take.
@@ -1034,7 +1041,11 @@ pub async fn run() -> Result<()> {
                             encoder::reconfigure_bitrate(client.bitrate_kbps, session_fps);
                             encoder::set_stream_bitrate_kbps(client.bitrate_kbps as i32);
                             congestion_stable_kbps = client.bitrate_kbps;
-                            congestion_last_event  = Instant::now() - Duration::from_secs(30);
+                            // checked_sub — see the init at the top of run():
+                            // plain subtraction panics when uptime < 30 s.
+                            congestion_last_event  = Instant::now()
+                                .checked_sub(Duration::from_secs(30))
+                                .unwrap_or_else(Instant::now);
                             // Mirror negotiated values into enc.config so any
                             // mid-session rebind (resolution/device change) inherits
                             // the session fps (may be capped below client.fps for H264)
@@ -1227,6 +1238,18 @@ pub async fn run() -> Result<()> {
                     // IDR so the client can decode from the first swapped frame.
                     enc.request_idr();
                 }
+                let (ox, oy) = capturer.origin();
+                input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+            }
+        } else if capturer.backend_kind() == capture::BackendKind::Dda {
+            // Idle heal only: a host that booted pre-login starts on DDA (see
+            // DesktopManager::new_wgc). Once the user logs in, hand the
+            // interactive desktop back to WGC even with no client connected —
+            // an idle DDA backend would otherwise hold the SYSTEM-impersonating
+            // capture thread and the output's single duplication slot
+            // indefinitely. WGC→DDA swaps stay gated on client_connected so an
+            // unwatched UAC prompt doesn't churn backends.
+            if capturer.maybe_swap_backend().is_some() {
                 let (ox, oy) = capturer.origin();
                 input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
             }

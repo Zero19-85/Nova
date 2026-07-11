@@ -45,39 +45,63 @@ fn tray_main(
     shutdown_tx: Arc<watch::Sender<bool>>,
     global_pin: Arc<Mutex<(String, String)>>,
 ) {
-    // ── Build the right-click context menu ────────────────────────────────
-    let pair_item = MenuItem::new("Pair Device", true, None);
-    let quit_item = MenuItem::new("Quit Nova", true, None);
-
-    let menu = Menu::new();
-    let _ = menu.append(&pair_item);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&quit_item);
-
-    // Capture IDs now — the items will be moved into the menu.
-    let pair_id = pair_item.id().clone();
-    let quit_id = quit_item.id().clone();
-
-    // ── Load the app icon ─────────────────────────────────────────────────
-    // Try to load from the Win32 resource section (resource ID 1, compiled
-    // into the .exe by build.rs via rc.exe).  Fall back to a plain blue
-    // 16 × 16 RGBA square so the tray always shows *something*.
-    let icon = Icon::from_resource(1, Some((32, 32))).unwrap_or_else(|_| {
-        // RGBA: solid #0078D4 (Windows accent blue), fully opaque
-        let px = [0u8, 120, 212, 255];
-        Icon::from_rgba(px.repeat(16 * 16), 16, 16).expect("fallback tray icon")
-    });
-
-    // ── Create the tray icon ─────────────────────────────────────────────
+    // ── Create the tray icon (with pre-login retry) ──────────────────────
     // tray-icon owns the hidden Win32 window, NOTIFYICONDATAW registration,
     // and SetForegroundWindow / TrackPopupMenu calls internally — all the
     // quirks our manual implementation was getting wrong.
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("Nova Game Streaming")
-        .with_icon(icon)
-        .build()
-        .expect("failed to create system tray icon");
+    //
+    // Shell_NotifyIconW needs the shell (Explorer taskbar). The service-
+    // launched host can start at the logon screen where no shell exists yet —
+    // creation fails there. That must NOT panic (it used to, once per boot-
+    // loop respawn): retry quietly until the user logs in and the taskbar
+    // appears, then the icon shows up as normal. The menu/icon values are
+    // consumed by the builder, so they are rebuilt on every attempt.
+    let mut logged_wait = false;
+    let (tray, pair_id, quit_id) = loop {
+        let pair_item = MenuItem::new("Pair Device", true, None);
+        let quit_item = MenuItem::new("Quit Nova", true, None);
+
+        let menu = Menu::new();
+        let _ = menu.append(&pair_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&quit_item);
+
+        // Capture IDs now — the items will be moved into the menu.
+        let pair_id = pair_item.id().clone();
+        let quit_id = quit_item.id().clone();
+
+        // Icon: from the Win32 resource section (resource ID 1, compiled into
+        // the .exe by build.rs via rc.exe), else a plain blue 16 × 16 square
+        // so the tray always shows *something*.
+        let icon = Icon::from_resource(1, Some((32, 32))).unwrap_or_else(|_| {
+            // RGBA: solid #0078D4 (Windows accent blue), fully opaque
+            let px = [0u8, 120, 212, 255];
+            Icon::from_rgba(px.repeat(16 * 16), 16, 16).expect("fallback tray icon")
+        });
+
+        match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("Nova Game Streaming")
+            .with_icon(icon)
+            .build()
+        {
+            Ok(tray) => break (tray, pair_id, quit_id),
+            Err(e) => {
+                if !logged_wait {
+                    println!(
+                        "ℹ️  Tray icon unavailable ({e}) — no shell yet \
+                         (pre-login?). Retrying every 10 s until the taskbar \
+                         exists."
+                    );
+                    logged_wait = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
+    };
+    if logged_wait {
+        println!("✅ Tray icon created after shell became available");
+    }
 
     // ── Event loop ────────────────────────────────────────────────────────
     let mut msg = MSG::default();
