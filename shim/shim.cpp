@@ -1292,6 +1292,16 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         g_nvEncoder->CreateEncoder(&initializeParams);
 
+        // Guarantee the FIRST frame out of a freshly-(re)created encoder is a
+        // forced IDR with inline headers (FORCEIDR | OUTPUT_SPSPPS). H264/HEVC
+        // emit SPS on their natural first keyframe, but NVENC AV1's first frame
+        // does NOT carry the sequence header (only OUTPUT_SPSPPS forces it), so
+        // without this the first AV1 frame is a header-less non-IDR: the client
+        // can't decode it, and a P-like first frame poisons the AV1 decoder for
+        // the real IDR that follows. Setting it here fixes AV1 and is a harmless
+        // explicit guarantee for H264/HEVC.
+        g_force_idr.store(true);
+
         if (is_hdr) BuildHdrMetadata();
 
         ShimLog("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
