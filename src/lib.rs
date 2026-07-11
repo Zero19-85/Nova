@@ -471,6 +471,15 @@ pub async fn run() -> Result<()> {
     let mut out_buffer       = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
     let mut video_learned    = false;
+    // The FIRST frame sent to the client each session must be an IDR. A leading
+    // P-frame is fatal for AV1 (its P-frames carry no sequence header, so the
+    // decoder can't initialize and rejects the stream — Moonlight kicks back to
+    // the app list). NVENC's forced IDR can land on a warm-up frame that is
+    // encoded before the client's video address is learned and thus never sent,
+    // so we gate: drop leading P-frames and keep re-requesting an IDR until a
+    // real keyframe is the first thing the client receives. No-op for H264/HEVC
+    // (their first frame is already an IDR). Reset per session.
+    let mut first_idr_sent   = false;
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
     // Congestion control: the session's negotiated bitrate ceiling and bookkeeping
@@ -1082,6 +1091,7 @@ pub async fn run() -> Result<()> {
                 next_frame_time = Instant::now();
                 client_connected    = false;
                 video_learned       = false;
+                first_idr_sent      = false; // next session must open with an IDR
                 congestion_stable_kbps = 0;
                 encoder::set_stream_bitrate_kbps(0);
 
@@ -1325,9 +1335,19 @@ pub async fn run() -> Result<()> {
                     let data = &out_buffer[..packet_size as usize];
                     let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc;
                     let is_av1_enc = enc.config.codec == encoder::Codec::Av1;
-                    let kind = if rtp::detect_frame_type(data, is_hevc_enc, is_av1_enc) == 2 { "IDR" } else { "P" };
-                    println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, kind);
-                    rtp_sender.send_frame(data);
+                    let is_idr = rtp::detect_frame_type(data, is_hevc_enc, is_av1_enc) == 2;
+                    if !first_idr_sent && !is_idr {
+                        // Don't open the stream with a P-frame — re-request an IDR
+                        // and drop this frame until the first keyframe is ready.
+                        enc.request_idr();
+                        if frames_encoded < 20 {
+                            println!("[ENC] frame={} ({} bytes) dropped — waiting for first IDR", frames_encoded, packet_size);
+                        }
+                    } else {
+                        first_idr_sent = true;
+                        println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, if is_idr { "IDR" } else { "P" });
+                        rtp_sender.send_frame(data);
+                    }
                 }
             }
         }
