@@ -32,7 +32,9 @@
 //! - console session changes (fast user switching, RDP connect/disconnect) ⇒
 //!   the `SERVICE_CONTROL_SESSIONCHANGE` handler nudges the worker, which kills
 //!   the host bound to the old session and spawns a fresh one in the new one;
-//! - `STOP` / `SHUTDOWN` ⇒ stop managing and terminate the host. (On OS
+//! - `STOP` / `SHUTDOWN` ⇒ signal the host's named shutdown event
+//!   (`Global\NovaHostShutdown`) so it runs its full graceful teardown, wait
+//!   the grace period, then `TerminateProcess` as the backstop. (On OS
 //!   shutdown the host also receives its own `WM_ENDSESSION` / console-ctrl
 //!   signals, so its emergency display-restore still runs; see `shutdown.rs`.)
 //!
@@ -55,7 +57,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, ERROR_ACCESS_DENIED};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE,
+};
 use windows::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SecurityIdentification, SecurityImpersonation,
     SetTokenInformation, TokenElevationType, TokenElevationTypeLimited, TokenLinkedToken,
@@ -75,9 +79,10 @@ use windows::Win32::System::Services::{
     SERVICE_STOP_PENDING, SERVICE_STATUS_CURRENT_STATE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent,
-    WaitForMultipleObjects, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
-    NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateEventW, CreateMutexW, CreateProcessAsUserW, GetCurrentProcess, OpenEventW,
+    OpenProcessToken, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_UNICODE_ENVIRONMENT, EVENT_MODIFY_STATE, INFINITE, NORMAL_PRIORITY_CLASS,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 // ── SYSTEM impersonation token handed to the host ─────────────────────────────
@@ -423,8 +428,11 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                 }
                 Some(h) if h.session_id != session => {
                     // Console moved to another session (fast user switch / RDP).
+                    // Graceful first: the old session's host restores its VDD
+                    // topology and audio endpoint before the new session's host
+                    // starts from a clean slate.
                     println!("🔄 Console session {} → {} — respawning host", h.session_id, session);
-                    h.terminate();
+                    stop_host(h);
                     // A session change is a fresh environment — don't carry a
                     // crash-loop backoff into it.
                     fast_exits = 0;
@@ -466,15 +474,13 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
         // WAIT_OBJECT_0+1 (wake) or WAIT_TIMEOUT ⇒ loop and reconcile.
     }
 
-    // Service is stopping. The common stop cause is the user's tray "Quit",
-    // which makes the host call `sc stop NovaService` and THEN run its own
-    // graceful teardown (display + audio restore). Give it a grace period to
-    // exit on its own before force-terminating, so that teardown completes.
+    // Service is stopping — from the tray "Quit" (host already exiting), an
+    // installer upgrade's `sc stop`, a manual stop, or OS shutdown. stop_host
+    // signals the host's named shutdown event so its graceful teardown
+    // (display + audio restore) runs even when the host did NOT initiate the
+    // stop, then grace-waits before the TerminateProcess backstop.
     if let Some(h) = host.take() {
-        unsafe {
-            let _ = WaitForSingleObject(h.process, HOST_GRACEFUL_EXIT_MS);
-        }
-        h.terminate(); // no-op terminate if it already exited; also closes the handle
+        stop_host(&h);
     }
 }
 
@@ -495,6 +501,126 @@ pub fn request_service_stop() {
         .args(["stop", SERVICE_NAME])
         .creation_flags(CREATE_NO_WINDOW)
         .status();
+}
+
+// ── Cross-process graceful stop (service → host) ─────────────────────────────
+//
+// TerminateProcess skips every Rust destructor and console handler in the
+// host, so a service-initiated stop (installer upgrade `sc stop`, manual stop,
+// session change) used to leave the VDD headless topology and the virtual
+// audio sink engaged until the next boot's healing pass. The fix is a named
+// kernel event: the HOST creates and waits on it; the SERVICE signals it and
+// only falls back to TerminateProcess after the grace period. This funnels a
+// service stop into the exact same graceful teardown path as the tray "Quit".
+
+/// Named manual-reset event bridging service (Session 0, SYSTEM) and host
+/// (Session 1+, elevated user). `Global\` namespace so it crosses sessions;
+/// the elevated host has `SeCreateGlobalPrivilege`, and SYSTEM can open
+/// anything the host creates with a default security descriptor.
+const HOST_SHUTDOWN_EVENT: &str = "Global\\NovaHostShutdown";
+
+/// (Host side) Create the named shutdown event and watch it from a background
+/// thread; `on_signal` runs once when the service asks this host to exit.
+///
+/// Manual-reset + reset-on-create: if a previous host crashed without
+/// consuming a signal, the stale set state would instantly kill the next
+/// host — so every new host clears the event before waiting. (Manual-reset
+/// rather than auto-reset so the signal is level-triggered: a host mid-wait
+/// always sees it even if a new host resets the event moments later.)
+pub fn spawn_host_shutdown_watcher(on_signal: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new()
+        .name("nova-host-shutdown".into())
+        .spawn(move || unsafe {
+            let name_w = wide(HOST_SHUTDOWN_EVENT);
+            let event = match CreateEventW(None, true, false, PCWSTR(name_w.as_ptr())) {
+                Ok(h) => h,
+                Err(e) => {
+                    println!("⚠️  Host shutdown event unavailable ({e:?}) — a service STOP \
+                        will fall back to TerminateProcess (display/audio restored at next boot)");
+                    return;
+                }
+            };
+            let _ = ResetEvent(event);
+            let _ = WaitForSingleObject(event, INFINITE);
+            println!("🛑 Service requested shutdown — starting graceful teardown");
+            on_signal();
+            let _ = CloseHandle(event);
+        });
+}
+
+/// (Service side) Signal the host's named shutdown event. `false` when the
+/// event doesn't exist (no host running, or a pre-15.5 host build) — callers
+/// then rely on the TerminateProcess backstop alone.
+fn signal_host_shutdown() -> bool {
+    unsafe {
+        let name_w = wide(HOST_SHUTDOWN_EVENT);
+        match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name_w.as_ptr())) {
+            Ok(ev) => {
+                let ok = SetEvent(ev).is_ok();
+                let _ = CloseHandle(ev);
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Stop a managed host with dignity: signal the named shutdown event so the
+/// host runs its graceful display/audio teardown, give it
+/// `HOST_GRACEFUL_EXIT_MS` to exit on its own, then force-terminate as the
+/// backstop (a no-op if it already exited; also closes the handle).
+fn stop_host(h: &HostProcess) {
+    if signal_host_shutdown() {
+        println!("🤝 Host (session {}) asked to exit gracefully", h.session_id);
+    }
+    unsafe {
+        let _ = WaitForSingleObject(h.process, HOST_GRACEFUL_EXIT_MS);
+    }
+    h.terminate();
+}
+
+// ── Machine-wide single-instance guard (host side) ────────────────────────────
+//
+// The scheduled-task fallback, a manual launch, and the NovaService deployment
+// must never run two hosts at once: the second instance would cycle the VDD
+// devnode, fight over the GameStream ports, and duel for the WGC session.
+// Ports failing to bind used to be the only (crashy) backstop; the named mutex
+// makes the second instance exit cleanly before touching ANY system state.
+
+const HOST_SINGLETON_MUTEX: &str = "Global\\NovaServerHostSingleton";
+
+/// Held for the host's entire lifetime; released automatically at process
+/// exit (kernel closes the handle), letting the next host start.
+pub struct HostSingleton(#[allow(dead_code)] Option<HandleGuard>);
+
+/// (Host side) Claim the machine-wide host mutex.
+///
+/// `Err(reason)` = another Nova host already holds it — the caller must exit
+/// WITHOUT touching system state (VDD devnode, ports, audio sink). Failing to
+/// CREATE the mutex at all (e.g. unelevated: no `SeCreateGlobalPrivilege` for
+/// the `Global\` namespace) is non-fatal: proceed unguarded with a warning —
+/// the port-bind conflicts still backstop a true double-launch.
+pub fn acquire_host_singleton() -> Result<HostSingleton, String> {
+    unsafe {
+        let name_w = wide(HOST_SINGLETON_MUTEX);
+        match CreateMutexW(None, false, PCWSTR(name_w.as_ptr())) {
+            Ok(h) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(h);
+                    Err(format!(
+                        "Another Nova host is already running ({HOST_SINGLETON_MUTEX} held) \
+                         — exiting; the existing instance keeps serving"
+                    ))
+                } else {
+                    Ok(HostSingleton(Some(HandleGuard(h))))
+                }
+            }
+            Err(e) => {
+                println!("⚠️  Could not create single-instance mutex ({e:?}) — continuing unguarded");
+                Ok(HostSingleton(None))
+            }
+        }
+    }
 }
 
 // ── Token acquisition + host spawn ────────────────────────────────────────────

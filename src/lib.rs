@@ -198,6 +198,21 @@ pub async fn run() -> Result<()> {
     // ── File logging: must be first so all subsequent println! go to nova.log ─
     debug::init_debug_logger();
 
+    // ── Single-instance guard (Phase 15.5) ────────────────────────────────────
+    // The scheduled-task fallback, a manual launch, and the NovaService
+    // deployment must never BOTH run a host (double VDD devnode cycling,
+    // dueling WGC sessions, port conflicts). Claim the machine-wide mutex
+    // BEFORE touching any system state; if another host holds it, exit
+    // cleanly and let the existing instance keep serving. The guard must stay
+    // named-alive for the whole of run().
+    let _host_singleton = match service::acquire_host_singleton() {
+        Ok(guard) => guard,
+        Err(msg) => {
+            println!("🚫 {msg}");
+            return Ok(());
+        }
+    };
+
     // Tell the C++ shim where to write its own log output.  The shim opens the
     // file independently (CRT file descriptors don't follow SetStdHandle) and
     // also _dup2's the CRT stdout/stderr so any stray printf() lands there too.
@@ -266,12 +281,25 @@ pub async fn run() -> Result<()> {
     // The watch channel is the graceful-shutdown bridge: the tray's "Quit"
     // menu item sends `true`; the capture-loop select! below breaks on it.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel::<tray::TrayCmd>(32);
     // global_pin is the handshake point between the tray PIN dialog and the
     // pairing async task: the tray writes the 4-digit string here and the
     // pairing poll loop reads + clears it.
     let global_pin: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((String::new(), String::new())));
-    tray::spawn(tray_rx, Arc::new(shutdown_tx), global_pin.clone());
+    tray::spawn(tray_rx, shutdown_tx.clone(), global_pin.clone());
+    // Service-initiated graceful stop (Phase 15.5): when the SCM stops
+    // NovaService (installer upgrade, manual `sc stop`, OS shutdown), the
+    // service signals a named event instead of immediately terminating us.
+    // The watcher funnels that signal into the same shutdown channel as the
+    // tray "Quit", so the full graceful teardown (display topology + audio
+    // endpoint restore) runs before the service's TerminateProcess backstop.
+    service::spawn_host_shutdown_watcher({
+        let tx = shutdown_tx.clone();
+        move || {
+            let _ = tx.send(true);
+        }
+    });
     let tray_tx = Arc::new(tray_tx);
     // Load nova.toml first; CLI args override individual fields.
     let cfg  = config::NovaConfig::load();
@@ -581,13 +609,15 @@ pub async fn run() -> Result<()> {
                     break;
                 }
                 _ = shutdown_rx.changed() => {
-                    println!("\n🛑 Tray exit — shutting down ({} frames encoded)", frames_encoded);
+                    println!("\n🛑 Quit requested (tray or service stop) — shutting down ({} frames encoded)", frames_encoded);
                     // Under the service deployment, the host is respawned on exit
                     // by design — so a user "Quit" must also stop the service, or
                     // it just relaunches. Request the stop now (before teardown)
                     // so the service's worker won't respawn us; the service then
                     // grace-waits for this graceful teardown to finish. No-op when
-                    // not launched by the service.
+                    // not launched by the service, and harmless when the shutdown
+                    // ORIGINATED from a service stop (service is already
+                    // STOP_PENDING; the extra `sc stop` errors and is ignored).
                     crate::service::request_service_stop();
                     break;
                 }
