@@ -246,6 +246,82 @@ int FindVirtualAudioSink(WCHAR* out_id, int cch)
     return find_render_device(out_id, cch, true);
 }
 
+// Case-insensitive substring search (CRT-only; shlwapi's StrStrIW would add a
+// link dependency for one call).
+static bool contains_icase(const WCHAR* hay, const WCHAR* needle)
+{
+    if (!hay || !needle || !*needle) return false;
+    size_t nlen = wcslen(needle);
+    for (const WCHAR* p = hay; *p; ++p) {
+        if (_wcsnicmp(p, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+// Finds an ACTIVE render endpoint by the operator's nova.toml designation:
+// matches `needle` case-insensitively as a SUBSTRING of the endpoint friendly
+// name (e.g. "VDD by MTT", "VoiceMeeter Input") or as the EXACT endpoint id
+// ("{0.0.0.00000000}.{guid}"). Lets any render device serve as the streaming
+// sink without extending kVirtualSinkNames. Returns 0 + id, 1 if no match,
+// <0 on error.
+extern "C" __declspec(dllexport)
+int FindAudioDeviceByName(const WCHAR* needle, WCHAR* out_id, int cch)
+{
+    if (!needle || !*needle) return 1;
+
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDeviceCollection* coll = nullptr;
+    int ret = 1; // not found
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(hr)) hr = en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll);
+
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = coll->GetCount(&count);
+    if (FAILED(hr)) ret = -2;
+
+    for (UINT i = 0; SUCCEEDED(hr) && ret == 1 && i < count; ++i) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(coll->Item(i, &dev))) continue;
+
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(dev->GetId(&id)) && id) {
+            bool matched = (_wcsicmp(id, needle) == 0);
+
+            if (!matched) {
+                IPropertyStore* props = nullptr;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props))) {
+                    PROPVARIANT name;
+                    PropVariantInit(&name);
+                    if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) &&
+                        name.vt == VT_LPWSTR && name.pwszVal &&
+                        contains_icase(name.pwszVal, needle)) {
+                        matched = true;
+                        printf("\xF0\x9F\x8E\xA7 Sink override matched: %ls\n", name.pwszVal);
+                    }
+                    PropVariantClear(&name);
+                    props->Release();
+                }
+            }
+
+            if (matched && (int)wcslen(id) < cch) {
+                wcscpy_s(out_id, cch, id);
+                ret = 0;
+            }
+            CoTaskMemFree(id);
+        }
+        dev->Release();
+    }
+
+    if (coll) coll->Release();
+    if (en)   en->Release();
+    return ret;
+}
+
 // Finds the first ACTIVE render endpoint that is NOT a known virtual sink —
 // used for crash recovery: if Nova exited without restoring the default
 // device (killed/closed rather than a clean shutdown), startup can detect

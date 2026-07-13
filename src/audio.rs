@@ -33,13 +33,26 @@
 // [`arm_endpoint_restore`] — idempotent, called by lib.rs before
 // `activate_for_stream` and again (as a no-op fallback) by
 // [`AudioCaptureManager::start_for_stream`].
+//
+// ## Mid-session routing watchdog (Phase 15.6 — the "ghost" duty)
+//
+// WASAPI loopback binds ONE device at init and never follows default changes.
+// A 1 Hz check inside the send loop keeps routing correct for the whole
+// session: in client-only mode the sink is RE-ASSERTED as default if anything
+// (late device arrival, sound-settings fiddling) moves it; when capturing the
+// default (host_audio, or no sink available) a default change triggers a full
+// capture REBIND onto the new endpoint — healing the "VDD HDMI audio appears
+// seconds after activation, apps migrate, stream goes silent" failure. The
+// streaming sink itself is selectable via nova.toml `[audio]
+// endpoint_override` ([`set_sink_override`]) on top of the shim's built-in
+// known-sink list.
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use audiopus::coder::Encoder as OpusEncoder;
@@ -57,7 +70,55 @@ extern "C" {
     fn GetDefaultAudioDeviceId(out_id: *mut u16, cch: i32) -> i32;
     fn FindVirtualAudioSink(out_id: *mut u16, cch: i32) -> i32;
     fn FindRealAudioDevice(out_id: *mut u16, cch: i32) -> i32;
+    fn FindAudioDeviceByName(needle: *const u16, out_id: *mut u16, cch: i32) -> i32;
     fn SetDefaultAudioDevice(device_id: *const u16) -> i32;
+}
+
+// ── Streaming-sink selection ──────────────────────────────────────────────────
+
+/// Operator-designated streaming sink (nova.toml `[audio] endpoint_override`),
+/// stored as NUL-terminated UTF-16 at startup. When set, sink resolution tries
+/// it FIRST — matched case-insensitively as a substring of endpoint friendly
+/// names or exactly as an endpoint id — so ANY active render device (the VDD's
+/// HDMI audio, VoiceMeeter, a vendor virtual output) can serve as the ghost
+/// sink without extending the shim's built-in list.
+static SINK_OVERRIDE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+/// Record the nova.toml override. Called once from `run()` right after config
+/// load, BEFORE `recover_stuck_sink` — crash recovery must recognise a custom
+/// sink as "the sink" too. Empty/whitespace = no override.
+pub fn set_sink_override(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    *SINK_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = Some(wide);
+    println!("🎧 Audio: endpoint_override set — \"{name}\" is the preferred streaming sink");
+}
+
+/// Resolve the streaming sink's endpoint id: the nova.toml override first
+/// (warn-and-fall-through when it matches no ACTIVE endpoint — e.g. the VDD's
+/// audio device before the display activates), then the shim's built-in known
+/// virtual sinks (Steam Streaming Speakers, VB-CABLE). `None` = no sink
+/// available; client-only routing degrades to capturing the default device.
+fn find_virtual_sink_id() -> Option<Vec<u16>> {
+    let needle = SINK_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(needle) = needle {
+        let mut id = [0u16; DEVICE_ID_CCH];
+        if unsafe { FindAudioDeviceByName(needle.as_ptr(), id.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0 {
+            return Some(wide_id(&id));
+        }
+        println!("⚠️  Audio: endpoint_override matched no active render endpoint — trying built-in virtual sinks");
+    }
+    let mut sink = [0u16; DEVICE_ID_CCH];
+    if unsafe { FindVirtualAudioSink(sink.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0 {
+        return Some(wide_id(&sink));
+    }
+    None
 }
 
 /// Crash recovery: if Nova exited without restoring the default audio device
@@ -69,24 +130,31 @@ extern "C" {
 /// Also the live-query fallback for every restore path: idempotent and quiet
 /// when the default is already a real device.
 pub fn recover_stuck_sink() {
-    let mut sink = [0u16; DEVICE_ID_CCH];
-    if unsafe { FindVirtualAudioSink(sink.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
-        return; // no virtual sink installed — nothing to recover
-    }
+    let Some(sink_id) = find_virtual_sink_id() else {
+        return; // no streaming sink present — nothing to recover
+    };
     let mut cur = [0u16; DEVICE_ID_CCH];
     if unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
         return;
     }
-    if wide_id(&cur) != wide_id(&sink) {
+    if wide_id(&cur) != sink_id {
         return; // default is already a real device
     }
 
     let mut real = [0u16; DEVICE_ID_CCH];
     if unsafe { FindRealAudioDevice(real.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
-        eprintln!("⚠️  Audio: default output is the virtual sink (from a previous unclean exit) and no real device was found to restore — check Windows sound settings");
+        eprintln!("⚠️  Audio: default output is the streaming sink (from a previous unclean exit) and no real device was found to restore — check Windows sound settings");
         return;
     }
-    if unsafe { SetDefaultAudioDevice(wide_id(&real).as_ptr()) } == 0 {
+    let real_id = wide_id(&real);
+    // With an endpoint_override, the "first non-built-in-sink device" can BE
+    // the override device itself — restoring the sink onto itself would fake
+    // success while the host stays silent.
+    if real_id == sink_id {
+        eprintln!("⚠️  Audio: the streaming sink is the only active output — cannot auto-restore a real device");
+        return;
+    }
+    if unsafe { SetDefaultAudioDevice(real_id.as_ptr()) } == 0 {
         println!("🔊 Audio: recovered from a previous unclean exit — default output restored to host speakers");
     } else {
         eprintln!("⚠️  Audio: found a real output device but failed to restore it as default — check Windows sound settings");
@@ -154,11 +222,8 @@ pub fn arm_endpoint_restore() {
     }
     let cur_id = wide_id(&cur);
 
-    let mut sink = [0u16; DEVICE_ID_CCH];
-    if unsafe { FindVirtualAudioSink(sink.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0
-        && wide_id(&sink) == cur_id
-    {
-        println!("⚠️  Audio: default output is currently the virtual sink — not arming it as the restore target (restore will pick a real device)");
+    if find_virtual_sink_id().is_some_and(|sink_id| sink_id == cur_id) {
+        println!("⚠️  Audio: default output is currently the streaming sink — not arming it as the restore target (restore will pick a real device)");
         return;
     }
 
@@ -219,13 +284,10 @@ impl SinkGuard {
             return Self { capture_id: None };
         }
 
-        let mut sink = [0u16; DEVICE_ID_CCH];
-        let found = unsafe { FindVirtualAudioSink(sink.as_mut_ptr(), DEVICE_ID_CCH as i32) };
-        if found != 0 {
-            eprintln!("⚠️  Audio: no virtual sink found (install Steam Streaming Speakers or VB-CABLE) — audio will also play on host speakers");
+        let Some(sink_id) = find_virtual_sink_id() else {
+            eprintln!("⚠️  Audio: no streaming sink found (set [audio] endpoint_override in nova.toml, or install Steam Streaming Speakers / VB-CABLE) — audio will also play on host speakers");
             return Self { capture_id: None };
-        }
-        let sink_id = wide_id(&sink);
+        };
 
         let mut cur = [0u16; DEVICE_ID_CCH];
         let have_cur = unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0;
@@ -288,13 +350,32 @@ pub struct AudioFormat {
 /// silently corrupting it.
 static SHIM_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Initialise WASAPI loopback (on `device_id`, or the default render device
-/// when None) and return a channel that yields raw PCM chunks (interleaved,
-/// format described by the returned AudioFormat).
-fn start_capture_thread(
+/// A running WASAPI loopback capture: PCM channel, format, and its OWN stop
+/// flag — separate from the session stop so a mid-session capture REBIND
+/// (default endpoint moved) can tear down and rebuild capture without ending
+/// the audio session.
+struct CaptureSession {
+    rx: mpsc::Receiver<Vec<u8>>,
+    fmt: AudioFormat,
     stop: Arc<AtomicBool>,
-    device_id: Option<&[u16]>,
-) -> Result<(mpsc::Receiver<Vec<u8>>, AudioFormat, thread::JoinHandle<()>), String> {
+    handle: thread::JoinHandle<()>,
+}
+
+impl CaptureSession {
+    /// Stop the capture thread and block until `CleanupAudio` has released the
+    /// shim's global WASAPI state (`SHIM_CAPTURE_ACTIVE` freed) — after this a
+    /// new `start_capture_thread` may run immediately.
+    fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        drop(self.rx); // also unblocks the capture thread's channel sends
+        let _ = self.handle.join();
+    }
+}
+
+/// Initialise WASAPI loopback (on `device_id`, or the default render device
+/// when None) and return the running capture session.
+fn start_capture_thread(device_id: Option<&[u16]>) -> Result<CaptureSession, String> {
+    let stop = Arc::new(AtomicBool::new(false));
     // Acquire the process-global capture slot. The manager joins the previous
     // session before starting a new one, so under normal operation this
     // succeeds first try; the short retry only covers a capture thread that is
@@ -334,7 +415,9 @@ fn start_capture_thread(
 
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
 
+    let stop_flag = stop.clone();
     let handle = thread::spawn(move || {
+        let stop = stop_flag;
         unsafe {
             use windows::Win32::System::Threading::{
                 GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
@@ -387,7 +470,7 @@ fn start_capture_thread(
         SHIM_CAPTURE_ACTIVE.store(false, Ordering::Release);
     });
 
-    Ok((rx, fmt, handle))
+    Ok(CaptureSession { rx, fmt, stop, handle })
 }
 
 /// AES-128-CBC with PKCS7 padding — GameStream audio encryption
@@ -509,6 +592,46 @@ impl Drop for AudioCaptureManager {
     }
 }
 
+/// Why `send_pcm_loop` returned.
+enum SendExit {
+    /// Session stop (client disconnect / manager stop) or a fatal pipeline
+    /// error — the audio session ends.
+    SessionStopped,
+    /// The default render endpoint changed while capture was FOLLOWING the
+    /// default (host_audio mode, or no sink available). WASAPI loopback is
+    /// bound to one device at init and does NOT follow default changes — the
+    /// classic case is the VDD's HDMI audio endpoint appearing a few seconds
+    /// after display activation: Windows flips the default, every app stream
+    /// migrates, and the old device we're capturing goes silent ("audio
+    /// missed by the capture loop"). The caller rebinds capture to the NEW
+    /// default and continues the same session.
+    DeviceChanged,
+}
+
+/// Where this capture is bound, for the once-per-second routing watchdog.
+enum CaptureRoute {
+    /// Client-only mode: capture is pinned to the sink by id, and the sink
+    /// must REMAIN the system default for the whole stream. If the default
+    /// drifts (late device arrival, user fiddling with sound settings), the
+    /// watchdog re-asserts the sink — the "ghost orchestrator" duty. The
+    /// armed pre-stream endpoint still restores at session end.
+    PinnedSink(Vec<u16>),
+    /// Capturing the default endpoint: remember WHICH device that was; when
+    /// the default moves, exit with `DeviceChanged` so capture rebinds to
+    /// where the application audio actually went. Empty id = the initial
+    /// query failed; the watchdog stays inert.
+    FollowDefault(Vec<u16>),
+}
+
+/// RTP transmit state that must SURVIVE a mid-session capture rebind: the
+/// client's learned audio address, and seq/timestamp continuity (a reset to 0
+/// would look like a stream restart to moonlight-common-c's depacketizer).
+struct AudioTxState {
+    target: Option<SocketAddr>,
+    seq: u16,
+    timestamp: u32,
+}
+
 fn audio_send_loop(
     socket: UdpSocket,
     rikey: [u8; 16],
@@ -521,29 +644,58 @@ fn audio_send_loop(
     // Routing must be decided before capture starts: client-only mode captures
     // the virtual sink by id, so the loopback never touches the host speakers.
     // The guard triggers the claim-once endpoint restore on every exit path.
+    // Engaged ONCE for the session — capture rebinds below reuse it.
     let sink_guard = SinkGuard::engage(host_audio);
+    let mut tx_state = AudioTxState { target: None, seq: 0, timestamp: 0 };
 
-    let (rx, fmt, cap_handle) = match start_capture_thread(stop.clone(), sink_guard.capture_id.as_deref()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("🎵 Audio disabled: {}", e);
-            return;
+    loop {
+        let cap = match start_capture_thread(sink_guard.capture_id.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("🎵 Audio disabled: {}", e);
+                break;
+            }
+        };
+
+        let route = match &sink_guard.capture_id {
+            Some(id) => CaptureRoute::PinnedSink(id.clone()),
+            None => {
+                let mut cur = [0u16; DEVICE_ID_CCH];
+                if unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0 {
+                    CaptureRoute::FollowDefault(wide_id(&cur))
+                } else {
+                    CaptureRoute::FollowDefault(Vec::new()) // unknown — watchdog inert
+                }
+            }
+        };
+
+        let exit = send_pcm_loop(
+            &socket, rikey, rikeyid, encrypt, packet_duration_ms,
+            &stop, &cap.rx, cap.fmt, &route, &mut tx_state,
+        );
+
+        // Tear capture down COMPLETELY before continuing: CleanupAudio releases
+        // the shim's GLOBAL WASAPI state, so the next InitAudioCapture (rebind
+        // or a future session) must never overlap it (SHIM_CAPTURE_ACTIVE
+        // enforces this; joining here means the guard is already free when the
+        // manager's stop_and_release returns).
+        cap.shutdown();
+
+        match exit {
+            SendExit::SessionStopped => break,
+            SendExit::DeviceChanged => {
+                println!("🎵 Audio: default output changed mid-stream — rebinding loopback capture to the new endpoint");
+                // Let the endpoint flip settle before re-querying/binding.
+                thread::sleep(Duration::from_millis(300));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
         }
-    };
+    }
 
-    send_pcm_loop(&socket, rikey, rikeyid, encrypt, packet_duration_ms, &stop, &rx, fmt);
-
-    // Tear capture down COMPLETELY before this function returns: CleanupAudio
-    // releases the shim's GLOBAL WASAPI state, so a reconnect's InitAudioCapture
-    // must never overlap it — a lingering capture thread from the old session
-    // would otherwise null out the new session's capture client mid-stream
-    // (SHIM_CAPTURE_ACTIVE enforces this; joining here means the guard is
-    // already free when the manager's stop_and_release returns).
-    // Joining also guarantees teardown precedes the SinkGuard drop below that
-    // restores the default output device.
-    stop.store(true, Ordering::Relaxed);
-    drop(rx); // also unblocks the capture thread's channel sends
-    let _ = cap_handle.join();
+    // Joining above guarantees capture teardown precedes the SinkGuard drop
+    // here that restores the default output device.
     drop(sink_guard);
 }
 
@@ -557,23 +709,25 @@ fn send_pcm_loop(
     stop: &AtomicBool,
     rx: &mpsc::Receiver<Vec<u8>>,
     fmt: AudioFormat,
-) {
+    route: &CaptureRoute,
+    tx_state: &mut AudioTxState,
+) -> SendExit {
     // Opus only accepts 48/24/16/12/8 kHz; the Windows shared-mode mix format
     // is essentially always 48 kHz. Resampling is out of scope for v1.
     if fmt.sample_rate != 48_000 {
         eprintln!("🎵 Audio disabled: mix format is {} Hz (need 48000)", fmt.sample_rate);
-        return;
+        return SendExit::SessionStopped;
     }
     if fmt.bits_per_sample != 32 && fmt.bits_per_sample != 16 {
         eprintln!("🎵 Audio disabled: unsupported sample format ({}-bit)", fmt.bits_per_sample);
-        return;
+        return SendExit::SessionStopped;
     }
 
     let mut encoder = match OpusEncoder::new(SampleRate::Hz48000, Channels::Stereo, Application::LowDelay) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("🎵 Audio disabled: Opus encoder init failed: {:?}", e);
-            return;
+            return SendExit::SessionStopped;
         }
     };
     let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(128_000));
@@ -586,17 +740,53 @@ fn send_pcm_loop(
     let mut pcm: VecDeque<f32> = VecDeque::with_capacity(48_000);
     let mut frame_buf: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
     let mut opus_buf = [0u8; 1400];
-    let mut target: Option<SocketAddr> = None;
-    let mut seq: u16 = 0;
-    let mut timestamp: u32 = 0;
     let mut ping = [0u8; 64];
+    // Routing watchdog bookkeeping — checked once per second.
+    let mut last_route_check = Instant::now();
+    let mut reasserts: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         // Learn (and keep refreshed) the client's audio address from its pings.
         while let Ok((_n, addr)) = socket.recv_from(&mut ping) {
-            if target != Some(addr) {
+            if tx_state.target != Some(addr) {
                 println!("🎵 Learned client audio address: {}", addr);
-                target = Some(addr);
+                tx_state.target = Some(addr);
+            }
+        }
+
+        // ── Routing watchdog (1 Hz) — the "ghost" enforcement ────────────────
+        if last_route_check.elapsed() >= Duration::from_secs(1) {
+            last_route_check = Instant::now();
+            let mut cur = [0u16; DEVICE_ID_CCH];
+            let have_cur =
+                unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0;
+            if have_cur {
+                let cur_id = wide_id(&cur);
+                match route {
+                    CaptureRoute::PinnedSink(sink_id) if cur_id != *sink_id => {
+                        // Default drifted off the sink mid-stream (late device
+                        // arrival, sound-settings fiddling) — application audio
+                        // would fall back to host speakers and vanish from the
+                        // stream. Re-assert the sink; capture (pinned by id)
+                        // stays valid throughout.
+                        reasserts += 1;
+                        if unsafe { SetDefaultAudioDevice(sink_id.as_ptr()) } == 0 {
+                            if reasserts == 1 || reasserts % 10 == 0 {
+                                println!("🎧 Audio: default output drifted off the streaming sink — re-asserted ({} time(s))", reasserts);
+                            }
+                        } else if reasserts == 1 {
+                            eprintln!("⚠️  Audio: default output drifted off the streaming sink and re-assert failed — host speakers may play");
+                        }
+                    }
+                    CaptureRoute::FollowDefault(initial)
+                        if !initial.is_empty() && cur_id != *initial =>
+                    {
+                        // The device we're loopback-capturing is no longer the
+                        // default — app audio migrated. Rebind capture.
+                        return SendExit::DeviceChanged;
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -636,12 +826,12 @@ fn send_pcm_loop(
                 }
             };
 
-            if let Some(t) = target {
+            if let Some(t) = tx_state.target {
                 // IV = 16 zero bytes, first 4 = BE(rikeyid + seq) — Sunshine
                 // stream.cpp:1630 / moonlight-common-c AudioStream.c.
                 let payload: Vec<u8> = if encrypt {
                     let mut iv = [0u8; 16];
-                    iv[..4].copy_from_slice(&rikeyid.wrapping_add(seq as u32).to_be_bytes());
+                    iv[..4].copy_from_slice(&rikeyid.wrapping_add(tx_state.seq as u32).to_be_bytes());
                     aes_cbc_encrypt(&rikey, &iv, &opus_buf[..n])
                 } else {
                     opus_buf[..n].to_vec()
@@ -650,15 +840,17 @@ fn send_pcm_loop(
                 let mut pkt = Vec::with_capacity(12 + payload.len());
                 pkt.push(0x80); // V=2
                 pkt.push(97);   // packetType: opus audio
-                pkt.extend_from_slice(&seq.to_be_bytes());
-                pkt.extend_from_slice(&timestamp.to_be_bytes());
+                pkt.extend_from_slice(&tx_state.seq.to_be_bytes());
+                pkt.extend_from_slice(&tx_state.timestamp.to_be_bytes());
                 pkt.extend_from_slice(&[0u8; 4]); // ssrc
                 pkt.extend_from_slice(&payload);
                 let _ = socket.send_to(&pkt, t);
             }
 
-            seq = seq.wrapping_add(1);
-            timestamp = timestamp.wrapping_add(packet_duration_ms);
+            tx_state.seq = tx_state.seq.wrapping_add(1);
+            tx_state.timestamp = tx_state.timestamp.wrapping_add(packet_duration_ms);
         }
     }
+
+    SendExit::SessionStopped
 }

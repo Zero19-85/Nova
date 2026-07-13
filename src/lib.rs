@@ -310,6 +310,15 @@ pub async fn run() -> Result<()> {
         cfg.hdr.max_cll_nits,
         cfg.hdr.max_fall_nits,
     );
+    // Designate the streaming sink from nova.toml (no-op when empty). Must be
+    // set before any sink resolution — recover_stuck_sink already ran above
+    // with the built-in list only, so re-run it here: with an override, a
+    // stuck default from a previous unclean exit might only now be
+    // recognisable as "the sink".
+    if !cfg.audio.endpoint_override.is_empty() {
+        audio::set_sink_override(&cfg.audio.endpoint_override);
+        audio::recover_stuck_sink();
+    }
     // Parse from a FILTERED arg list: the service launches the host with
     // `--system-token <n>` (handled in bin/main before run()), which clap does
     // not know about. Strip that flag and its value so clap doesn't abort.
