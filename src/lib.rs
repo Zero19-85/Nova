@@ -182,6 +182,19 @@ pub async fn run() -> Result<()> {
     }
     println!("⚡ Process power throttling disabled (foreground performance mode)");
 
+    // ── 1 ms system timer resolution ──────────────────────────────────────────
+    // Windows' default timer tick is ~15.6 ms; every sleep-based wait in the
+    // process (tokio's frame-pacing sleep in the capture loop below included)
+    // rounds up to it. At 120 fps the frame budget is 8.33 ms — coarser than
+    // the timer — so without this the pacing sleep alone injects multi-ms
+    // rhythmic dispatch jitter. Sunshine/Apollo do the same. Windows undoes
+    // the request automatically at process exit.
+    unsafe {
+        use windows::Win32::Media::timeBeginPeriod;
+        let _ = timeBeginPeriod(1);
+    }
+    println!("⏱️  System timer resolution → 1 ms (timeBeginPeriod)");
+
     // ── File logging: must be first so all subsequent println! go to nova.log ─
     debug::init_debug_logger();
 
@@ -482,6 +495,10 @@ pub async fn run() -> Result<()> {
     let mut first_idr_sent   = false;
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
+    // Frames refused by the RTP send thread's bounded queue (saturated link).
+    // Each refusal triggers an IDR re-request; count is per session, for the
+    // rate-limited diagnostic log.
+    let mut send_queue_drops = 0u64;
     // Congestion control: the session's negotiated bitrate ceiling and bookkeeping
     // for the reduce→ramp-back cycle. Written at session start, reset on disconnect.
     let mut congestion_stable_kbps: u32 = 0;
@@ -532,11 +549,21 @@ pub async fn run() -> Result<()> {
 
     loop {
         // Frame pacing: sleep until the next frame slot, but also watch for shutdown signals.
+        // While a client is streaming, hand the LAST ~1 ms to a spin-wait below:
+        // even at 1 ms timer resolution the OS sleep wakes ±1 ms, which at
+        // 120 fps (8.33 ms budget) is enough dispatch jitter to sample WGC a
+        // frame late/early — visible as micro-stutter on motion. Idle (no
+        // client) keeps the plain sleep: nobody is watching, don't burn CPU.
         let now = Instant::now();
         if now < next_frame_time {
             let wait = next_frame_time - now;
+            let sleep_for = if client_connected {
+                wait.saturating_sub(Duration::from_millis(1))
+            } else {
+                wait
+            };
             tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
+                _ = tokio::time::sleep(sleep_for) => {}
                 _ = signal::ctrl_c() => {
                     println!("\n🛑 Ctrl+C — shutting down ({} frames encoded)", frames_encoded);
                     break;
@@ -563,6 +590,12 @@ pub async fn run() -> Result<()> {
                     // not launched by the service.
                     crate::service::request_service_stop();
                     break;
+                }
+            }
+            // Precise dispatch: spin out the sub-millisecond remainder.
+            if client_connected {
+                while Instant::now() < next_frame_time {
+                    std::hint::spin_loop();
                 }
             }
         }
@@ -1103,6 +1136,7 @@ pub async fn run() -> Result<()> {
                 client_connected    = false;
                 video_learned       = false;
                 first_idr_sent      = false; // next session must open with an IDR
+                send_queue_drops    = 0;
                 congestion_stable_kbps = 0;
                 encoder::set_stream_bitrate_kbps(0);
 
@@ -1366,10 +1400,25 @@ pub async fn run() -> Result<()> {
                         if frames_encoded < 20 {
                             println!("[ENC] frame={} ({} bytes) dropped — waiting for first IDR", frames_encoded, packet_size);
                         }
-                    } else {
+                    } else if rtp_sender.send_frame(data, if is_idr { 2 } else { 1 }) {
+                        // Frame queued to the nova-rtp-send thread — packetize/
+                        // FEC/pacing/sendto all happen off the capture thread.
                         first_idr_sent = true;
-                        println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, if is_idr { "IDR" } else { "P" });
-                        rtp_sender.send_frame(data);
+                        // Per-frame logging is itself a hot-path cost (one
+                        // blocking WriteFile to nova.log per frame at up to
+                        // 120 Hz) — log only session-start frames and IDRs.
+                        if frames_encoded <= 10 || is_idr {
+                            println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, if is_idr { "IDR" } else { "P" });
+                        }
+                    } else {
+                        // Send thread ≥3 frames behind (saturated link) — the
+                        // frame was refused. A silently dropped frame breaks
+                        // the P-frame reference chain, so recover with an IDR.
+                        send_queue_drops += 1;
+                        enc.request_idr();
+                        if send_queue_drops == 1 || send_queue_drops % 120 == 0 {
+                            println!("⚠️  RTP send queue full — frame dropped ({} total this session), IDR re-requested", send_queue_drops);
+                        }
                     }
                 }
             }

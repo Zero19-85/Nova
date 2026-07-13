@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+};
 
 // NV_VIDEO_PACKET flags (from moonlight-common-c VideoDepacketizer.c)
 const FLAG_CONTAINS_PIC_DATA: u8 = 0x01;
@@ -33,12 +37,19 @@ const DEFAULT_MIN_PARITY_SHARDS: usize = 2;
 // overflow the router/AP transmit queue, dropping the tail packets — the
 // decoder then renders the top of the frame and corrupts everything below.
 // Send in small batches with a short gap, like Sunshine's ratecontrol
-// batching (≤64KB batches at 80% of link rate).
-//
-// PACE_GAP is no longer a constant — see `send_frame`, which computes it as
-// 300µs × (60 / fps) so total pacing overhead stays proportional to the
-// frame budget (e.g. 150µs at 120fps vs 300µs at 60fps).
+// batching (≤64KB batches at 80% of link rate). The gap is computed per
+// frame in `TxEngine::send_frame` from the frame's shard count so the whole
+// frame spreads across a fixed fraction of the frame interval — bounding the
+// burst rate independently of frame size (heavy HEVC/HDR10 pan frames get
+// more, closer-spaced batches instead of blasting the queue).
 const PACE_BATCH_PACKETS: usize = 10;
+
+/// Maximum encoded frames queued to the send thread at once. The capture
+/// thread never blocks on the network: if the send thread falls this far
+/// behind (link saturated / pacing budget exceeded for several consecutive
+/// frames), `send_frame` refuses the frame and the caller must request an IDR
+/// (a silently dropped frame would break the P-frame reference chain).
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// Send one UDP datagram, retrying on `WouldBlock` instead of silently
 /// dropping it. Free function (not a method) so callers can pass `&socket`
@@ -57,7 +68,8 @@ fn send_packet(socket: &UdpSocket, pkt: &[u8], target: SocketAddr) {
 
 /// Busy-wait for sub-millisecond pacing gaps. `thread::sleep` is unusable
 /// here: Windows sleep granularity is 1-15ms, which would stretch a 45-packet
-/// IDR over tens of milliseconds and wreck 60fps frame pacing.
+/// IDR over tens of milliseconds and wreck 60fps frame pacing. Runs on the
+/// dedicated send thread, so the spin never steals capture/encode budget.
 fn spin_wait(d: Duration) {
     let end = Instant::now() + d;
     while Instant::now() < end {
@@ -65,12 +77,222 @@ fn spin_wait(d: Duration) {
     }
 }
 
+/// Commands processed in order by the send thread. Frames use `try_send`
+/// (dropped with an error signal when the sender is hopelessly behind);
+/// control commands use blocking `send` (rare, must never be lost).
+enum TxCmd {
+    Frame { buf: Vec<u8>, frame_type: u8 },
+    SetTarget(SocketAddr),
+    SetFps(u32),
+    SetCodec { is_hevc: bool, is_av1: bool },
+    Configure { packet_size: usize, fec_percentage: usize, min_parity_shards: usize },
+    Reset,
+}
+
+/// Capture-thread handle to the video RTP pipeline.
+///
+/// All heavy per-frame work — shard building, Reed-Solomon parity, pacing
+/// gaps, and the `sendto` syscalls — happens on the dedicated `nova-rtp-send`
+/// worker thread (Phase 15 micro-stutter fix). Previously `send_frame` ran
+/// synchronously on the capture/encode thread, where a large HEVC/HDR10 pan
+/// frame (60+ packets) cost 1.5–3 ms of spin-paced sending per frame — a
+/// third of the 8.33 ms budget at 120 fps, and the single biggest rhythmic
+/// jitter source for 10-bit streams.
+///
+/// The handle keeps ping-learning (`try_learn_target`) and session state on
+/// the capture thread using a cloned socket handle (recv only); learned
+/// targets are forwarded to the worker through the same ordered command
+/// channel as frames, so a `Reset` can never race a stale target.
 pub struct RtpSender {
+    /// Cloned handle of the send socket — used ONLY to drain client "ping"
+    /// packets on the capture thread (the worker owns the send side).
+    recv_socket: UdpSocket,
+    /// Capture-thread copy of the learned client address (session state).
+    target: Option<SocketAddr>,
+    tx: SyncSender<TxCmd>,
+    /// Frame payload buffers coming back from the worker for reuse.
+    buf_rx: Receiver<Vec<u8>>,
+    /// Recycled buffers ready for the next frame.
+    spare_bufs: Vec<Vec<u8>>,
+    /// Buffers currently owned by the worker (queued or being sent).
+    bufs_in_flight: usize,
+}
+
+impl RtpSender {
+    pub fn new(bind_port: u16) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", bind_port))?;
+        // Give the OS headroom for the ~25-packet bursts sent per frame so a
+        // momentary full send buffer blocks (and retries) rather than drops.
+        let sock2 = socket2::Socket::from(socket);
+        // 8 MB: covers a worst-case 4K IDR burst (~6 MB at uncapped bitrate)
+        // plus 2 MB headroom so a full-buffer back-pressure stalls instead of drops.
+        sock2.set_send_buffer_size(8 * 1024 * 1024)?;
+        // DSCP EF (0xB8 = 101110_00) — Expedited Forwarding: marks video UDP
+        // datagrams as low-latency minimum-delay traffic. Best-effort on Windows
+        // (honoured by DSCP-aware managed switches and QoS Group Policies).
+        // Apollo/Sunshine use qwave.dll QOSAddSocketToFlow for hard guarantees;
+        // IP_TOS is the portable fallback that covers most LAN gaming routers.
+        let _ = sock2.set_tos(0xB8_u32);
+        let socket: UdpSocket = sock2.into();
+        socket.set_nonblocking(true)?;
+
+        // Two handles to ONE socket: the capture thread drains pings (recv),
+        // the worker sends datagrams. Concurrent recv/send on a UDP socket
+        // from different threads is safe — they're independent operations.
+        let recv_socket = socket.try_clone()?;
+
+        let (tx, rx) = sync_channel::<TxCmd>(MAX_FRAMES_IN_FLIGHT + 5);
+        let (buf_tx, buf_rx) = sync_channel::<Vec<u8>>(MAX_FRAMES_IN_FLIGHT);
+        std::thread::Builder::new()
+            .name("nova-rtp-send".into())
+            .spawn(move || tx_worker(socket, rx, buf_tx))?;
+
+        Ok(Self {
+            recv_socket,
+            target: None,
+            tx,
+            buf_rx,
+            spare_bufs: Vec::new(),
+            bufs_in_flight: 0,
+        })
+    }
+
+    /// Non-blocking drain of all queued "ping" packets, keeping the most recent
+    /// sender. GameStream clients ping the video port every ~500ms for the WHOLE
+    /// session (not just after PLAY), so this must be called every loop iteration
+    /// — if the socket goes unread after the first learn, stale pings from a
+    /// previous session pile up in the receive buffer and the next session
+    /// latches onto a dead source port (black screen on reconnect).
+    /// Returns the address only when it changes.
+    pub fn try_learn_target(&mut self) -> Option<SocketAddr> {
+        let mut buf = [0u8; 64];
+        let mut latest = None;
+        while let Ok((_n, addr)) = self.recv_socket.recv_from(&mut buf) {
+            latest = Some(addr);
+        }
+        let addr = latest?;
+        if self.target != Some(addr) {
+            self.target = Some(addr);
+            let _ = self.tx.send(TxCmd::SetTarget(addr));
+            return Some(addr);
+        }
+        None
+    }
+
+    pub fn set_fps(&mut self, fps: u32) {
+        let _ = self.tx.send(TxCmd::SetFps(fps.max(1)));
+    }
+
+    /// Set the codec used for the worker's early-session NAL diagnostics.
+    /// Frame-type classification itself is done by the CALLER (which already
+    /// runs `detect_frame_type` for the first-IDR gate) and passed per frame —
+    /// avoiding a second full scan of every payload.
+    pub fn set_codec(&mut self, is_hevc: bool, is_av1: bool) {
+        let _ = self.tx.send(TxCmd::SetCodec { is_hevc, is_av1 });
+    }
+
+    /// Apply per-session stream parameters. `packet_size` must be the client's
+    /// negotiated x-nv-video[0].packetSize; `fec_percentage` 0 disables FEC.
+    pub fn configure(&mut self, packet_size: usize, fec_percentage: usize, min_parity_shards: usize) {
+        let _ = self.tx.send(TxCmd::Configure { packet_size, fec_percentage, min_parity_shards });
+    }
+
+    /// Drop per-session state so a future PLAY starts a clean stream
+    /// (fresh sequence numbers/timestamps, and re-learn the client's
+    /// ephemeral video source port via `try_learn_target`).
+    pub fn reset(&mut self) {
+        // Flush pings buffered from the ending session so the next learn
+        // can't latch onto a stale source port.
+        let mut buf = [0u8; 64];
+        while self.recv_socket.recv_from(&mut buf).is_ok() {}
+        self.target = None;
+        let _ = self.tx.send(TxCmd::Reset);
+    }
+
+    /// Queue one complete encoded frame (Annex-B NALs, or AV1 OBUs) for
+    /// transmission. `frame_type` is the NV_VIDEO_PACKET classification the
+    /// caller already computed: 2 = IDR/keyframe, 1 = P-frame.
+    ///
+    /// Returns `false` when the frame had to be DROPPED because the send
+    /// thread is more than `MAX_FRAMES_IN_FLIGHT` frames behind — the caller
+    /// MUST request an IDR in that case (the dropped frame breaks the P-frame
+    /// reference chain). Never blocks the capture thread.
+    pub fn send_frame(&mut self, data: &[u8], frame_type: u8) -> bool {
+        if data.is_empty() || self.target.is_none() {
+            return true; // nothing to send / nobody to send to — not a drop
+        }
+
+        // Harvest buffers the worker has finished with.
+        while let Ok(b) = self.buf_rx.try_recv() {
+            self.bufs_in_flight -= 1;
+            self.spare_bufs.push(b);
+        }
+
+        let mut buf = match self.spare_bufs.pop() {
+            Some(b) => b,
+            None if self.bufs_in_flight < MAX_FRAMES_IN_FLIGHT => Vec::new(),
+            None => return false, // worker owns every buffer — it's ≥3 frames behind
+        };
+        buf.clear();
+        buf.extend_from_slice(data);
+
+        match self.tx.try_send(TxCmd::Frame { buf, frame_type }) {
+            Ok(()) => {
+                self.bufs_in_flight += 1;
+                true
+            }
+            Err(TrySendError::Full(TxCmd::Frame { buf, .. }))
+            | Err(TrySendError::Disconnected(TxCmd::Frame { buf, .. })) => {
+                self.spare_bufs.push(buf);
+                false
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Send-thread entry: processes commands in order, returns frame buffers for
+/// reuse. Exits when the capture-thread handle is dropped (channel closes).
+fn tx_worker(socket: UdpSocket, rx: Receiver<TxCmd>, buf_tx: SyncSender<Vec<u8>>) {
+    // HIGHEST (one notch below the capture thread's TIME_CRITICAL): the
+    // pacing spins must not be preempted by background threads, but must
+    // never starve capture/encode either.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+
+    let mut eng = TxEngine::new(socket);
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            TxCmd::Frame { buf, frame_type } => {
+                eng.send_frame(&buf, frame_type);
+                // Return the buffer for reuse. Capacity == MAX_FRAMES_IN_FLIGHT
+                // so this can never be Full; a Disconnected handle just means
+                // shutdown, where dropping the buffer is fine.
+                let _ = buf_tx.try_send(buf);
+            }
+            TxCmd::SetTarget(addr) => eng.target = Some(addr),
+            TxCmd::SetFps(fps) => eng.fps = fps.max(1),
+            TxCmd::SetCodec { is_hevc, is_av1 } => {
+                eng.is_hevc = is_hevc;
+                eng.is_av1 = is_av1;
+            }
+            TxCmd::Configure { packet_size, fec_percentage, min_parity_shards } => {
+                eng.configure(packet_size, fec_percentage, min_parity_shards);
+            }
+            TxCmd::Reset => eng.reset(),
+        }
+    }
+}
+
+/// The actual packetizer/sender — lives entirely on the `nova-rtp-send`
+/// thread; single-owner, no locks on any per-frame state.
+struct TxEngine {
     socket: UdpSocket,
     sequence_number: u16,
     timestamp: u32,
-    /// Client's video address, learned from its first incoming "ping" packet —
-    /// the client's source port is ephemeral and cannot be known in advance.
+    /// Client's video address, learned from its incoming "ping" packets by the
+    /// capture-thread handle and forwarded via `TxCmd::SetTarget`.
     target: Option<SocketAddr>,
     /// Global packet counter — shifted into NV_VIDEO_PACKET.streamPacketIndex
     packet_counter: u32,
@@ -84,18 +306,10 @@ pub struct RtpSender {
     /// ("reduce your bitrate" dialog). Sunshine starts at 1 (video.cpp frame_nr).
     frame_index: u32,
     fps: u32,
-    /// True when the active session uses HEVC or AV1. Controls NAL unit
-    /// parsing in `detect_frame_type` / `list_nal_types`: HEVC uses a 2-byte
-    /// NAL header where `nal_unit_type = (first_byte >> 1) & 0x3F`, versus
-    /// H.264's `first_byte & 0x1F`. Incorrect parsing produces all-P-frame
-    /// classifications even for IDR/VPS/SPS NALUs → Moonlight never gets a
-    /// decodable keyframe → 10-second watchdog timeout.
+    /// HEVC flag — only used for the early-session NAL-listing diagnostics
+    /// (frame classification is computed by the caller and passed per frame).
     is_hevc: bool,
-    /// True when the active session uses AV1. AV1 is NOT an Annex-B NAL stream —
-    /// it is a sequence of OBUs — so `detect_frame_type` parses OBUs (sequence
-    /// header ⇒ keyframe) instead of NAL units. The GameStream packetization
-    /// itself (NV_VIDEO_PACKET shards + FEC) is codec-agnostic, so only the
-    /// keyframe detection differs.
+    /// AV1 flag — same diagnostics-only role as `is_hevc`.
     is_av1: bool,
     /// Negotiated packet size (from ANNOUNCE) — wire datagram = this + 16.
     packet_size: usize,
@@ -120,24 +334,9 @@ pub struct RtpSender {
     shard_pool: Vec<Vec<u8>>,
 }
 
-impl RtpSender {
-    pub fn new(bind_port: u16) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", bind_port))?;
-        // Give the OS headroom for the ~25-packet bursts sent per frame so a
-        // momentary full send buffer blocks (and retries) rather than drops.
-        let sock2 = socket2::Socket::from(socket);
-        // 8 MB: covers a worst-case 4K IDR burst (~6 MB at uncapped bitrate)
-        // plus 2 MB headroom so a full-buffer back-pressure stalls instead of drops.
-        sock2.set_send_buffer_size(8 * 1024 * 1024)?;
-        // DSCP EF (0xB8 = 101110_00) — Expedited Forwarding: marks video UDP
-        // datagrams as low-latency minimum-delay traffic. Best-effort on Windows
-        // (honoured by DSCP-aware managed switches and QoS Group Policies).
-        // Apollo/Sunshine use qwave.dll QOSAddSocketToFlow for hard guarantees;
-        // IP_TOS is the portable fallback that covers most LAN gaming routers.
-        let _ = sock2.set_tos(0xB8_u32);
-        let socket: UdpSocket = sock2.into();
-        socket.set_nonblocking(true)?;
-        Ok(Self {
+impl TxEngine {
+    fn new(socket: UdpSocket) -> Self {
+        Self {
             socket,
             sequence_number: 0,
             timestamp: 0,
@@ -158,46 +357,10 @@ impl RtpSender {
             stat_window_start: Instant::now(),
             stream_buf: Vec::new(),
             shard_pool: Vec::new(),
-        })
-    }
-
-    /// Non-blocking drain of all queued "ping" packets, keeping the most recent
-    /// sender. GameStream clients ping the video port every ~500ms for the WHOLE
-    /// session (not just after PLAY), so this must be called every loop iteration
-    /// — if the socket goes unread after the first learn, stale pings from a
-    /// previous session pile up in the receive buffer and the next session
-    /// latches onto a dead source port (black screen on reconnect).
-    /// Returns the address only when it changes.
-    pub fn try_learn_target(&mut self) -> Option<SocketAddr> {
-        let mut buf = [0u8; 64];
-        let mut latest = None;
-        while let Ok((_n, addr)) = self.socket.recv_from(&mut buf) {
-            latest = Some(addr);
         }
-        let addr = latest?;
-        if self.target != Some(addr) {
-            self.target = Some(addr);
-            return Some(addr);
-        }
-        None
     }
 
-    pub fn set_fps(&mut self, fps: u32) {
-        self.fps = fps.max(1);
-    }
-
-    /// Set the codec for frame-type detection. Must be called at session start
-    /// after the codec is confirmed so `detect_frame_type` uses the right layout:
-    /// AV1 OBUs, or HEVC 2-byte vs H.264 1-byte NAL headers. `is_av1` wins when
-    /// set (AV1 is not a NAL stream, so `is_hevc` is irrelevant then).
-    pub fn set_codec(&mut self, is_hevc: bool, is_av1: bool) {
-        self.is_hevc = is_hevc;
-        self.is_av1 = is_av1;
-    }
-
-    /// Apply per-session stream parameters. `packet_size` must be the client's
-    /// negotiated x-nv-video[0].packetSize; `fec_percentage` 0 disables FEC.
-    pub fn configure(&mut self, packet_size: usize, fec_percentage: usize, min_parity_shards: usize) {
+    fn configure(&mut self, packet_size: usize, fec_percentage: usize, min_parity_shards: usize) {
         self.packet_size       = packet_size.clamp(512, 1392);
         self.fec_percentage    = fec_percentage.min(100);
         self.min_parity_shards = min_parity_shards.max(1);
@@ -206,14 +369,7 @@ impl RtpSender {
             self.fec_percentage, self.min_parity_shards);
     }
 
-    /// Drop per-session state so a future PLAY starts a clean stream
-    /// (fresh sequence numbers/timestamps, and re-learn the client's
-    /// ephemeral video source port via `try_learn_target`).
-    pub fn reset(&mut self) {
-        // Flush pings buffered from the ending session so the next learn
-        // can't latch onto a stale source port.
-        let mut buf = [0u8; 64];
-        while self.socket.recv_from(&mut buf).is_ok() {}
+    fn reset(&mut self) {
         self.target          = None;
         self.sequence_number = 0;
         self.timestamp       = 0;
@@ -223,8 +379,7 @@ impl RtpSender {
         self.is_av1          = false;
     }
 
-
-    /// Send a complete H.264 Annex-B frame using the GameStream NV_VIDEO_PACKET wire format.
+    /// Send a complete encoded frame using the GameStream NV_VIDEO_PACKET wire format.
     ///
     /// Packet layout per UDP datagram (matches Sunshine's `video_packet_raw_t`):
     ///   [RTP header 12 B, X=1] + [reserved 4 B] + [NV_VIDEO_PACKET 16 B]
@@ -236,11 +391,10 @@ impl RtpSender {
     /// Our DESCRIBE response advertises encryptionSupported:0/encryptionRequested:0,
     /// so on real Sunshine session->video.cipher is never set for this session —
     /// video payloads are sent in plaintext (no AES).
-    pub fn send_frame(&mut self, data: &[u8]) {
+    fn send_frame(&mut self, data: &[u8], frame_type: u8) {
         if data.is_empty() { return; }
         let Some(target) = self.target else { return };
 
-        let frame_type = detect_frame_type(data, self.is_hevc, self.is_av1);
         let block_size         = self.packet_size + MAX_RTP_HEADER_SIZE;
         let payload_per_packet = block_size - HEADERS_SIZE;
 
@@ -345,13 +499,22 @@ impl RtpSender {
             rs.encode(&mut self.shard_pool[..total_shards]).expect("all shards are block_size");
         }
 
-        // ── Pacing gap — scaled to fps so overhead fits the frame budget ────
-        // 300µs × (60 / fps): at 60fps = 300µs, at 120fps = 150µs.
-        // A 50-packet IDR at 120fps produces 4 gaps = 600µs (<10% of 8.33ms)
-        // vs the old 1200µs (>14%). Clamped 50–300µs so very high fps values
-        // don't approach zero and very low fps values don't exceed 300µs.
-        let pace_gap_us = (300u64 * 60 / self.fps.max(1) as u64).clamp(50, 300);
-        let pace_gap = Duration::from_micros(pace_gap_us);
+        // ── Pacing gap — bound the burst rate independently of frame size ────
+        // Spread the frame's batches across ≤40% of the frame interval: the
+        // peak transmit rate is then ~2.5× the nominal stream bitrate no
+        // matter how big the frame is. A massive HEVC/HDR10 pan frame or IDR
+        // gets more, closer-spaced gaps (total send time grows but stays
+        // bounded, and the send thread always finishes well before the next
+        // frame arrives); small frames keep a gentle 300 µs ceiling per gap.
+        // Clamped ≥40 µs so the gap never degenerates to a pure burst.
+        let batches = (total_shards + PACE_BATCH_PACKETS - 1) / PACE_BATCH_PACKETS;
+        let pace_gap = if batches > 1 {
+            let frame_interval_us = 1_000_000u64 / self.fps.max(1) as u64;
+            let budget_us = frame_interval_us * 2 / 5; // 40% of the frame budget
+            Duration::from_micros((budget_us / batches as u64).clamp(40, 300))
+        } else {
+            Duration::ZERO
+        };
 
         // ── Finalize per-packet fields and send (data + parity) ─────────────
         // Split borrow: socket and shard_pool are separate fields.
@@ -379,7 +542,10 @@ impl RtpSender {
             send_packet(socket, shard, target);
 
             // Inter-batch pacing gap.
-            if (x + 1) % PACE_BATCH_PACKETS == 0 && x + 1 < total_shards {
+            if !pace_gap.is_zero()
+                && (x + 1) % PACE_BATCH_PACKETS == 0
+                && x + 1 < total_shards
+            {
                 spin_wait(pace_gap);
             }
         }
@@ -471,7 +637,9 @@ fn list_nal_types(data: &[u8], is_hevc: bool) -> Vec<u8> {
 /// NVENC with `NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS`
 /// prefixes an IDR with AUD + VPS + SPS + PPS (HEVC) or AUD + SPS + PPS (H.264)
 /// before the slice NAL, so we must scan all NALs rather than just the first.
-/// The returned value goes in byte 3 of the NV_VIDEO_PACKET frame header.
+/// The returned value goes in byte 3 of the NV_VIDEO_PACKET frame header
+/// (passed into `RtpSender::send_frame` by the caller, which needs the
+/// classification anyway for its first-IDR gate — one scan per frame total).
 pub(crate) fn detect_frame_type(data: &[u8], is_hevc: bool, is_av1: bool) -> u8 {
     if is_av1 {
         return if av1_is_keyframe(data) { 2 } else { 1 };
@@ -565,7 +733,7 @@ mod tests {
     /// must be learned — not a stale session-1 ping.
     fn loopback_addr(sender: &RtpSender) -> std::net::SocketAddr {
         // The sender binds 0.0.0.0 — rewrite to a sendable loopback address.
-        let port = sender.socket.local_addr().unwrap().port();
+        let port = sender.recv_socket.local_addr().unwrap().port();
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
@@ -597,8 +765,8 @@ mod tests {
     }
 
     /// Receive every datagram of one sent frame (data + parity shards).
-    /// send_frame is synchronous, so after it returns everything is in the
-    /// loopback receive buffer within the read timeout.
+    /// Transmission happens on the nova-rtp-send worker thread; the 250 ms
+    /// read timeout comfortably covers command-channel handoff + send.
     fn recv_frame_datagrams(sock: &UdpSocket) -> Vec<Vec<u8>> {
         sock.set_read_timeout(Some(std::time::Duration::from_millis(250))).unwrap();
         let mut pkts = Vec::new();
@@ -632,14 +800,15 @@ mod tests {
         // Minimal H.264 Annex-B IDR payload (00 00 01 65 ...).
         let mut frame = vec![0u8, 0, 1, 0x65];
         frame.extend_from_slice(&[0xAA; 64]);
+        let ft = detect_frame_type(&frame, false, false);
 
-        sender.send_frame(&frame);
+        assert!(sender.send_frame(&frame, ft), "frame 1 must be accepted");
         let pkts = recv_frame_datagrams(&client);
         assert!(!pkts.is_empty(), "no datagrams received for frame 1");
         assert_eq!(frame_index_of(&pkts[0]), 1, "first frame must be index 1, not 0");
         assert_eq!(pkts[0][24] & FLAG_SOF, FLAG_SOF, "first data shard must carry SOF");
 
-        sender.send_frame(&frame);
+        assert!(sender.send_frame(&frame, ft), "frame 2 must be accepted");
         let pkts = recv_frame_datagrams(&client);
         assert_eq!(frame_index_of(&pkts[0]), 2, "second frame must be index 2");
 
@@ -648,7 +817,7 @@ mod tests {
         sender.reset();
         ping(&client, dst, 1);
         sender.try_learn_target().expect("re-learn client after reset");
-        sender.send_frame(&frame);
+        assert!(sender.send_frame(&frame, ft), "post-reset frame must be accepted");
         let pkts = recv_frame_datagrams(&client);
         assert_eq!(frame_index_of(&pkts[0]), 1, "post-reset first frame must be index 1");
     }

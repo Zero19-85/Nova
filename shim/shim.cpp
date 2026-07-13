@@ -341,19 +341,23 @@ static ID3D11ShaderResourceView* g_cursorXorSRV  = nullptr;
 static UINT                      g_cursorTexW    = 0;
 static UINT                      g_cursorTexH    = 0;
 
-// "Clean background" — a copy of the captured frame (dxgiFrame), refreshed
-// every EncodeFrame call BEFORE the cursor overlay is drawn anywhere. Source
-// for g_compositeTex below, so a DXGI_ERROR_WAIT_TIMEOUT replay (the same
-// dxgiFrame re-submitted by Rust while the desktop is static) never
-// re-composites onto an already cursor-stamped buffer.
-static ID3D11Texture2D*          g_cleanBgTex    = nullptr;
-
-// Render-targetable copy of g_cleanBgTex with the cursor overlay drawn on
-// top — the VideoProcessorBlt source for NV12 conversion. Re-copied from
-// g_cleanBgTex every EncodeFrame call (see EncodeFrame), so cursor pixels
-// from a previous frame never persist into this one. The DXGI duplication
-// texture isn't guaranteed to support D3D11_BIND_RENDER_TARGET, which is why
-// the cursor is drawn onto this copy rather than dxgiFrame directly.
+// Render-targetable copy of the captured frame (dxgiFrame) with the cursor
+// overlay drawn on top — the source for the YUV conversion passes. Re-copied
+// from dxgiFrame every EncodeFrame call (see EncodeFrame), so cursor pixels
+// from a previous frame never persist into this one. The capture texture
+// isn't guaranteed to support D3D11_BIND_RENDER_TARGET, which is why the
+// cursor is drawn onto this copy rather than dxgiFrame directly.
+//
+// NOTE (Phase 15 micro-stutter fix): the former g_cleanBgTex intermediate and
+// the g_copyFence event-query busy-spin were removed. Both existed to guard
+// against IDXGIOutputDuplication::ReleaseFrame letting DWM overwrite the
+// source surface while the GPU copy was still queued — but dxgiFrame is now
+// always Nova's OWN stable cache texture (WgcCapturer::cache_frame / the DDA
+// staging upload), never a live duplication surface, and the only writer of
+// that cache is the same capture thread through the same immediate context.
+// D3D11 same-context ordering makes the extra copy + CPU stall pure overhead
+// — at 4K FP16 (HDR) the removed copy alone was ~66 MB of GPU traffic per
+// frame, and the spin serialized CPU against the whole queued GPU workload.
 static ID3D11Texture2D*          g_compositeTex  = nullptr;
 static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
 
@@ -363,11 +367,6 @@ static ID3D11RenderTargetView*   g_compositeRTV  = nullptr;
 // at 60–120 Hz. Invalidated whenever g_compositeTex changes (resize/format switch).
 static ID3D11ShaderResourceView* g_compositeSRV    = nullptr;
 static ID3D11Texture2D*          g_compositeSrvTex = nullptr;
-
-// GPU fence used to block EncodeFrame() until the CopyResource of the DXGI
-// duplication surface into g_cleanBgTex has actually finished on the GPU
-// (see EncodeFrame for why this matters).
-static ID3D11Query*              g_copyFence     = nullptr;
 
 // Updated every frame from DXGI_OUTDUPL_FRAME_INFO.PointerPosition. Only
 // touched from the single capture/encode thread, so no locking needed.
@@ -1345,17 +1344,6 @@ extern "C" __declspec(dllexport) int EncodeFrame(
 
     ID3D11Texture2D* dxgiFrame = (ID3D11Texture2D*)d3d11_texture;
 
-    // Copy the DXGI duplication surface into the clean-background texture
-    // and block until the GPU has actually finished that copy before
-    // returning. The Rust capture loop calls
-    // IDXGIOutputDuplication::ReleaseFrame() immediately after this function
-    // returns, which lets DWM start writing the NEXT frame into this same
-    // recycled surface. Without this fence, the CopyResource below is only
-    // *queued*, not executed — so the GPU could still be reading dxgiFrame
-    // while DWM is already overwriting it, tearing the captured image. A
-    // static desktop hides this (old/new pixels match); moving content
-    // (cursor, text, scrolling) doesn't — visible as the smearing/ghosting
-    // that only self-heals at the next IDR.
     // Use dimensions cached in InitColorConversion — avoids a per-frame COM
     // GetDesc() round-trip on the hot encode path. Resolution can only change
     // on a rebind (which calls InitColorConversion again), so the cache is
@@ -1363,9 +1351,6 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     const UINT        fw         = g_encWidth;
     const UINT        fh         = g_encHeight;
     const DXGI_FORMAT captureFmt = g_captureFmt;
-    if (!EnsureSizedTexture(&g_cleanBgTex, nullptr, (int)fw, (int)fh, D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
-        return 0;
-    }
     if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)fw, (int)fh, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
@@ -1380,27 +1365,23 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_compositeSrvTex = g_compositeTex;
     }
 
-    if (!g_copyFence) {
-        D3D11_QUERY_DESC qdesc = {};
-        qdesc.Query = D3D11_QUERY_EVENT;
-        if (FAILED(g_device->CreateQuery(&qdesc, &g_copyFence))) return 0;
-    }
-
-    g_context->CopyResource(g_cleanBgTex, dxgiFrame);
-    g_context->End(g_copyFence);
-    while (g_context->GetData(g_copyFence, nullptr, 0, 0) == S_FALSE) {
-        // Spin: this copy is a few hundred microseconds at most, and we must
-        // not return (letting Rust call ReleaseFrame) before it completes.
-    }
-
-    // Refresh the encode buffer from the clean background on EVERY call —
-    // including a DXGI_ERROR_WAIT_TIMEOUT replay of the same dxgiFrame while
-    // the desktop is static — so the cursor drawn below never persists into
-    // the next iteration's source. Previously g_compositeTex was copied
-    // directly from dxgiFrame and cursor-overlaid in place: a static desktop
-    // kept re-copying the same source frame onto a buffer that still had the
-    // last cursor draw on it, "stamping" a permanent trail of cursor images.
-    g_context->CopyResource(g_compositeTex, g_cleanBgTex);
+    // Refresh the composite from the source on EVERY call — including a
+    // static-desktop replay of the same dxgiFrame — so the cursor overlay
+    // drawn below never persists into the next iteration's source (no
+    // "stamped" cursor trails).
+    //
+    // ONE queued copy, NO CPU fence — deliberate (see the g_compositeTex
+    // declaration comment): dxgiFrame is Nova's own stable cache texture, only
+    // ever written by this same thread on this same immediate context, so
+    // same-context command ordering already guarantees (a) this copy reads the
+    // finished capture data and (b) the NEXT capture copy into dxgiFrame runs
+    // after this frame's reads. The NVENC driver likewise orders the encode
+    // after the conversion draws on the mapped input texture. The old
+    // event-query busy-spin here stalled the capture thread for a full GPU
+    // queue drain every frame — with FP16/HDR frames (2× the bytes of BGRA8)
+    // it was a per-frame stall that scaled with exactly the workload that
+    // showed pan micro-stutter.
+    g_context->CopyResource(g_compositeTex, dxgiFrame);
 
     // Composite the cursor onto g_compositeTex before NV12 conversion
     // (Sunshine's approach: blend into an intermediate render-targetable
@@ -1605,12 +1586,10 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_cursorTex)         { g_cursorTex->Release();         g_cursorTex         = nullptr; }
     if (g_cursorXorSRV)      { g_cursorXorSRV->Release();      g_cursorXorSRV      = nullptr; }
     if (g_cursorXorTex)      { g_cursorXorTex->Release();      g_cursorXorTex      = nullptr; }
-    if (g_cleanBgTex)        { g_cleanBgTex->Release();        g_cleanBgTex        = nullptr; }
     if (g_compositeSRV)      { g_compositeSRV->Release();      g_compositeSRV      = nullptr; }
     g_compositeSrvTex = nullptr;
     if (g_compositeRTV)      { g_compositeRTV->Release();      g_compositeRTV      = nullptr; }
     if (g_compositeTex)      { g_compositeTex->Release();      g_compositeTex      = nullptr; }
-    if (g_copyFence)         { g_copyFence->Release();         g_copyFence         = nullptr; }
     if (g_cursorSampler)     { g_cursorSampler->Release();     g_cursorSampler     = nullptr; }
     if (g_cursorBlend)       { g_cursorBlend->Release();       g_cursorBlend       = nullptr; }
     if (g_cursorBlendInvert) { g_cursorBlendInvert->Release(); g_cursorBlendInvert = nullptr; }

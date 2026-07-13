@@ -61,6 +61,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_Security",
     "Win32_Media_Audio",
+    # timeBeginPeriod — 1 ms system timer resolution for frame-pacing sleeps
+    # (Phase 15 HEVC/HDR10 micro-stutter batch). Bindings only.
+    "Win32_Media",
     # Windows Graphics Capture (WGC) — HDR-safe capture backend
     "Graphics_Capture",                    # Direct3D11CaptureFramePool / GraphicsCaptureSession
     "Graphics_DirectX",                    # DirectXPixelFormat
