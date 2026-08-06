@@ -1369,12 +1369,20 @@ async fn handle_request(
                 if path == "/launch" {
                     info.activated = false;
                 }
+                // Only /launch (re)starts the app's process; /resume reattaches
+                // to one already running. Under the Master/Worker split the
+                // launch itself happens Worker-side (see pending_app_launch's
+                // doc comment), so record the intent on the session either way.
+                info.pending_app_launch = path == "/launch";
                 *guard = Some(info);
             }
 
             // /resume reattaches to an already-running session — only /launch
-            // should (re)start the app's process.
-            if path == "/launch" {
+            // should (re)start the app's process. When the split is live this
+            // process is the SYSTEM Master: launching here would spawn the app
+            // into the service's session, invisible to the stream — the Worker
+            // launches it in the user session instead, after VDD activation.
+            if path == "/launch" && !crate::app_launcher::launch_via_worker() {
                 crate::app_launcher::launch_app(app_id_num);
             }
 

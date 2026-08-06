@@ -49,6 +49,14 @@ pub fn service_log_path() -> PathBuf {
     exe_dir().join("nova-service.log")
 }
 
+/// The SYSTEM input helper (`--system-input-helper`) logs to its own file, for
+/// the same reason the service does: the Worker holds `nova.log` open for its
+/// whole life, and a helper spawns/dies inside that window. A third file keeps
+/// the secure-desktop injection trail readable on its own.
+pub fn input_helper_log_path() -> PathBuf {
+    exe_dir().join("nova-input.log")
+}
+
 /// Log path encoded as a null-terminated UTF-16 string for the C shim.
 pub fn log_path_wide() -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -74,6 +82,12 @@ pub fn init_debug_logger() {
 /// ([`service_log_path`]) so it never collides with the host's `nova.log`.
 pub fn init_service_logger() {
     init_logger_to(service_log_path());
+}
+
+/// Logger init for the SYSTEM input helper (`--system-input-helper`) — see
+/// [`input_helper_log_path`].
+pub fn init_input_helper_logger() {
+    init_logger_to(input_helper_log_path());
 }
 
 fn init_logger_to(path: PathBuf) {

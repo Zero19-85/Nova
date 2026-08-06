@@ -322,6 +322,29 @@ impl Drop for DdaCapturer {
 
 // ── Capture thread ────────────────────────────────────────────────────────────
 
+/// **RE-ENABLED (2026-08-06)** — the "local physical input deadlock" that
+/// previously quarantined this path was a misdiagnosis, clarified by the
+/// user the same day: the physical, wired mouse/keyboard NEVER froze at
+/// the PIN screen. What stopped working was the REMOTE Moonlight input —
+/// which is ordinary Winlogon secure-desktop isolation (an elevated-user
+/// thread's `SendInput` never reaches the secure desktop), not a deadlock,
+/// and it happens with this flag on or off. The 2026-07-10 live validation
+/// stands: SYSTEM-impersonated attach + duplication showed the Ctrl+Alt+Del
+/// secure screen on the client with no host-side casualties. Capture-side
+/// failures remain graceful either way (Phase 15.2a/b: stay on WGC, client
+/// keeps the last frame, 5 s retry cooldown). The remote-input half of the
+/// story is input.rs's `SECURE_DESKTOP_INPUT_ENABLED` (SecureDesktopGuard),
+/// re-enabled in the same change.
+const DDA_SECURE_DESKTOP_ENABLED: bool = true;
+
+/// Whether secure-desktop DDA capture is compiled in as available — lets the
+/// swap state machine skip doomed activation attempts (each one spawns a
+/// thread just to report the disabled error) instead of retrying every 5 s
+/// for the whole secure-desktop interlude.
+pub fn secure_desktop_capture_enabled() -> bool {
+    DDA_SECURE_DESKTOP_ENABLED
+}
+
 /// Body of the `nova-dda-secure` thread: assume the SYSTEM token, attach to the
 /// secure desktop, create the duplication, then loop acquiring frames into the
 /// shared slot. Reports the outcome of setup once via `init_tx`.
@@ -331,6 +354,12 @@ fn capture_thread_main(
     is_hdr: bool,
     init_tx: mpsc::Sender<InitResult>,
 ) {
+    if !DDA_SECURE_DESKTOP_ENABLED {
+        let _ = init_tx.send(Err(
+            "DDA secure-desktop capture is disabled (local input safety — see DDA_SECURE_DESKTOP_ENABLED)".to_string()
+        ));
+        return;
+    }
     unsafe {
         // 1. Assume the SYSTEM-in-console-session token so the secure desktop's
         //    ACL admits us. Fresh thread ⇒ no windows ⇒ SetThreadDesktop works.
@@ -457,7 +486,15 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
                 break;
             }
             Err(e) => {
-                println!("⚠️  DDA AcquireNextFrame: {e:?}");
+                // Any other failure (seen live 2026-08-06: 0x887A0001
+                // DXGI_ERROR_INVALID_CALL as the secure desktop dismissed)
+                // still means this duplication is dead. Flag it as
+                // access-lost so DesktopManager's restore/swap logic rebuilds
+                // or replaces the backend — without the flag the thread
+                // exited silently and, had the error struck mid-interlude,
+                // the stream would have frozen until the next desktop switch.
+                println!("⚠️  DDA AcquireNextFrame: {e:?} — treating as access lost");
+                shared.access_lost.store(true, Ordering::Release);
                 break;
             }
         }

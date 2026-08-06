@@ -255,6 +255,16 @@ pub struct DesktopManager {
     /// Backoff after a failed swap so a persistently-denied DDA init doesn't
     /// spam an attempt per frame.
     swap_retry_after: Option<std::time::Instant>,
+    /// `desktop_switch::switch_generation()` at the moment the current WGC
+    /// session was (re)built. With DDA disabled for the secure desktop the
+    /// backend stays `Wgc` across a Winlogon interlude, and the session that
+    /// was bound to the pre-switch desktop keeps serving stale ("ghost")
+    /// buffers after login. A generation mismatch while back on the Default
+    /// desktop triggers a scorched-earth WGC rebuild.
+    wgc_built_generation: u64,
+    /// Generation the "secure desktop up, DDA disabled" notice was last
+    /// logged for — one line per interlude instead of one per retry cooldown.
+    secure_notice_generation: u64,
 }
 
 impl DesktopManager {
@@ -287,6 +297,8 @@ impl DesktopManager {
                     exclude: exclude.map(str::to_owned),
                     is_hdr: false,
                     swap_retry_after: None,
+                    wgc_built_generation: desktop_switch::switch_generation(),
+                    secure_notice_generation: u64::MAX,
                 });
             }
             Err(e) => e,
@@ -306,6 +318,8 @@ impl DesktopManager {
                 exclude: exclude.map(str::to_owned),
                 is_hdr: false,
                 swap_retry_after: None,
+                wgc_built_generation: desktop_switch::switch_generation(),
+                secure_notice_generation: u64::MAX,
             }),
             Err(dda_err) => {
                 println!(
@@ -335,8 +349,40 @@ impl DesktopManager {
 
         let desk = desktop_switch::current_input_desktop();
         match (self.backend.kind(), desk) {
-            (BackendKind::Wgc, InputDesktop::Secure) => self.swap_to_dda(),
+            (BackendKind::Wgc, InputDesktop::Secure) => {
+                // With the DDA secure-desktop path quarantined (see dda.rs's
+                // DDA_SECURE_DESKTOP_ENABLED), don't attempt-and-fail every
+                // cooldown period — log the situation once per interlude and
+                // stay on WGC (client keeps the last interactive frame until
+                // the secure desktop dismisses).
+                if !dda::secure_desktop_capture_enabled() {
+                    let gen = desktop_switch::switch_generation();
+                    if self.secure_notice_generation != gen {
+                        self.secure_notice_generation = gen;
+                        println!(
+                            "🔒 Secure desktop active — DDA capture is disabled (local input \
+                             safety); staying on WGC until it dismisses"
+                        );
+                    }
+                    return None;
+                }
+                self.swap_to_dda()
+            }
             (BackendKind::Dda, InputDesktop::Default) => self.swap_to_wgc(),
+            (BackendKind::Wgc, InputDesktop::Default) => {
+                // Scorched-earth rebind: we stayed on WGC across a desktop
+                // switch (DDA disabled, or the swap never activated) and the
+                // input desktop is back to Default. The old WGC session was
+                // bound to the pre-switch desktop environment — after a
+                // Winlogon→Default login handoff it reads stale/ghost buffers
+                // (frozen PIN screen). Generation compare catches even a fast
+                // Default→Secure→Default flip between loop iterations.
+                if desktop_switch::switch_generation() != self.wgc_built_generation {
+                    self.rebuild_wgc_after_switch()
+                } else {
+                    None
+                }
+            }
             (BackendKind::Dda, _) => {
                 // Still on the secure desktop (or state unknown): if the
                 // duplication died (mode change mid-prompt), rebuild it.
@@ -413,12 +459,55 @@ impl DesktopManager {
                 );
                 self.backend = CaptureBackend::Wgc(wgc);
                 self.swap_retry_after = None;
+                self.wgc_built_generation = desktop_switch::switch_generation();
                 Some(resized)
             }
             Err(e) => {
                 // The desktop just transitioned — WGC session creation can race
                 // the compositor settling. Short cooldown, keep trying.
                 println!("⚠️  WGC restore after secure desktop failed ({e:?}) — retrying");
+                self.swap_retry_after =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                None
+            }
+        }
+    }
+
+    /// Scorched-earth WGC rebuild after a desktop switch that never left WGC
+    /// (secure-desktop DDA disabled). Drops the stale session/frame-pool
+    /// entirely and re-creates it against the now-current desktop environment;
+    /// the fresh capturer starts with `has_frame() == false`, so the frame loop
+    /// cannot re-encode a stale cached surface — the first texture it hands
+    /// out is a real post-login frame.
+    fn rebuild_wgc_after_switch(&mut self) -> Option<bool> {
+        if self.cooldown_active() {
+            return None;
+        }
+        let (old_w, old_h) = (self.backend.width(), self.backend.height());
+        match WgcCapturer::new_on_device(
+            self.device.clone(),
+            self.target.as_deref(),
+            self.exclude.as_deref(),
+            self.is_hdr,
+        ) {
+            Ok(wgc) => {
+                let resized = wgc.width != old_w || wgc.height != old_h;
+                println!(
+                    "🔀 Capture backend: WGC → WGC (desktop switch — stale session rebuilt){}",
+                    if resized { " — capture size changed" } else { "" }
+                );
+                // Old WGC session/pool drop here → no ghost buffers survive.
+                self.backend = CaptureBackend::Wgc(wgc);
+                self.swap_retry_after = None;
+                self.wgc_built_generation = desktop_switch::switch_generation();
+                Some(resized)
+            }
+            Err(e) => {
+                // Right after login the compositor/broker can still be settling
+                // — keep the old (stale) session so the client at least sees a
+                // frozen frame, and retry shortly. Generation stays unstamped
+                // so the rebuild re-arms until it succeeds.
+                println!("⚠️  WGC rebuild after desktop switch failed ({e:?}) — retrying");
                 self.swap_retry_after =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
                 None
@@ -501,9 +590,16 @@ impl DesktopCapture for DesktopManager {
             println!("🔀 Capture backend: DDA → WGC (session rebind)");
             self.backend = CaptureBackend::Wgc(wgc);
             self.swap_retry_after = None;
+            self.wgc_built_generation = desktop_switch::switch_generation();
             return Ok(resized);
         }
-        self.backend.rebind(gdi_device_name, is_hdr, expected_size)
+        let result = self.backend.rebind(gdi_device_name, is_hdr, expected_size);
+        // A successful WGC rebind recreates the capture session, so it is
+        // implicitly bound to the current desktop — stamp the generation.
+        if result.is_ok() && self.backend.kind() == BackendKind::Wgc {
+            self.wgc_built_generation = desktop_switch::switch_generation();
+        }
+        result
     }
     fn width(&self) -> u32 {
         self.backend.width()

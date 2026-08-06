@@ -8,6 +8,23 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 - Native C++ FFI shim (`shim.cpp`) compiled to `nova_shim.dll` — zero-copy DXGI-to-NVENC hardware encoding.
 - Architecture targets: High performance, ultra-low latency, and minimal portable `.exe` footprint.
 
+## ⚠️ READ FIRST — Nova is THREE processes (Session-Survival Architecture, Phase 16)
+
+Anything below describing Nova as "ONE interactive elevated process" is pre-Phase-16 history. Current process model — one binary, four modes:
+
+| Mode | Identity / session | Owns |
+|---|---|---|
+| `--service` (**Master**, `NovaService`) | LocalSystem, Session 0 | ALL networking: `pairing.rs`, `rtsp.rs`, `control.rs`, `rtp.rs`, `session_negotiate.rs`, mDNS, `RtpSender`, audio TX, Worker supervision |
+| `--worker` (**Worker**) | elevated USER, console session | `capture/`, `encoder.rs`, `virtual_display.rs`, `audio.rs` capture, `input.rs`, `tray.rs` |
+| `--system-input-helper` | **SYSTEM primary token**, console session | secure-desktop mouse/keyboard injection ONLY; spawned per lock-screen interlude, killed on unlock |
+| (no flag) | elevated USER | legacy monolithic `run()` — still intact as a fallback; **mirror Worker-loop changes here** |
+
+- **IPC:** `\\.\pipe\NovaControl` + `\\.\pipe\NovaMedia` (Master↔Worker), `\\.\pipe\NovaInput` (Master→input helper). Hand-rolled `[u32 len][u8 tag][payload]` framing in `src/ipc.rs`. Toggle: `service.rs WORKER_SPLIT_ENABLED` (true).
+- **Why three:** WGC's broker fails under SYSTEM (`0x80070424`) ⇒ capture must be the interactive user. The Winlogon desktop's ACL admits only SYSTEM ⇒ DDA capture impersonates a service-supplied SYSTEM token. **UIPI judges the injecting process's PRIMARY token** ⇒ input at the credential provider needs a SYSTEM-primary process. Session 0 can't `SendInput` into the console session at all ⇒ the Master can never inject on the Worker's behalf. Each boundary is load-bearing; do not "simplify" by merging processes.
+- **Never re-litigate these (all live-confirmed dead ends):** host-as-SYSTEM (breaks WGC); Master-side input injection (session-local `SendInput`); a kernel-mode virtual HID driver (ViGEmBus is gamepad-only; FakerInput unmaintained; cf. the VAD attestation-signing wall).
+- **Secure-desktop flags are ON and correct:** `dda.rs DDA_SECURE_DESKTOP_ENABLED` + `input.rs SECURE_DESKTOP_INPUT_ENABLED`. The 2026-07-30 "local physical input deadlock" that once justified disabling them was a **misdiagnosis** — the user's wired mouse/keyboard never froze; only REMOTE input did, which was the UIPI swallow. Physical HID input is never affected by desktop attachment. Do not re-quarantine on that basis.
+- **Logs are per-process:** `nova-service.log` (Master), `nova.log` (Worker), `nova-input.log` (input helper). Read the right one — a Worker-side symptom is invisible in the Master's log and vice versa.
+
 ## Developer Rules for Claude
 1. **Always verify:** Before executing changes, audit the Rust `Cargo.toml` and `build.rs` to ensure no hallucinated static links are injected into the NVENC pipeline.
 2. **Performance First:** Keep dependencies minimal. Prioritize zero-copy transfers (DXGI to NVENC).
@@ -15,7 +32,45 @@ Nova is an ultra-low footprint, native Rust game-streaming host.
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 15 — Secure-desktop capture (WGC+DDA dual backend), two-process privilege model, audio single-owner (2026-07-09)
+## Current Phase: Phase 16 — **ALPHA 2.0** — Session-Survival Architecture: Master/Worker split, lock-screen streaming + remote PIN entry (2026-08-06)
+
+Alpha 2.0's headline: **reboot → connect from Moonlight → see the Windows login screen → type the PIN with the remote mouse/keyboard.** All items below are live-confirmed on the dev box unless marked otherwise.
+
+### 16.1 — Master/Worker split (networking survives sign-out)
+Master (SYSTEM service) owns every socket and the client session; Workers come and go beneath it on sign-out, session swap, or crash. `control_supervisor` replays the live session's `ConfigureStart` to each newly-connected Worker, so streaming resumes without the client reconnecting. `session_watcher` (Master) polls `ClientInfo` for the PLAY edge and the active→inactive edge, sending `ConfigureStart`/`Deactivate`. Key invariant: **a non-cancelled `Deactivate` must NOT clear `last_configure`** — a sign-out's suspend would otherwise leave the post-login Worker unconfigured forever ("video never resumes after the session swap").
+
+### 16.2 — Strict frame pacing (static-screen blur) — FIXED
+Phase 11's static-frame gate (encode nothing until a 5 s keep-alive) starved the client decoder and let CBR degrade a motionless screen until the mouse moved. Now every missed slot re-submits `capturer.cached_texture()` as a duplicate P-frame ⇒ uninterrupted constant-fps bitstream, idle bitrate spent refining the static image. Gated on `client_connected` so idle-with-no-client keeps NVENC at 0%. `IDR_KEEPALIVE_INTERVAL`/`last_frame_sent` are gone from both loops; the Worker loop also gained the monolithic path's ~1 ms spin-finish dispatch. **Deliberate trade:** Phase 11's "0% encode while streaming a static desktop" signature is intentionally abandoned.
+
+### 16.3 — Login-handoff ghosting (frozen PIN screen after sign-in) — FIXED
+`maybe_swap_backend` had no `(Wgc, Default)` arm, so a WGC session bound to the pre-switch desktop survived the Winlogon→Default login and served stale ghost buffers. `DesktopManager` now tracks `wgc_built_generation` (stamped on every path that builds a WGC session); a generation mismatch while back on Default triggers `rebuild_wgc_after_switch()` — drop session+pool, fresh `new_on_device`, 1 s retry cooldown (generation left unstamped so it re-arms). The rebuilt capturer has `has_frame() == false`, so the loop cannot encode a stale surface.
+
+### 16.4 — Universal VDD app routing + Worker-side app launch
+`uses_virtual_display`: apps 2/3/4/5 (Steam/Xbox/RetroArch/Virtual Desktop) are always headless; only app 1 (Desktop) mirrors the physical primary. **`/launch` no longer starts apps in the Master** — that spawned them into the service's Session 0, invisible to the stream. Chain: `app_launcher::LAUNCH_VIA_WORKER` (set in `start_master_network`) ⇒ pairing skips its direct launch ⇒ `ClientInfo.pending_app_launch` (set by `/launch`, never `/resume`) ⇒ `NegotiatedParams.launch_app` ⇒ `ConfigureStart.launch_app` ⇒ Worker launches AFTER VDD activation (VDD is primary ⇒ the window lands on it). Master clears the flag post-send so a Worker respawn can't double-launch.
+
+### 16.5 — Fresh-install pairing hang — FIXED
+Pairing runs in Master (Session 0, no tray) so `getservercert` blocked forever at "waiting for PIN"; "exit and restart Nova" appeared to fix it only because a manual launch runs the monolithic path. Full relay now: pairing `tray_tx` → Master `nova-pair-dialog-fwd` thread → `ControlMsg::OpenPairDialog` → Worker tray dialog → `ControlMsg::PinRelay` → `control_supervisor` writes pairing's `global_pin`. Manual "Pair Device" from the tray relays the same way. (Pre-pairing `47984 TLS CertificateUnknown` spam is normal client probing — it stops once paired.)
+
+### 16.6 — Lock-screen streaming + remote PIN entry: the **UIPI "silent swallow"** — FIXED
+**The lesson worth keeping.** With SYSTEM impersonation + a successful `SetThreadDesktop(Winlogon)`, the Worker's `SendInput` returned SUCCESS and the PIN field stayed empty. Reason: the checks impersonation satisfies (`OpenInputDesktop`, `SetThreadDesktop`, DXGI duplication) are kernel-object ACL checks, which honour a thread's impersonation token — but injected input reaching the credential provider is gated by UIPI/integrity in **win32k, which evaluates the injecting process's PRIMARY token**. The Worker's is the interactive user (High) < Winlogon (System) ⇒ accepted at the API boundary, dropped before the UI, nothing to log. **Signature: capture works, input silently doesn't.**
+Fix — `--system-input-helper`: `service::spawn_input_helper()` builds a SYSTEM **primary** token (`create_inheritable_system_token` used AS the process token, like `spawn_host_as_system_fallback`) and `CreateProcessAsUserW`s a minimal helper into the console session with `lpDesktop="WinSta0\Default"` (deliberately NOT Winlogon — that would bind to the secure desktop object live at spawn time). `lib.rs::input_helper_supervisor` owns its pipe/process/`ready` flag; `control_supervisor` detours `InjectInput` there while `secure_desktop && ready`, else falls through to the Worker (spawn/connect failure ⇒ never worse than before). `ControlMsg::SecureDesktopChanged` (Worker→Master, 250 ms poll task) drives the lifecycle — only the Worker can observe the boundary. **Gamepad packets stay on the Worker** (`input::is_gamepad_packet`): ViGEmBus is a kernel bus device, never UIPI-blocked, and routing it would materialise a second virtual pad on every lock. Helper runs on a **current-thread** runtime — desktop attachment is thread-affine thread-local state, so the recv→inject loop must never migrate threads.
+Injection hardening in `input.rs`: `send_input_synced` funnels all mouse/keyboard injection and, if `SendInput` inserts 0 events, force-resyncs the desktop and retries once (Sunshine's `send_input` + `syncThreadDesktop` model); `sync_desktop_for_input(force)` now records the desktop generation only once the desired state is REACHED (stamping it before a failed attach meant input stayed dead for the whole interlude); `OpenInputDesktop` uses `DF_ALLOWOTHERACCOUNTHOOK` (Sunshine parity); `ALWAYS_FOLLOW_INPUT_DESKTOP` mode for the helper (no desktop-switch monitor in that process).
+
+### 16.7 — Pre-login Worker crash-loop — FIXED
+WGC `0x80070424` pre-login with no usable backend made `run_worker` exit via `?`; the service's 4→60 s respawn backoff then also delayed post-login recovery. The Worker now retries `DesktopManager::new_wgc` in place every 3 s, staying alive with pipes and tray retry intact. Also: any `AcquireNextFrame` error (live: `0x887A0001` at dismissal) now sets `access_lost` so the manager rebuilds/swaps instead of the capture thread dying silently.
+
+### 🐛 Open bug for the next polish pass — sign-out stream recovery
+**Symptom:** signing out mid-stream drops the client to a permanent black screen; it never falls back to showing the logon/PIN screen. Manual disconnect + reconnect in Moonlight recovers it. Reboot → lock screen → remote PIN works fine, so this is specific to the *interactive → sign-out* transition. Deliberately deferred (user's call, "Alpha 2.0" ships with it).
+**Plan of attack (start here, in order):**
+1. **Read `nova-service.log` + `nova.log` across the sign-out boundary first.** Establish whether (a) the replacement SYSTEM-fallback Worker ever spawned, (b) it reported `WorkerReady`, (c) `🔁 Master: replaying ConfigureStart to newly-connected worker` fired, and (d) frames resumed (`📊 RTP/s`). That single question splits the whole search space.
+2. **Prime suspect — `last_configure` cleared or never replayed.** `stop_host` on session change sends a graceful stop; verify the sign-out path's `Deactivate` is `cancelled: false` (suspend) and that nothing clears `last_configure` (16.1's invariant). If the replay fires but no frames flow, suspect the Worker applying `ConfigureStart` while the VDD/CCD calls fail under the SYSTEM-fallback token (`is_system_fallback` skips VDD activation by design — confirm capture still binds *something*).
+3. **Second suspect — RTP/session continuity.** `session_watcher` only sends `ConfigureStart` once per `session_generation`; if the sign-out produced a `Deactivate` that reset `active_generation` without a new PLAY, the new Worker gets configured but `rtp_sender` may be reset/unlearned (`frame_index`, learned client target). Check whether `📦 frame 1` / `🎯 learned client video target` reappear.
+4. **Third — the media pipe.** Confirm `🔗 Master: worker media pipe connected` for the new Worker; a Worker that connects control-only would encode into a dead pipe (silent black).
+5. Only then consider forcing an IDR + `rtp_sender.reset()` on Worker adoption, which is the likely one-line fix if the client is simply waiting on a keyframe whose reference chain died with the old Worker.
+
+---
+
+## Phase 15 — Secure-desktop capture (WGC+DDA dual backend), two-process privilege model, audio single-owner (2026-07-09)
 
 Phase 15 is the "shippable, no-obvious-gaps-vs-Sunshine/Moonlight" push. The confirmed decision (do the full architecture, no half-measures): dual-backend capture (WGC primary + DDA secure-desktop fallback), a thin SYSTEM launcher service that spawns the interactive host, desktop-switch detection with seamless backend swap, and a single-owner audio lifecycle. Reference sources (patterns only, do not copy): Sunshine `C:\Sunshine-2026.516.143833` (`display_base.cpp` `syncThreadDesktop`, `display_ddup.cpp`, service arch in `misc.cpp`), Apollo `C:\Apollo-0.4.6`.
 

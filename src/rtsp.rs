@@ -72,6 +72,12 @@ pub struct ClientInfo {
     /// the codec intersection actually produced. HDR encoding must only
     /// be activated when this field is 1.
     pub dynamic_range_mode: u32,
+    /// Set by `/launch` (never `/resume`): the app's process should be started
+    /// for this session. Under the Master/Worker split the launch is deferred
+    /// to the Worker (via `ConfigureStart::launch_app`) so it runs in the user
+    /// session after the VDD is primary; Master clears this after sending the
+    /// ConfigureStart so a re-send can never double-launch.
+    pub pending_app_launch: bool,
     /// Set by the /cancel HTTP handler; cleared by the capture loop after the
     /// full VDD teardown completes. Distinguishes an intentional "Quit App"
     /// (teardown VDD, restore host topology) from a natural network disconnect

@@ -37,6 +37,14 @@ pub struct StreamConfig {
     /// When false, only App 5 (Virtual Desktop) activates headless mode.
     /// Default true — universal headless is the recommended configuration.
     pub headless_for_all_apps: bool,
+    /// Seconds a suspended-but-idle virtual monitor (client disconnected
+    /// without hitting "Quit App" — the common case) is left active before
+    /// Nova auto-tears it down, exactly as if /cancel had been sent. Keeps
+    /// /resume fast for a normal app-switch/reconnect while still reclaiming
+    /// the ghost monitor if nobody comes back. 0 disables auto-teardown
+    /// (old behaviour — VDD stays up until an explicit /cancel or restart).
+    /// Default 300 (5 minutes).
+    pub idle_teardown_secs: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +107,7 @@ impl Default for StreamConfig {
             codec:                "h264".to_string(),
             enable_hdr:           false,
             headless_for_all_apps: true,
+            idle_teardown_secs:   300,
         }
     }
 }
@@ -134,6 +143,9 @@ enable_hdr           = false   # set true to allow HDR10/HEVC-Main10 even when t
                                 # capability query is slow to reflect HDRPlus=true
 headless_for_all_apps = true   # route ALL apps through the VDD (recommended);
                                 # set false to restrict headless mode to App 5 only
+idle_teardown_secs   = 300     # auto-detach the virtual monitor after this many
+                                # seconds idle-but-connected-less (0 = never;
+                                # VDD stays up until /cancel or restart)
 
 [audio]
 endpoint_override = ""  # Windows audio endpoint friendly name or GUID;

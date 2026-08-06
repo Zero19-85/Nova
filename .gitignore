@@ -27,6 +27,9 @@ nova_paired.json
 nova_debug.log
 nova.log
 nova-service.log
+nova-input.log
+vigem_install_declined.flag
+nova.toml
 
 # IDE / Editor
 .vscode/

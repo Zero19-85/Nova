@@ -118,8 +118,9 @@ pub fn current_input_desktop() -> InputDesktop {
 /// [`GENERATION`] for the rationale. The swap logic currently keys off the
 /// desktop KIND (a sub-frame Default→Secure→Default flash needs no action, so
 /// missing one is fine); the counter stays as the transition-observability API
-/// (tests, diagnostics, and any future consumer that must not miss flips).
-#[allow(dead_code)] // consumed by tests/diagnostics only, by design (see above)
+/// (tests, diagnostics, and any consumer that must not miss flips — as of
+/// Task 1, `input.rs`'s `sync_desktop_for_input` uses this to cheaply skip
+/// re-deriving desktop-attachment state on every packet).
 pub fn switch_generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }

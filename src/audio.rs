@@ -491,6 +491,108 @@ fn aes_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
     buf
 }
 
+// ── Network-send relay (Phase 3 — Master-side, reused by the monolithic
+// path too) ──────────────────────────────────────────────────────────────
+//
+// Owns exactly what `send_pcm_loop` used to build in-process: the RTP-audio
+// header, AES-128-CBC encryption, seq/timestamp continuity, and the actual
+// UDP send — the network-facing half of the audio pipeline, as opposed to
+// the WASAPI-capture/Opus-encode half above, which stays wherever the
+// capture thread runs (the Worker, under the split architecture; still
+// in-process for the monolithic `run()`). Relocating ONLY this half mirrors
+// exactly how `rtp.rs`'s `RtpSender` already owns video's network-send
+// independently of wherever encoding happens.
+//
+// A fresh instance's `target`/`seq`/`timestamp` all start at their "no
+// session yet" defaults; `reconfigure` (called once per new session, before
+// any frames arrive) resets them again so a reconnect never inherits a
+// stale session's sequence numbers or a stale learned address — the same
+// reasoning `RtpSender::reset()` follows for video's `frame_index`.
+pub struct AudioTxState {
+    socket: UdpSocket,
+    target: Option<SocketAddr>,
+    seq: u16,
+    timestamp: u32,
+    rikey: [u8; 16],
+    rikeyid: u32,
+    encrypt: bool,
+    packet_duration_ms: u32,
+}
+
+impl AudioTxState {
+    pub fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            target: None,
+            seq: 0,
+            timestamp: 0,
+            rikey: [0; 16],
+            rikeyid: 0,
+            encrypt: false,
+            packet_duration_ms: 5,
+        }
+    }
+
+    /// Call once per new session (mirrors the old fused `send_pcm_loop`
+    /// building a brand new `AudioTxState` per `audio_send_loop` call).
+    pub fn reconfigure(&mut self, rikey: [u8; 16], rikeyid: u32, encrypt: bool, packet_duration_ms: u32) {
+        self.rikey = rikey;
+        self.rikeyid = rikeyid;
+        self.encrypt = encrypt;
+        self.packet_duration_ms = packet_duration_ms.max(1);
+        self.seq = 0;
+        self.timestamp = 0;
+        self.target = None;
+    }
+
+    /// Drains any pending client pings, learning/refreshing the target
+    /// address — mirrors `rtp::RtpSender::try_learn_target`. Called from
+    /// `send_frame` itself (below) rather than on a separate timer: audio
+    /// frames arrive every 5-20ms, far more often than any tick would fire,
+    /// so piggybacking here is both simpler and more responsive.
+    fn learn_target(&mut self) {
+        let mut buf = [0u8; 64];
+        while let Ok((_n, addr)) = self.socket.recv_from(&mut buf) {
+            if self.target != Some(addr) {
+                println!("🎵 Learned client audio address: {addr}");
+                self.target = Some(addr);
+            }
+        }
+    }
+
+    /// Encrypts (if configured) and sends one Opus-encoded audio frame as an
+    /// RTP audio packet — the exact wire format the old fused
+    /// `send_pcm_loop` built in-process, just relocated here. A no-op until
+    /// the target is learned (mirrors the old `if let Some(t) = tx_state.target`
+    /// gate).
+    pub fn send_frame(&mut self, opus_payload: &[u8]) {
+        self.learn_target();
+        let Some(target) = self.target else { return };
+
+        // IV = 16 zero bytes, first 4 = BE(rikeyid + seq) — Sunshine
+        // stream.cpp:1630 / moonlight-common-c AudioStream.c.
+        let payload: Vec<u8> = if self.encrypt {
+            let mut iv = [0u8; 16];
+            iv[..4].copy_from_slice(&self.rikeyid.wrapping_add(self.seq as u32).to_be_bytes());
+            aes_cbc_encrypt(&self.rikey, &iv, opus_payload)
+        } else {
+            opus_payload.to_vec()
+        };
+
+        let mut pkt = Vec::with_capacity(12 + payload.len());
+        pkt.push(0x80); // V=2
+        pkt.push(97);   // packetType: opus audio
+        pkt.extend_from_slice(&self.seq.to_be_bytes());
+        pkt.extend_from_slice(&self.timestamp.to_be_bytes());
+        pkt.extend_from_slice(&[0u8; 4]); // ssrc
+        pkt.extend_from_slice(&payload);
+        let _ = self.socket.send_to(&pkt, target);
+
+        self.seq = self.seq.wrapping_add(1);
+        self.timestamp = self.timestamp.wrapping_add(self.packet_duration_ms);
+    }
+}
+
 // ── Session lifecycle ─────────────────────────────────────────────────────────
 
 /// A live audio session: the send thread (which owns the SinkGuard and the
@@ -527,15 +629,16 @@ impl AudioCaptureManager {
         Self { session: None }
     }
 
-    /// Start the audio pipeline for a streaming session
-    /// (WASAPI loopback → Opus → RTP on `socket`).
-    #[allow(clippy::too_many_arguments)]
+    /// Start the audio pipeline for a streaming session (WASAPI loopback →
+    /// Opus). The encoded frames go out over `frame_tx` — raw Opus bytes,
+    /// pre-encryption — to whoever is forwarding them to Master over IPC
+    /// (the Worker's main loop); this module no longer touches a network
+    /// socket at all. Master's `AudioTxState` (below) owns the RTP-audio
+    /// header, AES-CBC encryption, and the actual UDP send — see this
+    /// file's module doc for why that ownership moved.
     pub fn start_for_stream(
         &mut self,
-        socket: UdpSocket,
-        rikey: [u8; 16],
-        rikeyid: u32,
-        encrypt: bool,
+        frame_tx: mpsc::Sender<Vec<u8>>,
         packet_duration_ms: u32,
         host_audio: bool,
     ) {
@@ -557,7 +660,7 @@ impl AudioCaptureManager {
                 };
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             }
-            audio_send_loop(socket, rikey, rikeyid, encrypt, packet_duration_ms, host_audio, stop_flag);
+            audio_send_loop(frame_tx, packet_duration_ms, host_audio, stop_flag);
         });
         self.session = Some(AudioSession { stop, handle });
     }
@@ -623,20 +726,8 @@ enum CaptureRoute {
     FollowDefault(Vec<u16>),
 }
 
-/// RTP transmit state that must SURVIVE a mid-session capture rebind: the
-/// client's learned audio address, and seq/timestamp continuity (a reset to 0
-/// would look like a stream restart to moonlight-common-c's depacketizer).
-struct AudioTxState {
-    target: Option<SocketAddr>,
-    seq: u16,
-    timestamp: u32,
-}
-
 fn audio_send_loop(
-    socket: UdpSocket,
-    rikey: [u8; 16],
-    rikeyid: u32,
-    encrypt: bool,
+    frame_tx: mpsc::Sender<Vec<u8>>,
     packet_duration_ms: u32,
     host_audio: bool,
     stop: Arc<AtomicBool>,
@@ -646,7 +737,6 @@ fn audio_send_loop(
     // The guard triggers the claim-once endpoint restore on every exit path.
     // Engaged ONCE for the session — capture rebinds below reuse it.
     let sink_guard = SinkGuard::engage(host_audio);
-    let mut tx_state = AudioTxState { target: None, seq: 0, timestamp: 0 };
 
     loop {
         let cap = match start_capture_thread(sink_guard.capture_id.as_deref()) {
@@ -670,8 +760,7 @@ fn audio_send_loop(
         };
 
         let exit = send_pcm_loop(
-            &socket, rikey, rikeyid, encrypt, packet_duration_ms,
-            &stop, &cap.rx, cap.fmt, &route, &mut tx_state,
+            packet_duration_ms, &stop, &cap.rx, cap.fmt, &route, &frame_tx,
         );
 
         // Tear capture down COMPLETELY before continuing: CleanupAudio releases
@@ -699,18 +788,13 @@ fn audio_send_loop(
     drop(sink_guard);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn send_pcm_loop(
-    socket: &UdpSocket,
-    rikey: [u8; 16],
-    rikeyid: u32,
-    encrypt: bool,
     packet_duration_ms: u32,
     stop: &AtomicBool,
     rx: &mpsc::Receiver<Vec<u8>>,
     fmt: AudioFormat,
     route: &CaptureRoute,
-    tx_state: &mut AudioTxState,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
 ) -> SendExit {
     // Opus only accepts 48/24/16/12/8 kHz; the Windows shared-mode mix format
     // is essentially always 48 kHz. Resampling is out of scope for v1.
@@ -733,27 +817,17 @@ fn send_pcm_loop(
     let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(128_000));
 
     let samples_per_packet = (48_000 * packet_duration_ms as usize) / 1000; // per channel
-    println!("🎵 Audio stream started: Opus 48kHz stereo 128kbps, {}ms packets, encrypted={}",
-        packet_duration_ms, encrypt);
+    println!("🎵 Audio stream started: Opus 48kHz stereo 128kbps, {}ms packets", packet_duration_ms);
 
     let src_channels = fmt.channels.max(1) as usize;
     let mut pcm: VecDeque<f32> = VecDeque::with_capacity(48_000);
     let mut frame_buf: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
     let mut opus_buf = [0u8; 1400];
-    let mut ping = [0u8; 64];
     // Routing watchdog bookkeeping — checked once per second.
     let mut last_route_check = Instant::now();
     let mut reasserts: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        // Learn (and keep refreshed) the client's audio address from its pings.
-        while let Ok((_n, addr)) = socket.recv_from(&mut ping) {
-            if tx_state.target != Some(addr) {
-                println!("🎵 Learned client audio address: {}", addr);
-                tx_state.target = Some(addr);
-            }
-        }
-
         // ── Routing watchdog (1 Hz) — the "ghost" enforcement ────────────────
         if last_route_check.elapsed() >= Duration::from_secs(1) {
             last_route_check = Instant::now();
@@ -826,29 +900,14 @@ fn send_pcm_loop(
                 }
             };
 
-            if let Some(t) = tx_state.target {
-                // IV = 16 zero bytes, first 4 = BE(rikeyid + seq) — Sunshine
-                // stream.cpp:1630 / moonlight-common-c AudioStream.c.
-                let payload: Vec<u8> = if encrypt {
-                    let mut iv = [0u8; 16];
-                    iv[..4].copy_from_slice(&rikeyid.wrapping_add(tx_state.seq as u32).to_be_bytes());
-                    aes_cbc_encrypt(&rikey, &iv, &opus_buf[..n])
-                } else {
-                    opus_buf[..n].to_vec()
-                };
-
-                let mut pkt = Vec::with_capacity(12 + payload.len());
-                pkt.push(0x80); // V=2
-                pkt.push(97);   // packetType: opus audio
-                pkt.extend_from_slice(&tx_state.seq.to_be_bytes());
-                pkt.extend_from_slice(&tx_state.timestamp.to_be_bytes());
-                pkt.extend_from_slice(&[0u8; 4]); // ssrc
-                pkt.extend_from_slice(&payload);
-                let _ = socket.send_to(&pkt, t);
+            // Raw Opus bytes only — Master's AudioTxState (below) owns the
+            // RTP-audio header, AES-CBC encryption, seq/timestamp, and the
+            // actual UDP send. A disconnected receiver means the Worker's
+            // main loop (and thus the whole IPC link) is already gone —
+            // this session is ending anyway, so just stop trying.
+            if frame_tx.send(opus_buf[..n].to_vec()).is_err() {
+                return SendExit::SessionStopped;
             }
-
-            tx_state.seq = tx_state.seq.wrapping_add(1);
-            tx_state.timestamp = tx_state.timestamp.wrapping_add(packet_duration_ms);
         }
     }
 

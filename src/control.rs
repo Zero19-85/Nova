@@ -5,13 +5,23 @@ use std::time::Duration;
 
 use rusty_enet as enet;
 
+use crate::ipc::{ControlMsg, WorkerLink};
 use crate::rtsp::ClientInfo;
 
 /// Moonlight's "control stream" is ENet (reliable UDP), not TCP — this is what
 /// was failing with "error 11 / check UDP 47999" after the RTSP handshake
 /// completed. We host a single-peer ENet server here; the library handles the
 /// CONNECT/VERIFY_CONNECT handshake, acks, and channel framing automatically.
-pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>>>) {
+///
+/// `worker_link`: `None` on the monolithic path (`lib.rs::run()`) — IDR/
+/// congestion/input events call straight into `encoder`/`input` in-process,
+/// exactly as before the Session-Survival Architecture existed. `Some` on
+/// the Master path (Session-Survival Architecture, Phase 2, gated behind
+/// `service::WORKER_SPLIT_ENABLED`) — those same three events become IPC
+/// sends to whichever Worker is currently connected instead, since the
+/// session-bound subsystems they used to call directly now live in a
+/// separate process.
+pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>>>, worker_link: Option<WorkerLink>) {
     let socket = match UdpSocket::bind(("0.0.0.0", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -49,7 +59,7 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
     loop {
         loop {
             let evict_others = match host.service() {
-                Ok(Some(event)) => handle_event(event, &client_info, &mut peer_generation),
+                Ok(Some(event)) => handle_event(event, &client_info, &mut peer_generation, &worker_link),
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("⚠️  Control stream socket error: {:?}", e);
@@ -257,6 +267,7 @@ fn handle_control_message(
     data: &[u8],
     client_info: &Arc<Mutex<Option<ClientInfo>>>,
     peer: &mut enet::Peer<UdpSocket>,
+    worker_link: &Option<WorkerLink>,
 ) {
     if data.len() < 4 {
         return;
@@ -276,7 +287,7 @@ fn handle_control_message(
                 Some(inner) if inner.len() >= 2
                     && u16::from_le_bytes([inner[0], inner[1]]) != PT_ENCRYPTED =>
                 {
-                    handle_control_message(channel_id, &inner, client_info, peer);
+                    handle_control_message(channel_id, &inner, client_info, peer, worker_link);
                 }
                 Some(_) => {}
                 None => {
@@ -289,14 +300,20 @@ fn handle_control_message(
         }
         PT_REQUEST_IDR_FRAME => {
             println!("🎮 Control: client requested IDR frame");
-            crate::encoder::request_idr_global();
+            match worker_link {
+                Some(link) => link.send(ControlMsg::RequestIdr),
+                None => crate::encoder::request_idr_global(),
+            }
         }
         // We don't do reference frame invalidation — recover with an IDR
         // instead (valid per protocol; Sunshine does this when the encoder
         // lacks ref-invalidation support).
         PT_INVALIDATE_REF_FRAMES => {
             println!("🎮 Control: reference frames invalidated → forcing IDR");
-            crate::encoder::request_idr_global();
+            match worker_link {
+                Some(link) => link.send(ControlMsg::RequestIdr),
+                None => crate::encoder::request_idr_global(),
+            }
         }
         // Loss stats arrive every ~50ms; payload[0] (i32 LE) is the loss count
         // since the last report. Signal congestion control on non-zero loss so
@@ -306,7 +323,10 @@ fn handle_control_message(
                 let lost = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 if lost > 0 {
                     println!("🎮 Loss stats: client lost {} packet(s) — signalling bitrate reduction", lost);
-                    crate::encoder::signal_congestion_reduction();
+                    match worker_link {
+                        Some(link) => link.send(ControlMsg::CongestionReduce),
+                        None => crate::encoder::signal_congestion_reduction(),
+                    }
                 }
             }
         }
@@ -346,7 +366,10 @@ fn handle_control_message(
         // (split-seat passthrough), while mouse/keyboard packets are
         // injected directly into the host session via SendInput.
         PT_INPUT_DATA => {
-            crate::input::handle_input_packet(&data[4..]);
+            match worker_link {
+                Some(link) => link.send(ControlMsg::InjectInput(data[4..].to_vec())),
+                None => crate::input::handle_input_packet(&data[4..]),
+            }
         }
         _ => {
             println!("🎮 Control rx type 0x{:04x} ({} bytes) on channel {}",
@@ -361,6 +384,7 @@ fn handle_event(
     event: enet::Event<UdpSocket>,
     client_info: &Arc<Mutex<Option<ClientInfo>>>,
     peer_generation: &mut HashMap<enet::PeerID, u64>,
+    worker_link: &Option<WorkerLink>,
 ) -> Option<enet::PeerID> {
     match event {
         enet::Event::Connect { peer, .. } => {
@@ -406,7 +430,7 @@ fn handle_event(
             None
         }
         enet::Event::Receive { peer, channel_id, packet, .. } => {
-            handle_control_message(channel_id, packet.data(), client_info, peer);
+            handle_control_message(channel_id, packet.data(), client_info, peer, worker_link);
             None
         }
     }

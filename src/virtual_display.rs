@@ -112,6 +112,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND, LUID, POINTL};
@@ -351,6 +352,17 @@ pub struct VirtualDisplay {
     /// so a transient post-CCD-apply 800x600 dip (see
     /// [`wait_for_display_resolution`]) gets retried instead of latched onto.
     active_resolution: Option<(u32, u32)>,
+
+    /// Set when the VDD is left active but idle — client disconnected without
+    /// `/cancel` (the common "just quit Moonlight" flow), so `activate_for_stream`
+    /// suspended rather than tore down, to make `/resume` fast (see lib.rs's
+    /// disconnect-handling comment). `None` while streaming or fully torn down.
+    /// Cleared by [`Self::activate_for_stream`] (a new/resumed session starts) and
+    /// [`Self::deactivate_after_stream`] (fully torn down either way). Read by
+    /// [`Self::suspended_idle_secs`], which lib.rs polls in its idle loop to
+    /// auto-teardown a suspended VDD after `[stream] idle_teardown_secs` of no
+    /// reconnect — closing the "ghost monitor left running indefinitely" gap.
+    suspended_since: Option<Instant>,
 }
 
 impl VirtualDisplay {
@@ -376,6 +388,7 @@ impl VirtualDisplay {
             saved_topology: None,
             active_device_name: None,
             active_resolution: None,
+            suspended_since: None,
         }
     }
 
@@ -1331,6 +1344,24 @@ impl VirtualDisplay {
             Err(e)    => println!("⚠️  Could not patch HDRPlus in vdd_settings.xml: {e}"),
         }
 
+        // The devnode enable/isolate/disable dance below is a REAL, visible
+        // topology change (the physical monitor gets briefly displaced and
+        // restored) — fine once per boot, but the service's SYSTEM-fallback
+        // upgrade path (service.rs) can now spawn a second host within well
+        // under a second of the first (fallback host → interactive upgrade
+        // once a real user token appears), and a naive second cycle here is
+        // exactly what got reported live (2026-07-20) as "the monitor is
+        // being hijacked on install" — every SECOND host in the same boot
+        // was redoing this cycle for no reason (the mode-table writes above
+        // are already idempotent/no-ops by then). `--skip-vdd-cycle` (set by
+        // the service on every spawn after the first this run) skips it here
+        // — the config-file work above still runs (cheap, harmless), just not
+        // the devnode toggle.
+        if crate::service::should_skip_vdd_cycle() {
+            println!("🕶️  VDD devnode cycle already done by a sibling host this boot — skipping");
+            return Ok(None);
+        }
+
         // Cycle the devnode once so MttVDD re-reads the freshly-written
         // vdd_settings.xml (IddCx only picks up the XML on (re)start).
         if self.is_enabled() {
@@ -1712,6 +1743,34 @@ impl VirtualDisplay {
         let saved_topology = Self::query_database_topology()?;
         println!("📸 Saved current display topology from the CCD database ({} path(s))", saved_topology.0.len());
 
+        // Guard against clobbering a good "restore to" baseline with a
+        // degenerate one. If Nova is already headless from a PRIOR activation
+        // that was never torn down (e.g. the client relaunches app 5 — /launch
+        // always resets `client.activated`, so lib.rs re-runs pre-activation
+        // even though the VDD is still primary from before), the CCD
+        // database's "current" topology at this point is whatever the FIRST
+        // activation's `SDC_SAVE_TO_DATABASE` persisted: the virtual display
+        // alone, primary, every physical path already inactive. Blindly
+        // re-arming `EMERGENCY_SNAPSHOT`/`self.saved_topology` from that
+        // capture leaves a later crash/sign-out/shutdown with nothing to
+        // restore TO but the headless state itself — confirmed live
+        // (2026-07-20 sign-out): `restore_topology` deactivated the sole
+        // remaining path, submitted a zero-active-path config, and
+        // `SetDisplayConfig` rejected it with error 87, leaving the physical
+        // monitor dark. Detect this by checking whether the fresh capture has
+        // any active path besides the VDD we already know about; if not, and
+        // something is already armed, keep it instead of overwriting it.
+        let already_headless = self.active_device_name.as_deref().is_some_and(|prev_vdd| {
+            !saved_topology.0.iter().any(|p| {
+                p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 && !Self::path_is_device(p, prev_vdd)
+            })
+        });
+        let keep_existing_snapshot = already_headless && EMERGENCY_SNAPSHOT.lock().unwrap().is_some();
+        if keep_existing_snapshot {
+            println!("📸 CCD database already reflects the headless topology (no physical path captured) \
+                — keeping the previously-armed restore snapshot instead of overwriting it");
+        }
+
         // configure_mode must run BEFORE enabling the devnode so MttVDD reads
         // the correct vdd_settings.xml on startup (IddCx reads it at start time).
         self.configure_mode(width, height, refresh_hz)?;
@@ -1839,16 +1898,20 @@ impl VirtualDisplay {
         // (console close, logoff, OS shutdown, WM_ENDSESSION), the shutdown
         // hooks call emergency_restore_for_shutdown() which re-applies this
         // exact snapshot synchronously before the process is allowed to die.
-        *EMERGENCY_SNAPSHOT.lock().unwrap() = Some(EmergencySnapshot {
-            topology: saved_topology.clone(),
-            device_name: virtual_device.clone(),
-        });
+        // Skipped when `keep_existing_snapshot` — see the guard above.
+        if !keep_existing_snapshot {
+            *EMERGENCY_SNAPSHOT.lock().unwrap() = Some(EmergencySnapshot {
+                topology: saved_topology.clone(),
+                device_name: virtual_device.clone(),
+            });
+            self.saved_topology = Some(saved_topology);
+        }
         EMERGENCY_FIRED.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        self.saved_topology = Some(saved_topology);
         self.active_device_name = Some(virtual_device);
         self.active_resolution = Some((width, height));
         self.active = true;
+        self.suspended_since = None;
 
         Ok(())
     }
@@ -1891,6 +1954,7 @@ impl VirtualDisplay {
             self.active_device_name = None;
             self.active_resolution = None;
             self.active = false;
+            self.suspended_since = None;
             return Ok(());
         }
 
@@ -1968,6 +2032,7 @@ impl VirtualDisplay {
         self.active_device_name = None;
         self.active_resolution = None;
         self.active = false;
+        self.suspended_since = None;
 
         match error {
             Some(e) => Err(e),
@@ -1981,6 +2046,23 @@ impl VirtualDisplay {
     /// `IDXGIOutput`.
     pub fn active_device_name(&self) -> Option<&str> {
         self.active_device_name.as_deref()
+    }
+
+    /// Record that the VDD is now idle-but-active (client disconnected
+    /// without `/cancel`). No-op if not currently active, or if already
+    /// marked (idempotent — lib.rs's idle loop may call this repeatedly).
+    /// See [`Self::suspended_since`] for why this exists.
+    pub fn mark_suspended(&mut self) {
+        if self.active && self.suspended_since.is_none() {
+            self.suspended_since = Some(Instant::now());
+        }
+    }
+
+    /// Seconds since [`Self::mark_suspended`] was called, if the VDD is
+    /// currently idle-but-active. `None` while streaming, while fully torn
+    /// down, or before the first idle tick has had a chance to mark it.
+    pub fn suspended_idle_secs(&self) -> Option<u64> {
+        self.suspended_since.map(|t| t.elapsed().as_secs())
     }
 
     /// `(width, height)` of the mode [`activate_for_stream`] requested, once
@@ -2983,6 +3065,35 @@ impl VirtualDisplay {
             if idx < modes.len() && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
                 modes[idx].Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
             }
+        }
+
+        // Guard: if clearing what we believe is the virtual device's path
+        // leaves ZERO active paths, `is_virtual`'s LIVE gdi_device_name_for_source
+        // lookup has misattributed a path that was genuinely the PHYSICAL
+        // monitor at snapshot time. This happens when `saved` was captured
+        // before the VDD's devnode was ever enabled (the common case — the
+        // VDD sits hardware-disabled between streams) and Windows later
+        // reassigns that exact (adapterId, sourceId) slot to the VDD once its
+        // devnode enables/extends; the stale coordinates then "look like" the
+        // VDD under a fresh lookup even though they were never it. Submitting
+        // a zero-active-path config always fails with error 87 — confirmed
+        // live (2026-07-20, `/cancel` right after a session's first-ever
+        // activation). Recover exactly like the already-hardened
+        // `ccd_isolate_vdd_and_restore_primary`/`ccd_deactivate_vdd_path`:
+        // re-light physical via `SDC_TOPOLOGY_EXTEND` on the CURRENT topology
+        // (not the stale saved one), then deactivate whatever CURRENTLY
+        // resolves to `virtual_device` — sidesteps the stale-coordinate
+        // misattribution entirely since that re-resolves fresh.
+        if !paths.iter().any(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0) {
+            println!("🔎 restore_topology: saved snapshot's only active path now resolves to the \
+                virtual device (stale adapter/source coordinates) — re-lighting physical directly");
+            return match virtual_device {
+                Some(vd) => {
+                    let vd = Self::extend_topology_and_wait_for_physical(vd)?;
+                    Self::ccd_deactivate_vdd_path(&vd).map(|_| ())
+                }
+                None => Self::extend_topology_and_wait_for_physical("").map(|_| ()),
+            };
         }
 
         let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;

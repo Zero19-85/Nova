@@ -54,6 +54,30 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // `--skip-vdd-cycle`, `--system-token <n>`, `--system-fallback`, and
+    // `--worker` are modifier flags service.rs can combine on one spawned
+    // command line (e.g. `--system-token 123 --skip-vdd-cycle --worker`),
+    // so all four are scanned order-independently up front rather than
+    // matched positionally against argv[1] below. A positional match meant
+    // `--worker` always lost to whichever primary-mode flag service.rs put
+    // first on the line — the process fell through to the monolithic
+    // run_host() with a stray trailing `--worker` that only clap ever saw
+    // (and rejected with "unexpected argument"), so run_worker() was never
+    // actually reachable from a service-spawned process.
+    if args.iter().any(|a| a == "--skip-vdd-cycle") {
+        nova_server::service::set_skip_vdd_cycle();
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--system-token") {
+        if let Some(raw) = args.get(pos + 1).and_then(|s| s.parse::<isize>().ok()) {
+            nova_server::service::set_system_impersonation_token(raw);
+        }
+    }
+    if args.iter().any(|a| a == "--system-fallback") {
+        nova_server::service::set_running_as_system_fallback();
+    }
+    let is_worker = args.iter().any(|a| a == "--worker");
+    let is_input_helper = args.iter().any(|a| a == "--system-input-helper");
+
     match args.get(1).map(String::as_str) {
         Some("--install") => {
             // Init the file logger so install output lands in nova.log even
@@ -133,19 +157,29 @@ fn main() {
             }
         }
 
-        // Host launched by the service WITH a SYSTEM impersonation token handle
-        // (`--system-token <n>`). The handle was inherited at the same numeric
-        // value; stash it (the DDA capture thread assumes it for secure-desktop
-        // capture), then run the host exactly like the normal no-arg path.
-        Some("--system-token") => {
-            if let Some(raw) = args.get(2).and_then(|s| s.parse::<isize>().ok()) {
-                nova_server::service::set_system_impersonation_token(raw);
-            }
-            run_host();
-        }
+        // Worker process (Session-Survival Architecture): spawned by the
+        // Master (the --service process) to connect to its IPC pipes and do
+        // the actual capture/encode/audio/input work. Separate entry point
+        // from run_host() — a Worker doesn't own the RTSP/control/pairing
+        // servers Master now owns, so it can't just run the full monolithic
+        // nova_server::run(). `--system-token`/`--system-fallback` (for
+        // secure-desktop DDA impersonation, still needed Worker-side) were
+        // already consumed by the order-independent scan above.
+        // SYSTEM input helper: spawned by the Master service (as SYSTEM, into
+        // the console session) for the duration of a secure-desktop
+        // interlude, purely to inject Moonlight's mouse/keyboard into the
+        // Winlogon/PIN screen — the one thing the interactive Worker's
+        // SendInput cannot do, because UIPI judges the process's PRIMARY
+        // token. See input.rs's UIPI note and service::spawn_input_helper.
+        _ if is_input_helper => run_input_helper(),
+
+        _ if is_worker => run_worker(),
 
         _ => {
-            // Normal run — launched by the scheduled task on logon, or manually.
+            // Normal run — launched by the scheduled task on logon, spawned
+            // by the service as a non-split host, or manually. Any
+            // `--system-token`/`--system-fallback` flags were already
+            // consumed above.
             run_host();
         }
     }
@@ -162,6 +196,39 @@ fn run_host() -> ! {
             // no display, WGC unsupported, etc.). Log to nova.log (stdout is
             // already redirected there) and exit 1 — a clean failure, not a panic.
             println!("❌ Nova exited with error: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Runs the SYSTEM input helper. Uses a **current-thread** runtime, not the
+/// multi-threaded one: the helper's desktop attachment is thread-affine
+/// thread-local state (`input.rs`), so its recv→inject loop must never migrate
+/// between OS threads. A single-threaded reactor also keeps this short-lived
+/// process about as light as a Windows process gets.
+fn run_input_helper() -> ! {
+    nova_server::debug::init_input_helper_logger();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime");
+    match rt.block_on(nova_server::run_input_helper()) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            println!("❌ Nova input helper exited with error: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Runs the Worker (tokio runtime + `nova_server::run_worker()`). Same
+/// exit-code convention as `run_host()`.
+fn run_worker() -> ! {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    match rt.block_on(nova_server::run_worker()) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            println!("❌ Nova worker exited with error: {e:?}");
             std::process::exit(1);
         }
     }

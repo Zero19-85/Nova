@@ -6,7 +6,9 @@
 //!   gamepad drives games on the host.
 //! - **Mouse / keyboard**: injected directly into the host session via the
 //!   Win32 `SendInput` API, so the remote player also drives the desktop
-//!   (mouse moves, clicks, scroll, and key presses).
+//!   (mouse moves, clicks, scroll, and key presses). Also works on the
+//!   Winlogon secure desktop (UAC prompts, Ctrl+Alt+Del, lock/PIN screen) —
+//!   see `sync_desktop_for_input`/`SecureDesktopGuard` below for how.
 //!
 //! Wire format verified against moonlight-common-c's Input.h
 //! (NV_MULTI_CONTROLLER_PACKET, magic = MULTI_CONTROLLER_MAGIC_GEN5):
@@ -39,9 +41,16 @@
 //! Mouse/keyboard packet magics and layouts are documented above the
 //! relevant `inject_*` functions further down in this file.
 
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
+use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+    DESKTOP_CONTROL_FLAGS, HDESK,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
@@ -368,6 +377,365 @@ pub fn stop_session() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Secure-desktop KBM injection (Task 1, 2026-07-20).
+//
+// Bug: mouse/keyboard freeze whenever the host is on the Winlogon secure
+// desktop (UAC prompt, Ctrl+Alt+Del, PIN/lock screen). Root cause is NOT a
+// UIPI privilege check on SendInput itself — it's that `SendInput` dispatches
+// to whatever desktop the CALLING THREAD is attached to (`GetThreadDesktop`),
+// and a normal elevated-user thread cannot even attach to Winlogon: its ACL
+// admits only SYSTEM (same wall `capture/dda.rs` hit and solved for video —
+// see that module's doc comment for the confirmed-live 0x800700AA finding).
+// Evidence this is the right diagnosis, not a driver-level dead end: gamepad
+// input (ViGEmBus, a kernel bus device) was NEVER reported frozen on the
+// secure desktop — only mouse/keyboard, which is exactly the SendInput/
+// desktop-attachment-specific path.
+//
+// UIPI "SILENT SWALLOW" — why SYSTEM IMPERSONATION IS NOT ENOUGH (2026-08-06,
+// live-confirmed): with the guard below engaged, the log shows a successful
+// SYSTEM impersonation, a successful Winlogon attach, and ZERO SendInput
+// rejections — and the PIN field still receives nothing. Reason: the ACL
+// checks that impersonation satisfies (`OpenInputDesktop`/`SetThreadDesktop`,
+// and DXGI duplication on the capture side) are kernel-object checks, which
+// DO honour a thread's impersonation token. Injected input reaching the
+// credential provider is instead gated by UIPI/integrity in win32k, which
+// evaluates the injecting process's PRIMARY token — and the Worker's primary
+// token is the interactive user (High integrity), below Winlogon's System
+// integrity. UIPI accepts the call at the API boundary (SendInput returns the
+// event count, so there is nothing to log) and drops the event before the UI
+// sees it. That asymmetry — capture works, input silently doesn't — is the
+// signature of this trap, and it is why the fix has to change the PRIMARY
+// token of whatever process calls SendInput, not the thread identity:
+// `service::spawn_input_helper` + the `--system-input-helper` mode
+// (`lib.rs::run_input_helper`). The guard below is still the right and
+// necessary mechanism for the DESKTOP ATTACH inside that helper (and remains
+// the fallback path when no helper is available).
+//
+// Rejected alternative: routing input packets back to the SYSTEM Master for
+// injection there (Master/Worker split — Master is already an immortal
+// LocalSystem service, so it looks like the privileged place to inject from).
+// This CANNOT work and must not be attempted: `SendInput` is session-local,
+// and the Master lives in Session 0. A process's desktop attachment is
+// constrained by its WINDOW STATION, and a Session 0 service is bound to
+// Session 0's `Winsta0` — it cannot `SetProcessWindowStation` onto the
+// console session's window station, so it can never reach that session's
+// `Winlogon` (or even `Default`) desktop. Sunshine looks like a
+// counter-example but isn't: its privileged helper does not inject from
+// Session 0 either — it spawns/keeps its input path inside the console
+// session and syncs THAT thread's desktop (`misc.cpp::syncThreadDesktop`,
+// called from `input.cpp::send_input`). The Worker — already in the console
+// session — is therefore the only correct injector; it just needs SYSTEM
+// IDENTITY for the desktop attach, which is exactly what the service's
+// `--system-token` impersonation handoff provides below.
+//
+// Rejected alternative: a new kernel-mode virtual HID keyboard/mouse driver
+// (ViGEmBus itself is confirmed gamepad-only — no KBM support upstream; the
+// one community project with that scope, Ryochan7/FakerInput, has been
+// archived/unmaintained since Jan 2024). Shipping an unmaintained driver
+// under Windows' 2026 WHCP-only kernel trust policy is exactly the failure
+// this codebase already hit with the bundled VAD audio driver (problem code
+// 52 — see the Phase 15.6 notes): a new binary dependency with no path to
+// re-signing if Windows tightens further. The fix below adds zero new
+// dependencies — it reuses the SYSTEM-impersonation/desktop-attach technique
+// `capture/dda.rs` already proved live on this exact box.
+//
+// Design: the control-stream ENet loop (`control::start_control_server`) is
+// a single dedicated OS thread for the process's lifetime (see lib.rs) with
+// no windows/hooks of its own — the same precondition that let the DDA
+// capture thread attach to Winlogon. `sync_desktop_for_input`, called once
+// per packet from that thread, cheaply no-ops (one atomic load) unless
+// `capture::desktop_switch`'s transition counter has moved, in which case it
+// engages or releases `SecureDesktopGuard` — impersonate the service-supplied
+// SYSTEM token, `OpenInputDesktop`, `SetThreadDesktop`. Thread-local, not a
+// process-global: this state is only meaningful for the specific OS thread
+// that owns it, and thread-locals naturally forbid any future caller on a
+// different thread from misusing stale desktop-attachment state.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// `Some` while this thread is impersonating SYSTEM and attached to the
+    /// secure desktop; `None` on the ordinary interactive desktop.
+    static SECURE_DESKTOP_GUARD: RefCell<Option<SecureDesktopGuard>> = const { RefCell::new(None) };
+    /// Last `desktop_switch::switch_generation()` this thread observed, so
+    /// the common case (no transition since the last packet) costs one
+    /// atomic load instead of re-deriving desktop state every packet.
+    /// `u64::MAX` forces the first call to always evaluate.
+    static LAST_DESKTOP_GENERATION: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// Holds the SYSTEM impersonation + secure-desktop thread-attachment for as
+/// long as the secure desktop is up. `Drop` restores this thread to whatever
+/// desktop it had before (saved via `GetThreadDesktop` in [`engage`]) and
+/// reverts impersonation — mirrors `capture::dda::DdaCapturer`'s teardown,
+/// except this guard is long-lived and toggles many times per process, so it
+/// must explicitly restore the previous desktop rather than just exiting.
+struct SecureDesktopGuard {
+    previous_desktop: HDESK,
+    attached_desktop: HDESK,
+    impersonating: bool,
+}
+
+impl SecureDesktopGuard {
+    /// `GENERIC_ALL` for desktop access rights — what `SetThreadDesktop`
+    /// needs (matches `capture::dda`'s `DESKTOP_GENERIC_ALL`).
+    const DESKTOP_GENERIC_ALL: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(0x1000_0000);
+
+    /// `DF_ALLOWOTHERACCOUNTHOOK` — the flag Sunshine passes to
+    /// `OpenInputDesktop` (`misc.cpp::syncThreadDesktop`). It permits
+    /// processes of other accounts to hook this desktop, which is what makes
+    /// the handle usable for injection from a thread whose token differs from
+    /// the desktop's owner (our case exactly: an elevated-user process
+    /// impersonating SYSTEM to reach Winlogon).
+    const DF_ALLOWOTHERACCOUNTHOOK: DESKTOP_CONTROL_FLAGS = DESKTOP_CONTROL_FLAGS(0x0001);
+
+    fn engage() -> Option<Self> {
+        unsafe {
+            let previous_desktop = match GetThreadDesktop(GetCurrentThreadId()) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("⚠️  Input: GetThreadDesktop failed ({e:?}) — cannot safely attach to secure desktop");
+                    return None;
+                }
+            };
+
+            // Best-effort, like capture::dda's identical step: impersonation is
+            // only NEEDED when the ambient thread identity isn't already
+            // SYSTEM. Under the service's pre-login fallback (--system-fallback,
+            // see service.rs) the whole process already IS SYSTEM-in-session,
+            // so there's no token to impersonate and none is required — try
+            // the desktop-attach regardless and let the OS be the judge (task/
+            // manual launch with no SYSTEM identity at all fails here exactly
+            // as before, gracefully).
+            let impersonating = match crate::service::system_impersonation_token() {
+                Some(tok) => ImpersonateLoggedOnUser(tok).is_ok(),
+                None => false,
+            };
+
+            let attached_desktop = match OpenInputDesktop(
+                Self::DF_ALLOWOTHERACCOUNTHOOK, false, Self::DESKTOP_GENERIC_ALL,
+            ) {
+                Ok(hdesk) => hdesk,
+                Err(e) => {
+                    eprintln!("⚠️  Input: OpenInputDesktop failed: {e:?} — \
+                        secure-desktop input will stay frozen until it dismisses");
+                    if impersonating {
+                        let _ = RevertToSelf();
+                    }
+                    return None;
+                }
+            };
+            if let Err(e) = SetThreadDesktop(attached_desktop) {
+                eprintln!("⚠️  Input: SetThreadDesktop(secure) failed: {e:?}");
+                let _ = CloseDesktop(attached_desktop);
+                if impersonating {
+                    let _ = RevertToSelf();
+                }
+                return None;
+            }
+
+            println!("🔐 Input: attached to secure desktop for mouse/keyboard injection");
+            Some(Self { previous_desktop, attached_desktop, impersonating })
+        }
+    }
+}
+
+impl Drop for SecureDesktopGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // Restore BEFORE releasing impersonation/closing the handle —
+            // this thread must always end up attached to a valid desktop.
+            if let Err(e) = SetThreadDesktop(self.previous_desktop) {
+                eprintln!("⚠️  Input: restoring previous desktop failed: {e:?} \
+                    (mouse/keyboard may misbehave until the next transition)");
+            }
+            let _ = CloseDesktop(self.attached_desktop);
+            if self.impersonating {
+                let _ = RevertToSelf();
+            }
+        }
+        println!("🔐 Input: secure desktop dismissed — back to the interactive desktop");
+    }
+}
+
+/// **RE-ENABLED (2026-08-06)** — the 2026-07-30 report that motivated
+/// disabling this ("user lost ALL local physical mouse/keyboard control at
+/// the login screen") was a misdiagnosis, clarified by the user: local
+/// physical input never froze. What died at the PIN screen was the REMOTE
+/// Moonlight mouse/keyboard — which is precisely the Winlogon isolation
+/// this guard exists to bridge (an elevated-user thread's `SendInput` is
+/// discarded while the secure desktop has input focus), so disabling the
+/// guard was CAUSING the observed symptom, not preventing a worse one.
+/// With it engaged, the injecting thread impersonates the service-supplied
+/// SYSTEM-in-session token and attaches to the Winlogon desktop —
+/// Sunshine's model (it injects from a SYSTEM process with its input
+/// thread synced to the current input desktop) — so remote PIN entry
+/// works. The physical keyboard/mouse are hardware input and are never
+/// touched by any of this.
+const SECURE_DESKTOP_INPUT_ENABLED: bool = true;
+
+/// Set in the `--system-input-helper` process (see [`set_always_follow_input_desktop`]).
+static ALWAYS_FOLLOW_INPUT_DESKTOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch this process into "always attach to the input desktop" mode — what
+/// the SYSTEM input helper wants, and what Sunshine does unconditionally.
+///
+/// The default (Worker) mode consults `capture::desktop_switch` and only
+/// attaches while that monitor reports a secure desktop. The helper has no
+/// such monitor (it is a bare process with no capture loop), and it exists
+/// ONLY to serve secure-desktop interludes, so it should simply follow
+/// whatever desktop currently has input focus: attach once at startup, and
+/// re-attach reactively whenever an injection reports it went nowhere.
+pub fn set_always_follow_input_desktop() {
+    ALWAYS_FOLLOW_INPUT_DESKTOP.store(true, Ordering::Relaxed);
+}
+
+/// Attach the CALLING thread to the desktop that currently has input focus,
+/// for the life of that thread (or until a re-sync moves it). Used by the
+/// SYSTEM input helper at startup so the first packet doesn't have to pay a
+/// rejected-injection round trip to discover the desktop.
+///
+/// Thread-affine, like everything else in this section: call it from the same
+/// thread that will call [`handle_input_packet`].
+pub fn attach_to_input_desktop() {
+    if sync_desktop_for_input(true) {
+        return;
+    }
+    // Already attached (or the attach failed — `engage` logs the reason, and
+    // `send_input_synced`'s reactive path retries on the first real packet).
+}
+
+/// Engage/release [`SecureDesktopGuard`] on this thread to track
+/// `capture::desktop_switch`'s view of which desktop currently has input
+/// focus. Must only be called from the control-stream thread (the only
+/// caller of [`handle_input_packet`]) — see the module note above for why
+/// that thread specifically is safe to reattach.
+///
+/// The cheap path (no transition since the last packet) is one atomic load.
+/// `force` skips that shortcut and reconciles unconditionally — used by
+/// [`send_input_synced`] when the OS reports an injection went nowhere,
+/// which is the authoritative signal that this thread is on the wrong
+/// desktop (Sunshine does the same in `send_input`: retry once after a
+/// `syncThreadDesktop`).
+///
+/// Returns `true` when the attachment state actually changed, so a caller
+/// retrying a failed injection knows whether a retry is worthwhile.
+fn sync_desktop_for_input(force: bool) -> bool {
+    if !SECURE_DESKTOP_INPUT_ENABLED {
+        return false;
+    }
+    let always_follow = ALWAYS_FOLLOW_INPUT_DESKTOP.load(Ordering::Relaxed);
+    let gen = crate::capture::desktop_switch::switch_generation();
+    if !force {
+        if always_follow {
+            // Helper mode: the only steady state is "attached". One
+            // thread-local bool check, no desktop-switch monitor needed
+            // (there isn't one in the helper process).
+            if SECURE_DESKTOP_GUARD.with(|s| s.borrow().is_some()) {
+                return false;
+            }
+        } else if LAST_DESKTOP_GENERATION.with(|c| c.get() == gen) {
+            return false;
+        }
+    }
+
+    let secure = always_follow
+        || matches!(
+            crate::capture::desktop_switch::current_input_desktop(),
+            crate::capture::desktop_switch::InputDesktop::Secure
+                | crate::capture::desktop_switch::InputDesktop::ScreenSaver
+        );
+
+    SECURE_DESKTOP_GUARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let changed = match (secure, slot.is_some()) {
+            (true, false) => {
+                *slot = SecureDesktopGuard::engage();
+                slot.is_some()
+            }
+            (true, true) if force => {
+                // Already attached, but injection still failed: the secure
+                // desktop we hold may be a STALE one (a dismissed prompt
+                // replaced by a fresh Winlogon instance gets a different
+                // desktop object). Drop and re-open to bind the live one.
+                *slot = None; // Drop restores the previous desktop + reverts
+                *slot = SecureDesktopGuard::engage();
+                slot.is_some()
+            }
+            (false, true) => {
+                *slot = None; // Drop restores + reverts
+                true
+            }
+            _ => false,
+        };
+        // Record the generation only once the desired state was actually
+        // REACHED. Stamping it unconditionally (the original bug) meant a
+        // failed engage was never retried: the guard stayed disengaged for
+        // the entire secure-desktop interlude, so every remote keystroke at
+        // the PIN screen was silently discarded.
+        let settled = secure == slot.is_some();
+        if settled {
+            LAST_DESKTOP_GENERATION.with(|c| c.set(gen));
+        }
+        changed
+    })
+}
+
+/// Inject one `INPUT` event, re-syncing this thread's desktop and retrying
+/// once if the OS accepted nothing.
+///
+/// `SendInput` returns the number of events inserted; 0 means the event was
+/// blocked — overwhelmingly because the calling thread is attached to a
+/// different desktop than the one with input focus (the Winlogon/PIN-screen
+/// case), which no amount of privilege on the packet itself can fix. This
+/// mirrors Sunshine's `platform/windows/input.cpp::send_input` retry-after-
+/// resync, and is what makes injection robust even when the desktop-switch
+/// monitor misses (or is slow to see) a transition.
+fn send_input_synced(input: INPUT) {
+    const SIZE: i32 = std::mem::size_of::<INPUT>() as i32;
+    unsafe {
+        if SendInput(&[input], SIZE) == 1 {
+            return;
+        }
+        // Nothing injected — reconcile the desktop attachment and retry once.
+        if sync_desktop_for_input(true) && SendInput(&[input], SIZE) == 1 {
+            return;
+        }
+    }
+    // Still refused. Rate-limit: a wrong-desktop condition affects every
+    // packet, and this runs on the control thread at up to ~200 Hz.
+    let n = INPUT_REJECTED.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n % 500 == 0 {
+        println!(
+            "⚠️  Input: SendInput injected nothing ({} total) — desktop={:?}, \
+             secure-desktop attach={}",
+            n + 1,
+            crate::capture::desktop_switch::current_input_desktop(),
+            SECURE_DESKTOP_GUARD.with(|s| s.borrow().is_some()),
+        );
+    }
+}
+
+/// Count of injections the OS refused even after a desktop re-sync — drives
+/// the rate-limited diagnostic in [`send_input_synced`].
+static INPUT_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True if this INPUT_DATA payload is a gamepad packet (dispatched to
+/// ViGEmBus rather than `SendInput`).
+///
+/// Master uses this to keep gamepad traffic on the Worker even while
+/// mouse/keyboard is detoured to the SYSTEM input helper: ViGEmBus is a kernel
+/// bus device and was never subject to the UIPI swallow (gamepad input was
+/// never among the symptoms), and routing it to the helper would have the
+/// helper connect its OWN ViGEm client — a second virtual pad appearing, and
+/// the Worker's going idle, every time the screen locked.
+pub fn is_gamepad_packet(payload: &[u8]) -> bool {
+    payload.len() >= 8
+        && u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+            == MULTI_CONTROLLER_MAGIC_GEN5
+}
+
 /// Handle a decrypted 0x0206 INPUT_DATA payload (control.rs): dispatches on
 /// the NV_INPUT_HEADER magic (offset 4, LE u32) to gamepad passthrough
 /// (ViGEmBus) or mouse/keyboard injection (SendInput). Unrecognized/short
@@ -377,6 +745,7 @@ pub fn handle_input_packet(payload: &[u8]) {
     if payload.len() < 8 {
         return;
     }
+    sync_desktop_for_input(false);
     let magic = u32::from_le_bytes(payload[4..8].try_into().unwrap());
 
     match magic {
@@ -485,23 +854,17 @@ fn virtual_desktop_to_absolute(x: f64, y: f64) -> Option<(i32, i32)> {
 }
 
 fn send_mouse_input(mi: MOUSEINPUT) {
-    let input = INPUT {
+    send_input_synced(INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
-    };
-    unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    });
 }
 
 fn send_key_input(ki: KEYBDINPUT) {
-    let input = INPUT {
+    send_input_synced(INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
-    };
-    unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    });
 }
 
 /// NV_ABS_MOUSE_MOVE_PACKET body (after the 8-byte NV_INPUT_HEADER):
@@ -859,5 +1222,39 @@ fn inject_keyboard(payload: &[u8], release: bool) {
     send_key_event(vk, false);
     for &m in synthetic.iter().rev() {
         send_key_event(m, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the Master-side routing predicate that keeps gamepad traffic on
+    /// the Worker while mouse/keyboard detours to the SYSTEM input helper (see
+    /// `is_gamepad_packet`'s doc comment for why that split matters).
+    #[test]
+    fn gamepad_packets_are_distinguished_from_kbm() {
+        let mut pad = vec![0u8; 34];
+        pad[4..8].copy_from_slice(&MULTI_CONTROLLER_MAGIC_GEN5.to_le_bytes());
+        assert!(is_gamepad_packet(&pad));
+
+        for magic in [
+            KEY_DOWN_EVENT_MAGIC,
+            KEY_UP_EVENT_MAGIC,
+            MOUSE_MOVE_ABS_MAGIC,
+            MOUSE_MOVE_REL_MAGIC_GEN5,
+            MOUSE_BUTTON_DOWN_MAGIC_GEN5,
+            MOUSE_BUTTON_UP_MAGIC_GEN5,
+            SCROLL_MAGIC_GEN5,
+        ] {
+            let mut kbm = vec![0u8; 16];
+            kbm[4..8].copy_from_slice(&magic.to_le_bytes());
+            assert!(!is_gamepad_packet(&kbm), "magic {magic:#x} misrouted as gamepad");
+        }
+
+        // Truncated payloads must never be classified as gamepad (they would
+        // otherwise be dropped by the helper instead of injected).
+        assert!(!is_gamepad_packet(&[0u8; 4]));
+        assert!(!is_gamepad_packet(&[]));
     }
 }

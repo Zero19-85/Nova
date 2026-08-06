@@ -28,10 +28,34 @@ pub const APP_ID_VIRTUAL_DESKTOP: u32 = 5;
 /// When `headless_for_all` is `true` (the default from `nova.toml`), every app
 /// routes through the VDD regardless of ID — capture always targets the virtual
 /// display, and the physical monitors are detached for the duration of the
-/// stream. When `false`, only App 5 (Virtual Desktop) activates headless mode;
-/// all other apps stream whatever is on the host's physical primary display.
+/// stream. When `false`, only App 1 (Desktop) mirrors the host's physical
+/// primary display; Steam, the Xbox app, RetroArch, and Virtual Desktop all
+/// spin up the virtual monitor and run headless — a game session should never
+/// depend on (or wake) the physical panel.
 pub fn uses_virtual_display(app_id: u32, headless_for_all: bool) -> bool {
-    headless_for_all || app_id == APP_ID_VIRTUAL_DESKTOP
+    headless_for_all
+        || matches!(
+            app_id,
+            APP_ID_STEAM | APP_ID_XBOX | APP_ID_RETROARCH | APP_ID_VIRTUAL_DESKTOP
+        )
+}
+
+/// When the Session-Survival split is live, `/launch` runs in the SYSTEM
+/// Master — spawning Steam/Xbox/RetroArch there would land them in the
+/// service's session/desktop, invisible to the stream. Master sets this flag
+/// at network bootstrap; `pairing.rs` then skips its direct [`launch_app`]
+/// call and the Worker launches the app in the user session instead, AFTER
+/// the VDD is active and primary (see `apply_configure_start`), so the app
+/// opens on the virtual monitor rather than the detached physical display.
+static LAUNCH_VIA_WORKER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_launch_via_worker() {
+    LAUNCH_VIA_WORKER.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn launch_via_worker() -> bool {
+    LAUNCH_VIA_WORKER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 const BOX_ART_DESKTOP: &[u8] = include_bytes!("../assets/desktop.jpg");

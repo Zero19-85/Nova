@@ -3,7 +3,7 @@
 ; Place this file in the root of your project (next to Cargo.toml)
 
 #define MyAppName "Nova Server"
-#define MyAppVersion "0.1.0 Alpha"
+#define MyAppVersion "0.2.0 Alpha"
 #define MyAppPublisher "Zero"
 #define MyAppURL "Origin1985.com"
 #define MyAppExeName "nova-server.exe"
@@ -45,28 +45,40 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; 1. Register NovaService (removes any old scheduled task first)
+; 1. Inject the Virtual Display Driver into the Windows Kernel (This triggers the "doo-doo" noise)
+Filename: "{app}\VirtualDisplayDriver\Dependencies\devcon.exe"; \
+    Parameters: "install ""{app}\VirtualDisplayDriver\SignedDrivers\x86\VDD\MttVDD.inf"" Root\MttVDD"; \
+    WorkingDir: "{app}\VirtualDisplayDriver\SignedDrivers\x86\VDD"; \
+    Flags: runhidden waituntilterminated
+
+; 2. Register NovaService (removes any old scheduled task first)
 Filename: "{app}\{#MyAppExeName}"; \
     Parameters: "--install-service"; \
     Flags: runhidden waituntilterminated
 
-; 2. Start the service
+; 3. Start the service
 Filename: "{sys}\sc.exe"; Parameters: "start NovaService"; \
     Flags: runhidden waituntilterminated
 
+
 [UninstallRun]
-; Stop and remove the service first
+; 1. Stop and remove the Nova service first
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--uninstall-service"; \
     Flags: runhidden waituntilterminated
 
-; Belt-and-suspenders: also remove old scheduled task
+; 2. Remove the Virtual Display Driver from the Windows OS
+Filename: "{app}\VirtualDisplayDriver\Dependencies\devcon.exe"; \
+    Parameters: "remove Root\MttVDD"; \
+    WorkingDir: "{app}\VirtualDisplayDriver\Dependencies"; \
+    Flags: runhidden waituntilterminated
+
+; 3. Belt-and-suspenders: also remove old scheduled task
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--uninstall"; \
     Flags: runhidden waituntilterminated
 
-; Force kill anything still running
+; 4. Force kill anything still running
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; \
     Flags: runhidden waituntilterminated
-
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
 var
