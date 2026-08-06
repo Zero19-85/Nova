@@ -822,6 +822,20 @@ pub fn set_active_capture_rect(origin_x: i32, origin_y: i32, width: u32, height:
     CAPTURE_HEIGHT.store(height as i32, Ordering::Relaxed);
 }
 
+/// The rect recorded by [`set_active_capture_rect`], as
+/// `(origin_x, origin_y, width, height)`.
+///
+/// Exists so the Worker can forward it to Master (and on to the SYSTEM input
+/// helper, a separate process whose copy of this state would otherwise stay
+/// 0×0 and silently drop every absolute mouse move — see
+/// `ipc::ControlMsg::CaptureRect`). Read from the Worker's desktop-state poll
+/// task rather than hooked into every `set_active_capture_rect` call site, so
+/// no future call site can forget to report.
+pub fn current_capture_rect() -> (i32, i32, u32, u32) {
+    let (ox, oy, w, h) = active_capture_rect();
+    (ox, oy, w.max(0) as u32, h.max(0) as u32)
+}
+
 fn active_capture_rect() -> (i32, i32, i32, i32) {
     (
         CAPTURE_ORIGIN_X.load(Ordering::Relaxed),

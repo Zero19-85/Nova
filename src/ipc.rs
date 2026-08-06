@@ -72,6 +72,7 @@ mod tag {
     pub const DEACTIVATE: u8 = 12;
     pub const OPEN_PAIR_DIALOG: u8 = 13;
     pub const SECURE_DESKTOP_CHANGED: u8 = 14;
+    pub const CAPTURE_RECT: u8 = 15;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -175,6 +176,17 @@ pub enum ControlMsg {
     /// the dialog was opened by [`ControlMsg::OpenPairDialog`] or manually
     /// from the tray menu.
     PinRelay { pin: String, device: String },
+    /// Worker -> Master, then Master -> input helper: the desktop-coordinate
+    /// rect of the surface currently being captured.
+    ///
+    /// `input.rs` maps Moonlight's fractional ABSOLUTE mouse positions onto
+    /// this rect, and it lives in a PER-PROCESS static — so the SYSTEM input
+    /// helper, which never runs a capture loop, had it at 0×0 and silently
+    /// dropped every absolute mouse move (confirmed live 2026-08-06: the
+    /// cursor froze mid-screen at every UAC prompt while clicks and keys kept
+    /// working). Master caches the Worker's last report and replays it to each
+    /// helper on connect, so injection in either process maps identically.
+    CaptureRect { origin_x: i32, origin_y: i32, width: u32, height: u32 },
     /// Worker -> Master: the input desktop crossed the secure/interactive
     /// boundary. Only the Worker can observe this (its `desktop_switch`
     /// monitor runs in the console session; Master is in Session 0, where
@@ -335,6 +347,14 @@ impl ControlMsg {
             ControlMsg::SecureDesktopChanged { secure } => {
                 vec![tag::SECURE_DESKTOP_CHANGED, *secure as u8]
             }
+            ControlMsg::CaptureRect { origin_x, origin_y, width, height } => {
+                let mut out = vec![tag::CAPTURE_RECT];
+                write_u32(&mut out, *origin_x as u32);
+                write_u32(&mut out, *origin_y as u32);
+                write_u32(&mut out, *width);
+                write_u32(&mut out, *height);
+                out
+            }
         }
     }
 
@@ -365,6 +385,16 @@ impl ControlMsg {
             tag::SECURE_DESKTOP_CHANGED => Ok(ControlMsg::SecureDesktopChanged {
                 secure: rest.first().copied().unwrap_or(0) != 0,
             }),
+            tag::CAPTURE_RECT => {
+                let at = &mut 0usize;
+                // origin_x/y are signed (a monitor left of / above the primary
+                // has negative desktop coordinates) — round-tripped as u32.
+                let origin_x = read_u32(rest, at)? as i32;
+                let origin_y = read_u32(rest, at)? as i32;
+                let width = read_u32(rest, at)?;
+                let height = read_u32(rest, at)?;
+                Ok(ControlMsg::CaptureRect { origin_x, origin_y, width, height })
+            }
             other => Err(invalid_data(&format!("unknown ControlMsg tag {other}"))),
         }
     }
@@ -627,6 +657,10 @@ mod tests {
             ControlMsg::PinRelay { pin: "1234".to_string(), device: "PiXeL".to_string() },
             ControlMsg::SecureDesktopChanged { secure: true },
             ControlMsg::SecureDesktopChanged { secure: false },
+            // Negative origins are real (a monitor left of/above the primary)
+            // and must survive the u32 round-trip on the wire.
+            ControlMsg::CaptureRect { origin_x: 0, origin_y: 0, width: 3840, height: 2160 },
+            ControlMsg::CaptureRect { origin_x: -1920, origin_y: -300, width: 1920, height: 1080 },
             ControlMsg::InjectInput(vec![0x22, 0, 0, 0, 0x0c, 0, 0, 0]),
         ] {
             let decoded = ControlMsg::decode(&msg.encode()).expect("decode");

@@ -572,6 +572,11 @@ async fn control_supervisor(
                             wc.width, wc.height, wc.fps, wc.codec, if wc.is_hdr { "/HDR10" } else { "" });
                     }
                     Some(Ok(ControlMsg::WorkerError(e))) => println!("⚠️  Master: worker reported error: {e}"),
+                    Some(Ok(msg @ ControlMsg::CaptureRect { .. })) => {
+                        // Cached by the helper supervisor and replayed to each
+                        // helper on connect — see ControlMsg::CaptureRect.
+                        let _ = helper_tx.send(HelperCmd::Rect(msg));
+                    }
                     Some(Ok(ControlMsg::SecureDesktopChanged { secure })) => {
                         // Only the Worker can see this (Session 0 can't) — it
                         // drives the SYSTEM input helper's whole lifecycle.
@@ -1049,6 +1054,70 @@ fn deactivate_worker(
     input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
 }
 
+/// Advance the frame-pacing deadline after a slot has been served, dropping
+/// missed slots instead of repaying them.
+///
+/// **The bug this exists to prevent** (live-confirmed 2026-08-06, 4K120 HDR):
+/// the loops previously did `next_frame_time += frame_interval` unconditionally.
+/// When anything blocked the loop past its deadline — VDD/CCD activation, an
+/// encoder recreate, a WGC↔DDA swap, host disk/GPU contention — the deadline
+/// stayed in the past, so the loop stopped sleeping entirely and emitted frames
+/// flat out until every missed slot had been repaid. One stalled second (64 fps)
+/// produced a TWELVE-second burst peaking at **179 fps on a 120 fps session**.
+/// Because NVENC's CBR budgets per frame at the configured fps, the wire rate
+/// scaled with it: 148–160 Mbps against a 90 Mbps negotiation, which floods the
+/// client's decode queue (freeze, then a catch-up jump) and saturates the link,
+/// whose loss causes the next stall. Self-sustaining.
+///
+/// Behaviour: normally returns `deadline + interval`, preserving exact cadence
+/// (and absorbing sub-frame slips, which self-correct within one frame). Only
+/// when that would still be in the past — a real stall — does it re-base on
+/// `now`, discarding the accumulated debt so it can never build up across
+/// repeated stalls.
+fn advance_frame_deadline(deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = deadline + interval;
+    if next < now {
+        now + interval
+    } else {
+        next
+    }
+}
+
+/// Rate-limited "the desktop has gone static" diagnostic, shared by both
+/// capture loops.
+///
+/// The guard this replaces (`streak == 1 || streak % 300 == 0`) *looked* like
+/// "once per episode, then every ~5 s", but `timeout_streak` resets on every
+/// delivered frame — so a 60 Hz source polled at 120 fps tripped `streak == 1`
+/// on every other slot. Live 2026-08-06: **55,203 lines / 2.3 MB in one
+/// session**, i.e. a blocking `WriteFile` ~60×/s on the TIME_CRITICAL capture
+/// thread. That is exactly the hot-path cost Phase 15.4 removed from the
+/// `[ENC]` line, and here it was itself causing the missed frame deadlines
+/// behind the pacing catch-up bursts — so the throttle is a correctness fix,
+/// not just log hygiene.
+fn log_static_desktop(
+    backend: capture::BackendKind,
+    streak: u32,
+    last_logged: &mut Option<Instant>,
+) {
+    /// Only a genuinely motionless screen is worth a line: ~0.25 s at 120 fps.
+    /// Normal alternating hit/miss slots never get near this.
+    const MIN_STREAK: u32 = 30;
+    const INTERVAL: Duration = Duration::from_secs(5);
+
+    if streak < MIN_STREAK {
+        return;
+    }
+    let due = match last_logged {
+        Some(t) => t.elapsed() >= INTERVAL,
+        None => true,
+    };
+    if due {
+        *last_logged = Some(Instant::now());
+        println!("⏳ {backend:?}: static desktop (streak {streak})");
+    }
+}
+
 /// Commands the dedicated `nova-worker-control` thread (see `run_worker`)
 /// hands to the main capture/encode loop. Everything else the control pipe
 /// can carry (`InjectInput`/`RequestIdr`/`CongestionReduce`) is applied
@@ -1114,6 +1183,14 @@ pub async fn run_input_helper() -> Result<()> {
                     println!("⌨️  Input helper: first packet injected on the secure desktop");
                 }
             }
+            Ok(ipc::ControlMsg::CaptureRect { origin_x, origin_y, width, height }) => {
+                // Without this the absolute-mouse mapping has no rect to work
+                // with and drops every move — the "cursor frozen mid-screen at
+                // the UAC prompt" bug. Master sends it before opening the
+                // injection path, and again on any change.
+                println!("🖱️  Input helper: capture rect {width}x{height} at ({origin_x},{origin_y})");
+                input::set_active_capture_rect(origin_x, origin_y, width, height);
+            }
             Ok(ipc::ControlMsg::Stop) => {
                 println!("🛑 Input helper: Master requested stop ({injected} packets injected)");
                 return Ok(());
@@ -1137,6 +1214,10 @@ enum HelperCmd {
     Stop,
     /// Forward one Moonlight INPUT_DATA payload to the helper.
     Inject(Vec<u8>),
+    /// The Worker's active capture rect. Cached and (re)sent to every helper
+    /// on connect — the helper needs it to map absolute mouse positions (see
+    /// `ipc::ControlMsg::CaptureRect`).
+    Rect(ControlMsg),
 }
 
 /// Owns the SYSTEM input helper's whole lifecycle: its pipe, its process, and
@@ -1156,9 +1237,23 @@ async fn input_helper_supervisor(
 
     let mut helper: Option<service::InputHelper> = None;
     let mut pipe: Option<NamedPipeServer> = None;
+    // Last capture rect the Worker reported. Replayed to each helper right
+    // after it connects, BEFORE any injection — without it the helper maps
+    // absolute mouse positions onto a 0×0 rect and drops them all.
+    let mut last_rect: Option<ControlMsg> = None;
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
+            HelperCmd::Rect(msg) => {
+                last_rect = Some(msg.clone());
+                // A rect change mid-interlude (backend swap, resolution
+                // change) must reach the live helper immediately.
+                if let Some(p) = pipe.as_mut() {
+                    if let Err(e) = ipc::send_control(p, &msg).await {
+                        println!("⚠️  Input helper: capture-rect send failed ({e})");
+                    }
+                }
+            }
             HelperCmd::Start => {
                 if helper.is_some() {
                     continue; // already running for this interlude
@@ -1174,6 +1269,18 @@ async fn input_helper_supervisor(
                 match service::spawn_input_helper() {
                     Ok(h) => match ipc::accept_input_helper(&server).await {
                         Ok(()) => {
+                            let mut server = server;
+                            // Rect FIRST, before `ready` opens the injection
+                            // path — otherwise the first packets race it and
+                            // get dropped by the helper's 0×0 rect guard.
+                            if let Some(rect) = last_rect.as_ref() {
+                                if let Err(e) = ipc::send_control(&mut server, rect).await {
+                                    println!("⚠️  Input helper: initial capture-rect send failed ({e})");
+                                }
+                            } else {
+                                println!("⚠️  Input helper: no capture rect known yet — \
+                                    absolute mouse moves will be dropped until the Worker reports one");
+                            }
                             println!("🔐 Input helper: SYSTEM injector live in the console session");
                             helper = Some(h);
                             pipe = Some(server);
@@ -1416,13 +1523,36 @@ pub async fn run_worker() -> Result<()> {
     // and Master runs in Session 0. Polled on the monitor's own 250 ms
     // cadence rather than wired into the capture loop, so it keeps reporting
     // even when no client is connected and the loop is idle.
+    // The same task also reports the active capture rect, which Master relays
+    // to the SYSTEM input helper: that process has its own copy of the rect
+    // static and never runs a capture loop, so without this it stays 0×0 and
+    // `inject_mouse_move_abs` drops every absolute move (live 2026-08-06: the
+    // cursor froze mid-screen at every UAC prompt). Reported from here rather
+    // than from each `set_active_capture_rect` call site so a future call site
+    // cannot forget to report.
     tokio::spawn({
         let reply_tx = reply_tx.clone();
         async move {
             use capture::desktop_switch::{current_input_desktop, InputDesktop};
             let mut last_secure: Option<bool> = None;
+            let mut last_rect: Option<(i32, i32, u32, u32)> = None;
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
+
+                let rect = input::current_capture_rect();
+                // (_, _, 0, 0) means capture hasn't bound yet — nothing useful
+                // to send, and the helper's guard would reject it anyway.
+                if rect.2 > 0 && rect.3 > 0 && last_rect != Some(rect) {
+                    last_rect = Some(rect);
+                    let (origin_x, origin_y, width, height) = rect;
+                    if reply_tx
+                        .send(ipc::ControlMsg::CaptureRect { origin_x, origin_y, width, height })
+                        .is_err()
+                    {
+                        return; // control thread gone — process is shutting down
+                    }
+                }
+
                 let secure = matches!(
                     current_input_desktop(),
                     InputDesktop::Secure | InputDesktop::ScreenSaver
@@ -1600,6 +1730,8 @@ pub async fn run_worker() -> Result<()> {
     let mut audio_send_drops = 0u64;
     let mut timeout_streak = 0u32;
     let mut jiggle_toggle = false;
+    // Throttle for the static-desktop diagnostic (see log_static_desktop).
+    let mut last_static_log: Option<Instant> = None;
     let mut enc_rate_bytes = 0u64;
     let mut enc_rate_tick = Instant::now();
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
@@ -1661,7 +1793,9 @@ pub async fn run_worker() -> Result<()> {
                 }
             }
         }
-        next_frame_time += frame_interval;
+        // Never a bare `+=` — missed slots are dropped, not repaid. See
+        // advance_frame_deadline for the 179-fps catch-up-burst bug.
+        next_frame_time = advance_frame_deadline(next_frame_time, frame_interval, Instant::now());
 
         // Drain any command that arrived exactly on a frame boundary (the
         // sleep above already consumed it via select! in the common case;
@@ -1725,8 +1859,8 @@ pub async fn run_worker() -> Result<()> {
             }
             None => {
                 timeout_streak += 1;
-                if client_connected && (timeout_streak == 1 || timeout_streak % 300 == 0) {
-                    println!("⏳ {:?}: static desktop (streak {})", capturer.backend_kind(), timeout_streak);
+                if client_connected {
+                    log_static_desktop(capturer.backend_kind(), timeout_streak, &mut last_static_log);
                 }
                 if !capturer.has_frame() && timeout_streak % 25 == 0 {
                     let (dx, dy): (i32, i32) = if jiggle_toggle { (1, 1) } else { (-1, -1) };
@@ -2255,6 +2389,8 @@ pub async fn run() -> Result<()> {
     let mut enc_rate_tick    = Instant::now();
     // Consecutive WGC iterations with no new frame (desktop unchanged).
     let mut timeout_streak = 0u32;
+    // Throttle for the static-desktop diagnostic (see log_static_desktop).
+    let mut last_static_log: Option<Instant> = None;
     // Stateful tick-tock for the damage-generator jiggle — alternates the
     // cursor between +1 and -1 each fire so it actually rests at a new
     // position for ~50 ms, guaranteeing DWM composites a fresh frame.
@@ -2336,7 +2472,9 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
-        next_frame_time += frame_interval;
+        // Never a bare `+=` — missed slots are dropped, not repaid. See
+        // advance_frame_deadline for the 179-fps catch-up-burst bug.
+        next_frame_time = advance_frame_deadline(next_frame_time, frame_interval, Instant::now());
 
         // Pre-activate the virtual display as soon as /launch or /resume has
         // recorded a target mode — well before RTSP PLAY/control-connect.
@@ -3081,10 +3219,11 @@ pub async fn run() -> Result<()> {
             }
             None => {
                 timeout_streak += 1;
-                // Suppress per-frame log spam: first hit and then every ~5 s at 60 fps.
-                // Suppress entirely when not streaming (nobody cares about idle WGC state).
-                if client_connected && (timeout_streak == 1 || timeout_streak % 300 == 0) {
-                    println!("⏳ {:?}: static desktop (streak {})", capturer.backend_kind(), timeout_streak);
+                // Rate-limited (see log_static_desktop) — and suppressed
+                // entirely when not streaming: nobody cares about idle
+                // capture state.
+                if client_connected {
+                    log_static_desktop(capturer.backend_kind(), timeout_streak, &mut last_static_log);
                 }
 
                 // ── Damage generator (tick-tock jiggle) ──────────────────────
@@ -3219,4 +3358,68 @@ pub async fn run() -> Result<()> {
     // `enc` drops here → CleanupEncoder is idempotent after enc.cleanup() above.
     // `vd` drops here → VirtualDisplay::drop() is a no-op because active=false.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the frame-pacing contract that regressed live on 2026-08-06: a
+    /// stalled capture loop must DROP the slots it missed, never repay them.
+    /// Repaying them made the loop emit up to 179 fps on a 120 fps session for
+    /// twelve seconds after a single stalled second, at ~1.6x the negotiated
+    /// bitrate. Instants are only ever built by ADDING to a base — never by
+    /// subtracting from `now`, which underflows QPC-backed Instants on a
+    /// freshly booted host (the panic fixed in Phase 15.3).
+    #[test]
+    fn frame_deadline_drops_missed_slots_instead_of_bursting() {
+        let base = Instant::now();
+        let interval = Duration::from_micros(8333); // 120 fps
+
+        // Steady state: the slot was served on time, so cadence is exact.
+        let on_time = advance_frame_deadline(base + interval, interval, base + interval);
+        assert_eq!(on_time, base + interval + interval);
+
+        // Sub-frame slip: `deadline + interval` is still ahead of now, so the
+        // cadence is preserved and the slip self-corrects within one frame
+        // rather than being treated as debt.
+        let slipped = advance_frame_deadline(base, interval, base + Duration::from_micros(2000));
+        assert_eq!(slipped, base + interval);
+
+        // Real stall (half a second — a VDD activation or DDA swap): the debt
+        // is discarded and the next slot is one interval after NOW, so the
+        // loop sleeps again immediately instead of running flat out.
+        let now = base + Duration::from_millis(500);
+        let after_stall = advance_frame_deadline(base, interval, now);
+        assert_eq!(after_stall, now + interval);
+        assert!(after_stall > now, "must be in the future or the loop won't sleep");
+
+        // Repeated stalls must not accumulate: feeding the result back through
+        // another stall still lands one interval past that stall's `now`.
+        let now2 = after_stall + Duration::from_millis(300);
+        assert_eq!(advance_frame_deadline(after_stall, interval, now2), now2 + interval);
+    }
+
+    /// The static-desktop diagnostic must stay off the hot path. The guard it
+    /// replaced fired on every other frame slot (55,203 blocking writes in one
+    /// live session) because `timeout_streak` resets on every delivered frame.
+    #[test]
+    fn static_desktop_log_is_throttled() {
+        let mut last: Option<Instant> = None;
+
+        // Alternating hit/miss slots (a 60 Hz source polled at 120 fps) never
+        // reach the streak threshold, so they must never log at all.
+        for _ in 0..10_000 {
+            log_static_desktop(capture::BackendKind::Wgc, 1, &mut last);
+        }
+        assert!(last.is_none(), "brief misses must not log");
+
+        // A genuinely static screen logs once, then is time-throttled.
+        log_static_desktop(capture::BackendKind::Wgc, 300, &mut last);
+        let first = last.expect("a real static episode should log");
+        for streak in 301..1_000 {
+            log_static_desktop(capture::BackendKind::Wgc, streak, &mut last);
+        }
+        assert_eq!(last, Some(first), "must not re-log inside the throttle window");
+    }
 }
