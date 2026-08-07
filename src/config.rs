@@ -61,6 +61,14 @@ pub struct AudioConfig {
 pub struct NetworkConfig {
     /// Reed-Solomon FEC parity shards as a percentage of data shards.
     /// 0 disables FEC entirely (useful for LAN-only installs with zero loss).
+    ///
+    /// This is pure overhead ON TOP of the negotiated video bitrate, so it is
+    /// the cheapest headroom in the whole pipeline: at the 90 Mbps a 4K120
+    /// session negotiates, 20% parity was adding ~20 Mbps and pushing the wire
+    /// rate to ~111 Mbps — enough to saturate the link and starve the ENet
+    /// control channel until it timed out (live 2026-08-07). 5% is a sane
+    /// baseline for the wired/stable networks Nova actually targets; raise it
+    /// only for genuinely lossy links (congested WiFi, powerline).
     pub fec_percentage: u32,
 }
 
@@ -120,7 +128,7 @@ impl Default for AudioConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { fec_percentage: 20 }
+        Self { fec_percentage: 5 }
     }
 }
 
@@ -152,7 +160,10 @@ endpoint_override = ""  # Windows audio endpoint friendly name or GUID;
                         # leave blank to use the system default device
 
 [network]
-fec_percentage = 20     # Reed-Solomon FEC parity % (0 = disabled)
+fec_percentage = 5      # Reed-Solomon FEC parity % (0 = disabled).
+                        # Pure overhead on top of the video bitrate — 5% suits
+                        # wired/stable LANs. Raise for lossy links (WiFi,
+                        # powerline); 20% at 4K120 added ~20 Mbps of parity.
 
 [hdr]
 # HDR10 HEVC SEI luminance parameters — tune to your TV's spec sheet.
