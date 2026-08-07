@@ -283,3 +283,46 @@ impl Drop for Encoder {
         self.cleanup();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the congestion-signal arithmetic. Every assertion lives in ONE
+    /// test on purpose: `STREAM_BITRATE_KBPS`/`CONGESTION_BITRATE_KBPS` are
+    /// process-global atomics, and `cargo test` runs test fns in parallel
+    /// threads — split across two tests these would race each other.
+    ///
+    /// No FFI is touched here (no `reconfigure_bitrate`), so this runs without
+    /// a GPU, an encoder session, or nova_shim.dll being loadable.
+    #[test]
+    fn congestion_signal_cuts_20_percent_and_collapses_bursts() {
+        // No session (bitrate 0) ⇒ signalling must be a no-op. This is exactly
+        // the state the Worker was stuck in before it published its bitrate,
+        // which silently disabled dynamic QoS for the whole split deployment.
+        set_stream_bitrate_kbps(0);
+        let _ = take_congestion_bitrate(); // clear any leftover
+        signal_congestion_reduction();
+        assert_eq!(take_congestion_bitrate(), None, "no session ⇒ no reduction");
+
+        // Active session: a loss report cuts to 80% of the current target.
+        set_stream_bitrate_kbps(90_400);
+        signal_congestion_reduction();
+        // A burst of further reports must collapse into the SAME pending
+        // reduction rather than stacking down toward the floor.
+        signal_congestion_reduction();
+        signal_congestion_reduction();
+        assert_eq!(take_congestion_bitrate(), Some(72_320));
+
+        // Claiming clears the signal — the ramp-back branch relies on this.
+        assert_eq!(take_congestion_bitrate(), None);
+
+        // The cut is floored so congestion can never collapse the stream to
+        // an unusable bitrate.
+        set_stream_bitrate_kbps(1_100);
+        signal_congestion_reduction();
+        assert_eq!(take_congestion_bitrate(), Some(1_000));
+
+        set_stream_bitrate_kbps(0); // leave the global clean for other tests
+    }
+}

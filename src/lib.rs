@@ -881,6 +881,21 @@ fn apply_configure_start(
     enc.config.fps = cs.fps as i32;
     enc.config.bitrate_kbps = cs.bitrate_kbps as i32;
 
+    // Publish the session's CBR target so congestion control can work at all.
+    // `encoder::signal_congestion_reduction` (called on the control thread when
+    // Master relays a PT_LOSS_STATS report) computes its reduction from
+    // STREAM_BITRATE_KBPS and does NOTHING while that reads 0 — which is
+    // exactly what happened for the whole Master/Worker era: the Worker never
+    // set it, so every congestion signal was silently discarded and the
+    // encoder held full bitrate straight through a saturated link. Together
+    // with the reduce/ramp block in the Worker's frame loop, this is what
+    // makes dynamic QoS live in the split deployment.
+    //
+    // `enc.config.bitrate_kbps` stays the negotiated CEILING (reconfigure
+    // never rewrites it), so the frame loop uses it as the ramp-back target
+    // while this atomic tracks what is CURRENTLY applied.
+    encoder::set_stream_bitrate_kbps(cs.bitrate_kbps as i32);
+
     // A SYSTEM-fallback (pre-login) Worker's token lacks whatever privilege
     // real VDD/CCD topology changes need — confirmed live (2026-08-06):
     // SetDisplayConfig(SDC_TOPOLOGY_EXTEND) and the "atomic headless
@@ -1017,6 +1032,10 @@ fn deactivate_worker(
 ) {
     audio_manager.stop_and_release();
     input::stop_session();
+    // Session over: park the congestion-control target so a late
+    // PT_LOSS_STATS relay can't compute a reduction against a dead session
+    // (mirrors the monolithic path's identical reset on disconnect).
+    encoder::set_stream_bitrate_kbps(0);
 
     let was_hdr = enc.config.is_hdr;
     enc.config.is_hdr = false;
@@ -1052,6 +1071,72 @@ fn deactivate_worker(
     }
     let (ox, oy) = capturer.origin();
     input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+}
+
+/// One tick of the dynamic-bitrate (QoS) control loop, shared by the Worker
+/// and monolithic capture loops.
+///
+/// `ceiling_kbps` is the session's negotiated bitrate — the value we ramp back
+/// toward, never past. `last_event` is the reduce/ramp cooldown clock.
+///
+/// **Why this is a function and not inline:** the reduce/ramp cycle existed
+/// only inside the monolithic `run()` loop, so under the Master/Worker split
+/// (i.e. every shipping Alpha 2.0 deployment) dynamic bitrate was completely
+/// dead — Master relayed `CongestionReduce`, the Worker's control thread
+/// called `signal_congestion_reduction()`, and the signal then evaporated
+/// because nothing consumed `take_congestion_bitrate()`. Live symptom
+/// (2026-08-06, background download saturating the link): macroblock
+/// corruption followed by an intra-refresh sweep repairing it, over and over,
+/// while the encoder held full bitrate into a link that could not carry it.
+///
+/// Control law: on a loss report, cut to the pending reduced target (20%,
+/// computed in `encoder::signal_congestion_reduction`, floored at 1 Mbps) with
+/// a 2 s cooldown so a burst of reports collapses into one step down. After
+/// [`QOS_RAMP_INTERVAL`] with no further loss, step back up 10% at a time.
+/// Asymmetric on purpose: drop fast to stop the bleeding, recover gently so
+/// the ramp itself doesn't re-saturate the link.
+/// One ramp-back step: +10% of the current bitrate, never past the ceiling.
+///
+/// `+ cur / 10` (not `* 11 / 10`) so the arithmetic cannot overflow at any
+/// plausible bitrate, and `max(1)` on the increment guarantees forward
+/// progress — an integer +10% of a very low bitrate would otherwise round to
+/// zero and the ramp would stall below the ceiling forever.
+fn qos_ramp_step(cur: u32, ceiling: u32) -> u32 {
+    cur.saturating_add((cur / 10).max(1)).min(ceiling)
+}
+
+fn qos_tick(ceiling_kbps: u32, fps: u32, last_event: &mut Instant) {
+    /// Minimum gap between two reductions — collapses a burst of loss reports
+    /// into a single step instead of collapsing the bitrate to the floor.
+    const QOS_REDUCE_COOLDOWN: Duration = Duration::from_secs(2);
+    /// Quiet period (no loss reports) before stepping the bitrate back up.
+    const QOS_RAMP_INTERVAL: Duration = Duration::from_secs(3);
+
+    if ceiling_kbps == 0 {
+        return; // no session
+    }
+    if let Some(reduced) = encoder::take_congestion_bitrate() {
+        if last_event.elapsed() >= QOS_REDUCE_COOLDOWN {
+            encoder::reconfigure_bitrate(reduced, fps);
+            encoder::set_stream_bitrate_kbps(reduced as i32);
+            *last_event = Instant::now();
+            println!(
+                "📉 Congestion: bitrate → {} Kbps ({}% of {} Kbps ceiling)",
+                reduced,
+                reduced * 100 / ceiling_kbps,
+                ceiling_kbps
+            );
+        }
+        return;
+    }
+    let cur = encoder::get_stream_bitrate_kbps() as u32;
+    if cur > 0 && cur < ceiling_kbps && last_event.elapsed() >= QOS_RAMP_INTERVAL {
+        let ramped = qos_ramp_step(cur, ceiling_kbps);
+        encoder::reconfigure_bitrate(ramped, fps);
+        encoder::set_stream_bitrate_kbps(ramped as i32);
+        *last_event = Instant::now();
+        println!("📈 Congestion: ramped bitrate → {ramped} Kbps (+10%, ceiling {ceiling_kbps})");
+    }
 }
 
 /// Advance the frame-pacing deadline after a slot has been served, dropping
@@ -1732,6 +1817,14 @@ pub async fn run_worker() -> Result<()> {
     let mut jiggle_toggle = false;
     // Throttle for the static-desktop diagnostic (see log_static_desktop).
     let mut last_static_log: Option<Instant> = None;
+    // Reduce/ramp cooldown clock for the QoS loop (see qos_tick). checked_sub:
+    // Instant is QPC-since-boot on Windows, so plain subtraction panics when
+    // the Worker starts <30 s after power-on (the Phase 15.3 crash) — and
+    // starting in the past lets the first loss report act immediately instead
+    // of waiting out a cooldown that never applied to anything.
+    let mut congestion_last_event = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .unwrap_or_else(Instant::now);
     let mut enc_rate_bytes = 0u64;
     let mut enc_rate_tick = Instant::now();
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
@@ -1830,6 +1923,21 @@ pub async fn run_worker() -> Result<()> {
                     next_frame_time = Instant::now();
                 }
             }
+        }
+
+        // ── Dynamic bitrate (QoS) ────────────────────────────────────────────
+        // Master relays the client's PT_LOSS_STATS as ControlMsg::
+        // CongestionReduce; the control thread turns that into a pending
+        // reduction, and THIS is where it gets applied to NVENC. Without this
+        // call the whole chain was a no-op in the split deployment — see
+        // qos_tick's doc comment. `enc.config.bitrate_kbps` is the negotiated
+        // ceiling (reconfigure never rewrites it).
+        if client_connected {
+            qos_tick(
+                enc.config.bitrate_kbps.max(0) as u32,
+                enc.config.fps.max(1) as u32,
+                &mut congestion_last_event,
+            );
         }
 
         if client_connected {
@@ -3131,36 +3239,13 @@ pub async fn run() -> Result<()> {
             }
         }
 
-        // ── Congestion control ────────────────────────────────────────────────
-        // PT_LOSS_STATS from the control thread atomically sets a pending
-        // reduced bitrate (via signal_congestion_reduction). We apply it here
-        // (on the main thread) with a 2-second cooldown to prevent thrashing,
-        // then ramp back up by 10% every 5 seconds once the link stabilises.
-        if client_connected && congestion_stable_kbps > 0 {
-            if let Some(reduced) = encoder::take_congestion_bitrate() {
-                if congestion_last_event.elapsed() >= Duration::from_secs(2) {
-                    let fps = enc.config.fps as u32;
-                    encoder::reconfigure_bitrate(reduced, fps);
-                    encoder::set_stream_bitrate_kbps(reduced as i32);
-                    congestion_last_event = Instant::now();
-                    println!("📉 Congestion: bitrate → {} Kbps ({}% of {} Kbps ceiling)",
-                        reduced,
-                        reduced * 100 / congestion_stable_kbps,
-                        congestion_stable_kbps);
-                }
-            } else {
-                let cur = encoder::get_stream_bitrate_kbps() as u32;
-                if cur > 0 && cur < congestion_stable_kbps
-                    && congestion_last_event.elapsed() >= Duration::from_secs(5)
-                {
-                    let ramped = (cur + cur / 10).min(congestion_stable_kbps);
-                    let fps = enc.config.fps as u32;
-                    encoder::reconfigure_bitrate(ramped, fps);
-                    encoder::set_stream_bitrate_kbps(ramped as i32);
-                    congestion_last_event = Instant::now();
-                    println!("📈 Congestion: ramped bitrate → {} Kbps (+10%)", ramped);
-                }
-            }
+        // ── Dynamic bitrate (QoS) ────────────────────────────────────────────
+        // Same control loop the Worker runs — see qos_tick. Kept as one shared
+        // function so the two capture loops can never drift apart again (they
+        // already had, which is how dynamic bitrate ended up dead in the split
+        // deployment while working here).
+        if client_connected {
+            qos_tick(congestion_stable_kbps, enc.config.fps.max(1) as u32, &mut congestion_last_event);
         }
 
         // ── Secure-desktop backend swap (Phase 15.2) ─────────────────────────
@@ -3421,5 +3506,33 @@ mod tests {
             log_static_desktop(capture::BackendKind::Wgc, streak, &mut last);
         }
         assert_eq!(last, Some(first), "must not re-log inside the throttle window");
+    }
+
+    /// The QoS ramp must climb, converge exactly on the ceiling, and never
+    /// overshoot it — overshooting would push the encoder above what the client
+    /// negotiated, which is the failure the whole loop exists to prevent.
+    #[test]
+    fn qos_ramp_converges_on_ceiling_without_overshoot() {
+        let ceiling = 90_400u32; // the live 4K120 HDR negotiation
+        let mut cur = 72_320; // where one 20% congestion cut lands
+        let mut steps = 0;
+        while cur < ceiling {
+            let next = qos_ramp_step(cur, ceiling);
+            assert!(next > cur, "ramp must make progress: {cur} -> {next}");
+            assert!(next <= ceiling, "ramp overshot the ceiling: {next} > {ceiling}");
+            cur = next;
+            steps += 1;
+            assert!(steps < 1000, "ramp failed to converge");
+        }
+        assert_eq!(cur, ceiling);
+
+        // At or above the ceiling: clamped, never climbing further.
+        assert_eq!(qos_ramp_step(ceiling, ceiling), ceiling);
+        assert_eq!(qos_ramp_step(ceiling + 5_000, ceiling), ceiling);
+
+        // Very low bitrates must still make progress — an integer +10% of a
+        // small value rounds to zero and would stall the ramp forever.
+        assert!(qos_ramp_step(1, 10_000) > 1);
+        assert!(qos_ramp_step(9, 10_000) > 9);
     }
 }

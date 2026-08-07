@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusty_enet as enet;
 
@@ -89,6 +89,60 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
 
 /// Current session generation — bumped by every /launch and /resume before
 /// the client opens its control connection.
+/// Route a congestion signal to whoever owns the encoder: the Worker over IPC
+/// under the Master/Worker split, or this process's own encoder in the
+/// monolithic deployment. Either way it lands in
+/// `encoder::signal_congestion_reduction`, and the capture loop's `qos_tick`
+/// applies it to NVENC.
+fn signal_congestion(worker_link: &Option<WorkerLink>) {
+    match worker_link {
+        Some(link) => link.send(ControlMsg::CongestionReduce),
+        None => crate::encoder::signal_congestion_reduction(),
+    }
+}
+
+/// `(session_generation, first IDR request of that session)` — see
+/// [`idr_request_is_congestion`].
+static IDR_SIGNAL_STATE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+
+/// Should this client IDR request ALSO be treated as a congestion signal?
+///
+/// Moonlight asks for an IDR when it has unrecoverable packet loss, so a
+/// repair request is a congestion report in its own right. That matters
+/// because for real clients it may be the ONLY one they send: during Bobby's
+/// background-download stress test (live 2026-08-06) the client sent **15 IDR
+/// requests and ZERO `PT_LOSS_STATS` reports with a non-zero count**. Driving
+/// QoS from loss stats alone therefore leaves the bitrate pinned at the
+/// ceiling exactly when the link is falling over — which is precisely the
+/// reported symptom (macroblock blips, then an intra-refresh sweep repairing
+/// them, over and over, with no bitrate response).
+///
+/// The catch: clients also request an IDR at the START of a session (and after
+/// a capture-backend swap), which is not congestion at all. Cutting the
+/// bitrate there would tax every single stream start. So the first request of
+/// each session — and anything within `GRACE` of it — is treated as handshake
+/// and ignored; only later requests count. `qos_tick`'s own 2 s reduce
+/// cooldown then keeps a burst of repair requests to one step down.
+fn idr_request_is_congestion(client_info: &Arc<Mutex<Option<ClientInfo>>>) -> bool {
+    /// Window after a session's first IDR request in which further requests are
+    /// still considered part of stream bring-up rather than congestion.
+    const GRACE: Duration = Duration::from_secs(3);
+
+    let generation = current_session_generation(client_info);
+    let Ok(mut slot) = IDR_SIGNAL_STATE.lock() else {
+        return false; // poisoned — never escalate on a broken lock
+    };
+    match *slot {
+        Some((g, first)) if g == generation => first.elapsed() >= GRACE,
+        // First request of this session (or a brand-new session): remember it
+        // and treat it as bring-up.
+        _ => {
+            *slot = Some((generation, Instant::now()));
+            false
+        }
+    }
+}
+
 fn current_session_generation(client_info: &Arc<Mutex<Option<ClientInfo>>>) -> u64 {
     client_info.lock().ok()
         .and_then(|g| g.as_ref().map(|i| i.session_generation))
@@ -304,6 +358,13 @@ fn handle_control_message(
                 Some(link) => link.send(ControlMsg::RequestIdr),
                 None => crate::encoder::request_idr_global(),
             }
+            // A repair request means unrecoverable loss — throttle too. See
+            // idr_request_is_congestion for why this is load-bearing and why
+            // the session's first request doesn't count.
+            if idr_request_is_congestion(client_info) {
+                println!("🎮 Control: IDR repair request mid-stream — signalling bitrate reduction");
+                signal_congestion(worker_link);
+            }
         }
         // We don't do reference frame invalidation — recover with an IDR
         // instead (valid per protocol; Sunshine does this when the encoder
@@ -314,6 +375,10 @@ fn handle_control_message(
                 Some(link) => link.send(ControlMsg::RequestIdr),
                 None => crate::encoder::request_idr_global(),
             }
+            if idr_request_is_congestion(client_info) {
+                println!("🎮 Control: ref-frame invalidation mid-stream — signalling bitrate reduction");
+                signal_congestion(worker_link);
+            }
         }
         // Loss stats arrive every ~50ms; payload[0] (i32 LE) is the loss count
         // since the last report. Signal congestion control on non-zero loss so
@@ -323,10 +388,7 @@ fn handle_control_message(
                 let lost = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                 if lost > 0 {
                     println!("🎮 Loss stats: client lost {} packet(s) — signalling bitrate reduction", lost);
-                    match worker_link {
-                        Some(link) => link.send(ControlMsg::CongestionReduce),
-                        None => crate::encoder::signal_congestion_reduction(),
-                    }
+                    signal_congestion(worker_link);
                 }
             }
         }

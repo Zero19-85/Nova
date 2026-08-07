@@ -51,14 +51,41 @@ const PACE_BATCH_PACKETS: usize = 10;
 /// (a silently dropped frame would break the P-frame reference chain).
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
-/// Send one UDP datagram, retrying on `WouldBlock` instead of silently
-/// dropping it. Free function (not a method) so callers can pass `&socket`
-/// and a shard slice simultaneously without borrow-checker conflicts.
-fn send_packet(socket: &UdpSocket, pkt: &[u8], target: SocketAddr) {
+/// How long one datagram may wait for socket-buffer space before it is
+/// dropped.
+///
+/// The socket is non-blocking with an 8 MB send buffer, so `WouldBlock` means
+/// the NIC/stack is genuinely backed up — during Bobby's background-download
+/// stress test, for instance. Retrying is right for a transient completion
+/// delay; retrying *forever* (the previous behaviour) is not: it stalls the
+/// `nova-rtp-send` thread inside one packet while the rest of the frame's
+/// pacing budget burns, and it does so in a `yield_now` loop on a
+/// THREAD_PRIORITY_HIGHEST thread. 1 ms is comfortably longer than any
+/// plausible transient at these rates and still a fraction of the 8.33 ms
+/// budget at 120 fps.
+///
+/// Dropping the odd shard is survivable by design — that is what the 20% RS
+/// parity is for — and the client's resulting loss report now actually drives
+/// the encoder down (see `lib.rs::qos_tick`), which is the correct answer to a
+/// saturated link. Forcing an IDR from here would be wrong: it adds a large
+/// frame to a link that just told us it is full.
+const SEND_BLOCK_BUDGET: Duration = Duration::from_millis(1);
+
+/// Send one UDP datagram. Retries briefly on `WouldBlock`, then gives up and
+/// reports the drop via `dropped` (folded into the per-second RTP diagnostic,
+/// so socket-buffer saturation is visible in the log rather than silent).
+/// Free function (not a method) so callers can pass `&socket` and a shard
+/// slice simultaneously without borrow-checker conflicts.
+fn send_packet(socket: &UdpSocket, pkt: &[u8], target: SocketAddr, dropped: &mut u32) {
+    let deadline = Instant::now() + SEND_BLOCK_BUDGET;
     loop {
         match socket.send_to(pkt, target) {
             Ok(_) => return,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    *dropped += 1;
+                    return;
+                }
                 std::thread::yield_now();
             }
             Err(_) => return,
@@ -324,6 +351,10 @@ struct TxEngine {
     stat_data_pkts: u32,
     stat_parity_pkts: u32,
     stat_bytes: u64,
+    /// Datagrams abandoned this window because the socket send buffer stayed
+    /// full past [`SEND_BLOCK_BUDGET`] — local uplink saturation, distinct from
+    /// network-path loss (which the client reports instead).
+    stat_buffer_drops: u32,
     stat_window_start: Instant,
     /// Persistent frame payload buffer — reused every frame to eliminate the
     /// per-call Vec heap allocation (frame_header ++ encoded_data).
@@ -354,6 +385,7 @@ impl TxEngine {
             stat_data_pkts: 0,
             stat_parity_pkts: 0,
             stat_bytes: 0,
+            stat_buffer_drops: 0,
             stat_window_start: Instant::now(),
             stream_buf: Vec::new(),
             shard_pool: Vec::new(),
@@ -539,7 +571,7 @@ impl TxEngine {
             shard[20..24].copy_from_slice(&self.frame_index.to_le_bytes());
             shard[27] = 0; // multiFecBlocks — single FEC block (block 0 of 1)
 
-            send_packet(socket, shard, target);
+            send_packet(socket, shard, target, &mut self.stat_buffer_drops);
 
             // Inter-batch pacing gap.
             if !pace_gap.is_zero()
@@ -563,13 +595,24 @@ impl TxEngine {
         self.stat_parity_pkts += parity_shards as u32;
         self.stat_bytes       += (total_shards * block_size) as u64;
         if self.stat_window_start.elapsed() >= Duration::from_secs(1) {
-            println!("📊 RTP/s: {} frames, {} data + {} parity pkts, fec={}%, {:.1} KB/s, pktsize={}",
+            // stat_buffer_drops is appended only when non-zero: it means the
+            // socket send buffer stayed full past SEND_BLOCK_BUDGET, i.e. the
+            // local link — not the network path — is the bottleneck. A steady
+            // stream of these alongside client loss reports is the signature
+            // of a saturated uplink rather than a lossy one.
+            let drops = if self.stat_buffer_drops > 0 {
+                format!(", {} pkt(s) dropped (socket buffer full)", self.stat_buffer_drops)
+            } else {
+                String::new()
+            };
+            println!("📊 RTP/s: {} frames, {} data + {} parity pkts, fec={}%, {:.1} KB/s, pktsize={}{}",
                 self.stat_frames, self.stat_data_pkts, self.stat_parity_pkts,
-                self.fec_percentage, self.stat_bytes as f64 / 1024.0, self.packet_size);
+                self.fec_percentage, self.stat_bytes as f64 / 1024.0, self.packet_size, drops);
             self.stat_frames       = 0;
             self.stat_data_pkts    = 0;
             self.stat_parity_pkts  = 0;
             self.stat_bytes        = 0;
+            self.stat_buffer_drops = 0;
             self.stat_window_start = Instant::now();
         }
     }
