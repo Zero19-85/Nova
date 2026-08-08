@@ -93,7 +93,7 @@ extern "C" {
 /// recovery uses on-demand IDRs exactly as before. Flip to `true` only after
 /// live validation under real packet loss: a bug here corrupts the stream
 /// rather than degrading it (the frame-index bijection must hold exactly).
-pub const RFI_ENABLED: bool = false;
+pub const RFI_ENABLED: bool = true;
 
 /// Attempt reference-frame invalidation for the client-reported lost range.
 /// `true` = NVENC will recover with a P-frame; `false` = the caller must fall

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(sc.exe start NovaService | Out-Null; Start-Sleep -Seconds 12; \\(Get-Service NovaService\\).Status; $p = Get-Process nova-server -ErrorAction SilentlyContinue; if \\($p\\) { \"nova-server PIDs: \" + \\($p.Id -join ', '\\) } else { \"no process yet\" })",
+      "Bash(cd \"/c/Program Files/Nova Server\" && echo \"=== most recent startup banners \\(worker\\) ===\"; grep -nE \"Nova  started at|Nova Worker|NVENC READY|Elevated token|Running as SYSTEM\" nova.log | tail -8; echo; echo \"=== nova.log last-modified vs now ===\"; date; stat -c '%y' nova.log)",
+      "Read(//c/Program Files/Nova Server/**)",
+      "Bash(awk 'NR>=167410 && \\(/NVENC READY|RFI|Initialized Codec|Codec selected|🧩|Activating virtual|First encoded/\\)' nova.log)",
+      "Bash(awk 'NR>=167410 && \\(/NVENC READY|\\\\[NVENC\\\\]|NVENC reconfigured|EncodeFrame|Failed/\\)' nova.log)",
+      "PowerShell(sc.exe stop NovaService | Out-Null; Start-Sleep -Seconds 8; Copy-Item \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Force; $a=\\(Get-FileHash \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Algorithm MD5\\).Hash; $b=\\(Get-FileHash \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" -Algorithm MD5\\).Hash; \"exe match: \" + \\($a -eq $b\\); sc.exe start NovaService | Out-Null; Start-Sleep -Seconds 10; \\(Get-Service NovaService\\).Status)"
+    ]
+  }
+}

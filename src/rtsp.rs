@@ -189,12 +189,17 @@ fn resp_describe(cseq: u32, is_hdr: bool) -> Vec<u8> {
         // a P010 stream because the chroma planes are sized for 8-bit NV12.
         sdp.extend_from_slice(b"a=x-nv-video[0].dynamicRangeMode:1\n");
     }
-    // Reference-frame invalidation (Sunshine rtsp.cpp:788-789: emitted only when
-    // the encoder probe reports support). This is what makes moonlight-common-c
-    // send PT_INVALIDATE_REF_FRAMES ranges for loss instead of full IDR
-    // requests — without it the whole RFI path is dead. Gated on the feature
-    // flag AND the live NVENC capability probe.
-    if crate::encoder::RFI_ENABLED && crate::encoder::rfi_supported() {
+    // Reference-frame invalidation (Sunshine rtsp.cpp:788-789). This line is
+    // what makes moonlight-common-c send PT_INVALIDATE_REF_FRAMES ranges for
+    // loss instead of full IDR requests — without it the whole RFI path is
+    // dead. Gated on the feature flag ONLY, deliberately NOT on
+    // `rfi_supported()`: this SDP is built in the Master process, which never
+    // creates an encoder, so its shim's capability probe is always false — the
+    // real probe lives in the Worker. The Worker's shim still guards the actual
+    // invalidation on its own probe and falls back to an IDR if unsupported, so
+    // advertising here is safe even on the (vanishingly rare, pre-Kepler) GPU
+    // that lacks RFI. See run_worker for the Worker-side gate.
+    if crate::encoder::RFI_ENABLED {
         sdp.extend_from_slice(b"a=x-nv-video[0].refPicInvalidation:1\n");
     }
 
