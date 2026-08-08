@@ -405,21 +405,28 @@ impl ControlMsg {
 pub enum MediaMsg {
     /// `frame_type`: 2 = IDR/keyframe, 1 = P-frame (matches `rtp::send_frame`'s
     /// existing convention — reused as-is, not redefined).
-    VideoFrame { frame_type: u8, data: Vec<u8> },
+    ///
+    /// `frame_index` is the wire frame index the Worker encoded this frame as
+    /// (== the NVENC inputTimeStamp). Master puts it straight on the wire via
+    /// `rtp::send_frame`. Video carries it — unlike audio — because
+    /// reference-frame invalidation requires the index NVENC stamped and the
+    /// index the client references to be identical, and only the Worker (which
+    /// owns the encoder) knows it. A frame the Worker dropped after encode
+    /// simply never arrives, leaving a gap the client recovers from.
+    VideoFrame { frame_index: u32, frame_type: u8, data: Vec<u8> },
     /// Raw Opus-encoded audio, pre-encryption. No seq/timestamp on the wire —
-    /// Master's `audio::AudioTxState` owns those independently (mirrors
-    /// `RtpSender` owning `frame_index` for video instead of trusting
-    /// whatever a respawned Worker thinks its own count is).
+    /// Master's `audio::AudioTxState` owns those independently.
     AudioFrame { data: Vec<u8> },
 }
 
 impl MediaMsg {
     fn encode(&self) -> Vec<u8> {
         match self {
-            MediaMsg::VideoFrame { frame_type, data } => {
-                let mut out = Vec::with_capacity(2 + data.len());
+            MediaMsg::VideoFrame { frame_index, frame_type, data } => {
+                let mut out = Vec::with_capacity(6 + data.len());
                 out.push(tag::VIDEO_FRAME);
                 out.push(*frame_type);
+                out.extend_from_slice(&frame_index.to_le_bytes());
                 out.extend_from_slice(data);
                 out
             }
@@ -438,10 +445,15 @@ impl MediaMsg {
             .ok_or_else(|| invalid_data("empty MediaMsg"))?;
         match t {
             tag::VIDEO_FRAME => {
-                let (&frame_type, data) = rest
+                // [frame_type: u8][frame_index: u32 LE][data...]
+                let (&frame_type, rest) = rest
                     .split_first()
                     .ok_or_else(|| invalid_data("truncated VideoFrame"))?;
-                Ok(MediaMsg::VideoFrame { frame_type, data: data.to_vec() })
+                let idx = rest
+                    .get(..4)
+                    .ok_or_else(|| invalid_data("truncated VideoFrame index"))?;
+                let frame_index = u32::from_le_bytes(idx.try_into().unwrap());
+                Ok(MediaMsg::VideoFrame { frame_index, frame_type, data: rest[4..].to_vec() })
             }
             tag::AUDIO_FRAME => Ok(MediaMsg::AudioFrame { data: rest.to_vec() }),
             other => Err(invalid_data(&format!("unknown MediaMsg tag {other}"))),
@@ -671,8 +683,8 @@ mod tests {
     #[test]
     fn media_msg_round_trips_through_encode_decode() {
         for msg in [
-            MediaMsg::VideoFrame { frame_type: 2, data: vec![0xDE, 0xAD, 0xBE, 0xEF] },
-            MediaMsg::VideoFrame { frame_type: 1, data: vec![] },
+            MediaMsg::VideoFrame { frame_index: 1, frame_type: 2, data: vec![0xDE, 0xAD, 0xBE, 0xEF] },
+            MediaMsg::VideoFrame { frame_index: 4_000_000_000, frame_type: 1, data: vec![] },
             MediaMsg::AudioFrame { data: vec![1, 2, 3] },
         ] {
             let decoded = MediaMsg::decode(&msg.encode()).expect("decode");

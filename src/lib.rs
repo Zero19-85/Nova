@@ -736,7 +736,8 @@ async fn media_supervisor(
     // to video_learned/first_idr_forwarded's reset-on-reconnect below: this
     // needs to keep resending the OLD session's last frame right through
     // that reset, until the NEW worker's own first real frame supersedes it.
-    let mut last_idr: Option<Vec<u8>> = None;
+    // Cached last IDR (index + bytes) for the keepalive retransmit below.
+    let mut last_idr: Option<(u32, Vec<u8>)> = None;
     // Confirmed live (2026-08-06): gating the resend on "no pipe connected"
     // was NOT enough — most of a respawn's dead-air window is spent with the
     // pipe already reconnected but the new Worker still mid-VDD/WGC/DDA
@@ -774,7 +775,7 @@ async fn media_supervisor(
                 }
             } => {
                 match frame {
-                    Some(Ok(ipc::MediaMsg::VideoFrame { frame_type, data })) => {
+                    Some(Ok(ipc::MediaMsg::VideoFrame { frame_index, frame_type, data })) => {
                         if !video_learned {
                             continue;
                         }
@@ -782,12 +783,15 @@ async fn media_supervisor(
                         if !first_idr_forwarded && !is_idr {
                             continue; // don't open the stream with a P-frame
                         }
-                        let sent = rtp_sender.lock().unwrap().send_frame(&data, frame_type);
+                        // The Worker chose frame_index (== the NVENC timestamp);
+                        // Master puts it straight on the wire so the index the
+                        // client references matches what invalidation targets.
+                        let sent = rtp_sender.lock().unwrap().send_frame(frame_index, &data, frame_type);
                         if sent {
                             first_idr_forwarded = true;
                             last_frame_at = Instant::now();
                             if is_idr {
-                                last_idr = Some(data);
+                                last_idr = Some((frame_index, data));
                             }
                         }
                         // else: send-thread queue saturated (rare/transient) —
@@ -829,8 +833,11 @@ async fn media_supervisor(
                 // static-desktop IDR keepalive (run_worker's loop) well
                 // under this threshold, so this never fights with it.
                 if video_learned && last_frame_at.elapsed() >= Duration::from_secs(1) {
-                    if let Some(data) = &last_idr {
-                        let _ = rtp_sender.lock().unwrap().send_frame(data, 2);
+                    if let Some((idx, data)) = &last_idr {
+                        // Retransmit the cached IDR under its ORIGINAL index — a
+                        // genuine retransmit, not a new frame; the client keeps
+                        // the same reference timeline.
+                        let _ = rtp_sender.lock().unwrap().send_frame(*idx, data, 2);
                     }
                 }
             }
@@ -1955,6 +1962,9 @@ pub async fn run_worker() -> Result<()> {
     let mut client_connected = false;
     let mut first_idr_sent = false;
     let mut frames_encoded = 0u64;
+    // Wire frame index (== NVENC inputTimeStamp), 1-based like Moonlight expects.
+    // Owned here so the encoder and the wire agree; reset to 1 per session.
+    let mut wire_index: u32 = 1;
     let mut send_queue_drops = 0u64;
     let mut audio_send_drops = 0u64;
     let mut timeout_streak = 0u32;
@@ -2002,6 +2012,7 @@ pub async fn run_worker() -> Result<()> {
                                     qos.reset();
                                     client_connected = true;
                                     first_idr_sent = false;
+                                    wire_index = 1; // fresh session ⇒ client expects frame 1
                                     frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                                     next_frame_time = Instant::now();
                                     let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
@@ -2053,6 +2064,7 @@ pub async fn run_worker() -> Result<()> {
                             qos.reset();
                             client_connected = true;
                             first_idr_sent = false;
+                            wire_index = 1; // fresh session ⇒ client expects frame 1
                             frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                             next_frame_time = Instant::now();
                             let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
@@ -2145,8 +2157,15 @@ pub async fn run_worker() -> Result<()> {
         }
 
         if let Some(texture) = texture_to_encode {
-            let packet_size = enc.encode_frame(&texture, &mut out_buffer);
+            // The index this frame is encoded AND sent under (== NVENC
+            // inputTimeStamp, see encode_frame). Advances once per encoded frame
+            // so NVENC's reference timeline and the client's wire indices stay
+            // in bijection; a frame dropped after encode simply leaves a gap.
+            let this_index = wire_index;
+            let packet_size = enc.encode_frame(&texture, &mut out_buffer, this_index as u64);
             if packet_size > 0 {
+                wire_index = wire_index.wrapping_add(1);
+                if wire_index == 0 { wire_index = 1; } // Moonlight discards frame 0
                 frames_encoded += 1;
                 if frames_encoded == 1 {
                     println!("🎬 First encoded frame: {} bytes", packet_size);
@@ -2167,7 +2186,7 @@ pub async fn run_worker() -> Result<()> {
                     } else {
                         let frame_type = if is_idr { 2u8 } else { 1u8 };
                         match ipc::send_media(&mut media_pipe, &ipc::MediaMsg::VideoFrame {
-                            frame_type, data: data.to_vec(),
+                            frame_index: this_index, frame_type, data: data.to_vec(),
                         }).await {
                             Ok(()) => {
                                 first_idr_sent = true;
@@ -2620,6 +2639,8 @@ pub async fn run() -> Result<()> {
     let mut first_idr_sent   = false;
     let mut next_frame_time  = Instant::now();
     let mut frames_encoded   = 0u64;
+    // Wire frame index (== NVENC inputTimeStamp), 1-based; reset per session.
+    let mut wire_index: u32  = 1;
     // Frames refused by the RTP send thread's bounded queue (saturated link).
     // Each refusal triggers an IDR re-request; count is per session, for the
     // rate-limited diagnostic log.
@@ -3206,6 +3227,7 @@ pub async fn run() -> Result<()> {
                             encoder::reconfigure_bitrate(client.bitrate_kbps, session_fps);
                             encoder::set_stream_bitrate_kbps(client.bitrate_kbps as i32);
                             congestion_stable_kbps = client.bitrate_kbps;
+                            wire_index = 1; // fresh session ⇒ client expects frame 1
                             // Fresh controller per session: the previous
                             // session's remembered failure point says nothing
                             // about this one's link budget (QosController::tick
@@ -3500,13 +3522,17 @@ pub async fn run() -> Result<()> {
             // Moonlight requests IDRs via the control stream when it can't
             // recover. The encoder runs an infinite GOP (Sunshine-style) —
             // IDRs happen only on demand.
-            let packet_size = enc.encode_frame(&texture, &mut out_buffer);
+            // Index this frame is encoded AND sent under (== NVENC inputTimeStamp).
+            let this_index = wire_index;
+            let packet_size = enc.encode_frame(&texture, &mut out_buffer, this_index as u64);
 
             if packet_size == 0 {
                 println!("⚠️  encode_frame returned 0 bytes ({}x{})", capturer.width(), capturer.height());
             }
 
             if packet_size > 0 {
+                wire_index = wire_index.wrapping_add(1);
+                if wire_index == 0 { wire_index = 1; } // Moonlight discards frame 0
                 frames_encoded += 1;
                 if frames_encoded == 1 {
                     println!("🎬 First encoded frame: {} bytes", packet_size);
@@ -3532,7 +3558,7 @@ pub async fn run() -> Result<()> {
                         if frames_encoded < 20 {
                             println!("[ENC] frame={} ({} bytes) dropped — waiting for first IDR", frames_encoded, packet_size);
                         }
-                    } else if rtp_sender.send_frame(data, if is_idr { 2 } else { 1 }) {
+                    } else if rtp_sender.send_frame(this_index, data, if is_idr { 2 } else { 1 }) {
                         // Frame queued to the nova-rtp-send thread — packetize/
                         // FEC/pacing/sendto all happen off the capture thread.
                         first_idr_sent = true;

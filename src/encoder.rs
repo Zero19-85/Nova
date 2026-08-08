@@ -69,11 +69,33 @@ extern "C" {
         height: i32,
         out_buffer: *mut u8,
         max_size: i32,
+        frame_index: u64,
     ) -> i32;
     fn CleanupEncoder(encoder: *mut c_void) -> i32;
     fn RequestIdrFrame(encoder: *mut c_void);
     fn ReconfigureBitrate(bitrate_kbps: i32, fps: i32) -> i32;
 
+    /// RFI: invalidate the client's `[first,last]` frame-index range in NVENC's
+    /// DPB so the next P-frame recovers without an IDR. Returns 1 on success,
+    /// 0 when the range can't be honoured (caller must force an IDR).
+    fn InvalidateRefFrames(first_frame: u64, last_frame: u64) -> i32;
+    /// RFI: whether this GPU/codec supports reference-picture invalidation
+    /// (probed at InitEncoder). 1 = supported.
+    fn RfiSupported() -> i32;
+}
+
+/// Attempt reference-frame invalidation for the client-reported lost range.
+/// `true` = NVENC will recover with a P-frame; `false` = the caller must fall
+/// back to forcing an IDR. See the shim's `InvalidateRefFrames`.
+pub fn invalidate_ref_frames(first_frame: u64, last_frame: u64) -> bool {
+    unsafe { InvalidateRefFrames(first_frame, last_frame) == 1 }
+}
+
+/// Whether NVENC on this host advertises reference-picture invalidation
+/// support. Only meaningful after the first `Encoder::new()`. Gates whether
+/// Nova advertises RFI to the client (see rtsp.rs).
+pub fn rfi_supported() -> bool {
+    unsafe { RfiSupported() == 1 }
 }
 
 /// Pass the log file path (UTF-16, null-terminated) to the C++ shim so that
@@ -227,9 +249,15 @@ impl Encoder {
 
     /// Feed one captured D3D11 texture through the VP→NVENC pipeline.
     ///
+    /// `frame_index` is the client-facing wire frame index this frame will be
+    /// sent as (see rtp.rs). It becomes NVENC's `inputTimeStamp`, which is what
+    /// reference-frame invalidation targets — so it MUST match the index the
+    /// client references, and must advance in lockstep with the wire index
+    /// (including for frames dropped after encode; see the capture loop).
+    ///
     /// Returns the number of encoded bytes written into `out`, or a negative
-    /// NVENC error code.  The shim also mirrors each packet to `test.h264`.
-    pub fn encode_frame<T>(&self, texture: &T, out: &mut [u8]) -> i32 {
+    /// NVENC error code.
+    pub fn encode_frame<T>(&self, texture: &T, out: &mut [u8], frame_index: u64) -> i32 {
         unsafe {
             // T is ID3D11Texture2D — same repr(transparent) COM wrapper trick.
             let tex_ptr = std::mem::transmute_copy::<T, *mut c_void>(texture);
@@ -240,6 +268,7 @@ impl Encoder {
                 self.config.height,
                 out.as_mut_ptr(),
                 out.len() as i32,
+                frame_index,
             )
         }
     }

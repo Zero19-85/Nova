@@ -166,6 +166,21 @@ public:
     int GetCapabilityValue(GUID guidCodec, NV_ENC_CAPS capsToQuery);
 
     /**
+    *  Nova RFI: when enabled, DoEncode uses the caller-supplied
+    *  NV_ENC_PIC_PARAMS::inputTimeStamp (the client-facing wire frame index)
+    *  instead of the SDK's internal auto-incrementing counter, so reference
+    *  frames can be invalidated by the exact index the client references.
+    */
+    void SetUseExternalTimeStamp(bool enable) { m_bUseExternalTimeStamp = enable; }
+
+    /**
+    *  Nova RFI: invalidate the reference frame encoded with `timeStamp`
+    *  (a wire frame index). Returns true on NV_ENC_SUCCESS. Only valid while
+    *  the frame is still in the DPB.
+    */
+    bool InvalidateRefFrame(uint64_t timeStamp);
+
+    /**
     *  @brief  This function is used to get the current device on which encoder is running.
     */
     void *GetDevice() const { return m_pDevice; }
@@ -480,6 +495,8 @@ private:
     uint32_t m_viewId = 0;
     uint32_t m_outputHevc3DReferenceDisplayInfo = 0;
 	uint64_t m_nInputTimeStamp = 0;
+	// Nova RFI: caller controls inputTimeStamp when true (see SetUseExternalTimeStamp).
+	bool m_bUseExternalTimeStamp = false;
 	void *m_pDevice;
 	NV_ENC_DEVICE_TYPE m_eDeviceType;
 	std::vector<NV_ENC_OUTPUT_PTR> m_vMVDataOutputBuffer;

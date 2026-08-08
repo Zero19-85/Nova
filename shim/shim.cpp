@@ -98,6 +98,16 @@ static ID3D11Device*        g_device    = nullptr;
 static ID3D11DeviceContext* g_context   = nullptr;
 static NvEncoderD3D11*      g_nvEncoder = nullptr;
 static std::atomic<bool>    g_force_idr{false};
+// Nova RFI (reference-frame invalidation) state.
+//   g_rfiSupported          — set by InitEncoder from NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION.
+//   g_refFramesInDpb        — DPB depth (must match the maxNumRefFrames* config below);
+//                             an invalidation range at least this large can't be honoured
+//                             (no good older reference survives) → caller forces an IDR.
+//   g_lastEncodedFrameIndex — most recent wire index handed to NVENC; an invalidation
+//                             expands its range up to this (Sunshine nvenc_base parity).
+static bool                 g_rfiSupported = false;
+static uint32_t             g_refFramesInDpb = 5;
+static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
 
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
@@ -1316,6 +1326,19 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         if (is_hdr) BuildHdrMetadata();
 
+        // Nova RFI foundation: drive NVENC's inputTimeStamp from the caller
+        // (Rust passes the client-facing wire frame index per frame), and probe
+        // whether this GPU/codec supports reference-picture invalidation. The
+        // probe result gates whether Rust advertises RFI to the client at all —
+        // a false probe means the whole feature stays off and loss recovery
+        // keeps using on-demand IDRs.
+        g_nvEncoder->SetUseExternalTimeStamp(true);
+        g_lastEncodedFrameIndex = 0;
+        g_rfiSupported = g_nvEncoder->GetCapabilityValue(
+                             codecGuid, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0;
+        ShimLog("🧩 RFI (reference-frame invalidation) support for %s: %s (DPB holds %u ref frames)\n",
+               codec, g_rfiSupported ? "YES" : "no", g_refFramesInDpb);
+
         ShimLog("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
                codec, is_hdr ? "/HDR10/Main10" : "", width, height, bitrate_kbps, fps);
         // Single-line codec summary so the operator can instantly confirm
@@ -1338,7 +1361,8 @@ extern "C" __declspec(dllexport) int InitEncoder(
 extern "C" __declspec(dllexport) int EncodeFrame(
     void* /*encoder*/, void* d3d11_texture,
     int /*width*/, int /*height*/,
-    uint8_t* out_buffer, int max_size)
+    uint8_t* out_buffer, int max_size,
+    uint64_t frame_index)
 {
     if (!g_nvEncoder || !d3d11_texture) return -1;
 
@@ -1497,8 +1521,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     }
 
     std::vector<NvEncOutputFrame> vPacket;
+    // Nova RFI: every frame carries picParams now, because inputTimeStamp must
+    // equal the client-facing wire frame index on EVERY frame (not just IDRs)
+    // for reference invalidation to target frames by that index. The SDK
+    // wrapper honours this only because SetUseExternalTimeStamp(true) was set at
+    // init; otherwise it would overwrite inputTimeStamp with its own counter.
+    NV_ENC_PIC_PARAMS picParams = {};
+    picParams.inputTimeStamp = frame_index;
     if (g_force_idr.exchange(false)) {
-        NV_ENC_PIC_PARAMS picParams = {};
         // NV_ENC_PIC_FLAG_FORCEIDR alone generates the IDR slice but does NOT
         // guarantee inline SPS/PPS/VPS headers unless the codec config set
         // repeatSPSPPS=1 for a *periodic* IDR. For on-demand IDRs triggered by
@@ -1515,10 +1545,9 @@ extern "C" __declspec(dllexport) int EncodeFrame(
             picParams.codecPicParams.hevcPicParams.seiPayloadArrayCnt = 2;
             picParams.codecPicParams.hevcPicParams.seiPayloadArray    = g_hdrSeiPayloads;
         }
-        g_nvEncoder->EncodeFrame(vPacket, &picParams);
-    } else {
-        g_nvEncoder->EncodeFrame(vPacket);
     }
+    g_nvEncoder->EncodeFrame(vPacket, &picParams);
+    g_lastEncodedFrameIndex.store(frame_index);
 
     int total_size = 0;
     for (const auto& packet : vPacket) {
@@ -1578,6 +1607,47 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
 // to a newly-connected Moonlight client is a keyframe (with inline SPS/PPS).
 extern "C" __declspec(dllexport) void RequestIdrFrame(void* /*encoder*/) {
     g_force_idr.store(true);
+}
+
+// ==================== REFERENCE-FRAME INVALIDATION ====================
+// Non-zero return = the client's [first,last] range was invalidated in the
+// DPB; the next encoded P-frame references an older good frame, so the client
+// recovers WITHOUT a full IDR (no "scanning down" repair sweep). Zero return =
+// the range can't be honoured — the caller (Rust) must force an IDR instead.
+// Mirrors Sunshine nvenc_base::invalidate_ref_frames.
+extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, uint64_t last_frame) {
+    if (!g_nvEncoder || !g_rfiSupported) return 0;
+    if (last_frame < first_frame)        return 0;
+
+    // Everything from the first lost frame up to the most recently encoded one
+    // transitively depends on the lost reference, so invalidate the whole tail.
+    uint64_t last_encoded = g_lastEncodedFrameIndex.load();
+    if (last_encoded > last_frame) last_frame = last_encoded;
+
+    // If the gap is at least the DPB depth, no un-invalidated reference
+    // survives for the next P-frame to key off — an IDR is unavoidable.
+    if (last_frame - first_frame + 1 >= (uint64_t)g_refFramesInDpb) {
+        ShimLog("🧩 RFI range %llu-%llu >= DPB %u — forcing IDR\n",
+               (unsigned long long)first_frame, (unsigned long long)last_frame, g_refFramesInDpb);
+        return 0;
+    }
+
+    for (uint64_t i = first_frame; i <= last_frame; i++) {
+        if (!g_nvEncoder->InvalidateRefFrame(i)) {
+            ShimLog("🧩 RFI: InvalidateRefFrame(%llu) failed — forcing IDR\n",
+                   (unsigned long long)i);
+            return 0;
+        }
+    }
+    ShimLog("🧩 RFI: invalidated %llu-%llu — recovering with a P-frame\n",
+           (unsigned long long)first_frame, (unsigned long long)last_frame);
+    return 1;
+}
+
+// Whether this GPU/codec supports RFI (probed at InitEncoder). Rust reads this
+// to decide whether to advertise refPicInvalidation:1 to the client.
+extern "C" __declspec(dllexport) int RfiSupported() {
+    return g_rfiSupported ? 1 : 0;
 }
 
 // ==================== CLEANUP ====================

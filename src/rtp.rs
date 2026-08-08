@@ -108,7 +108,7 @@ fn spin_wait(d: Duration) {
 /// (dropped with an error signal when the sender is hopelessly behind);
 /// control commands use blocking `send` (rare, must never be lost).
 enum TxCmd {
-    Frame { buf: Vec<u8>, frame_type: u8 },
+    Frame { frame_index: u32, buf: Vec<u8>, frame_type: u8 },
     SetTarget(SocketAddr),
     SetFps(u32),
     SetCodec { is_hevc: bool, is_av1: bool },
@@ -244,7 +244,7 @@ impl RtpSender {
     /// thread is more than `MAX_FRAMES_IN_FLIGHT` frames behind — the caller
     /// MUST request an IDR in that case (the dropped frame breaks the P-frame
     /// reference chain). Never blocks the capture thread.
-    pub fn send_frame(&mut self, data: &[u8], frame_type: u8) -> bool {
+    pub fn send_frame(&mut self, frame_index: u32, data: &[u8], frame_type: u8) -> bool {
         if data.is_empty() || self.target.is_none() {
             return true; // nothing to send / nobody to send to — not a drop
         }
@@ -263,7 +263,7 @@ impl RtpSender {
         buf.clear();
         buf.extend_from_slice(data);
 
-        match self.tx.try_send(TxCmd::Frame { buf, frame_type }) {
+        match self.tx.try_send(TxCmd::Frame { frame_index, buf, frame_type }) {
             Ok(()) => {
                 self.bufs_in_flight += 1;
                 true
@@ -291,8 +291,8 @@ fn tx_worker(socket: UdpSocket, rx: Receiver<TxCmd>, buf_tx: SyncSender<Vec<u8>>
     let mut eng = TxEngine::new(socket);
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            TxCmd::Frame { buf, frame_type } => {
-                eng.send_frame(&buf, frame_type);
+            TxCmd::Frame { frame_index, buf, frame_type } => {
+                eng.send_frame(frame_index, &buf, frame_type);
                 // Return the buffer for reuse. Capacity == MAX_FRAMES_IN_FLIGHT
                 // so this can never be Full; a Disconnected handle just means
                 // shutdown, where dropping the buffer is fine.
@@ -423,9 +423,17 @@ impl TxEngine {
     /// Our DESCRIBE response advertises encryptionSupported:0/encryptionRequested:0,
     /// so on real Sunshine session->video.cipher is never set for this session —
     /// video payloads are sent in plaintext (no AES).
-    fn send_frame(&mut self, data: &[u8], frame_type: u8) {
+    fn send_frame(&mut self, frame_index: u32, data: &[u8], frame_type: u8) {
         if data.is_empty() { return; }
         let Some(target) = self.target else { return };
+
+        // The wire frame index is chosen by the capture loop (lib.rs) and passed
+        // in, NOT incremented here — it must equal the NVENC inputTimeStamp the
+        // same frame was encoded with, so reference-frame invalidation can
+        // target frames by the exact index the client references. A frame the
+        // capture loop dropped after encode leaves a GAP in this sequence, which
+        // the client detects as loss and recovers via an invalidation request.
+        self.frame_index = frame_index;
 
         let block_size         = self.packet_size + MAX_RTP_HEADER_SIZE;
         let payload_per_packet = block_size - HEADERS_SIZE;
@@ -585,9 +593,10 @@ impl TxEngine {
         self.sequence_number = self.sequence_number.wrapping_add(total_shards as u16);
         self.packet_counter  = self.packet_counter.wrapping_add(total_shards as u32);
 
-        // Advance 90 kHz RTP clock by one frame period
+        // Advance 90 kHz RTP clock by one frame period. frame_index is NOT
+        // advanced here — the capture loop owns it (see the note at the top of
+        // this function) and supplies it per frame.
         self.timestamp   = self.timestamp.wrapping_add(90000 / self.fps);
-        self.frame_index = self.frame_index.wrapping_add(1);
 
         // ── Per-second send diagnostics ──────────────────────────────────────
         self.stat_frames      += 1;
@@ -832,7 +841,14 @@ mod tests {
     /// IDR = permanent black screen + ML_ERROR_NO_VIDEO_FRAME ("reduce your
     /// bitrate") after 10 s. Sunshine starts at frame_nr = 1.
     #[test]
-    fn first_frame_carries_frame_index_1_and_reset_restarts_at_1() {
+    fn wire_frame_index_is_exactly_what_the_caller_supplies() {
+        // The capture loop (lib.rs) now owns the wire frame index — it must
+        // equal the NVENC inputTimeStamp the same frame was encoded with, for
+        // reference-frame invalidation. This test locks that the RTP layer puts
+        // EXACTLY the supplied index on the wire (no internal renumbering), and
+        // that a caller-created GAP (a frame dropped after encode) appears as a
+        // gap on the wire so the client detects the loss. The Phase 13 "start
+        // at 1" invariant now lives in the capture loop, not here.
         let mut sender = RtpSender::new(0).expect("bind ephemeral");
         let dst = loopback_addr(&sender);
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -845,24 +861,16 @@ mod tests {
         frame.extend_from_slice(&[0xAA; 64]);
         let ft = detect_frame_type(&frame, false, false);
 
-        assert!(sender.send_frame(&frame, ft), "frame 1 must be accepted");
+        assert!(sender.send_frame(1, &frame, ft), "frame 1 must be accepted");
         let pkts = recv_frame_datagrams(&client);
         assert!(!pkts.is_empty(), "no datagrams received for frame 1");
-        assert_eq!(frame_index_of(&pkts[0]), 1, "first frame must be index 1, not 0");
+        assert_eq!(frame_index_of(&pkts[0]), 1, "wire index must be the supplied 1");
         assert_eq!(pkts[0][24] & FLAG_SOF, FLAG_SOF, "first data shard must carry SOF");
 
-        assert!(sender.send_frame(&frame, ft), "frame 2 must be accepted");
+        // Skip index 2 (a dropped-after-encode frame) — the wire must show 3.
+        assert!(sender.send_frame(3, &frame, ft), "frame 3 must be accepted");
         let pkts = recv_frame_datagrams(&client);
-        assert_eq!(frame_index_of(&pkts[0]), 2, "second frame must be index 2");
-
-        // A new session must restart at 1 — the client's depacketizer is
-        // reinitialized per connection and expects frame 1 again.
-        sender.reset();
-        ping(&client, dst, 1);
-        sender.try_learn_target().expect("re-learn client after reset");
-        assert!(sender.send_frame(&frame, ft), "post-reset frame must be accepted");
-        let pkts = recv_frame_datagrams(&client);
-        assert_eq!(frame_index_of(&pkts[0]), 1, "post-reset first frame must be index 1");
+        assert_eq!(frame_index_of(&pkts[0]), 3, "wire must carry the supplied 3 (gap at 2)");
     }
 
     /// AV1 keyframe detection: an OBU stream containing a sequence header (type

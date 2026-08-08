@@ -560,7 +560,14 @@ NVENCSTATUS NvEncoder::DoEncode(NV_ENC_INPUT_PTR inputBuffer, NV_ENC_OUTPUT_PTR 
     HEVC_3D_REFERENCE_DISPLAY_INFO *p3dReferenceDisplayInfo = NULL;
     picParams.version = NV_ENC_PIC_PARAMS_VER;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    picParams.inputTimeStamp = m_nInputTimeStamp++;
+    // Nova RFI: when external timestamps are enabled the caller sets
+    // inputTimeStamp = the client-facing wire frame index (copied in from
+    // pPicParams above), so nvEncInvalidateRefFrames can target a frame by the
+    // exact index the client references. Otherwise keep the SDK's internal
+    // monotonic counter.
+    if (!m_bUseExternalTimeStamp) {
+        picParams.inputTimeStamp = m_nInputTimeStamp++;
+    }
     picParams.inputBuffer = inputBuffer;
     picParams.bufferFmt = GetPixelFormat();
     picParams.inputWidth = GetEncodeWidth();
@@ -1027,6 +1034,22 @@ int NvEncoder::GetCapabilityValue(GUID guidCodec, NV_ENC_CAPS capsToQuery)
     int v;
     m_nvenc.nvEncGetEncodeCaps(m_hEncoder, guidCodec, &capsParam, &v);
     return v;
+}
+
+bool NvEncoder::InvalidateRefFrame(uint64_t timeStamp)
+{
+    // Nova RFI: tell NVENC that the reference frame it encoded with this
+    // inputTimeStamp is unusable (the client never decoded it), so the next
+    // P-frame references an older, still-good frame from the DPB instead of
+    // requiring a full IDR. `timeStamp` is the client-facing wire frame index
+    // (see the m_bUseExternalTimeStamp path in DoEncode). Succeeds only while
+    // the frame is still in the DPB — the caller bounds the range to the DPB
+    // depth and forces an IDR on any failure.
+    if (!m_hEncoder)
+    {
+        return false;
+    }
+    return m_nvenc.nvEncInvalidateRefFrames(m_hEncoder, timeStamp) == NV_ENC_SUCCESS;
 }
 
 int NvEncoder::GetFrameSize() const
