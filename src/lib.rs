@@ -1134,21 +1134,41 @@ impl QosController {
     const REDUCE_COOLDOWN: Duration = Duration::from_secs(2);
     /// Quiet period before stepping the bitrate back up.
     const RAMP_INTERVAL: Duration = Duration::from_secs(3);
-    /// Quiet period parked at the target before probing above it.
-    const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+    /// Quiet period parked at the target before probing above it. Short so a
+    /// link that has actually healed recovers in seconds, not minutes — during
+    /// genuine congestion the reduce path keeps firing and resets this clock,
+    /// so it only elapses once the link is truly quiet.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(10);
     /// The remembered target may never drive the stream below this.
     const FLOOR_KBPS: u32 = 1_000;
 
-    fn new() -> Self {
-        // Clocks start in the past so the first congestion signal acts at once
-        // instead of waiting out a cooldown that never applied to anything.
+    fn a_past_instant() -> Instant {
         // checked_sub: Instant is QPC-since-boot on Windows, so plain
         // subtraction panics when the process starts <30 s after power-on (the
-        // Phase 15.3 crash-loop).
-        let past = Instant::now()
+        // Phase 15.3 crash-loop). Starting the clocks in the past lets the
+        // first congestion signal act at once instead of waiting out a cooldown
+        // that never applied to anything.
+        Instant::now()
             .checked_sub(Duration::from_secs(120))
-            .unwrap_or_else(Instant::now);
+            .unwrap_or_else(Instant::now)
+    }
+
+    fn new() -> Self {
+        let past = Self::a_past_instant();
         Self { ceiling_seen: 0, known_bad_kbps: None, last_event: past, last_probe: past }
+    }
+
+    /// Forget everything a session learned about the link. Called at each new
+    /// session (see the Worker's Configure arm) — the failure memory is
+    /// per-link-episode, and a reconnect after a MoCA/Wi-Fi glitch deserves a
+    /// clean slate. Without this the memory leaked across reconnects whenever
+    /// two sessions negotiated the same ceiling (live 2026-08-08: an 11-session
+    /// MoCA-failure run left a fresh session capped at 3.5 Mbps by the previous
+    /// session's collapse, because the ceiling-change reset never fired).
+    fn reset(&mut self) {
+        self.known_bad_kbps = None;
+        self.last_event = Self::a_past_instant();
+        self.last_probe = Self::a_past_instant();
     }
 
     /// What recovery is allowed to climb to: 90% of whatever failed, clamped to
@@ -1173,12 +1193,29 @@ impl QosController {
         });
     }
 
-    /// Relax the remembered failure point upward (+5%) so a transient blip
-    /// can't cap the session forever. Clearing it once the target would reach
+    /// Relax the remembered failure point toward the ceiling by a QUARTER of
+    /// the remaining gap each probe, so recovery time is BOUNDED regardless of
+    /// how deep congestion drove the stream: geometric convergence reaches the
+    /// ceiling in ~13 probes from any depth, versus the old fixed +5% which
+    /// took ~80 minutes to climb back from a 3.5 Mbps collapse (live
+    /// 2026-08-08). Big steps far from the ceiling (fast recovery through the
+    /// safe zone) taper to small steps near it (cautious where the cliff was) —
+    /// the shape you actually want. Clearing the memory once the target reaches
     /// the ceiling lets a fully recovered link return to full quality.
     fn relax_target(&mut self, ceiling_kbps: u32) {
         let Some(bad) = self.known_bad_kbps else { return };
-        let relaxed = bad.saturating_add((bad / 20).max(1));
+        if bad >= ceiling_kbps {
+            self.known_bad_kbps = None;
+            return;
+        }
+        // A quarter of the remaining gap, but never a smaller step than
+        // ceiling/16 — pure geometric convergence crawls in tiny steps near
+        // the top (the gap, and thus gap/4, shrinks toward 1), which would
+        // drag the last stretch of the recovery out to dozens of probes. The
+        // floor makes the tail snap to full instead: once within ~ceiling/16
+        // of the ceiling the next step clears it and the memory is forgotten.
+        let step = ((ceiling_kbps - bad) / 4).max(ceiling_kbps / 16).max(1);
+        let relaxed = bad.saturating_add(step);
         self.known_bad_kbps = if relaxed >= ceiling_kbps { None } else { Some(relaxed) };
     }
 
@@ -1959,6 +1996,10 @@ pub async fn run_worker() -> Result<()> {
                                         cs.audio_packet_duration_ms, cs.host_audio,
                                     );
                                     input::start_session();
+                                    // Fresh session ⇒ clear the QoS link memory:
+                                    // it is per-link-episode and a reconnect
+                                    // deserves a clean slate (see reset()).
+                                    qos.reset();
                                     client_connected = true;
                                     first_idr_sent = false;
                                     frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
@@ -2008,6 +2049,8 @@ pub async fn run_worker() -> Result<()> {
                                 cs.audio_packet_duration_ms, cs.host_audio,
                             );
                             input::start_session();
+                            // Fresh session ⇒ clear the QoS link memory (see reset()).
+                            qos.reset();
                             client_connected = true;
                             first_idr_sent = false;
                             frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
@@ -3673,30 +3716,59 @@ mod tests {
         assert_eq!(qos.ramp_target(ceiling), before);
     }
 
-    /// The slow probe must let a recovered link climb back, and must fully
-    /// forget the failure once the target reaches the ceiling — otherwise one
-    /// transient blip would cap quality for the rest of the session.
+    /// The probe must let a recovered link climb back in BOUNDED time from any
+    /// depth — the live 2026-08-08 MoCA failure drove the stream to ~3.5 Mbps,
+    /// where the old fixed +5% probe needed ~80 minutes to recover. Geometric
+    /// relaxation (a quarter of the gap per probe) must reach the ceiling in a
+    /// handful of steps even from the floor.
     #[test]
-    fn qos_probe_recovers_toward_the_ceiling() {
+    fn qos_probe_recovers_in_bounded_time_from_any_depth() {
         let ceiling = 90_400u32;
-        let mut qos = QosController::new();
-        qos.note_congestion(70_000);
+        for start in [70_000u32, 8_640, QosController::FLOOR_KBPS] {
+            let mut qos = QosController::new();
+            qos.note_congestion(start);
 
-        let mut prev = qos.ramp_target(ceiling);
-        let mut probes = 0;
-        while qos.ramp_target(ceiling) < ceiling {
-            qos.relax_target(ceiling);
-            let now = qos.ramp_target(ceiling);
-            assert!(now >= prev, "probe must not move the target backwards");
-            prev = now;
-            probes += 1;
-            assert!(probes < 500, "probe failed to reach the ceiling");
+            let mut prev = qos.ramp_target(ceiling);
+            let mut probes = 0;
+            while qos.ramp_target(ceiling) < ceiling {
+                qos.relax_target(ceiling);
+                let now = qos.ramp_target(ceiling);
+                assert!(now >= prev, "probe must not move the target backwards");
+                prev = now;
+                probes += 1;
+                assert!(probes < 40, "recovery from {start} took {probes} probes — not bounded");
+            }
+            // ~13 probes max from the floor; at PROBE_INTERVAL that is well
+            // under 3 minutes, versus ~80 min for the old policy.
+            assert!(probes <= 20, "recovery from {start} took {probes} probes");
+            assert!(qos.known_bad_kbps.is_none(), "a recovered link should forget the failure");
         }
-        assert_eq!(qos.ramp_target(ceiling), ceiling);
-        assert!(qos.known_bad_kbps.is_none(), "a fully recovered link should forget the failure");
 
         // Relaxing with nothing remembered is a no-op, not a panic.
+        let mut qos = QosController::new();
         qos.relax_target(ceiling);
         assert_eq!(qos.ramp_target(ceiling), ceiling);
+    }
+
+    /// A new session must NOT inherit the previous session's link memory — the
+    /// bug that left a fresh 4K session capped at 3.5 Mbps after a MoCA-failure
+    /// session collapsed, because every reconnect negotiated the same ceiling
+    /// so the ceiling-change reset never fired.
+    #[test]
+    fn qos_reset_clears_cross_session_memory() {
+        let ceiling = 90_400u32;
+        let mut qos = QosController::new();
+
+        // Previous session collapsed to the floor.
+        for _ in 0..50 {
+            let t = qos.ramp_target(ceiling);
+            qos.note_congestion(t);
+        }
+        assert!(qos.ramp_target(ceiling) < ceiling, "precondition: memory is capped");
+
+        // A new session begins.
+        qos.reset();
+        assert_eq!(qos.ramp_target(ceiling), ceiling, "fresh session must start at the full ceiling");
+        assert!(qos.known_bad_kbps.is_none());
     }
 }
