@@ -73,6 +73,7 @@ mod tag {
     pub const OPEN_PAIR_DIALOG: u8 = 13;
     pub const SECURE_DESKTOP_CHANGED: u8 = 14;
     pub const CAPTURE_RECT: u8 = 15;
+    pub const INVALIDATE_REF_FRAMES: u8 = 16;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -169,6 +170,11 @@ pub enum ControlMsg {
     RequestIdr,
     /// Master -> Worker: client sent PT_LOSS_STATS with loss > 0.
     CongestionReduce,
+    /// Master -> Worker: client sent PT_INVALIDATE_REF_FRAMES for the given
+    /// wire frame-index range. The Worker asks NVENC to invalidate those
+    /// references so the next P-frame recovers without an IDR; on failure it
+    /// falls back to forcing an IDR. See encoder::invalidate_ref_frames.
+    InvalidateRefFrames { first: u32, last: u32 },
     /// Worker -> Master: PIN + device name entered on the Worker's tray
     /// dialog, forwarded into Master-side pairing's `global_pin` slot (the
     /// same handshake point the monolithic host's tray uses in-process).
@@ -336,6 +342,12 @@ impl ControlMsg {
             }
             ControlMsg::RequestIdr => vec![tag::REQUEST_IDR],
             ControlMsg::CongestionReduce => vec![tag::CONGESTION_REDUCE],
+            ControlMsg::InvalidateRefFrames { first, last } => {
+                let mut out = vec![tag::INVALIDATE_REF_FRAMES];
+                write_u32(&mut out, *first);
+                write_u32(&mut out, *last);
+                out
+            }
             ControlMsg::PinRelay { pin, device } => {
                 let mut out = vec![tag::PIN_RELAY];
                 write_string(&mut out, pin);
@@ -371,6 +383,12 @@ impl ControlMsg {
             tag::INJECT_INPUT => Ok(ControlMsg::InjectInput(rest.to_vec())),
             tag::REQUEST_IDR => Ok(ControlMsg::RequestIdr),
             tag::CONGESTION_REDUCE => Ok(ControlMsg::CongestionReduce),
+            tag::INVALIDATE_REF_FRAMES => {
+                let at = &mut 0usize;
+                let first = read_u32(rest, at)?;
+                let last = read_u32(rest, at)?;
+                Ok(ControlMsg::InvalidateRefFrames { first, last })
+            }
             tag::PIN_RELAY => {
                 let at = &mut 0usize;
                 let pin = read_string(rest, at)?;

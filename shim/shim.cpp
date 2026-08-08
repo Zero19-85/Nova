@@ -108,6 +108,14 @@ static std::atomic<bool>    g_force_idr{false};
 static bool                 g_rfiSupported = false;
 static uint32_t             g_refFramesInDpb = 5;
 static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
+//   g_rfiConfirm         — set true when an invalidation succeeds; the NEXT
+//                          encoded frame is the recovery frame.
+//   g_lastFrameRecovery  — whether the most recently encoded frame WAS that
+//                          recovery frame; Rust reads it to mark the wire
+//                          frame type 5 (post-RFI), which the client needs to
+//                          decode a P-frame whose reference was re-pointed.
+static std::atomic<bool>    g_rfiConfirm{false};
+static std::atomic<bool>    g_lastFrameRecovery{false};
 
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
@@ -1548,6 +1556,10 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     }
     g_nvEncoder->EncodeFrame(vPacket, &picParams);
     g_lastEncodedFrameIndex.store(frame_index);
+    // Tie the RFI recovery marker to the frame just encoded: if an invalidation
+    // landed since the last encode, THIS frame is the one that references the
+    // re-pointed (older, good) frame, so the wire must mark it type 5.
+    g_lastFrameRecovery.store(g_rfiConfirm.exchange(false));
 
     int total_size = 0;
     for (const auto& packet : vPacket) {
@@ -1641,6 +1653,7 @@ extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, u
     }
     ShimLog("🧩 RFI: invalidated %llu-%llu — recovering with a P-frame\n",
            (unsigned long long)first_frame, (unsigned long long)last_frame);
+    g_rfiConfirm.store(true); // mark the next encoded frame as the recovery frame
     return 1;
 }
 
@@ -1648,6 +1661,13 @@ extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, u
 // to decide whether to advertise refPicInvalidation:1 to the client.
 extern "C" __declspec(dllexport) int RfiSupported() {
     return g_rfiSupported ? 1 : 0;
+}
+
+// Whether the most recently encoded frame was an RFI recovery frame (references
+// a re-pointed reference after an invalidation). Rust reads this right after
+// EncodeFrame to mark that frame's wire type 5.
+extern "C" __declspec(dllexport) int LastFrameWasRfiRecovery() {
+    return g_lastFrameRecovery.load() ? 1 : 0;
 }
 
 // ==================== CLEANUP ====================

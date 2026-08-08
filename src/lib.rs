@@ -1907,6 +1907,14 @@ pub async fn run_worker() -> Result<()> {
                                 Some(Ok(ipc::ControlMsg::InjectInput(bytes))) => input::handle_input_packet(&bytes),
                                 Some(Ok(ipc::ControlMsg::RequestIdr)) => encoder::request_idr_global(),
                                 Some(Ok(ipc::ControlMsg::CongestionReduce)) => encoder::signal_congestion_reduction(),
+                                Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last })) => {
+                                    // RFI recovery: invalidate the lost range so the
+                                    // next P-frame recovers; fall back to an IDR if
+                                    // NVENC can't honour it (range too large, etc).
+                                    if !encoder::invalidate_ref_frames(first as u64, last as u64) {
+                                        encoder::request_idr_global();
+                                    }
+                                }
                                 Some(Ok(ipc::ControlMsg::ConfigureStart(cs))) => {
                                     if cmd_tx.send(WorkerCommand::Configure(cs)).is_err() {
                                         break; // main loop gone
@@ -2184,7 +2192,15 @@ pub async fn run_worker() -> Result<()> {
                     if !first_idr_sent && !is_idr {
                         enc.request_idr();
                     } else {
-                        let frame_type = if is_idr { 2u8 } else { 1u8 };
+                        // 2 = IDR, 5 = RFI recovery (reference re-pointed after an
+                        // invalidation — client needs this to decode it), 1 = P.
+                        let frame_type = if is_idr {
+                            2u8
+                        } else if encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery() {
+                            5u8
+                        } else {
+                            1u8
+                        };
                         match ipc::send_media(&mut media_pipe, &ipc::MediaMsg::VideoFrame {
                             frame_index: this_index, frame_type, data: data.to_vec(),
                         }).await {
@@ -3551,6 +3567,14 @@ pub async fn run() -> Result<()> {
                     let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc;
                     let is_av1_enc = enc.config.codec == encoder::Codec::Av1;
                     let is_idr = rtp::detect_frame_type(data, is_hevc_enc, is_av1_enc) == 2;
+                    // 2 = IDR, 5 = RFI recovery, 1 = P (see the Worker path).
+                    let frame_type = if is_idr {
+                        2u8
+                    } else if encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery() {
+                        5u8
+                    } else {
+                        1u8
+                    };
                     if !first_idr_sent && !is_idr {
                         // Don't open the stream with a P-frame — re-request an IDR
                         // and drop this frame until the first keyframe is ready.
@@ -3558,7 +3582,7 @@ pub async fn run() -> Result<()> {
                         if frames_encoded < 20 {
                             println!("[ENC] frame={} ({} bytes) dropped — waiting for first IDR", frames_encoded, packet_size);
                         }
-                    } else if rtp_sender.send_frame(this_index, data, if is_idr { 2 } else { 1 }) {
+                    } else if rtp_sender.send_frame(this_index, data, frame_type) {
                         // Frame queued to the nova-rtp-send thread — packetize/
                         // FEC/pacing/sendto all happen off the capture thread.
                         first_idr_sent = true;

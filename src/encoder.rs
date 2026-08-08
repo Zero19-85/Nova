@@ -82,7 +82,18 @@ extern "C" {
     /// RFI: whether this GPU/codec supports reference-picture invalidation
     /// (probed at InitEncoder). 1 = supported.
     fn RfiSupported() -> i32;
+    /// RFI: whether the most recently encoded frame was a recovery frame (its
+    /// reference was re-pointed by an invalidation). 1 = mark it wire type 5.
+    fn LastFrameWasRfiRecovery() -> i32;
 }
+
+/// Master feature flag for reference-frame invalidation. While `false`, Nova
+/// never advertises RFI to the client (so the client keeps requesting IDRs for
+/// loss) and never calls invalidation — the entire path is inert, and loss
+/// recovery uses on-demand IDRs exactly as before. Flip to `true` only after
+/// live validation under real packet loss: a bug here corrupts the stream
+/// rather than degrading it (the frame-index bijection must hold exactly).
+pub const RFI_ENABLED: bool = false;
 
 /// Attempt reference-frame invalidation for the client-reported lost range.
 /// `true` = NVENC will recover with a P-frame; `false` = the caller must fall
@@ -96,6 +107,13 @@ pub fn invalidate_ref_frames(first_frame: u64, last_frame: u64) -> bool {
 /// Nova advertises RFI to the client (see rtsp.rs).
 pub fn rfi_supported() -> bool {
     unsafe { RfiSupported() == 1 }
+}
+
+/// Whether the frame just returned by `encode_frame` is an RFI recovery frame,
+/// which must go on the wire as frame type 5 so the client decodes its
+/// re-pointed reference correctly. Call immediately after `encode_frame`.
+pub fn last_frame_was_rfi_recovery() -> bool {
+    unsafe { LastFrameWasRfiRecovery() == 1 }
 }
 
 /// Pass the log file path (UTF-16, null-terminated) to the C++ shim so that

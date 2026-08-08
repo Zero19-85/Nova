@@ -366,14 +366,40 @@ fn handle_control_message(
                 signal_congestion(worker_link);
             }
         }
-        // We don't do reference frame invalidation — recover with an IDR
-        // instead (valid per protocol; Sunshine does this when the encoder
-        // lacks ref-invalidation support).
+        // Reference-frame invalidation. Payload (Sunshine stream.cpp): two
+        // int64 LE frame numbers [firstFrame, lastFrame] the client could not
+        // decode. When RFI is enabled we ask the encoder to invalidate that
+        // range so the next P-frame recovers without an IDR; the encoder falls
+        // back to an IDR on its own if the range is too large. When RFI is off
+        // (the client shouldn't send this then, but be robust) we force an IDR,
+        // the historical behaviour.
         PT_INVALIDATE_REF_FRAMES => {
-            println!("🎮 Control: reference frames invalidated → forcing IDR");
-            match worker_link {
-                Some(link) => link.send(ControlMsg::RequestIdr),
-                None => crate::encoder::request_idr_global(),
+            let range = if data.len() >= 20 {
+                let first = i64::from_le_bytes(data[4..12].try_into().unwrap()) as u32;
+                let last = i64::from_le_bytes(data[12..20].try_into().unwrap()) as u32;
+                Some((first, last))
+            } else {
+                None
+            };
+            match (crate::encoder::RFI_ENABLED, range) {
+                (true, Some((first, last))) => {
+                    println!("🎮 Control: ref-frame invalidation {first}-{last} → RFI recovery");
+                    match worker_link {
+                        Some(link) => link.send(ControlMsg::InvalidateRefFrames { first, last }),
+                        None => {
+                            if !crate::encoder::invalidate_ref_frames(first as u64, last as u64) {
+                                crate::encoder::request_idr_global();
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    println!("🎮 Control: reference frames invalidated → forcing IDR");
+                    match worker_link {
+                        Some(link) => link.send(ControlMsg::RequestIdr),
+                        None => crate::encoder::request_idr_global(),
+                    }
+                }
             }
             if idr_request_is_congestion(client_info) {
                 println!("🎮 Control: ref-frame invalidation mid-stream — signalling bitrate reduction");

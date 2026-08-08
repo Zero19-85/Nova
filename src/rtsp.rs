@@ -189,6 +189,14 @@ fn resp_describe(cseq: u32, is_hdr: bool) -> Vec<u8> {
         // a P010 stream because the chroma planes are sized for 8-bit NV12.
         sdp.extend_from_slice(b"a=x-nv-video[0].dynamicRangeMode:1\n");
     }
+    // Reference-frame invalidation (Sunshine rtsp.cpp:788-789: emitted only when
+    // the encoder probe reports support). This is what makes moonlight-common-c
+    // send PT_INVALIDATE_REF_FRAMES ranges for loss instead of full IDR
+    // requests — without it the whole RFI path is dead. Gated on the feature
+    // flag AND the live NVENC capability probe.
+    if crate::encoder::RFI_ENABLED && crate::encoder::rfi_supported() {
+        sdp.extend_from_slice(b"a=x-nv-video[0].refPicInvalidation:1\n");
+    }
 
     let mut r = Vec::with_capacity(128 + sdp.len());
     r.extend_from_slice(b"RTSP/1.0 200 OK\r\n");
