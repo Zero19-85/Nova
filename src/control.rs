@@ -117,25 +117,45 @@ static IDR_SIGNAL_STATE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
 /// reported symptom (macroblock blips, then an intra-refresh sweep repairing
 /// them, over and over, with no bitrate response).
 ///
-/// The catch: clients also request an IDR at the START of a session (and after
-/// a capture-backend swap), which is not congestion at all. Cutting the
-/// bitrate there would tax every single stream start. So the first request of
-/// each session — and anything within `GRACE` of it — is treated as handshake
-/// and ignored; only later requests count. `qos_tick`'s own 2 s reduce
-/// cooldown then keeps a burst of repair requests to one step down.
+/// The catch: clients fire a BURST of IDR requests at the start of every
+/// session — warmup, as the client re-requests keyframes until it syncs on the
+/// first decodable frame. That burst is never congestion, and misreading it
+/// (live regression 2026-08-08: all ~20 warmup requests classified as loss)
+/// hammers the bitrate down exactly as the stream is establishing, so it opens
+/// degraded and the gentle AIMD ramp takes ~a minute to recover.
+///
+/// Two rules keep warmup out of the congestion path:
+///   1. **Pre-PLAY requests never count and never anchor the clock.** A client
+///      IDR request can arrive during setup, before `streaming_active`; letting
+///      it start the grace window meant the window had already expired by the
+///      time the post-PLAY warmup burst arrived.
+///   2. **The grace window is anchored to the first request WHILE streaming**
+///      (= warmup start) and is generous enough (`GRACE`) to cover the whole
+///      burst. Only requests past it — genuine mid-stream loss — count, and
+///      `qos_tick`'s 2 s reduce cooldown then collapses a burst into one step.
 fn idr_request_is_congestion(client_info: &Arc<Mutex<Option<ClientInfo>>>) -> bool {
-    /// Window after a session's first IDR request in which further requests are
-    /// still considered part of stream bring-up rather than congestion.
-    const GRACE: Duration = Duration::from_secs(3);
+    /// Warmup can outlast a few seconds on a high-RTT link, and cutting the
+    /// bitrate anywhere in the first several seconds of a session is exactly
+    /// the wrong move — let it establish at the negotiated rate first.
+    const GRACE: Duration = Duration::from_secs(8);
 
-    let generation = current_session_generation(client_info);
+    let (generation, streaming) = client_info
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|i| (i.session_generation, i.streaming_active)))
+        .unwrap_or((0, false));
+
+    // Rule 1: pre-PLAY setup requests are never congestion and must not anchor.
+    if !streaming {
+        return false;
+    }
+
     let Ok(mut slot) = IDR_SIGNAL_STATE.lock() else {
         return false; // poisoned — never escalate on a broken lock
     };
     match *slot {
         Some((g, first)) if g == generation => first.elapsed() >= GRACE,
-        // First request of this session (or a brand-new session): remember it
-        // and treat it as bring-up.
+        // First streaming request of this session: anchor the warmup clock.
         _ => {
             *slot = Some((generation, Instant::now()));
             false
