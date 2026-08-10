@@ -74,6 +74,7 @@ mod tag {
     pub const SECURE_DESKTOP_CHANGED: u8 = 14;
     pub const CAPTURE_RECT: u8 = 15;
     pub const INVALIDATE_REF_FRAMES: u8 = 16;
+    pub const WORKER_CAPABILITIES: u8 = 17;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -171,6 +172,28 @@ pub enum ControlMsg {
     /// (may differ from what was requested if e.g. a resolution re-snap
     /// landed somewhere else) — see [`WorkerConfigured`].
     WorkerConfigured(WorkerConfigured),
+    /// Worker -> Master: what this Worker is physically able to stream, sent
+    /// once its capture backend is up (before any session exists).
+    ///
+    /// A Moonlight session's resolution and HDR profile are fixed when the
+    /// client builds its decoder; changing either mid-session wrecks it
+    /// (confirmed live 2026-08-10: black frame with a green region). A
+    /// SYSTEM-fallback Worker covering the logon screen CANNOT drive the VDD —
+    /// `SetDisplayConfig` is denied on the Winlogon desktop regardless of
+    /// token — so it can only ever serve the physical monitor's native size in
+    /// SDR. Master therefore negotiates sessions down to what the CURRENT
+    /// Worker can actually sustain (see `session_negotiate::negotiate`), and
+    /// holds that geometry for the session's whole life so no handoff can
+    /// change it.
+    WorkerCapabilities {
+        /// False while this Worker is the SYSTEM fallback: no VDD, no HDR,
+        /// capture is whatever the physical primary happens to be.
+        vdd_capable: bool,
+        /// The capture size available right now (the physical primary, for a
+        /// fallback Worker).
+        native_width: u32,
+        native_height: u32,
+    },
     /// Master -> Worker: raw Moonlight INPUT_DATA payload (the same bytes
     /// `control.rs` used to pass straight to `input::handle_input_packet`).
     InjectInput(Vec<u8>),
@@ -370,6 +393,12 @@ impl ControlMsg {
             ControlMsg::SecureDesktopChanged { secure } => {
                 vec![tag::SECURE_DESKTOP_CHANGED, *secure as u8]
             }
+            ControlMsg::WorkerCapabilities { vdd_capable, native_width, native_height } => {
+                let mut out = vec![tag::WORKER_CAPABILITIES, *vdd_capable as u8];
+                write_u32(&mut out, *native_width);
+                write_u32(&mut out, *native_height);
+                out
+            }
             ControlMsg::CaptureRect { origin_x, origin_y, width, height } => {
                 let mut out = vec![tag::CAPTURE_RECT];
                 write_u32(&mut out, *origin_x as u32);
@@ -414,6 +443,19 @@ impl ControlMsg {
             tag::SECURE_DESKTOP_CHANGED => Ok(ControlMsg::SecureDesktopChanged {
                 secure: rest.first().copied().unwrap_or(0) != 0,
             }),
+            tag::WORKER_CAPABILITIES => {
+                let (&vdd, sizes) = rest
+                    .split_first()
+                    .ok_or_else(|| invalid_data("truncated WorkerCapabilities"))?;
+                let at = &mut 0usize;
+                let native_width = read_u32(sizes, at)?;
+                let native_height = read_u32(sizes, at)?;
+                Ok(ControlMsg::WorkerCapabilities {
+                    vdd_capable: vdd != 0,
+                    native_width,
+                    native_height,
+                })
+            }
             tag::CAPTURE_RECT => {
                 let at = &mut 0usize;
                 // origin_x/y are signed (a monitor left of / above the primary

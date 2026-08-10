@@ -331,6 +331,12 @@ pub async fn start_master_network() -> MasterHandles {
     let helper_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(input_helper_supervisor(helper_rx, helper_ready.clone()));
 
+    // What the live Worker can physically stream (ControlMsg::
+    // WorkerCapabilities). session_watcher negotiates against it so a session
+    // is never given a geometry/HDR profile the serving Worker can't hold for
+    // the session's whole life — see session_negotiate::negotiate.
+    let worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>> = Arc::new(Mutex::new(None));
+
     let (control_pipe_tx, control_pipe_rx) = mpsc::unbounded_channel();
     tokio::spawn(control_supervisor(
         control_pipe_rx,
@@ -339,12 +345,13 @@ pub async fn start_master_network() -> MasterHandles {
         global_pin,
         helper_tx,
         helper_ready,
+        worker_caps.clone(),
     ));
 
     let (media_pipe_tx, media_pipe_rx) = mpsc::unbounded_channel();
     tokio::spawn(media_supervisor(media_pipe_rx, rtp_sender.clone(), audio_tx.clone()));
 
-    tokio::spawn(session_watcher(client_info.clone(), worker_link.clone(), cfg, rtp_sender.clone(), audio_tx));
+    tokio::spawn(session_watcher(client_info.clone(), worker_link.clone(), cfg, rtp_sender.clone(), audio_tx, worker_caps));
 
     println!("🎬 Master network stack ready — RTSP:48010 control:47999 pairing:47989/47984 RTP:47998");
 
@@ -368,6 +375,7 @@ async fn session_watcher(
     cfg: Arc<config::NovaConfig>,
     rtp_sender: Arc<Mutex<rtp::RtpSender>>,
     audio_tx: Arc<Mutex<audio::AudioTxState>>,
+    worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>>,
 ) {
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut configured_generation: Option<u64> = None;
@@ -436,7 +444,8 @@ async fn session_watcher(
         if configured_generation == Some(client.session_generation) {
             continue; // already sent ConfigureStart for this session/generation
         }
-        let negotiated = session_negotiate::negotiate(&client, &cfg.stream);
+        let caps = *worker_caps.lock().unwrap();
+        let negotiated = session_negotiate::negotiate(&client, &cfg.stream, caps);
         println!(
             "🚀 Master: PLAY latched — negotiated {}x{}@{}fps {}{} (session {}) — sending ConfigureStart",
             negotiated.width, negotiated.height, negotiated.fps, negotiated.codec.as_str(),
@@ -521,6 +530,7 @@ async fn control_supervisor(
     global_pin: Arc<Mutex<(String, String)>>,
     helper_tx: mpsc::UnboundedSender<HelperCmd>,
     helper_ready: Arc<std::sync::atomic::AtomicBool>,
+    worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>>,
 ) {
     // Mirrors the Worker's view of the input desktop (ControlMsg::
     // SecureDesktopChanged). While true AND a helper is live, input routes to
@@ -587,6 +597,12 @@ async fn control_supervisor(
                             wc.width, wc.height, wc.fps, wc.codec, if wc.is_hdr { "/HDR10" } else { "" });
                     }
                     Some(Ok(ControlMsg::WorkerError(e))) => println!("⚠️  Master: worker reported error: {e}"),
+                    Some(Ok(ControlMsg::WorkerCapabilities { vdd_capable, native_width, native_height })) => {
+                        println!("🧩 Master: worker capabilities — vdd={vdd_capable} native={native_width}x{native_height}");
+                        *worker_caps.lock().unwrap() = Some(session_negotiate::WorkerCaps {
+                            vdd_capable, native_width, native_height,
+                        });
+                    }
                     Some(Ok(msg @ ControlMsg::CaptureRect { .. })) => {
                         // Cached by the helper supervisor and replayed to each
                         // helper on connect — see ControlMsg::CaptureRect.
@@ -896,6 +912,27 @@ fn desktop_is_secure() -> bool {
         capture::desktop_switch::current_input_desktop(),
         InputDesktop::Secure | InputDesktop::ScreenSaver
     )
+}
+
+/// True when this Worker cannot possibly produce `cs`'s geometry, so taking
+/// the session over would change the stream's resolution/profile underneath a
+/// client that has already built its decoder — which corrupts it permanently
+/// (live 2026-08-10: black frame with a green region; the green is the shim's
+/// `CopyResource` no-op'ing on a size mismatch and leaving the composite
+/// texture uninitialised).
+///
+/// Only a SYSTEM-fallback Worker can hit this, and only for a session that was
+/// negotiated while a full Worker was live (i.e. the user signed OUT
+/// mid-stream). New sessions can't: Master clamps them to what the live Worker
+/// reported via `ControlMsg::WorkerCapabilities`.
+///
+/// The caller leaves the client alone rather than serving it garbage —
+/// `media_supervisor`'s 1 Hz keepalive keeps retransmitting the last good IDR,
+/// so the client holds a frozen frame (still connected) until someone signs
+/// back in and a full Worker adopts the session at its original geometry.
+fn cannot_serve_session(cs: &ipc::ConfigureStart, capturer: &capture::DesktopManager) -> bool {
+    service::is_system_fallback()
+        && (cs.width != capturer.width() || cs.height != capturer.height())
 }
 
 fn apply_configure_start(
@@ -2066,6 +2103,22 @@ pub async fn run_worker() -> Result<()> {
 
     println!("▶️  Worker capture loop running");
 
+    // Tell Master what this Worker can physically stream, now that the capture
+    // backend is up and its native size is known. Master negotiates every new
+    // session against this so a session is never handed a geometry/HDR profile
+    // its Worker can't hold for the session's whole life — see
+    // session_negotiate::negotiate and ControlMsg::WorkerCapabilities.
+    {
+        let vdd_capable = !service::is_system_fallback();
+        let _ = reply_tx.send(ipc::ControlMsg::WorkerCapabilities {
+            vdd_capable,
+            native_width: capturer.width(),
+            native_height: capturer.height(),
+        });
+        println!("🧩 Worker capabilities: vdd={vdd_capable} native={}x{}",
+            capturer.width(), capturer.height());
+    }
+
     'outer: loop {
         // Frame pacing, same shape as the monolithic path's loop, racing the
         // command channel instead of ClientInfo/tray/service-shutdown signals
@@ -2081,6 +2134,16 @@ pub async fn run_worker() -> Result<()> {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(WorkerCommand::Stop) | None => break 'outer,
+                        Some(WorkerCommand::Configure(cs)) if cannot_serve_session(&cs, &capturer) => {
+                            println!("⏸️  Worker: cannot serve this session ({}x{} — this host has \
+                                no VDD and captures {}x{}). Leaving the client on its last frame \
+                                rather than changing the stream geometry mid-session; a full \
+                                Worker will take it over at sign-in.",
+                                cs.width, cs.height, capturer.width(), capturer.height());
+                            let _ = reply_tx.send(ipc::ControlMsg::WorkerError(format!(
+                                "cannot serve {}x{} without a VDD (capture is {}x{})",
+                                cs.width, cs.height, capturer.width(), capturer.height())));
+                        }
                         Some(WorkerCommand::Configure(cs)) => {
                             match apply_configure_start(&cs, &mut vd, &mut capturer, &mut enc, &cfg) {
                                 Ok(applied) => {
@@ -2148,6 +2211,17 @@ pub async fn run_worker() -> Result<()> {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 WorkerCommand::Stop => break 'outer,
+                // See the select!-arm twin above: never change a live session's
+                // geometry — hold the client on its last frame instead.
+                WorkerCommand::Configure(cs) if cannot_serve_session(&cs, &capturer) => {
+                    println!("⏸️  Worker: cannot serve this session ({}x{} — this host has \
+                        no VDD and captures {}x{}). Leaving the client on its last frame; \
+                        a full Worker will take it over at sign-in.",
+                        cs.width, cs.height, capturer.width(), capturer.height());
+                    let _ = reply_tx.send(ipc::ControlMsg::WorkerError(format!(
+                        "cannot serve {}x{} without a VDD (capture is {}x{})",
+                        cs.width, cs.height, capturer.width(), capturer.height())));
+                }
                 WorkerCommand::Configure(cs) => {
                     match apply_configure_start(&cs, &mut vd, &mut capturer, &mut enc, &cfg) {
                         Ok(applied) => {
