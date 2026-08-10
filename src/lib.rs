@@ -987,7 +987,12 @@ fn apply_configure_start(
     // HDR10 activation gate — mirrors the monolithic path's PLAY-time block.
     // Also skipped under SYSTEM-fallback — same futile-CCD-call reasoning.
     let hdr_ok = !system_fallback && (cfg.stream.enable_hdr || vd.is_advanced_color_supported());
-    if cs.hdr_confirmed && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr && hdr_ok {
+    // While deferred (secure desktop), do NOT switch the encoder to HDR/4K:
+    // HDR needs the VDD in FP16 mode, which can't be activated on the secure
+    // desktop. Stay SDR at the physical lock-screen resolution; the post-login
+    // re-activation sets up HDR/4K cleanly. Skipping this (and the re-snap
+    // below) is what prevents the green/garbled half frame.
+    if !defer_for_secure && cs.hdr_confirmed && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr && hdr_ok {
         println!("🎨 HEVC Main10/HDR10 encoder active (VDD switching to FP16 mode)");
         let _ = vd.set_active_display_hdr(true);
         enc.config.is_hdr = true;
@@ -1029,7 +1034,12 @@ fn apply_configure_start(
     // polling), so this costs nothing extra in the common case — it only
     // extends the worst-case wait for a slow-to-settle VDD instead of
     // giving up and streaming the wrong resolution.
-    if !system_fallback {
+    // Also skipped while deferred: forcing the VDD to cs.width×height is exactly
+    // the CCD call that's denied on the secure desktop, and re-snapping toward
+    // the client's 4K while capturing the physical lock screen at its native
+    // size is what produced the encoder/capture mismatch (green half). Leave the
+    // encoder at the physical resolution until the post-login re-activation.
+    if !system_fallback && !defer_for_secure {
         for attempt in 1..=3 {
             if enc.config.width as u32 == cs.width && enc.config.height as u32 == cs.height {
                 break;
