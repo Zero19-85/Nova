@@ -857,6 +857,23 @@ async fn media_supervisor(
 /// path, since Phase 2 doesn't pre-activate during the `/launch`→PLAY gap
 /// (known scope simplification — see `session_watcher`'s doc comment). Every
 /// `ConfigureStart` goes through the full activation sequence.
+/// True when the input desktop is the secure/Winlogon (or screensaver) desktop,
+/// where `SetDisplayConfig` (the VDD/CCD topology changes) is denied with
+/// ERROR_ACCESS_DENIED (error 5). Activating the VDD there half-succeeds — the
+/// resolution force fails but capture/encoder proceed at the requested size
+/// against a VDD that never actually resized, producing a green/garbled half
+/// frame (confirmed live 2026-08-09: a client connected at the sign-in screen,
+/// the session started on Winlogon, and app-5 activation error-5'd before the
+/// user finished logging in). VDD activation must wait for the interactive
+/// (Default) desktop.
+fn desktop_is_secure() -> bool {
+    use capture::desktop_switch::InputDesktop;
+    matches!(
+        capture::desktop_switch::current_input_desktop(),
+        InputDesktop::Secure | InputDesktop::ScreenSaver
+    )
+}
+
 fn apply_configure_start(
     cs: &ipc::ConfigureStart,
     vd: &mut virtual_display::VirtualDisplay,
@@ -914,7 +931,16 @@ fn apply_configure_start(
     // a real user token picks the VDD back up on the very next
     // ConfigureStart once someone signs in and the Worker upgrades.
     let system_fallback = service::is_system_fallback();
-    if app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps) && !system_fallback {
+    // Also defer VDD activation while the secure desktop is up: the CCD calls
+    // are denied there (error 5) and half-activating produces a green/garbled
+    // frame — see desktop_is_secure(). The Worker's capture loop re-runs this
+    // ConfigureStart the moment the desktop returns to Default (post-login), so
+    // the VDD comes up cleanly then instead.
+    let defer_for_secure = desktop_is_secure();
+    if app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps)
+        && !system_fallback
+        && !defer_for_secure
+    {
         println!("🖥️  Activating virtual display for upcoming session ({}x{}@{}fps{})",
             cs.width, cs.height, cs.fps, if cs.hdr_confirmed { " HDR10" } else { "" });
         // Capture the restore target BEFORE the VDD flip — see audio.rs's
@@ -934,6 +960,13 @@ fn apply_configure_start(
             }
         }
     } else {
+        if defer_for_secure
+            && app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps)
+            && !system_fallback
+        {
+            println!("🖥️  VDD activation deferred — secure desktop up; will activate on return to \
+                the interactive desktop (post-login)");
+        }
         rebind_capture_and_encoder(capturer, enc, None, None)?;
     }
 
@@ -1973,6 +2006,14 @@ pub async fn run_worker() -> Result<()> {
     // Wire frame index (== NVENC inputTimeStamp), 1-based like Moonlight expects.
     // Owned here so the encoder and the wire agree; reset to 1 per session.
     let mut wire_index: u32 = 1;
+    // Deferred VDD activation: when a ConfigureStart arrives while the secure
+    // desktop is up (client connected at the sign-in screen), the VDD/CCD
+    // topology change is denied (error 5) and half-activating garbles the frame
+    // — see desktop_is_secure(). We stash the ConfigureStart and re-run it the
+    // moment the desktop returns to Default (post-login), so the VDD comes up
+    // cleanly then instead of the user having to restart the app.
+    let mut pending_configure: Option<ipc::ConfigureStart> = None;
+    let mut vdd_activation_pending = false;
     let mut send_queue_drops = 0u64;
     let mut audio_send_drops = 0u64;
     let mut timeout_streak = 0u32;
@@ -2021,6 +2062,14 @@ pub async fn run_worker() -> Result<()> {
                                     client_connected = true;
                                     first_idr_sent = false;
                                     wire_index = 1; // fresh session ⇒ client expects frame 1
+                                    // Remember the config so a deferred VDD
+                                    // activation (secure desktop up) can run on
+                                    // return to the interactive desktop.
+                                    pending_configure = Some(cs.clone());
+                                    vdd_activation_pending = app_launcher::uses_virtual_display(
+                                            cs.app_id, cfg.stream.headless_for_all_apps)
+                                        && !service::is_system_fallback()
+                                        && desktop_is_secure();
                                     frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                                     next_frame_time = Instant::now();
                                     let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
@@ -2033,6 +2082,8 @@ pub async fn run_worker() -> Result<()> {
                             client_connected = false;
                             first_idr_sent = false;
                             send_queue_drops = 0;
+                            pending_configure = None;
+                            vdd_activation_pending = false;
                             frame_interval = startup_frame_interval;
                             next_frame_time = Instant::now();
                         }
@@ -2073,6 +2124,11 @@ pub async fn run_worker() -> Result<()> {
                             client_connected = true;
                             first_idr_sent = false;
                             wire_index = 1; // fresh session ⇒ client expects frame 1
+                            pending_configure = Some(cs.clone());
+                            vdd_activation_pending = app_launcher::uses_virtual_display(
+                                    cs.app_id, cfg.stream.headless_for_all_apps)
+                                && !service::is_system_fallback()
+                                && desktop_is_secure();
                             frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                             next_frame_time = Instant::now();
                             let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
@@ -2085,6 +2141,8 @@ pub async fn run_worker() -> Result<()> {
                     client_connected = false;
                     first_idr_sent = false;
                     send_queue_drops = 0;
+                    pending_configure = None;
+                    vdd_activation_pending = false;
                     frame_interval = startup_frame_interval;
                     next_frame_time = Instant::now();
                 }
@@ -2121,6 +2179,30 @@ pub async fn run_worker() -> Result<()> {
             if capturer.maybe_swap_backend().is_some() {
                 let (ox, oy) = capturer.origin();
                 input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+            }
+        }
+
+        // Deferred VDD activation: a ConfigureStart that arrived while the
+        // secure desktop was up skipped the VDD/CCD topology change (it would
+        // have been denied and garbled the frame — see desktop_is_secure).
+        // Now that the interactive desktop is back (user logged in), re-run it
+        // so the VDD comes up cleanly, WITHOUT re-launching the app.
+        if client_connected && vdd_activation_pending && !desktop_is_secure() {
+            if let Some(mut cs) = pending_configure.clone() {
+                cs.launch_app = false; // already launched at the original configure
+                println!("🖥️  Interactive desktop restored — running deferred VDD activation");
+                match apply_configure_start(&cs, &mut vd, &mut capturer, &mut enc, &cfg) {
+                    Ok(applied) => {
+                        vdd_activation_pending = false;
+                        let (ox, oy) = capturer.origin();
+                        input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+                        enc.request_idr();
+                        let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
+                    }
+                    Err(e) => println!("❌ deferred VDD activation failed: {e}"),
+                }
+            } else {
+                vdd_activation_pending = false;
             }
         }
 

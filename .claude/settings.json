@@ -6,7 +6,9 @@
       "Read(//c/Program Files/Nova Server/**)",
       "Bash(awk 'NR>=167410 && \\(/NVENC READY|RFI|Initialized Codec|Codec selected|🧩|Activating virtual|First encoded/\\)' nova.log)",
       "Bash(awk 'NR>=167410 && \\(/NVENC READY|\\\\[NVENC\\\\]|NVENC reconfigured|EncodeFrame|Failed/\\)' nova.log)",
-      "PowerShell(sc.exe stop NovaService | Out-Null; Start-Sleep -Seconds 8; Copy-Item \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Force; $a=\\(Get-FileHash \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Algorithm MD5\\).Hash; $b=\\(Get-FileHash \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" -Algorithm MD5\\).Hash; \"exe match: \" + \\($a -eq $b\\); sc.exe start NovaService | Out-Null; Start-Sleep -Seconds 10; \\(Get-Service NovaService\\).Status)"
+      "PowerShell(sc.exe stop NovaService | Out-Null; Start-Sleep -Seconds 8; Copy-Item \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Force; $a=\\(Get-FileHash \"C:\\\\Program Files\\\\Nova Server\\\\nova-server.exe\" -Algorithm MD5\\).Hash; $b=\\(Get-FileHash \"C:\\\\Users\\\\nova-server\\\\target\\\\release\\\\nova-server.exe\" -Algorithm MD5\\).Hash; \"exe match: \" + \\($a -eq $b\\); sc.exe start NovaService | Out-Null; Start-Sleep -Seconds 10; \\(Get-Service NovaService\\).Status)",
+      "Bash(awk 'NR>=316990 && NR<=317055 && \\(/Running as SYSTEM|Elevated token|Nova Worker|Codec selected|Activating virtual|error 5|is_system|launching app|Input desktop switch|First encoded/\\)' nova.log)",
+      "Bash(awk -F: '$1<317031')"
     ]
   }
 }
