@@ -67,7 +67,10 @@ use windows::Win32::Security::{
     TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::{
+    WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSQueryUserToken,
+    WTSSessionInfoEx, WTSINFOEXW, WTS_SESSIONSTATE_UNLOCK,
+};
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, ControlService,
@@ -82,7 +85,7 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, CreateProcessAsUserW, GetCurrentProcess, OpenEventW,
     OpenProcessToken, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_UNICODE_ENVIRONMENT, EVENT_MODIFY_STATE, INFINITE, NORMAL_PRIORITY_CLASS,
-    PROCESS_INFORMATION, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 // ── SYSTEM impersonation token handed to the host ─────────────────────────────
@@ -536,6 +539,13 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
     // arms this — so the happy path is unchanged.
     const INTERACTIVE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(45);
     let mut interactive_retry_not_before: Option<std::time::Instant> = None;
+    // True while the spawn on this tick was triggered by the fallback→
+    // interactive upgrade branch. If that spawn lands back on a SYSTEM
+    // fallback, the cooldown must arm UNCONDITIONALLY — re-probing the token
+    // at spawn-result time (the old behavior) raced the OS's own login-state
+    // transitions and could skip arming, letting the upgrade thrash every
+    // MIN_FALLBACK_UPTIME seconds (confirmed live 2026-08-10).
+    let mut upgrade_attempted = false;
 
     loop {
         // Reconcile: ensure a host is running in the CURRENT console session.
@@ -582,30 +592,36 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                 }
                 Some(h) if h.is_system_fallback
                     && last_spawn.is_some_and(|t| t.elapsed() >= MIN_FALLBACK_UPTIME_BEFORE_UPGRADE)
-                    && !host_has_connected_client()
                     && session_has_user_token(session)
+                    // The load-bearing gate: only upgrade when the session is
+                    // genuinely UNLOCKED. A token alone also exists at an
+                    // ARSO-locked lock screen (overnight-update reboot), where
+                    // the interactive spawn can't produce a usable host — the
+                    // old token-only gate killed a healthy lock-screen host on
+                    // every cooldown expiry (confirmed live 2026-08-10).
+                    && session_is_unlocked(session)
                     // Don't re-attempt the upgrade while the interactive spawn
-                    // is known to be failing (locked session) — see the cooldown
-                    // declaration. Keeps the lock-screen host stable instead of
-                    // thrashing and kicking the connected client.
+                    // is known to be failing — see the cooldown declaration.
                     && interactive_retry_not_before.is_none_or(|t| std::time::Instant::now() >= t) =>
                 {
-                    // The pre-login SYSTEM-fallback host was covering a bare
-                    // logon screen (no user token existed yet). One now does —
-                    // someone finished signing in — so replace the degraded
-                    // fallback host (no WGC/HDR/full audio) with a proper
-                    // interactive-user one. Graceful stop first, same as a
-                    // session change: the fallback host hands back its VDD/
-                    // audio state before the upgraded host starts.
+                    // Someone finished signing in (token + UNLOCK) — replace
+                    // the degraded SYSTEM-fallback host (DDA-only, no WGC/HDR/
+                    // VDD) with a proper interactive-user one. Graceful stop
+                    // first, same as a session change: the fallback host hands
+                    // back its VDD/audio state before the upgraded host starts.
                     //
-                    // Gated on !host_has_connected_client(): upgrading while a
-                    // client is actively watching/controlling the lock screen
-                    // (e.g. entering the PIN itself over Moonlight) would tear
-                    // down their session mid-stream. Deferred, not skipped —
-                    // every reconcile tick re-checks, so the upgrade fires the
-                    // moment the client disconnects or the session ends.
-                    println!("🔑 User token now available for session {session} — \
+                    // Deliberately NOT gated on "no client connected" anymore:
+                    // this handoff IS how a client that just signed in over
+                    // Moonlight gets its full-quality stream back. Master keeps
+                    // the client's RTSP/control session alive across the swap,
+                    // replays ConfigureStart to the new Worker, and stamps
+                    // start_frame_index so the client's frame timeline
+                    // continues — a ~2-5 s freeze, not a disconnect. (The old
+                    // client-connected event gate was blind in the split
+                    // deployment anyway: only the monolithic path ever set it.)
+                    println!("🔑 Session {session} is signed in + unlocked — \
                         upgrading from SYSTEM fallback to interactive host");
+                    upgrade_attempted = true;
                     stop_host(h);
                     fast_exits = 0;
                     respawn_not_before = None;
@@ -640,6 +656,7 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                     .unwrap_or_else(|_| Err("spawn_host_with_ipc panicked".to_string()))
                 } else {
                     spawn_host_in_session(&exe, session, false).or_else(|user_err| {
+                        println!("   ↳ interactive spawn failed ({user_err}) — trying SYSTEM fallback");
                         spawn_host_as_system_fallback(&exe, session, false)
                             .map_err(|sys_err| format!("{user_err}; SYSTEM-fallback also failed: {sys_err}"))
                     })
@@ -652,14 +669,18 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                             ""
                         };
                         println!("✅ Host spawned in session {session}{mode} (pid handle live)");
-                        // Arm/clear the upgrade cooldown. If we got a SYSTEM
-                        // fallback even though a user token exists, the
-                        // interactive spawn is failing (locked session) — don't
-                        // let the upgrade thrash; re-test only after the cooldown.
-                        // A real interactive host means the session is usable, so
-                        // clear any suppression.
+                        // Arm/clear the upgrade cooldown. A SYSTEM fallback
+                        // landing where an interactive host was expected —
+                        // after an explicit upgrade attempt, or with a user
+                        // token present — means the interactive spawn is
+                        // failing; don't let the upgrade thrash, re-test only
+                        // after the cooldown. (`upgrade_attempted` matters:
+                        // re-probing the token here raced login-state
+                        // transitions and skipping the arm re-enabled the
+                        // 5-second thrash loop.) A real interactive host means
+                        // the session is usable — clear any suppression.
                         interactive_retry_not_before = if h.is_system_fallback
-                            && session_has_user_token(session)
+                            && (upgrade_attempted || session_has_user_token(session))
                         {
                             println!("   ↳ interactive spawn unavailable (session locked?) — \
                                 holding this lock-screen host stable for {}s before re-testing",
@@ -675,8 +696,16 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                         // Transient at boot (no shell yet) or a real privilege
                         // problem — either way keep the service alive and retry.
                         println!("⚠️  Host spawn into session {session} failed: {e}");
+                        // A failed upgrade spawn (no host at all came up) must
+                        // also arm the cooldown, or the next tick re-kills
+                        // whatever respawns and tries again immediately.
+                        if upgrade_attempted {
+                            interactive_retry_not_before =
+                                Some(std::time::Instant::now() + INTERACTIVE_RETRY_COOLDOWN);
+                        }
                     }
                 }
+                upgrade_attempted = false;
             }
         }
 
@@ -782,26 +811,23 @@ fn signal_host_shutdown() -> bool {
 
 // ── Client-connected signal (host → service) ──────────────────────────────────
 //
-// The service used to upgrade a SYSTEM-fallback host to the interactive user
-// the INSTANT a real login token appeared — including mid-stream, tearing
-// down a client's RTSP/control/RTP session that had just connected to watch
-// the lock screen and enter a PIN. Reported live (2026-07-20): "connection
-// terminates after entering the Windows PIN... we want fluid, no connection
-// termination." Same principle the codebase already applies to WGC/DDA
-// backend swaps (gated on `client_connected` so an unwatched UAC prompt
-// doesn't churn backends mid-stream) — just applied across a process
-// boundary this time, since the fallback→interactive swap needs the OLD
-// process to die (Windows never lets a running process change its own
-// primary token from SYSTEM to a user).
+// Historical: the upgrade gate used to defer the fallback→interactive swap
+// while this event was set, so a client watching the lock screen wasn't cut
+// off mid-stream. Two problems killed that design (2026-08-10): the split
+// deployment's Master never set the event (only the monolithic path did — the
+// gate was permanently open), and deferring the upgrade is the OPPOSITE of
+// what a just-signed-in client needs — the swap is precisely how it gets its
+// full-quality (WGC/HDR/VDD) stream back, survivable now that Master replays
+// ConfigureStart with a continued frame timeline. The upgrade gate now keys
+// on session UNLOCK instead (see `session_is_unlocked`); the event remains
+// only as a monolithic-path breadcrumb with no service-side reader.
 
 const CLIENT_CONNECTED_EVENT: &str = "Global\\NovaClientConnected";
 
-/// (Host side) Record whether a Moonlight client is currently connected, so
-/// the service can defer a disruptive respawn (the SYSTEM-fallback→
-/// interactive upgrade) until the stream reaches a natural boundary instead
-/// of cutting it off mid-session. Best-effort: a failure here just means the
-/// service falls back to upgrading immediately, exactly like before this
-/// existed — never worse, only potentially less fluid.
+/// (Host side, monolithic path) Record whether a Moonlight client is
+/// currently connected. No service-side consumer since the UNLOCK-keyed
+/// upgrade gate — kept as a cheap externally-observable signal (e.g. for
+/// diagnosing with `handle.exe`), and so the monolithic path stays unchanged.
 pub fn set_client_connected(connected: bool) {
     unsafe {
         let name_w = wide(CLIENT_CONNECTED_EVENT);
@@ -812,24 +838,6 @@ pub fn set_client_connected(connected: bool) {
                 let _ = ResetEvent(ev);
             }
             let _ = CloseHandle(ev);
-        }
-    }
-}
-
-/// (Service side) Best-effort peek at whether a client is CURRENTLY
-/// connected. `false` (safe default — never blocks an upgrade forever) when
-/// the event doesn't exist: no host running yet, or an older host build that
-/// predates this signal.
-fn host_has_connected_client() -> bool {
-    unsafe {
-        let name_w = wide(CLIENT_CONNECTED_EVENT);
-        match OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name_w.as_ptr())) {
-            Ok(ev) => {
-                let signaled = WaitForSingleObject(ev, 0).0 == 0;
-                let _ = CloseHandle(ev);
-                signaled
-            }
-            Err(_) => false,
         }
     }
 }
@@ -1027,6 +1035,55 @@ fn session_has_user_token(session_id: u32) -> bool {
                 true
             }
             Err(_) => false,
+        }
+    }
+}
+
+/// True when `session_id` is genuinely UNLOCKED (a user is signed in AND at
+/// their desktop), per `WTSQuerySessionInformationW(WTSSessionInfoEx)`.
+///
+/// Why this exists (confirmed live 2026-08-10): "a user token exists" is NOT
+/// the same as "a user is signed in and usable". Windows 11's automatic
+/// restart sign-on (ARSO — overnight update reboots) signs the user in and
+/// then LOCKS the session, so `session_has_user_token` reads true at what
+/// looks like a plain lock screen. The upgrade gate keyed on the token alone
+/// therefore killed a healthy lock-screen fallback host on every cooldown
+/// expiry (45 s), all morning, kicking any connected client with it. LOCK vs
+/// UNLOCK is the signal that actually distinguishes "mid-PIN-entry /parked at
+/// the lock screen" from "signed in for real".
+///
+/// Fail-open (`true`) when the query itself errors: the 45 s retry cooldown
+/// still bounds any resulting thrash, which is the pre-existing behavior.
+fn session_is_unlocked(session_id: u32) -> bool {
+    unsafe {
+        let mut buf = windows::core::PWSTR::null();
+        let mut len = 0u32;
+        match WTSQuerySessionInformationW(
+            HANDLE::default(), // WTS_CURRENT_SERVER_HANDLE
+            session_id,
+            WTSSessionInfoEx,
+            &mut buf,
+            &mut len,
+        ) {
+            Ok(()) => {
+                let mut unlocked = true;
+                if !buf.is_null() && len as usize >= std::mem::size_of::<WTSINFOEXW>() {
+                    let info = &*(buf.as_ptr() as *const WTSINFOEXW);
+                    if info.Level == 1 {
+                        // Win8+ semantics: LOCK = 0, UNLOCK = 1 (the swapped
+                        // values only afflicted Win7/2008R2 — not a target).
+                        let flags = info.Data.WTSInfoExLevel1.SessionFlags;
+                        unlocked = flags == WTS_SESSIONSTATE_UNLOCK as i32;
+                    }
+                }
+                WTSFreeMemory(buf.as_ptr() as *mut c_void);
+                unlocked
+            }
+            Err(e) => {
+                println!("⚠️  WTSSessionInfoEx query for session {session_id} failed ({e:?}) — \
+                    treating as unlocked");
+                true
+            }
         }
     }
 }
@@ -1241,6 +1298,11 @@ fn spawn_host_with_ipc(
     };
 
     let h = spawn_host_in_session(exe, session_id, true).or_else(|user_err| {
+        // Say WHY the interactive spawn failed before falling back — this was
+        // silent (the error only surfaced if the fallback ALSO failed), which
+        // made every "spawned as SYSTEM when a user looked signed-in" episode
+        // undiagnosable from the logs (2026-08-10).
+        println!("   ↳ interactive spawn failed ({user_err}) — trying SYSTEM fallback");
         spawn_host_as_system_fallback(exe, session_id, true)
             .map_err(|sys_err| format!("{user_err}; SYSTEM-fallback also failed: {sys_err}"))
     })?;

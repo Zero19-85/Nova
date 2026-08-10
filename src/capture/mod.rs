@@ -368,7 +368,21 @@ impl DesktopManager {
                 }
                 self.swap_to_dda()
             }
-            (BackendKind::Dda, InputDesktop::Default) => self.swap_to_wgc(),
+            (BackendKind::Dda, InputDesktop::Default) => {
+                // A SYSTEM-fallback Worker can NEVER host WGC (WinRT's capture
+                // broker needs a real interactive user — 0x80070424, confirmed
+                // live 2026-07-10 and again 2026-08-10 as the post-sign-in
+                // rebind crash-loop). Under SYSTEM, DDA on the interactive
+                // desktop is the correct steady state (Sunshine's model);
+                // just heal the duplication if the desktop switch killed it.
+                if crate::service::is_system_fallback() {
+                    let lost =
+                        matches!(&self.backend, CaptureBackend::Dda(d) if d.access_lost());
+                    if lost { self.restore_dda() } else { None }
+                } else {
+                    self.swap_to_wgc()
+                }
+            }
             (BackendKind::Wgc, InputDesktop::Default) => {
                 // Scorched-earth rebind: we stayed on WGC across a desktop
                 // switch (DDA disabled, or the swap never activated) and the
@@ -570,7 +584,14 @@ impl DesktopCapture for DesktopManager {
 
         let on_secure = desktop_switch::current_input_desktop()
             == desktop_switch::InputDesktop::Secure;
-        if self.backend.kind() == BackendKind::Dda && !on_secure {
+        // Under the SYSTEM-fallback identity WGC is impossible (0x80070424) —
+        // a session rebind must retarget the live DDA duplication instead of
+        // force-routing to WGC. Without this, every ConfigureStart replayed to
+        // a post-sign-in fallback Worker failed its capture rebind and the
+        // Worker never streamed (confirmed live 2026-08-10, the
+        // "apply_configure_start failed: Capture rebind failed 0x80070424" spam).
+        let wgc_possible = !crate::service::is_system_fallback();
+        if self.backend.kind() == BackendKind::Dda && !on_secure && wgc_possible {
             // Session event arrived while a DDA interlude was still latched —
             // rebind implies WGC. `expected_size` is skipped on this path (the
             // resolution guard in lib.rs re-snaps if the mode is still settling).

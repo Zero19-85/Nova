@@ -201,6 +201,10 @@ fn negotiated_to_configure_start(n: &session_negotiate::NegotiatedParams) -> ipc
         audio_packet_duration_ms: n.audio_packet_duration_ms,
         packet_size: n.packet_size,
         min_fec_packets: n.min_fec_packets,
+        // Placeholder — control_supervisor stamps the real value (RtpSender's
+        // last-sent index + 1) on every ConfigureStart it puts on the pipe,
+        // including this initial one. See ipc::ConfigureStart::start_frame_index.
+        start_frame_index: 1,
     }
 }
 
@@ -542,8 +546,19 @@ async fn control_supervisor(
                         println!("🔗 Master: worker control pipe connected");
                         if let Some(h) = reader_task.take() { h.abort(); }
                         let (read_half, mut w) = tokio::io::split(pipe);
-                        if let Some(cs) = last_configure.clone() {
-                            println!("🔁 Master: replaying ConfigureStart to newly-connected worker");
+                        if let Some(mut cs) = last_configure.clone() {
+                            // Mid-session Worker adoption: the replacement must
+                            // continue the client's frame timeline, not restart
+                            // at 1 — the client discards indices behind its
+                            // expected next frame FOREVER (permanent black after
+                            // a sign-out/upgrade respawn, confirmed live
+                            // 2026-08-10). Also never re-launch the app: it is
+                            // (at most) already running from the original send.
+                            cs.start_frame_index =
+                                rtp_sender.lock().unwrap().last_sent_index().wrapping_add(1).max(1);
+                            cs.launch_app = false;
+                            println!("🔁 Master: replaying ConfigureStart to newly-connected worker \
+                                (resuming at wire frame {})", cs.start_frame_index);
                             if let Err(e) = ipc::send_control(&mut w, &ControlMsg::ConfigureStart(cs)).await {
                                 println!("⚠️  Master: ConfigureStart replay failed ({e})");
                             }
@@ -622,7 +637,7 @@ async fn control_supervisor(
                         // exactly as before — never worse than the old path.
                         // Gamepad packets deliberately stay with the Worker —
                         // see input::is_gamepad_packet.
-                        let msg = if secure_desktop
+                        let mut msg = if secure_desktop
                             && helper_ready.load(std::sync::atomic::Ordering::Acquire)
                         {
                             match msg {
@@ -637,6 +652,15 @@ async fn control_supervisor(
                         } else {
                             msg
                         };
+                        // Stamp the wire-timeline start on every outbound
+                        // ConfigureStart: 1 for a fresh session (RtpSender was
+                        // reset ⇒ last_sent_index == 0), or last+1 when a
+                        // session is being re-configured with frames already
+                        // on the wire — see ConfigureStart::start_frame_index.
+                        if let ControlMsg::ConfigureStart(cs) = &mut msg {
+                            cs.start_frame_index =
+                                rtp_sender.lock().unwrap().last_sent_index().wrapping_add(1).max(1);
+                        }
                         // Recorded BEFORE the send attempt so a dropped/failed
                         // send (no pipe connected yet, or the pipe just died)
                         // still gets replayed to whichever Worker connects
@@ -2071,7 +2095,10 @@ pub async fn run_worker() -> Result<()> {
                                     qos.reset();
                                     client_connected = true;
                                     first_idr_sent = false;
-                                    wire_index = 1; // fresh session ⇒ client expects frame 1
+                                    // 1 for a fresh session; a mid-session adoption
+                                    // (Worker respawn) continues the client's frame
+                                    // timeline — see ConfigureStart::start_frame_index.
+                                    wire_index = cs.start_frame_index.max(1);
                                     // Remember the config so a deferred VDD
                                     // activation (secure desktop up) can run on
                                     // return to the interactive desktop.
@@ -2133,7 +2160,9 @@ pub async fn run_worker() -> Result<()> {
                             qos.reset();
                             client_connected = true;
                             first_idr_sent = false;
-                            wire_index = 1; // fresh session ⇒ client expects frame 1
+                            // See the select!-arm twin above: fresh session ⇒ 1,
+                            // mid-session adoption ⇒ continue the timeline.
+                            wire_index = cs.start_frame_index.max(1);
                             pending_configure = Some(cs.clone());
                             vdd_activation_pending = app_launcher::uses_virtual_display(
                                     cs.app_id, cfg.stream.headless_for_all_apps)

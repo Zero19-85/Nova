@@ -143,6 +143,12 @@ pub struct RtpSender {
     spare_bufs: Vec<Vec<u8>>,
     /// Buffers currently owned by the worker (queued or being sent).
     bufs_in_flight: usize,
+    /// Highest wire frame index queued this client session (0 = none yet).
+    /// Master reads it to stamp `ConfigureStart::start_frame_index` so a
+    /// replacement Worker adopted mid-session continues the client's frame
+    /// timeline instead of restarting at 1 (which the client would discard
+    /// forever — see ipc::ConfigureStart::start_frame_index).
+    last_sent_index: u32,
 }
 
 impl RtpSender {
@@ -181,7 +187,15 @@ impl RtpSender {
             buf_rx,
             spare_bufs: Vec::new(),
             bufs_in_flight: 0,
+            last_sent_index: 0,
         })
+    }
+
+    /// Highest wire frame index queued this session; 0 when nothing has been
+    /// sent since the last `reset()`. `+ 1` = the index the next Worker must
+    /// start from.
+    pub fn last_sent_index(&self) -> u32 {
+        self.last_sent_index
     }
 
     /// Non-blocking drain of all queued "ping" packets, keeping the most recent
@@ -233,6 +247,7 @@ impl RtpSender {
         let mut buf = [0u8; 64];
         while self.recv_socket.recv_from(&mut buf).is_ok() {}
         self.target = None;
+        self.last_sent_index = 0; // next session's client expects frame 1 again
         let _ = self.tx.send(TxCmd::Reset);
     }
 
@@ -266,6 +281,10 @@ impl RtpSender {
         match self.tx.try_send(TxCmd::Frame { frame_index, buf, frame_type }) {
             Ok(()) => {
                 self.bufs_in_flight += 1;
+                // max(): the media keepalive retransmits an OLD IDR under its
+                // original index — that must not walk the session's high-water
+                // mark backwards.
+                self.last_sent_index = self.last_sent_index.max(frame_index);
                 true
             }
             Err(TrySendError::Full(TxCmd::Frame { buf, .. }))
@@ -885,6 +904,39 @@ mod tests {
         // temporal delimiter + frame OBU (type 6, size 3) — no sequence header.
         let inter = [0x12, 0x00, 0x32, 0x03, 0xAA, 0xBB, 0xCC];
         assert_eq!(detect_frame_type(&inter, false, true), 1, "no seq header ⇒ P");
+    }
+
+    /// `last_sent_index` is the session's high-water mark: Master stamps
+    /// `ConfigureStart::start_frame_index = last_sent_index + 1` so a Worker
+    /// adopted mid-session continues the client's frame timeline instead of
+    /// restarting at 1 (which moonlight-common-c discards forever — the
+    /// permanent-black-after-sign-out/upgrade bug, live 2026-08-10). The
+    /// keepalive retransmit of an OLD IDR must not walk it backwards, and
+    /// `reset()` must return it to 0 so a fresh session starts at 1 again.
+    #[test]
+    fn last_sent_index_tracks_high_water_mark_and_resets() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ping(&client, dst, 1);
+        sender.try_learn_target().expect("learn client");
+
+        let mut frame = vec![0u8, 0, 1, 0x65];
+        frame.extend_from_slice(&[0xAA; 64]);
+        let ft = detect_frame_type(&frame, false, false);
+
+        assert_eq!(sender.last_sent_index(), 0, "nothing sent yet");
+        assert!(sender.send_frame(41, &frame, ft));
+        let _ = recv_frame_datagrams(&client);
+        assert_eq!(sender.last_sent_index(), 41);
+
+        // Keepalive retransmit of an older IDR: no regression.
+        assert!(sender.send_frame(7, &frame, ft));
+        let _ = recv_frame_datagrams(&client);
+        assert_eq!(sender.last_sent_index(), 41, "old-index retransmit must not regress");
+
+        sender.reset();
+        assert_eq!(sender.last_sent_index(), 0, "fresh session must restart at index 1");
     }
 
     /// Draining must keep the most recent sender when pings from an old and a

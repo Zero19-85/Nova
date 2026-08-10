@@ -1,13 +1,15 @@
-# Nova — Handoff to Next Chat (2026-08-09)
+# Nova — Handoff to Next Chat (2026-08-10)
 
 ## TL;DR
 Streaming pipeline is under a **CODE FREEZE** and is in great shape (smooth, resilient,
-120–121 fps rock-solid, QoS + FEC eradicated the MoCA saturation). Next planned work was
-**UI / QoL — a System Tray menu with live Server Stats**. One live regression was found and
-partially fixed at the very end (lock-screen host kick loop) that **needs a live boot/lock test**.
+120–121 fps rock-solid, QoS + FEC eradicated the MoCA saturation). This session went after the
+**session-transition (sign-in / sign-out survival)** bug — four separate defects found from the
+2026-08-10 logs and all four fixed. **Needs the live boot → connect → sign-in → sign-out test
+pass** (see "How to test the session-transition fix" below).
 
-- Git HEAD: `4b7edf9` on `main`, pushed. Remote: https://github.com/Zero19-85/Nova.git
-- Working tree clean; live install matches HEAD (exe + dll hash-verified).
+- Live install is running the fix (exe hash-verified, service healthy, 4K120 HDR session
+  streaming on it right now).
+- Remote: https://github.com/Zero19-85/Nova.git
 
 ## Key locations
 | What | Where |
@@ -60,20 +62,83 @@ Always hash-verify the copy, and after start confirm `🎬 Master network stack 
 - `src/encoder.rs` — `RFI_ENABLED = true`, `set/get_stream_bitrate_kbps`, congestion signal.
 - `src/control.rs` — ENet control; `idr_request_is_congestion` (QoS-via-IDR + 8s warmup grace).
 - `src/config.rs` — nova.toml (`fec_percentage` default 5).
-- `src/service.rs` — SCM service, spawn/upgrade reconcile loop (the lock-screen bug below lives here).
+- `src/service.rs` — SCM service, spawn/upgrade reconcile loop; `session_is_unlocked()` (the
+  upgrade gate), `spawn_host_in_session` vs `spawn_host_as_system_fallback`.
+- `src/capture/mod.rs` — `DesktopManager::rebind` / `maybe_swap_backend`: which backend serves
+  which (identity, desktop) combination. WGC is impossible under SYSTEM — see item 2(C).
+- `src/ipc.rs` — `ConfigureStart` wire format (append-only: both sides are one binary, but a
+  field added mid-struct silently shifts every later field, so add at the END and bump both
+  `encode_into` and `decode` together).
 
 ## OPEN ITEMS for next session
-1. **[DONE — CONFIRMED LIVE 2026-08-09] Lock-screen kick fix (`4b7edf9`).** Bug was: at a locked
-   session the fallback→interactive upgrade thrashed every ~5s, each `stop_host` kicking the remote
-   client at the PIN screen. Fix arms a 45s cooldown when an interactive spawn fails despite a user
-   token. **User verified it's squashed — connect-at-sign-in-screen + PIN entry now holds.** No
-   action needed unless it regresses.
-2. **"Sign OUT without dropping the connection" — STILL OPEN, UNTESTED.** The deferred Phase 16
-   session-survival bug (CLAUDE.md has a 5-step plan). User has NOT tested it (I said it needs
-   work). Full ask: boot → connect+PIN → stays → sign out without drop → sign into ANY profile →
-   keeps running. Item 1 delivered the connect-at-PIN half; THIS is the remaining half and the
-   natural first task next session. Start with the CLAUDE.md Phase 16 5-step plan (read
-   nova-service.log + nova.log across the sign-out boundary first).
+1. **[PARTIAL — superseded by item 2] Lock-screen kick fix (`4b7edf9`).** Arms a 45 s cooldown when
+   an interactive spawn fails despite a user token. User confirmed connect-at-sign-in + PIN entry
+   holds, and that much is real — but the 2026-08-10 logs show the thrash was only *slowed*, not
+   stopped: the cooldown could fail to arm, and on expiry it killed the host again anyway. See
+   item 2(A) for the actual root cause (ARSO locked-session tokens) and the real fix.
+1b. **[FIXED 2026-08-09 `24761dd`, deployed] Green-half / wrong-geometry at connect.** Connecting
+   at the sign-in screen drove VDD activation on the Winlogon desktop where SetDisplayConfig is
+   denied (error 5); the resolution force failed but WGC+encoder came up at 4K anyway = green half.
+   Fix: `apply_configure_start` skips VDD activation while `desktop_is_secure()`; the worker loop
+   re-runs the stored ConfigureStart (launch_app cleared) once the desktop returns to Default. Happy
+   path (logged-in launch) unchanged. Same live-test caveat as 1 — confirm with a real sign-in-screen
+   connect → login (should come up clean with no green half, no app-5 restart).
+2. **Session-transition survival (sign-in / sign-out) — FOUR BUGS FIXED 2026-08-10, NEEDS LIVE
+   TEST.** Symptoms reported: reboot → connect → wrong/garbled screen, physical monitor stays lit,
+   and signing in kicks the client (had to quit app 5 and relaunch). The 2026-08-10 logs
+   (nova-service.log ~line 66180+ and 70502+, nova.log ~305046+) showed four independent defects,
+   each of which alone breaks the transition:
+   - **(A) Upgrade thrash — the host was being killed in a loop.** `🔑 User token now available
+     → upgrading` fired over and over (hundreds of times across the morning), each one a
+     `stop_host` that kills the Worker and drops the client. Two causes, both fixed in
+     `service.rs`: (i) **a user token exists at a LOCKED session** — Windows 11 ARSO (automatic
+     restart sign-on after an update reboot) signs the user in and re-locks, so the token-only
+     gate read "signed in!" at what is visually a lock screen; the gate now also requires
+     `session_is_unlocked()` (`WTSQuerySessionInformationW(WTSSessionInfoEx)`, LOCK=0/UNLOCK=1);
+     (ii) the 45 s anti-thrash cooldown **re-probed the token at spawn-result time** and could
+     skip arming when that probe raced the login state — now armed unconditionally whenever an
+     upgrade attempt lands back on a fallback (`upgrade_attempted`), and also on a failed spawn.
+   - **(B) The interactive-spawn failure reason was never logged.** `spawn_host_in_session`'s
+     error was swallowed unless the SYSTEM fallback ALSO failed, so "why did it fall back?" was
+     undiagnosable. Now printed (`↳ interactive spawn failed (…) — trying SYSTEM fallback`).
+     **Read this line first next time** — it names the real privilege/session problem.
+   - **(C) A SYSTEM-fallback Worker tried to use WGC and died on every ConfigureStart.** WGC is
+     impossible under SYSTEM (`0x80070424`, the long-known Phase 15.2c finding), but
+     `DesktopManager::rebind` and `maybe_swap_backend` both force-route DDA→WGC whenever the
+     input desktop is Default — which is exactly the state after someone signs in. Result:
+     `❌ apply_configure_start failed: Capture rebind failed … 0x80070424` on repeat, the Worker
+     never streamed, the VDD never activated (hence the physical monitor staying lit). Both paths
+     are now gated on `!service::is_system_fallback()`; under SYSTEM, DDA stays the steady state
+     on the interactive desktop too (Sunshine's model).
+   - **(D) A replacement Worker restarted the wire frame index at 1 → permanent black.**
+     moonlight-common-c discards any frame whose index is before the next one it expects
+     (`isBefore32`), so a Worker adopted mid-session (sign-in upgrade, sign-out fallback, crash
+     respawn) fed the client frames it threw away forever — the client stays connected and black
+     until the app is quit and relaunched, which is exactly the reported symptom. Fixed with a
+     new `ipc::ConfigureStart::start_frame_index`: `RtpSender` tracks `last_sent_index()` (session
+     high-water mark, immune to keepalive retransmits, cleared by `reset()`), and Master's
+     `control_supervisor` stamps `last + 1` on every outbound ConfigureStart — including the
+     replay to a newly-connected Worker, which also now forces `launch_app = false` so an adoption
+     can't start a second copy of the app. Regression test:
+     `rtp::tests::last_sent_index_tracks_high_water_mark_and_resets`.
+   - Also **removed the `host_has_connected_client()` gate** on the upgrade. It was dead in the
+     split deployment (only the monolithic path ever set the event) AND backwards: the handoff to
+     an interactive host is precisely how a just-signed-in client gets WGC/HDR/VDD back. With (D)
+     fixed, the client survives the swap as a ~2–5 s freeze instead of a disconnect.
+
+   **How to test the session-transition fix** (the whole point — do this end to end):
+   1. Reboot, do NOT sign in. Connect from Moonlight at the sign-in screen → expect the login UI,
+      correct geometry, no green half.
+   2. Type the PIN over Moonlight and sign in. Expect a brief freeze, then a full-quality stream —
+      **no kick, no app-5 restart**. In nova-service.log expect exactly ONE `🔑 Session N is
+      signed in + unlocked — upgrading…`, then `🔁 Master: replaying ConfigureStart … (resuming at
+      wire frame N)` with N ≫ 1, then `📦 frame N…` continuing (NOT restarting at 1).
+   3. Sign out mid-stream. Expect the client to keep the connection and land back on the
+      logon screen (fallback Worker, DDA) instead of black.
+   4. Sign in again — same profile and a DIFFERENT profile (the second one also exercises the
+      `🔄 Console session X → Y` respawn path).
+   If it kicks again, the first thing to grep is `↳ interactive spawn failed` (B) — that now names
+   the cause directly.
 3. **RFI is ON but inert for this client:** advertised (`refPicInvalidation:1`) but the HEVC
    Moonlight client sends 0 invalidation requests (legacy H.264-centric feature). Harmless. The
    real streaming win was FEC 20→5 + AIMD-with-memory, NOT RFI — don't misattribute.

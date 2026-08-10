@@ -130,6 +130,15 @@ pub struct ConfigureStart {
     pub audio_packet_duration_ms: u32,
     pub packet_size: u32,
     pub min_fec_packets: u32,
+    /// First wire frame index the Worker must use (== its first NVENC
+    /// timestamp). 1 for a fresh client session; a replacement Worker adopted
+    /// MID-session (sign-in upgrade, sign-out fallback, crash respawn) gets
+    /// `last index Master put on the wire + 1` instead — moonlight-common-c
+    /// discards every frame whose index is before the next one it expects
+    /// (`isBefore32`), so a respawned Worker restarting at 1 while the client
+    /// sits at frame N blacked the stream out permanently. Master
+    /// (`control_supervisor`) stamps this on every ConfigureStart it sends.
+    pub start_frame_index: u32,
 }
 
 /// Worker -> Master: the ACTUAL params the encoder ended up running, once
@@ -257,6 +266,7 @@ impl ConfigureStart {
         write_u32(out, self.audio_packet_duration_ms);
         write_u32(out, self.packet_size);
         write_u32(out, self.min_fec_packets);
+        write_u32(out, self.start_frame_index);
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Self> {
@@ -285,10 +295,11 @@ impl ConfigureStart {
         let audio_packet_duration_ms = read_u32(bytes, at)?;
         let packet_size = read_u32(bytes, at)?;
         let min_fec_packets = read_u32(bytes, at)?;
+        let start_frame_index = read_u32(bytes, at)?;
         Ok(ConfigureStart {
             width, height, fps, codec, hdr_confirmed, bitrate_kbps, app_id, launch_app,
             device_name, rikey, rikeyid, host_audio, audio_encryption,
-            audio_packet_duration_ms, packet_size, min_fec_packets,
+            audio_packet_duration_ms, packet_size, min_fec_packets, start_frame_index,
         })
     }
 }
