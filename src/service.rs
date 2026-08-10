@@ -521,6 +521,21 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
     let mut last_spawn: Option<std::time::Instant> = None;
     let mut fast_exits: u32 = 0;
     let mut respawn_not_before: Option<std::time::Instant> = None;
+    // Suppress the fallback→interactive UPGRADE while the interactive spawn is
+    // demonstrably failing. At a LOCKED session a user token exists
+    // (session_has_user_token == true) but CreateProcessAsUserW into the locked
+    // console can't produce a working interactive host, so the spawn falls back
+    // to SYSTEM again. Without this guard the upgrade fired every
+    // MIN_FALLBACK_UPTIME_BEFORE_UPGRADE seconds, and each attempt killed the
+    // running SYSTEM-fallback host — dropping the remote client that was
+    // connected to the lock screen (live 2026-08-09: ~23 rapid respawns, the
+    // client "kicked" every few seconds and unable to reach the PIN screen).
+    // We re-test at most once per this interval; between tests the lock-screen
+    // host stays STABLE so the client can connect and type its PIN. A real
+    // sign-in makes the interactive spawn succeed (not a fallback), which never
+    // arms this — so the happy path is unchanged.
+    const INTERACTIVE_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(45);
+    let mut interactive_retry_not_before: Option<std::time::Instant> = None;
 
     loop {
         // Reconcile: ensure a host is running in the CURRENT console session.
@@ -559,15 +574,21 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                     println!("🔄 Console session {} → {} — respawning host", h.session_id, session);
                     stop_host(h);
                     // A session change is a fresh environment — don't carry a
-                    // crash-loop backoff into it.
+                    // crash-loop backoff or upgrade-suppression into it.
                     fast_exits = 0;
                     respawn_not_before = None;
+                    interactive_retry_not_before = None;
                     true
                 }
                 Some(h) if h.is_system_fallback
                     && last_spawn.is_some_and(|t| t.elapsed() >= MIN_FALLBACK_UPTIME_BEFORE_UPGRADE)
                     && !host_has_connected_client()
-                    && session_has_user_token(session) =>
+                    && session_has_user_token(session)
+                    // Don't re-attempt the upgrade while the interactive spawn
+                    // is known to be failing (locked session) — see the cooldown
+                    // declaration. Keeps the lock-screen host stable instead of
+                    // thrashing and kicking the connected client.
+                    && interactive_retry_not_before.is_none_or(|t| std::time::Instant::now() >= t) =>
                 {
                     // The pre-login SYSTEM-fallback host was covering a bare
                     // logon screen (no user token existed yet). One now does —
@@ -631,6 +652,22 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                             ""
                         };
                         println!("✅ Host spawned in session {session}{mode} (pid handle live)");
+                        // Arm/clear the upgrade cooldown. If we got a SYSTEM
+                        // fallback even though a user token exists, the
+                        // interactive spawn is failing (locked session) — don't
+                        // let the upgrade thrash; re-test only after the cooldown.
+                        // A real interactive host means the session is usable, so
+                        // clear any suppression.
+                        interactive_retry_not_before = if h.is_system_fallback
+                            && session_has_user_token(session)
+                        {
+                            println!("   ↳ interactive spawn unavailable (session locked?) — \
+                                holding this lock-screen host stable for {}s before re-testing",
+                                INTERACTIVE_RETRY_COOLDOWN.as_secs());
+                            Some(std::time::Instant::now() + INTERACTIVE_RETRY_COOLDOWN)
+                        } else {
+                            None
+                        };
                         host = Some(h);
                         last_spawn = Some(std::time::Instant::now());
                     }
