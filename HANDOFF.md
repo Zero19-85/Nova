@@ -126,17 +126,46 @@ Always hash-verify the copy, and after start confirm `🎬 Master network stack 
      an interactive host is precisely how a just-signed-in client gets WGC/HDR/VDD back. With (D)
      fixed, the client survives the swap as a ~2–5 s freeze instead of a disconnect.
 
+   - **(E) THE ONE UNDERNEATH — geometry pinning (`b3bcc1b`).** With A–D fixed, the 2026-08-10
+     21:25 test showed the transition machinery working perfectly (one clean upgrade, replay at
+     wire frame 4773, new Worker at 3840x2160 HDR10, zero rebind failures) — and the client STILL
+     broke. Cause: **a Moonlight client fixes its decoder's resolution and HDR profile at session
+     start; changing either mid-session corrupts it permanently** (black + green region, needs an
+     app relaunch; the green is the shim's `CopyResource` no-op'ing on a size mismatch — the same
+     mechanism as the old green-half bugs). And the change is unavoidable, because a
+     SYSTEM-fallback Worker **cannot drive the VDD at all** — `SetDisplayConfig` is denied on the
+     Winlogon desktop (error 5) regardless of token — so it serves the physical monitor's native
+     size in SDR while the client negotiated 4K HDR10. Fix: geometry is now a property of the
+     SESSION, not of whichever Worker serves it. New `ControlMsg::WorkerCapabilities`
+     (`vdd_capable` + native size) → `session_negotiate::negotiate` pins a session started at the
+     logon screen to the monitor's native size + SDR for its whole life (the full Worker just
+     drives the VDD at that pinned size after sign-in), and a Worker that can't match a live
+     session's geometry now REFUSES the ConfigureStart so the client freezes on its last good IDR
+     (via the existing keepalive) instead of being handed a different stream.
+     **Deliberate cost:** a session started at the logon screen stays at the monitor's native
+     res/SDR until you reconnect, and Moonlight renders it inside the larger surface it allocated
+     (image doesn't fill the frame). Making it fill needs encoder-size/capture-size decoupling —
+     scaling + an SDR-into-HDR-session shader path — in the shim. That's the open follow-up if the
+     framing matters; it would also permanently kill the "green" bug class.
+
    **How to test the session-transition fix** (the whole point — do this end to end):
-   1. Reboot, do NOT sign in. Connect from Moonlight at the sign-in screen → expect the login UI,
-      correct geometry, no green half.
-   2. Type the PIN over Moonlight and sign in. Expect a brief freeze, then a full-quality stream —
-      **no kick, no app-5 restart**. In nova-service.log expect exactly ONE `🔑 Session N is
-      signed in + unlocked — upgrading…`, then `🔁 Master: replaying ConfigureStart … (resuming at
-      wire frame N)` with N ≫ 1, then `📦 frame N…` continuing (NOT restarting at 1).
-   3. Sign out mid-stream. Expect the client to keep the connection and land back on the
-      logon screen (fallback Worker, DDA) instead of black.
+   1. Reboot, do NOT sign in. Connect from Moonlight at the sign-in screen. Expect the login UI at
+      the MONITOR's native size (2560x1440 here), SDR, not filling the client's frame — that is now
+      correct-by-design, not a bug. nova-service.log should show `🧩 Master: worker capabilities —
+      vdd=false native=2560x1440` and `📐 Master: session pinned to 2560x1440 SDR`.
+   2. Type the PIN over Moonlight and sign in. Expect a brief freeze, then the SAME 1440p SDR
+      stream continuing — **no kick, no green, no app-5 restart**, and the physical monitor should
+      go dark (the full Worker drives the VDD at the pinned 1440p). Expect exactly ONE `🔑 Session
+      N is signed in + unlocked — upgrading…` and `🔁 … (resuming at wire frame N)` with N ≫ 1.
+   3. Sign out mid-stream. Expect the client to keep the connection and land back on the logon
+      screen at the same geometry (the fallback Worker can serve 1440p SDR), still usable for a
+      remote PIN.
    4. Sign in again — same profile and a DIFFERENT profile (the second one also exercises the
       `🔄 Console session X → Y` respawn path).
+   5. Disconnect and reconnect while signed in → this session negotiates unconstrained, so expect
+      full 3840x2160 HDR10. Then sign out DURING it: the client should FREEZE on its last frame
+      (still connected, `⏸️ Worker: cannot serve this session`) and resume 4K when you sign back
+      in — it will not show the logon screen in this state, by design.
    If it kicks again, the first thing to grep is `↳ interactive spawn failed` (B) — that now names
    the cause directly.
 3. **RFI is ON but inert for this client:** advertised (`refPicInvalidation:1`) but the HEVC
