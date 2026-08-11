@@ -137,6 +137,33 @@ static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
 static std::atomic<bool>    g_rfiConfirm{false};
 static std::atomic<bool>    g_lastFrameRecovery{false};
 
+// ── Intra refresh ─────────────────────────────────────────────────────────────
+//
+// OFF, matching both reference implementations' behaviour for a client that
+// doesn't ask for it (Sunshine `nvenc_base.cpp:343`, Apollo `:329` — both gate
+// the whole block on `client_config.enableIntraRefresh == 1`, parsed from the
+// RTSP `x-ss-video[0].intraRefresh` argument, and Moonlight leaves it off by
+// default).
+//
+// Nova previously enabled it unconditionally at `period = cnt = fps`, described
+// as "continuous rolling refresh; no off-gap between cycles". That is a refresh
+// wave sweeping the entire frame once per SECOND, forever, with every frame
+// carrying intra macroblocks — 2.5x the per-frame intra of the reference
+// setting and with no rest period. A rolling intra band is a visible quality
+// discontinuity, and under CBR it also steals bits from the actual content on
+// every single frame. Live symptom (2026-08-11): the picture "still kinda
+// flashy, especially going over things clickable" — i.e. worst on the crisp
+// edges and hover highlights of UI, exactly where an intra band shows up.
+//
+// Recovery does not depend on this: the GOP is infinite with on-demand IDRs
+// (client requests, QoS repair) plus reference-frame invalidation.
+//
+// If it is ever turned back on, these are the reference values — a slow sweep
+// (299 frames) once every 300, single-sliced.
+static const bool     kEnableIntraRefresh  = false;
+static const uint32_t kIntraRefreshPeriod  = 300;
+static const uint32_t kIntraRefreshCnt     = 299;
+
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
 // with (only rate-control fields changed).
@@ -1454,13 +1481,12 @@ extern "C" __declspec(dllexport) int InitEncoder(
             // oscillation that manifests as "pulsing" text.
             h264.enableFillerDataInsertion = 1;
             h264.h264VUIParameters = vuiParams;
-            // Continuous intra refresh: period == cnt means a new refresh cycle
-            // starts the instant the previous one ends — every frame carries some
-            // intra MBs, the entire frame is refreshed every second (at 60fps).
-            // No "off" gap between cycles, so text snaps crisp without pulsing.
-            h264.enableIntraRefresh = 1;
-            h264.intraRefreshPeriod = fps;
-            h264.intraRefreshCnt    = fps;
+            if (kEnableIntraRefresh) {
+                h264.enableIntraRefresh      = 1;
+                h264.intraRefreshPeriod      = kIntraRefreshPeriod;
+                h264.intraRefreshCnt         = kIntraRefreshCnt;
+                h264.singleSliceIntraRefresh = 1;
+            }
         } else if (codecGuid == NV_ENC_CODEC_HEVC_GUID) {
             encodeConfig.profileGUID = is_hdr ? NV_ENC_HEVC_PROFILE_MAIN10_GUID
                                               : NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -1493,9 +1519,12 @@ extern "C" __declspec(dllexport) int InitEncoder(
                 hevc.hevcVUIParameters.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
                 hevc.hevcVUIParameters.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
             }
-            hevc.enableIntraRefresh = 1;
-            hevc.intraRefreshPeriod = fps;
-            hevc.intraRefreshCnt    = fps;
+            if (kEnableIntraRefresh) {
+                hevc.enableIntraRefresh      = 1;
+                hevc.intraRefreshPeriod      = kIntraRefreshPeriod;
+                hevc.intraRefreshCnt         = kIntraRefreshCnt;
+                hevc.singleSliceIntraRefresh = 1;
+            }
         } else if (codecGuid == NV_ENC_CODEC_AV1_GUID) {
             // AV1 had NO config block before — it ran on raw NVENC defaults,
             // which produced an undecodable stream on the client (black screen
