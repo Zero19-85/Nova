@@ -126,8 +126,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
     GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_DEVICE_INFO_TYPE,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_SDR_WHITE_LEVEL,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO, SET_DISPLAY_CONFIG_FLAGS,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
@@ -2486,6 +2486,55 @@ impl VirtualDisplay {
             let num = path.targetInfo.refreshRate.Numerator as f64;
             let den = path.targetInfo.refreshRate.Denominator as f64;
             return (num > 0.0 && den > 0.0).then(|| num / den);
+        }
+        None
+    }
+
+    /// The display's current **SDR white level**, expressed in scRGB units
+    /// (1.0 == 80 nits), for the active path driving `device_name`. `None` when
+    /// the device has no active path or the query fails.
+    ///
+    /// This is the number Windows itself uses when compositing SDR content into
+    /// an HDR (Advanced Color) surface — the "SDR content brightness" slider.
+    /// Nova needs the identical value when it converts an SDR *capture* into an
+    /// HDR session, otherwise the two disagree and the picture visibly changes
+    /// brightness whenever the capture path switches: a UAC prompt swaps WGC
+    /// (FP16, already composited by Windows at THIS level) for DDA (BGRA8,
+    /// converted by our shader), and with a hardcoded constant the two land at
+    /// different luminance (reported live 2026-08-11 as the screen brightening
+    /// while the mouse moves during a UAC prompt and dimming when it stops —
+    /// motion is what alternates real capture frames with the cached ones).
+    ///
+    /// `SDRWhiteLevel` is documented in units of 1/1000 of 80 nits, so
+    /// `level / 1000.0` is directly the scRGB multiplier for SDR white; 1000
+    /// (= 80 nits) is the Windows default when the slider has never moved.
+    pub fn query_sdr_white_level(device_name: &str) -> Option<f32> {
+        let (paths, _modes) = Self::query_active_topology().ok()?;
+        for path in &paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+            if !Self::path_is_device(path, device_name) {
+                continue;
+            }
+            let mut info = DISPLAYCONFIG_SDR_WHITE_LEVEL {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+                    adapterId: path.targetInfo.adapterId,
+                    id: path.targetInfo.id,
+                },
+                ..Default::default()
+            };
+            let status = unsafe { DisplayConfigGetDeviceInfo(&mut info.header) };
+            if status != 0 {
+                println!("⚠️  SDR white level query for {device_name} failed (error {status})");
+                return None;
+            }
+            if info.SDRWhiteLevel == 0 {
+                return None;
+            }
+            return Some(info.SDRWhiteLevel as f32 / 1000.0);
         }
         None
     }

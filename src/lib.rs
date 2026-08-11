@@ -986,6 +986,29 @@ fn desktop_is_secure() -> bool {
     )
 }
 
+/// Align the shim's SDR→HDR conversion with the level Windows itself uses.
+///
+/// The display that matters is the one being ENCODED FOR — the VDD, when it is
+/// active in Advanced Color. Windows composites SDR content into that display's
+/// HDR surface at its "SDR content brightness", so an FP16 capture arrives
+/// already scaled that way. Using the same number when we convert an SDR
+/// capture makes the two paths land at identical luminance, which is what stops
+/// the brightness jumping when the capture path switches under a UAC prompt
+/// (WGC/FP16 → DDA/BGRA8 and back).
+///
+/// Deliberately NOT the *source* display's level when no VDD is active: a
+/// display that isn't in Advanced Color reports the 80-nit default, which would
+/// render the logon screen dimmer than reference. With nothing to match, the
+/// shim's BT.2408 default (203 nits) is the right answer, so leave it alone.
+fn refresh_sdr_white_level(vd: &virtual_display::VirtualDisplay) {
+    let Some(device) = vd.active_device_name() else { return };
+    if let Some(level) = virtual_display::VirtualDisplay::query_sdr_white_level(device) {
+        println!("🔆 SDR white level for {device}: {:.0} nits — matching the shim's \
+            SDR→HDR conversion to it", level * 80.0);
+        encoder::set_sdr_white_level(level);
+    }
+}
+
 fn apply_configure_start(
     cs: &ipc::ConfigureStart,
     vd: &mut virtual_display::VirtualDisplay,
@@ -1199,6 +1222,10 @@ fn apply_configure_start(
                 Some(vdd_hdr_possible && enc.config.is_hdr))?;
         }
     }
+
+    // Advanced Color (if any) is settled by now, so the level we read is the
+    // one Windows will actually composite SDR content at for this session.
+    refresh_sdr_white_level(vd);
 
     Ok(ipc::WorkerConfigured {
         width: enc.config.width as u32,
@@ -3388,6 +3415,8 @@ pub async fn run() -> Result<()> {
                         // NOTE: print the LIVE codec, not enc_name — enc_name was
                         // captured before the ANNOUNCE-driven codec switch above and
                         // showed "h264" for sessions that were actually HEVC.
+                        // Parity with apply_configure_start (see its call site).
+                        refresh_sdr_white_level(&vd);
                         println!("📐 Encoder: {}x{}@{}fps {}{}  |  Client requested: {}x{}@{}fps{}",
                             enc.config.width, enc.config.height, enc.config.fps,
                             enc.config.codec.as_str(),

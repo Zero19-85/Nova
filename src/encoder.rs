@@ -51,6 +51,10 @@ extern "C" {
     /// InitEncoder.  BT.2020 primaries are always the standard constants.
     fn SetHdrMetadata(max_luminance_nits: u32, max_cll_nits: u32, max_fall_nits: u32);
 
+    /// Set the SDR white level (scRGB units, i.e. nits / 80) the SDR↔HDR
+    /// conversion shaders use. See `set_sdr_white_level`.
+    fn SetSdrWhiteLevel(scrgb_units: f32);
+
     fn OpenNvEncSession(d3d11_device: *mut c_void, out_encoder: *mut *mut c_void) -> i32;
     fn InitEncoder(
         encoder: *mut c_void,
@@ -134,6 +138,18 @@ pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nit
             max_fall_nits      as u32,
         );
     }
+}
+
+/// Tell the shim where SDR white sits inside the HDR container, in scRGB units
+/// (nits / 80), as reported by `VirtualDisplay::query_sdr_white_level`.
+///
+/// Only the SDR↔HDR cross-conversion shaders use it — an FP16 capture arrives
+/// already composited by Windows at this level, so its path needs no scaling.
+/// Getting the two to agree is what stops the picture changing brightness when
+/// the capture path switches (a UAC prompt swapping WGC/FP16 for DDA/BGRA8).
+/// Applied to the next encoded frame; safe to call from any thread.
+pub fn set_sdr_white_level(scrgb_units: f32) {
+    unsafe { SetSdrWhiteLevel(scrgb_units) }
 }
 
 /// Thread-safe IDR trigger callable from any thread (e.g. the control-stream

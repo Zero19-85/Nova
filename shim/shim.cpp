@@ -390,14 +390,23 @@ float3 linear_to_srgb(float3 c) {
     return lerp(lo, hi, step(0.0031308f, c));
 }
 
-// scRGB units: 1.0 == 80 nits. BT.2408 puts HDR reference white (i.e. what
-// SDR paper-white should map to inside an HDR container) at 203 nits, which
-// is also roughly where Windows composites SDR content under Advanced Color.
-static const float kSdrWhiteScRGB = 203.0f / 80.0f;
+// scRGB units: 1.0 == 80 nits. Where SDR white lands inside the HDR container
+// is NOT a constant — it is the display's "SDR content brightness", which
+// Windows itself uses when compositing SDR content into an Advanced Color
+// surface. Nova must use the SAME value, or an SDR capture converted here and
+// an FP16 capture already composited by Windows disagree, and the picture
+// jumps brightness whenever the capture path switches (live 2026-08-11: a UAC
+// prompt swapping WGC/FP16 for DDA/BGRA8). Fed from
+// VirtualDisplay::query_sdr_white_level via SetSdrWhiteLevel; the default is
+// BT.2408 reference white (203 nits) for when the query is unavailable.
+cbuffer ToneMapParams : register(b0) {
+    float gSdrWhiteScRGB;   // SDR white in scRGB units (nits / 80)
+    float3 _toneMapPad;
+};
 
 // ── SDR BGRA8 capture → HDR10 P010 (BT.2020 NCL PQ, full range) ──────────
 float3 sdr_src_to_scrgb(float2 uv) {
-    return srgb_to_linear(src.SampleLevel(smp, uv, 0).rgb) * kSdrWhiteScRGB;
+    return srgb_to_linear(src.SampleLevel(smp, uv, 0).rgb) * gSdrWhiteScRGB;
 }
 float  ps_sdr2hdr_y (VS_OUT i) : SV_TARGET {
     float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, sdr_src_to_scrgb(i.uv))));
@@ -412,7 +421,7 @@ float2 ps_sdr2hdr_uv(VS_OUT i) : SV_TARGET {
 // scRGB shares BT.709 primaries, so this is just a white-level rescale, a
 // clamp, and the sRGB OETF — no gamut matrix needed.
 float3 hdr_src_to_srgb(float2 uv) {
-    float3 lin = src.SampleLevel(smp, uv, 0).rgb / kSdrWhiteScRGB;
+    float3 lin = src.SampleLevel(smp, uv, 0).rgb / gSdrWhiteScRGB;
     return linear_to_srgb(saturate(lin));
 }
 float  ps_hdr2sdr_y (VS_OUT i) : SV_TARGET {
@@ -437,6 +446,28 @@ static ID3D11PixelShader*  g_sdr2hdrYPS  = nullptr;  // BGRA8 → R16_UNORM   Y 
 static ID3D11PixelShader*  g_sdr2hdrUVPS = nullptr;  // BGRA8 → R16G16_UNORM UV
 static ID3D11PixelShader*  g_hdr2sdrYPS  = nullptr;  // FP16  → R8_UNORM    Y  (HDR capture in an SDR session)
 static ID3D11PixelShader*  g_hdr2sdrUVPS = nullptr;  // FP16  → R8G8_UNORM  UV
+
+// ── SDR white level (b0) ──────────────────────────────────────────────────────
+// Where SDR white sits inside the HDR container, in scRGB units (nits / 80).
+// Set from Rust via SetSdrWhiteLevel whenever the captured display changes;
+// defaults to BT.2408 reference white (203 nits) until then. `g_sdrWhiteDirty`
+// makes the GPU upload happen on the render thread, not the caller's.
+struct ToneMapParams { float sdrWhiteScRGB; float pad[3]; };
+static ID3D11Buffer*     g_toneMapCB    = nullptr;
+static std::atomic<float> g_sdrWhiteScRGB{203.0f / 80.0f};
+static std::atomic<bool>  g_sdrWhiteDirty{true};
+
+/// Rust -> shim: the captured display's SDR white level, in scRGB units.
+/// Applied to the SDR<->HDR conversion shaders on the next encoded frame.
+extern "C" __declspec(dllexport) void SetSdrWhiteLevel(float scrgb_units) {
+    if (!(scrgb_units > 0.0f) || scrgb_units > 100.0f) return; // ignore nonsense
+    float prev = g_sdrWhiteScRGB.exchange(scrgb_units);
+    if (prev != scrgb_units) {
+        g_sdrWhiteDirty.store(true);
+        ShimLog("🔆 SDR white level: %.3f scRGB (%.0f nits)\n",
+                scrgb_units, scrgb_units * 80.0f);
+    }
+}
 
 // Typed RTVs on the planar output textures.
 // D3D11 selects the correct plane via format: R8→plane0, R8G8→plane1 on NV12;
@@ -1220,6 +1251,21 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
                width, height);
     }
 
+    // Tone-mapping constants (b0) — the SDR white level the conversion shaders
+    // read. Recreated per session alongside the rest of the pipeline; marked
+    // dirty so the first frame uploads the current value.
+    if (!g_toneMapCB) {
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth      = sizeof(ToneMapParams);
+        cbDesc.Usage          = D3D11_USAGE_DEFAULT;
+        cbDesc.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &g_toneMapCB))) {
+            ShimLog("⚠️  Tone-map constant buffer creation failed — SDR↔HDR conversions "
+                    "will use the compiled-in default white level\n");
+        }
+    }
+    g_sdrWhiteDirty.store(true);
+
     if (!InitCursorPipeline(device)) {
         ShimLog("⚠️  Cursor compositing pipeline failed to initialize — stream will have no cursor\n");
     }
@@ -1557,10 +1603,15 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     const UINT        fw         = g_encWidth;
     const UINT        fh         = g_encHeight;
 
-    // Re-read the SOURCE geometry whenever the capture hands us a different
-    // texture (a rebind: backend swap, VDD activation, resolution change).
-    // Same-pointer frames — the overwhelming majority — skip the COM call.
-    if (dxgiFrame != g_lastSrcTex) {
+    // Re-read the SOURCE geometry every frame. GetDesc reads the texture's own
+    // cached descriptor (no driver round-trip), and keying this off the pointer
+    // instead was an ABA hazard: a backend swap frees one capture texture and
+    // allocates another, which D3D can hand back at the SAME address — the
+    // stale size/format would then survive a real change, CopyResource would
+    // silently no-op on the mismatch, and the wrong conversion shader would run
+    // on whatever the composite still held. Exactly the class of bug this whole
+    // batch has been chasing; not worth re-introducing to save a struct copy.
+    {
         D3D11_TEXTURE2D_DESC srcDesc = {};
         dxgiFrame->GetDesc(&srcDesc);
         const bool changed = (srcDesc.Width != g_capWidth) || (srcDesc.Height != g_capHeight)
@@ -1676,6 +1727,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->VSSetShader(g_yuvVS, nullptr, 0);
         g_context->PSSetShaderResources(0, 1, &srcSRV);
         g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
+        // SDR white level (b0) — uploaded only when Rust reported a change.
+        if (g_toneMapCB) {
+            if (g_sdrWhiteDirty.exchange(false)) {
+                ToneMapParams p = { g_sdrWhiteScRGB.load(), { 0.0f, 0.0f, 0.0f } };
+                g_context->UpdateSubresource(g_toneMapCB, 0, nullptr, &p, 0, 0);
+            }
+            g_context->PSSetConstantBuffers(0, 1, &g_toneMapCB);
+        }
 
         // The viewport IS the scaler: the fullscreen triangle's [0,1] UV span
         // is rasterised across exactly this rect, so a linear-sampled capture
@@ -1754,6 +1813,14 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->VSSetShader(g_yuvVS, nullptr, 0);
         g_context->PSSetShaderResources(0, 1, &srcSRV);
         g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
+        // SDR white level (b0) — uploaded only when Rust reported a change.
+        if (g_toneMapCB) {
+            if (g_sdrWhiteDirty.exchange(false)) {
+                ToneMapParams p = { g_sdrWhiteScRGB.load(), { 0.0f, 0.0f, 0.0f } };
+                g_context->UpdateSubresource(g_toneMapCB, 0, nullptr, &p, 0, 0);
+            }
+            g_context->PSSetConstantBuffers(0, 1, &g_toneMapCB);
+        }
 
         // The viewport IS the scaler — see the HDR path's note.
         const float dx = (float)g_dstX, dy = (float)g_dstY;
@@ -1949,6 +2016,7 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_sdrUVPS)  { g_sdrUVPS->Release();  g_sdrUVPS  = nullptr; }
     if (g_hdrYPS)   { g_hdrYPS->Release();   g_hdrYPS   = nullptr; }
     if (g_hdrUVPS)  { g_hdrUVPS->Release();  g_hdrUVPS  = nullptr; }
+    if (g_toneMapCB)   { g_toneMapCB->Release();   g_toneMapCB   = nullptr; }
     if (g_sdr2hdrYPS)  { g_sdr2hdrYPS->Release();  g_sdr2hdrYPS  = nullptr; }
     if (g_sdr2hdrUVPS) { g_sdr2hdrUVPS->Release(); g_sdr2hdrUVPS = nullptr; }
     if (g_hdr2sdrYPS)  { g_hdr2sdrYPS->Release();  g_hdr2sdrYPS  = nullptr; }
