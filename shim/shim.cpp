@@ -139,28 +139,29 @@ static std::atomic<bool>    g_lastFrameRecovery{false};
 
 // ── Intra refresh ─────────────────────────────────────────────────────────────
 //
-// OFF, matching both reference implementations' behaviour for a client that
-// doesn't ask for it (Sunshine `nvenc_base.cpp:343`, Apollo `:329` — both gate
-// the whole block on `client_config.enableIntraRefresh == 1`, parsed from the
-// RTSP `x-ss-video[0].intraRefresh` argument, and Moonlight leaves it off by
-// default).
+// ON, but at the reference cadence — NOT the old `period = cnt = fps`.
 //
-// Nova previously enabled it unconditionally at `period = cnt = fps`, described
-// as "continuous rolling refresh; no off-gap between cycles". That is a refresh
-// wave sweeping the entire frame once per SECOND, forever, with every frame
-// carrying intra macroblocks — 2.5x the per-frame intra of the reference
-// setting and with no rest period. A rolling intra band is a visible quality
-// discontinuity, and under CBR it also steals bits from the actual content on
-// every single frame. Live symptom (2026-08-11): the picture "still kinda
-// flashy, especially going over things clickable" — i.e. worst on the crisp
-// edges and hover highlights of UI, exactly where an intra band shows up.
+// Nova originally enabled it unconditionally at `period = cnt = fps`: a refresh
+// wave sweeping the entire frame once per SECOND, forever, every frame carrying
+// intra macroblocks. That is 2.5x the per-frame intra of the reference setting
+// with no rest period and no single-slice, and a rolling intra band is a
+// visible quality discontinuity that under CBR also steals bits from the
+// content on every frame. Live symptom (2026-08-11): "still kinda flashy,
+// especially going over things clickable" — worst on crisp UI edges.
 //
-// Recovery does not depend on this: the GOP is infinite with on-demand IDRs
-// (client requests, QoS repair) plus reference-frame invalidation.
+// Sunshine (`nvenc_base.cpp:343`) and Apollo (`:329`) gate the whole block on
+// the client asking (`x-ss-video[0].intraRefresh`) and otherwise leave it off.
+// Turning it off here to match cost us the picture: with an INFINITE GOP there
+// are no periodic keyframes, this HEVC client requested exactly 2 IDRs in a
+// whole session, and RFI is inert for it (0 recoveries) — so nothing repaired
+// transient corruption and wrong/missing regions persisted indefinitely. The
+// references can default it off because they rely on clients that request IDRs
+// on loss; ours does not, so the rolling refresh IS Nova's repair mechanism.
 //
-// If it is ever turned back on, these are the reference values — a slow sweep
-// (299 frames) once every 300, single-sliced.
-static const bool     kEnableIntraRefresh  = false;
+// Keep it, at the references' values: a slow sweep (299 frames) once every 300
+// — ~2.5 s at 120 fps instead of every second — and single-sliced, which Nova
+// never set. Same repair property, a fraction of the visible cost.
+static const bool     kEnableIntraRefresh  = true;
 static const uint32_t kIntraRefreshPeriod  = 300;
 static const uint32_t kIntraRefreshCnt     = 299;
 
