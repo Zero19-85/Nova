@@ -171,9 +171,29 @@ Always hash-verify the copy, and after start confirm `🎬 Master network stack 
 3. **RFI is ON but inert for this client:** advertised (`refPicInvalidation:1`) but the HEVC
    Moonlight client sends 0 invalidation requests (legacy H.264-centric feature). Harmless. The
    real streaming win was FEC 20→5 + AIMD-with-memory, NOT RFI — don't misattribute.
-4. **Pre-existing shim-logging gap:** shim `ShimLog` (🧩/[NVENC]/[Shim] lines) doesn't reach
-   nova.log (file-open/sharing issue). Only matters if you need shim-side visibility. Rust-side
-   logs are the source of truth (e.g. the RFI signal is control.rs's `→ RFI recovery`, not 🧩).
+4. **[FIXED 2026-08-11] Shim logging now works.** `InitShimLog` opened nova.log with
+   `FILE_SHARE_READ` while the Rust logger already held it for write → sharing violation → every
+   `[Shim]`/`[NVENC]`/🔧/🔭 line was silently discarded. Fixed (share read+write, and the CRT now
+   gets a *duplicate* handle — `_open_osfhandle` takes ownership and the old `_close(fd)` would
+   have closed `g_logFile` itself the moment the open succeeded). The 🔭 line
+   (`Capture WxH fmt → encoder WxH fmt: dst rect …`) is the fastest way to confirm the scaling
+   and colour-path routing; format codes: 0x57 BGRA8, 0xA FP16, 0x67 NV12, 0x68 P010.
+5. **Encoder/capture decoupling (`d594d20`) — the current design.** The encoder always runs at the
+   SESSION's negotiated geometry + colour space; the shim scales the capture into it
+   (aspect-preserving, even-aligned black bars) and cross-converts SDR↔HDR
+   (`ps_sdr2hdr_*` / `ps_hdr2sdr_*`, SDR white ↔ 203 nits per BT.2408). So any Worker can serve
+   any session, which is what makes a mid-session Worker handoff invisible to the client's
+   decoder. Two rules fall out of this and must not be re-broken:
+   - the capture's pixel format follows the **display's real Advanced Color state**, never the
+     encoder's HDR flag (see `rebind_capture_and_encoder`'s `capture_hdr`);
+   - VDD/CCD work is gated on the **desktop** (secure vs Default), never on the Worker's identity.
+6. **Standard (non-admin) users — the 2026-08-11 "dead screen".** `mordo` and `zimme` on this box
+   are NOT administrators; only `bobby` is. Signing into a standard account makes the elevated
+   Worker impossible (`ERROR_ELEVATION_REQUIRED` — no linked elevated token, and the exe is
+   `requireAdministrator`), and the old code retried every 45 s, stopping the running host each
+   time → the stream died on a loop (309 cycles). Now detected and suppressed per session, and
+   the SYSTEM Worker is allowed to drive the VDD so those sessions still get a full stream.
+   **If a future test regresses here, grep `↳ interactive spawn failed` first.**
 
 ## Guardrails
 - Streaming pipeline is FROZEN — don't reopen capture/encode/RTP/QoS/RFI/pacing internals without
