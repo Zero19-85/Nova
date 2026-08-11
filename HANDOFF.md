@@ -1,204 +1,135 @@
-# Nova — Handoff to Next Chat (2026-08-10)
+# Nova — Handoff to Next Chat (2026-08-11)
 
 ## TL;DR
-Streaming pipeline is under a **CODE FREEZE** and is in great shape (smooth, resilient,
-120–121 fps rock-solid, QoS + FEC eradicated the MoCA saturation). This session went after the
-**session-transition (sign-in / sign-out survival)** bug — four separate defects found from the
-2026-08-10 logs and all four fixed. **Needs the live boot → connect → sign-in → sign-out test
-pass** (see "How to test the session-transition fix" below).
+The **session-survival work is DONE and live-confirmed**: connect at the logon screen, enter the
+PIN, sign in, sign out, sign back in — the stream survives all of it, full-screen 4K HDR10, no
+kicks, no app-5 restarts. Streaming quality is good (no shimmer, no missing regions).
 
-- Live install is running the fix (exe hash-verified, service healthy, 4K120 HDR session
-  streaming on it right now).
-- Remote: https://github.com/Zero19-85/Nova.git
+**ONE bug remains, and it is narrow:** flickering **on the security (UAC) screen only**, when the
+mouse moves over clickable elements (e.g. the "Yes"/consent link). Everything else is clean.
+
+- Git HEAD `9b8bbb6` on `main`. **11 commits UNPUSHED** — push when convenient.
+- Working tree clean; live install hash-verified against HEAD (exe + dll); service Running.
 
 ## Key locations
 | What | Where |
 |---|---|
 | **Source repo** (build here) | `c:\Users\nova-server` |
 | **LIVE install** (hot-patch target) | `C:\Program Files\Nova Server` |
-| Worker log (capture/encode/VDD/audio) | `C:\Program Files\Nova Server\nova.log` |
-| Master log (networking/pairing/QoS/RFI signals) | `C:\Program Files\Nova Server\nova-service.log` |
-| Input-helper log (secure-desktop injection) | `C:\Program Files\Nova Server\nova-input.log` |
-| Runtime config | `C:\Program Files\Nova Server\nova.toml` (fec_percentage=5) |
-| Sunshine reference source | `C:\Sunshine-2026.516.143833` |
-| Apollo reference source | `C:\Apollo-0.4.6` |
-| VDD driver source/package | `C:\VDD.Control.25.7.23` (and bundled `.\VirtualDisplayDriver\`) |
+| Worker log (capture/encode/VDD/audio **+ shim**) | `C:\Program Files\Nova Server\nova.log` |
+| Master log (networking/pairing/QoS/sessions) | `C:\Program Files\Nova Server\nova-service.log` |
+| Input-helper log | `C:\Program Files\Nova Server\nova-input.log` |
+| Runtime config | `C:\Program Files\Nova Server\nova.toml` |
+| Sunshine reference | `C:\Sunshine-2026.516.143833` (`src/nvenc/nvenc_base.cpp`) |
+| Apollo reference | `C:\Apollo-0.4.6` (`src/nvenc/nvenc_base.cpp`) |
 
-## Build + hot-patch the live install
-The user is FINE with restarting NovaService to hot-patch (they reconnect after).
-```
-# from c:\Users\nova-server
-cargo build --release          # produces target/release/{nova-server.exe, nova_shim.dll}
-cargo test --lib               # expect 27 passed
-# then (PowerShell), stop → copy → start:
+## Build + hot-patch (user is fine with this; **restart the service immediately after copying**)
+```powershell
+cd c:\Users\nova-server
+cargo build --release      # expect 30 tests via: cargo test --lib
 sc.exe stop NovaService; Start-Sleep 8
 Copy-Item target\release\nova-server.exe "C:\Program Files\Nova Server\" -Force
-Copy-Item target\release\nova_shim.dll   "C:\Program Files\Nova Server\" -Force   # only if shim changed
-sc.exe start NovaService; Start-Sleep 10; (Get-Service NovaService).Status
+Copy-Item target\release\nova_shim.dll   "C:\Program Files\Nova Server\" -Force  # if shim changed
+sc.exe start NovaService                 # ALWAYS bring it straight back up
 ```
-Always hash-verify the copy, and after start confirm `🎬 Master network stack ready` +
-`worker control/media pipe connected` in nova-service.log.
+Hash-verify both files, then confirm `🎬 Master network stack ready` + both worker pipes in
+nova-service.log.
 
-## Architecture reminder (three processes — see CLAUDE.md "READ FIRST")
-- **Master** (`--service`, LocalSystem, Session 0): all networking — pairing/rtsp/control/rtp,
-  mDNS, RtpSender, audio TX, Worker supervision. Logs → nova-service.log.
-- **Worker** (`--worker`, elevated user, console session): capture/encoder/VDD/audio/input/tray.
-  Logs → nova.log.
-- **Input helper** (`--system-input-helper`, SYSTEM primary token): secure-desktop KBM injection
-  only, spawned per lock interlude. Logs → nova-input.log.
-- IPC: `\\.\pipe\NovaControl` + `\\.\pipe\NovaMedia` (Master↔Worker), `\\.\pipe\NovaInput`
-  (Master→helper). `service.rs WORKER_SPLIT_ENABLED = true`.
-- **Cross-process gotcha:** anything the Master needs about the encoder/GPU it CANNOT query
-  directly (Master has no encoder). This bit us 3× (input injection, QoS, RFI advertisement).
-  For tray Server Stats: RTP stats are Master-side (`rtp.rs TxEngine` `📊 RTP/s`), encoder/QoS
-  stats are Worker-side (`🎞 Encoder output`, `QosController` in lib.rs) — telemetry to the tray
-  (Worker-side, `src/tray.rs`) will need the Master's RTP numbers pushed over IPC.
+---
 
-## Where recent work lives (for the tray/stats task and context)
-- `src/tray.rs` — the system tray (Worker-side; also spawned in monolithic run()). Start here for UI.
-- `src/rtp.rs` — `TxEngine` holds per-second RTP stats (frames, data/parity pkts, KB/s, buffer drops).
-- `src/lib.rs` — both capture loops; `QosController` (AIMD-with-memory); `qos_tick`; frame pacing
-  (`advance_frame_deadline`); media_supervisor / control_supervisor (Master); run_worker (Worker).
-- `src/encoder.rs` — `RFI_ENABLED = true`, `set/get_stream_bitrate_kbps`, congestion signal.
-- `src/control.rs` — ENet control; `idr_request_is_congestion` (QoS-via-IDR + 8s warmup grace).
-- `src/config.rs` — nova.toml (`fec_percentage` default 5).
-- `src/service.rs` — SCM service, spawn/upgrade reconcile loop; `session_is_unlocked()` (the
-  upgrade gate), `spawn_host_in_session` vs `spawn_host_as_system_fallback`.
-- `src/capture/mod.rs` — `DesktopManager::rebind` / `maybe_swap_backend`: which backend serves
-  which (identity, desktop) combination. WGC is impossible under SYSTEM — see item 2(C).
-- `src/ipc.rs` — `ConfigureStart` wire format (append-only: both sides are one binary, but a
-  field added mid-struct silently shifts every later field, so add at the END and bump both
-  `encode_into` and `decode` together).
+## THE OPEN BUG — UAC/secure-screen flicker on hover
 
-## OPEN ITEMS for next session
-1. **[PARTIAL — superseded by item 2] Lock-screen kick fix (`4b7edf9`).** Arms a 45 s cooldown when
-   an interactive spawn fails despite a user token. User confirmed connect-at-sign-in + PIN entry
-   holds, and that much is real — but the 2026-08-10 logs show the thrash was only *slowed*, not
-   stopped: the cooldown could fail to arm, and on expiry it killed the host again anyway. See
-   item 2(A) for the actual root cause (ARSO locked-session tokens) and the real fix.
-1b. **[FIXED 2026-08-09 `24761dd`, deployed] Green-half / wrong-geometry at connect.** Connecting
-   at the sign-in screen drove VDD activation on the Winlogon desktop where SetDisplayConfig is
-   denied (error 5); the resolution force failed but WGC+encoder came up at 4K anyway = green half.
-   Fix: `apply_configure_start` skips VDD activation while `desktop_is_secure()`; the worker loop
-   re-runs the stored ConfigureStart (launch_app cleared) once the desktop returns to Default. Happy
-   path (logged-in launch) unchanged. Same live-test caveat as 1 — confirm with a real sign-in-screen
-   connect → login (should come up clean with no green half, no app-5 restart).
-2. **Session-transition survival (sign-in / sign-out) — FOUR BUGS FIXED 2026-08-10, NEEDS LIVE
-   TEST.** Symptoms reported: reboot → connect → wrong/garbled screen, physical monitor stays lit,
-   and signing in kicks the client (had to quit app 5 and relaunch). The 2026-08-10 logs
-   (nova-service.log ~line 66180+ and 70502+, nova.log ~305046+) showed four independent defects,
-   each of which alone breaks the transition:
-   - **(A) Upgrade thrash — the host was being killed in a loop.** `🔑 User token now available
-     → upgrading` fired over and over (hundreds of times across the morning), each one a
-     `stop_host` that kills the Worker and drops the client. Two causes, both fixed in
-     `service.rs`: (i) **a user token exists at a LOCKED session** — Windows 11 ARSO (automatic
-     restart sign-on after an update reboot) signs the user in and re-locks, so the token-only
-     gate read "signed in!" at what is visually a lock screen; the gate now also requires
-     `session_is_unlocked()` (`WTSQuerySessionInformationW(WTSSessionInfoEx)`, LOCK=0/UNLOCK=1);
-     (ii) the 45 s anti-thrash cooldown **re-probed the token at spawn-result time** and could
-     skip arming when that probe raced the login state — now armed unconditionally whenever an
-     upgrade attempt lands back on a fallback (`upgrade_attempted`), and also on a failed spawn.
-   - **(B) The interactive-spawn failure reason was never logged.** `spawn_host_in_session`'s
-     error was swallowed unless the SYSTEM fallback ALSO failed, so "why did it fall back?" was
-     undiagnosable. Now printed (`↳ interactive spawn failed (…) — trying SYSTEM fallback`).
-     **Read this line first next time** — it names the real privilege/session problem.
-   - **(C) A SYSTEM-fallback Worker tried to use WGC and died on every ConfigureStart.** WGC is
-     impossible under SYSTEM (`0x80070424`, the long-known Phase 15.2c finding), but
-     `DesktopManager::rebind` and `maybe_swap_backend` both force-route DDA→WGC whenever the
-     input desktop is Default — which is exactly the state after someone signs in. Result:
-     `❌ apply_configure_start failed: Capture rebind failed … 0x80070424` on repeat, the Worker
-     never streamed, the VDD never activated (hence the physical monitor staying lit). Both paths
-     are now gated on `!service::is_system_fallback()`; under SYSTEM, DDA stays the steady state
-     on the interactive desktop too (Sunshine's model).
-   - **(D) A replacement Worker restarted the wire frame index at 1 → permanent black.**
-     moonlight-common-c discards any frame whose index is before the next one it expects
-     (`isBefore32`), so a Worker adopted mid-session (sign-in upgrade, sign-out fallback, crash
-     respawn) fed the client frames it threw away forever — the client stays connected and black
-     until the app is quit and relaunched, which is exactly the reported symptom. Fixed with a
-     new `ipc::ConfigureStart::start_frame_index`: `RtpSender` tracks `last_sent_index()` (session
-     high-water mark, immune to keepalive retransmits, cleared by `reset()`), and Master's
-     `control_supervisor` stamps `last + 1` on every outbound ConfigureStart — including the
-     replay to a newly-connected Worker, which also now forces `launch_app = false` so an adoption
-     can't start a second copy of the app. Regression test:
-     `rtp::tests::last_sent_index_tracks_high_water_mark_and_resets`.
-   - Also **removed the `host_has_connected_client()` gate** on the upgrade. It was dead in the
-     split deployment (only the monolithic path ever set the event) AND backwards: the handoff to
-     an interactive host is precisely how a just-signed-in client gets WGC/HDR/VDD back. With (D)
-     fixed, the client survives the swap as a ~2–5 s freeze instead of a disconnect.
+**Symptom:** while a UAC prompt is up, moving the mouse over clickable elements makes the picture
+flicker. Not reproducible on the normal desktop any more (that was intra refresh, fixed in
+`9b8bbb6`), and not the SDR white level (fixed in `0f5748a`).
 
-   - **(E) THE ONE UNDERNEATH — geometry pinning (`b3bcc1b`).** With A–D fixed, the 2026-08-10
-     21:25 test showed the transition machinery working perfectly (one clean upgrade, replay at
-     wire frame 4773, new Worker at 3840x2160 HDR10, zero rebind failures) — and the client STILL
-     broke. Cause: **a Moonlight client fixes its decoder's resolution and HDR profile at session
-     start; changing either mid-session corrupts it permanently** (black + green region, needs an
-     app relaunch; the green is the shim's `CopyResource` no-op'ing on a size mismatch — the same
-     mechanism as the old green-half bugs). And the change is unavoidable, because a
-     SYSTEM-fallback Worker **cannot drive the VDD at all** — `SetDisplayConfig` is denied on the
-     Winlogon desktop (error 5) regardless of token — so it serves the physical monitor's native
-     size in SDR while the client negotiated 4K HDR10. Fix: geometry is now a property of the
-     SESSION, not of whichever Worker serves it. New `ControlMsg::WorkerCapabilities`
-     (`vdd_capable` + native size) → `session_negotiate::negotiate` pins a session started at the
-     logon screen to the monitor's native size + SDR for its whole life (the full Worker just
-     drives the VDD at that pinned size after sign-in), and a Worker that can't match a live
-     session's geometry now REFUSES the ConfigureStart so the client freezes on its last good IDR
-     (via the existing keepalive) instead of being handed a different stream.
-     **Deliberate cost:** a session started at the logon screen stays at the monitor's native
-     res/SDR until you reconnect, and Moonlight renders it inside the larger surface it allocated
-     (image doesn't fill the frame). Making it fill needs encoder-size/capture-size decoupling —
-     scaling + an SDR-into-HDR-session shader path — in the shim. That's the open follow-up if the
-     framing matters; it would also permanently kill the "green" bug class.
+**Why the secure desktop is special:** it is the only path where capture is **DDA**, and DDA is
+also the only path where **Nova blends the cursor itself** (`dda.rs` `blend_cursor` /
+`blend_cursor_fp16` — DDA delivers the pointer as separate metadata, not composited).
 
-   **How to test the session-transition fix** (the whole point — do this end to end):
-   1. Reboot, do NOT sign in. Connect from Moonlight at the sign-in screen. Expect the login UI at
-      the MONITOR's native size (2560x1440 here), SDR, not filling the client's frame — that is now
-      correct-by-design, not a bug. nova-service.log should show `🧩 Master: worker capabilities —
-      vdd=false native=2560x1440` and `📐 Master: session pinned to 2560x1440 SDR`.
-   2. Type the PIN over Moonlight and sign in. Expect a brief freeze, then the SAME 1440p SDR
-      stream continuing — **no kick, no green, no app-5 restart**, and the physical monitor should
-      go dark (the full Worker drives the VDD at the pinned 1440p). Expect exactly ONE `🔑 Session
-      N is signed in + unlocked — upgrading…` and `🔁 … (resuming at wire frame N)` with N ≫ 1.
-   3. Sign out mid-stream. Expect the client to keep the connection and land back on the logon
-      screen at the same geometry (the fallback Worker can serve 1440p SDR), still usable for a
-      remote PIN.
-   4. Sign in again — same profile and a DIFFERENT profile (the second one also exercises the
-      `🔄 Console session X → Y` respawn path).
-   5. Disconnect and reconnect while signed in → this session negotiates unconstrained, so expect
-      full 3840x2160 HDR10. Then sign out DURING it: the client should FREEZE on its last frame
-      (still connected, `⏸️ Worker: cannot serve this session`) and resume 4K when you sign back
-      in — it will not show the logon screen in this state, by design.
-   If it kicks again, the first thing to grep is `↳ interactive spawn failed` (B) — that now names
-   the cause directly.
-3. **RFI is ON but inert for this client:** advertised (`refPicInvalidation:1`) but the HEVC
-   Moonlight client sends 0 invalidation requests (legacy H.264-centric feature). Harmless. The
-   real streaming win was FEC 20→5 + AIMD-with-memory, NOT RFI — don't misattribute.
-4. **[FIXED 2026-08-11] Shim logging now works.** `InitShimLog` opened nova.log with
-   `FILE_SHARE_READ` while the Rust logger already held it for write → sharing violation → every
-   `[Shim]`/`[NVENC]`/🔧/🔭 line was silently discarded. Fixed (share read+write, and the CRT now
-   gets a *duplicate* handle — `_open_osfhandle` takes ownership and the old `_close(fd)` would
-   have closed `g_logFile` itself the moment the open succeeded). The 🔭 line
-   (`Capture WxH fmt → encoder WxH fmt: dst rect …`) is the fastest way to confirm the scaling
-   and colour-path routing; format codes: 0x57 BGRA8, 0xA FP16, 0x67 NV12, 0x68 P010.
-5. **Encoder/capture decoupling (`d594d20`) — the current design.** The encoder always runs at the
-   SESSION's negotiated geometry + colour space; the shim scales the capture into it
-   (aspect-preserving, even-aligned black bars) and cross-converts SDR↔HDR
-   (`ps_sdr2hdr_*` / `ps_hdr2sdr_*`, SDR white ↔ 203 nits per BT.2408). So any Worker can serve
-   any session, which is what makes a mid-session Worker handoff invisible to the client's
-   decoder. Two rules fall out of this and must not be re-broken:
-   - the capture's pixel format follows the **display's real Advanced Color state**, never the
-     encoder's HDR flag (see `rebind_capture_and_encoder`'s `capture_hdr`);
-   - VDD/CCD work is gated on the **desktop** (secure vs Default), never on the Worker's identity.
-6. **Standard (non-admin) users — the 2026-08-11 "dead screen".** `mordo` and `zimme` on this box
-   are NOT administrators; only `bobby` is. Signing into a standard account makes the elevated
-   Worker impossible (`ERROR_ELEVATION_REQUIRED` — no linked elevated token, and the exe is
-   `requireAdministrator`), and the old code retried every 45 s, stopping the running host each
-   time → the stream died on a loop (309 cycles). Now detected and suppressed per session, and
-   the SYSTEM Worker is allowed to drive the VDD so those sessions still get a full stream.
-   **If a future test regresses here, grep `↳ interactive spawn failed` first.**
+**Leads, roughly in order:**
+1. **Cursor blend.** Hovering a clickable changes the cursor SHAPE (arrow → hand), and on this path
+   every shape change re-runs the blend. `blend_cursor` dispatches on `frame.format`; check the
+   FP16 variant's brightness math against the rest of the frame — its doc says it maps sRGB 255 →
+   scRGB 1.0 (80 nits), which no longer matches the 160-nit SDR white level the shim now uses.
+   **This mismatch is real and is my prime suspect.**
+2. **Motion alternates fresh vs cached frames.** A static screen re-submits
+   `capturer.cached_texture()`; motion delivers fresh ones. Any per-path difference shows up as
+   flicker exactly when the mouse moves. Whatever differs must differ between those two.
+3. **Secure-desktop SDR white level.** `refresh_sdr_white_level` reads the level for the VDD. The
+   Winlogon desktop may be composited at a different level, so FP16 frames captured during the
+   interlude could carry a different SDR white than the shim assumes.
+4. **DDA restore churn.** The logs show frequent `AcquireNextFrame … access lost` → restore during
+   interludes. `duplicate_output` silently falls back BGRA8 when the FP16 request fails, so the
+   actual capture format can change across restores (the shim follows it correctly per-frame now,
+   but the two paths must land at identical brightness for that to be invisible).
+
+**Diagnosis tooling is good now** — see "shim logging" below. The `🔭` line reports capture
+size/format → encoder size/format and the destination rect, per change.
+
+---
+
+## What was fixed this session (chain of root causes, newest first)
+1. **`9b8bbb6` intra refresh at the reference cadence.** `b3672d8` had turned it OFF to match
+   Sunshine/Apollo and that regressed instantly into wrong/missing regions that never healed:
+   infinite GOP ⇒ no periodic keyframes, this HEVC client requests ~2 IDRs per session, RFI inert
+   (0 recoveries) ⇒ **rolling intra refresh IS Nova's only repair mechanism**. Back on at the
+   references' values (`period=300, cnt=299`, `singleSliceIntraRefresh`) instead of Nova's original
+   `period=cnt=fps` (a gapless wave sweeping the frame every second — the desktop shimmer).
+   **Do not turn it off again** unless you first give the client a different repair path.
+2. **`0f5748a` SDR white level is not a constant.** Windows composites SDR into an Advanced Color
+   surface at the display's own "SDR content brightness" — **160 nits on this box**, not BT.2408's
+   203. Queried via `DISPLAYCONFIG_SDR_WHITE_LEVEL` for the display being ENCODED FOR (the VDD), fed
+   to the shim's `SetSdrWhiteLevel` → `ToneMapParams` cbuffer at b0 → `gSdrWhiteScRGB`. Also closed
+   an **ABA hazard**: the shim had cached capture size/format keyed on the texture POINTER, and a
+   backend swap can reallocate at the same address. It reads the descriptor every frame now.
+3. **`a63b277` sign-out no longer blocks on impossible work.** Windows blocks on `WM_ENDSESSION`;
+   Nova ran a full display restore there regardless of cause, including a CCD restore that fails
+   with error 5 because the secure desktop already owns the input. Now split on
+   `ENDSESSION_LOGOFF`: sign-out restores audio only and returns (the successor Worker heals
+   topology from the Default desktop); real shutdown keeps the full restore. Logs
+   `⏱️ WM_ENDSESSION handled in N ms`. **Not yet measured live — check this on the next sign-out.**
+4. **`2c58ea8` the freeze: Master was dropping every frame.** `media_supervisor` gated forwarding on
+   `video_learned`, cleared it on each new media pipe, and re-armed from `try_learn_target()` — an
+   EDGE detector. A Worker respawn re-adopts a client that never went away, so the edge never fires
+   and the gate stays shut forever. New `RtpSender::has_target()` ("is a target KNOWN"). Plus a
+   thaw IDR on every ConfigureStart, and an orphaned-VDD heal on Worker startup (a Worker killed by
+   sign-out leaves the VDD enabled+primary; the replacement then captured a dead virtual display =
+   black screen with cursor).
+5. **`d594d20` encoder/capture decoupling + shim logging + standard users.** See below.
+
+## Architecture facts that must not be re-broken
+- **Encoder geometry/colour space belongs to the SESSION, not the capture.** A Moonlight client
+  fixes its decoder at session start; changing resolution or HDR profile mid-session corrupts it
+  permanently (black + green region, needs an app relaunch on the client). The shim scales
+  (aspect-preserving, even-aligned bars) and cross-converts SDR↔HDR, so any Worker can serve any
+  session — that is what makes a mid-session handoff invisible.
+- **Capture pixel format follows the DISPLAY's real Advanced Color state**, never the encoder's HDR
+  flag (`rebind_capture_and_encoder`'s `capture_hdr`). Asking DXGI for FP16 from an SDR display
+  gives scRGB with SDR white at 80 nits, and a failed FP16 request silently falls back to BGRA8.
+- **VDD/CCD work is gated on the DESKTOP (secure vs Default), never the Worker's identity.** The old
+  "no VDD under SYSTEM" rule came from a pre-login (i.e. secure-desktop) observation.
+- **Standard (non-admin) users:** only `bobby` is an administrator; `mordo` and `zimme` are not.
+  Signing into a standard account makes the elevated Worker impossible
+  (`ERROR_ELEVATION_REQUIRED` — no linked token, exe is `requireAdministrator`). Detected and
+  suppressed per-session now; the SYSTEM Worker drives the VDD so those sessions still stream.
+  **Grep `↳ interactive spawn failed` first if a host comes up as a fallback unexpectedly.**
+- **Already correct — do NOT "fix" again:** Master holds every socket (RTSP/control/RTP/audio) for
+  the service's lifetime and never drops them across a Worker swap;
+  `SERVICE_ACCEPT_SESSIONCHANGE`/`SERVICE_CONTROL_SESSIONCHANGE` are registered and wake the
+  reconcile loop; desktop retargeting (`OpenInputDesktop`/`SetThreadDesktop`) lives in `dda.rs`,
+  `input.rs`, `capture/desktop_switch.rs`.
+
+## Shim logging WORKS now (fixed 2026-08-11)
+`InitShimLog` opened nova.log with `FILE_SHARE_READ` while Rust held it for write ⇒ sharing
+violation ⇒ **every `[Shim]`/`[NVENC]`/🔧/🔭 line was silently discarded for the whole Master/Worker
+era**. Any older note saying "shim logs don't reach nova.log" is stale. Format codes in `🔭`:
+`0x57` BGRA8, `0xA` FP16, `0x67` NV12, `0x68` P010.
 
 ## Guardrails
-- Streaming pipeline is FROZEN — don't reopen capture/encode/RTP/QoS/RFI/pacing internals without
-  a real regression + confirming intent first.
-- Commit style: end messages with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; only
-  push when asked. User commits/pushes directly to `main` (solo repo, no PRs).
-- Check the Windows event log FIRST before assuming a "crash" (a suspected Master crash was once
-  just a user reboot): `Get-WinEvent -FilterHashtable @{LogName='System'; Id=@(41,1074,6005,6006,109)}`.
+- Commit style: end messages with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; user
+  commits/pushes to `main` directly (solo repo). Only push when asked.
+- Check the Windows event log before assuming a crash:
+  `Get-WinEvent -FilterHashtable @{LogName='System'; Id=@(41,1074,6005,6006,109)}`.
+- **Read the logs before theorising.** Every root cause this session came from a log line, and every
+  guess made without one was wrong.
