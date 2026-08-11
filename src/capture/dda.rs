@@ -498,6 +498,10 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
     let mut last_fmt: Option<DXGI_FORMAT> = None;
     let mut fmt_flips: u32 = 0;
 
+    // The most recent REAL desktop image, kept cursor-free so the cursor can be
+    // re-blended at a new position without the previous one smearing.
+    let mut pristine: Option<CpuFrame> = None;
+
     while !shared.stop.load(Ordering::Acquire) {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
@@ -553,35 +557,69 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
             }
         }
 
-        if let Some(res) = resource.as_ref() {
-            if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
-                if let Some(mut frame) =
-                    copy_frame_to_cpu(&session.device, &tex, &mut staging, &mut staging_dims)
-                {
-                    if last_fmt != Some(frame.format) {
-                        if let Some(prev) = last_fmt {
-                            fmt_flips += 1;
-                            println!(
-                                "🎨 DDA capture format changed 0x{:X} → 0x{:X} (flip #{fmt_flips} \
-                                 this session) — the shim must re-convert; investigate if this \
-                                 repeats",
-                                prev.0, frame.format.0
-                            );
+        // Only refresh the desktop image when DXGI actually delivered one.
+        //
+        // `LastPresentTime == 0` means this wake-up carried NO new desktop
+        // content — it is a pointer-only update (the cursor moved, or changed
+        // shape). The resource handed back for those is not a fresh desktop
+        // frame, and live logs (2026-08-11) show DXGI returning it in a
+        // DIFFERENT format from the duplication's own: 206 BGRA8↔FP16 changes
+        // in a single UAC interlude, every one of them while the mouse was
+        // moving. Copying it unconditionally meant the encoder alternated
+        // between the real desktop and whatever that surface held — the
+        // hover-flicker on the security screen. Sunshine gates on the same
+        // field (`display_ddup.cpp`).
+        let desktop_updated = info.LastPresentTime != 0;
+        if desktop_updated {
+            if let Some(res) = resource.as_ref() {
+                if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
+                    if let Some(frame) =
+                        copy_frame_to_cpu(&session.device, &tex, &mut staging, &mut staging_dims)
+                    {
+                        if last_fmt != Some(frame.format) {
+                            if let Some(prev) = last_fmt {
+                                fmt_flips += 1;
+                                println!(
+                                    "🎨 DDA capture format changed 0x{:X} → 0x{:X} (flip \
+                                     #{fmt_flips} this session) — a real desktop frame changed \
+                                     format mid-duplication; the shim must re-convert",
+                                    prev.0, frame.format.0
+                                );
+                            }
+                            last_fmt = Some(frame.format);
                         }
-                        last_fmt = Some(frame.format);
-                    }
-                    if cursor_visible {
-                        if let Some(c) = &cursor {
-                            blend_cursor(&mut frame, c, cursor_x, cursor_y);
-                        }
-                    }
-                    if let Ok(mut slot) = shared.frame.lock() {
-                        *slot = Some(frame);
+                        pristine = Some(frame);
                     }
                 }
             }
         }
         let _ = session.dup.ReleaseFrame();
+
+        // Publish when the desktop changed OR the pointer did — a pointer-only
+        // update still has to reach the client, or the cursor would freeze
+        // until the screen behind it happened to repaint. The cursor is blended
+        // onto a COPY, so `pristine` stays cursor-free and successive positions
+        // never leave a trail.
+        let pointer_updated = info.LastMouseUpdateTime != 0 || info.PointerShapeBufferSize > 0;
+        if desktop_updated || pointer_updated {
+            if let Some(base) = pristine.as_ref() {
+                let mut frame = CpuFrame {
+                    bytes: base.bytes.clone(),
+                    width: base.width,
+                    height: base.height,
+                    row_pitch: base.row_pitch,
+                    format: base.format,
+                };
+                if cursor_visible {
+                    if let Some(c) = &cursor {
+                        blend_cursor(&mut frame, c, cursor_x, cursor_y);
+                    }
+                }
+                if let Ok(mut slot) = shared.frame.lock() {
+                    *slot = Some(frame);
+                }
+            }
+        }
     }
 }
 
