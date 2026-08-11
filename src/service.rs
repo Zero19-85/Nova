@@ -58,7 +58,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    ERROR_ELEVATION_REQUIRED, HANDLE,
 };
 use windows::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SecurityIdentification, SecurityImpersonation,
@@ -546,6 +547,15 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
     // transitions and could skip arming, letting the upgrade thrash every
     // MIN_FALLBACK_UPTIME seconds (confirmed live 2026-08-10).
     let mut upgrade_attempted = false;
+    // Set when the interactive spawn failed with ERROR_ELEVATION_REQUIRED: the
+    // signed-in user is a STANDARD (non-admin) account, so there is no linked
+    // elevated token and `nova-server.exe` (requireAdministrator) can never be
+    // launched as them. Retrying is futile AND destructive — every attempt
+    // stops the running fallback host first, killing the client's stream
+    // (confirmed live 2026-08-11: 309 such cycles on a standard-user sign-in,
+    // reported as "signing in loads a dead screen"). Suppressed until the
+    // console session changes, i.e. until somebody else signs in.
+    let mut interactive_impossible_for_session: Option<u32> = None;
 
     loop {
         // Reconcile: ensure a host is running in the CURRENT console session.
@@ -584,7 +594,9 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                     println!("🔄 Console session {} → {} — respawning host", h.session_id, session);
                     stop_host(h);
                     // A session change is a fresh environment — don't carry a
-                    // crash-loop backoff or upgrade-suppression into it.
+                    // crash-loop backoff or upgrade-suppression into it. The
+                    // non-admin verdict is per-session and keyed by id, so it
+                    // needs no explicit reset here.
                     fast_exits = 0;
                     respawn_not_before = None;
                     interactive_retry_not_before = None;
@@ -600,6 +612,9 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                     // old token-only gate killed a healthy lock-screen host on
                     // every cooldown expiry (confirmed live 2026-08-10).
                     && session_is_unlocked(session)
+                    // A standard (non-admin) user can never host the elevated
+                    // Worker — see interactive_impossible_for_session.
+                    && interactive_impossible_for_session != Some(session)
                     // Don't re-attempt the upgrade while the interactive spawn
                     // is known to be failing — see the cooldown declaration.
                     && interactive_retry_not_before.is_none_or(|t| std::time::Instant::now() >= t) =>
@@ -682,10 +697,24 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                         interactive_retry_not_before = if h.is_system_fallback
                             && (upgrade_attempted || session_has_user_token(session))
                         {
-                            println!("   ↳ interactive spawn unavailable (session locked?) — \
-                                holding this lock-screen host stable for {}s before re-testing",
-                                INTERACTIVE_RETRY_COOLDOWN.as_secs());
-                            Some(std::time::Instant::now() + INTERACTIVE_RETRY_COOLDOWN)
+                            if INTERACTIVE_NEEDS_ELEVATION.load(Ordering::Acquire) {
+                                // Permanent for this session — retrying would
+                                // just kill this host again every cooldown.
+                                if interactive_impossible_for_session != Some(session) {
+                                    interactive_impossible_for_session = Some(session);
+                                    println!("   ↳ the user signed into session {session} is NOT an \
+                                        administrator, so the elevated Worker cannot be started as \
+                                        them. Staying on the SYSTEM host (it can still capture and \
+                                        drive the virtual display); no further upgrade attempts for \
+                                        this session.");
+                                }
+                                None
+                            } else {
+                                println!("   ↳ interactive spawn unavailable (session locked?) — \
+                                    holding this lock-screen host stable for {}s before re-testing",
+                                    INTERACTIVE_RETRY_COOLDOWN.as_secs());
+                                Some(std::time::Instant::now() + INTERACTIVE_RETRY_COOLDOWN)
+                            }
                         } else {
                             None
                         };
@@ -914,7 +943,15 @@ pub fn acquire_host_singleton() -> Result<HostSingleton, String> {
 /// **impersonation token** that the host assumes only on its DDA capture thread
 /// (`dda::begin_system_impersonation`). Sunshine can run wholesale as SYSTEM
 /// because its primary backend is DDA, not WGC.
+/// Set by [`spawn_host_in_session`] when `CreateProcessAsUserW` reports
+/// ERROR_ELEVATION_REQUIRED — i.e. the console user is a standard account with
+/// no admin rights to derive an elevated token from. Read (and cleared) by the
+/// reconcile loop, which then stops attempting the upgrade for that session.
+static INTERACTIVE_NEEDS_ELEVATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_host_in_session(exe: &str, session_id: u32, worker_mode: bool) -> Result<HostProcess, String> {
+    INTERACTIVE_NEEDS_ELEVATION.store(false, Ordering::Release);
     unsafe {
         // 1. The console user's token (filtered/limited under UAC).
         let mut user_token = HANDLE::default();
@@ -1007,6 +1044,13 @@ fn spawn_host_in_session(exe: &str, session_id: u32, worker_mode: bool) -> Resul
         result.map_err(|e| {
             if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
                 format!("CreateProcessAsUserW denied ({e:?}) — the service must run as LocalSystem")
+            } else if e.code() == windows::core::HRESULT::from_win32(ERROR_ELEVATION_REQUIRED.0) {
+                // The signed-in user is a STANDARD account: no linked elevated
+                // token exists, so a requireAdministrator binary cannot be
+                // launched as them at all. Flagged so the reconcile loop stops
+                // retrying — see interactive_impossible_for_session.
+                INTERACTIVE_NEEDS_ELEVATION.store(true, Ordering::Release);
+                format!("CreateProcessAsUserW: {e:?} — the signed-in user is not an administrator")
             } else {
                 format!("CreateProcessAsUserW: {e:?}")
             }

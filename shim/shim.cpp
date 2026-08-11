@@ -48,10 +48,17 @@ static void ShimLog(const char* fmt, ...) {
 extern "C" __declspec(dllexport) void InitShimLog(const wchar_t* log_path) {
     if (!log_path) return;
 
+    // FILE_SHARE_READ | FILE_SHARE_WRITE is load-bearing: the Rust side already
+    // holds this file open for WRITE (logger init runs first, and since Phase
+    // 15.2c it shares read+write). Opening with FILE_SHARE_READ alone declares
+    // "nobody else may write", which conflicts with that existing handle — the
+    // open failed with a sharing violation on EVERY start, silently discarding
+    // every shim log line for the whole Master/Worker era. That gap is why the
+    // 2026-08-11 colour/scaling regression had to be diagnosed blind.
     g_logFile = CreateFileW(
         log_path,
         FILE_APPEND_DATA,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
@@ -68,15 +75,28 @@ extern "C" __declspec(dllexport) void InitShimLog(const wchar_t* log_path) {
     SetStdHandle(STD_OUTPUT_HANDLE, g_logFile);
     SetStdHandle(STD_ERROR_HANDLE,  g_logFile);
 
-    // Also redirect CRT file descriptors 1 (stdout) and 2 (stderr) so any
-    // remaining ShimLog() calls in this DLL land in the log file too.
-    int fd = _open_osfhandle((intptr_t)g_logFile, _O_APPEND | _O_TEXT);
-    if (fd >= 0) {
-        _dup2(fd, 1);
-        _dup2(fd, 2);
-        _close(fd);
-        setvbuf(stdout, nullptr, _IONBF, 0);
-        setvbuf(stderr, nullptr, _IONBF, 0);
+    // Also redirect CRT file descriptors 1 (stdout) and 2 (stderr) so plain
+    // printf/std::cout output (e.g. from the NVENC SDK wrapper) lands in the
+    // log too.
+    //
+    // Must hand _open_osfhandle a DUPLICATE, never g_logFile itself: the CRT
+    // takes ownership of whatever handle it is given, and the _close(fd) below
+    // would then close the very handle ShimLog's WriteFile depends on, leaving
+    // every subsequent shim log line writing to a dead handle.
+    HANDLE crtHandle = INVALID_HANDLE_VALUE;
+    if (DuplicateHandle(GetCurrentProcess(), g_logFile,
+                        GetCurrentProcess(), &crtHandle,
+                        0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        int fd = _open_osfhandle((intptr_t)crtHandle, _O_APPEND | _O_TEXT);
+        if (fd >= 0) {
+            _dup2(fd, 1);
+            _dup2(fd, 2);
+            _close(fd);          // closes crtHandle (the CRT's copy), not g_logFile
+            setvbuf(stdout, nullptr, _IONBF, 0);
+            setvbuf(stderr, nullptr, _IONBF, 0);
+        } else {
+            CloseHandle(crtHandle);
+        }
     }
 
     ShimLog("[Shim] InitShimLog: logging active → %S", log_path);
@@ -123,11 +143,80 @@ static std::atomic<bool>    g_lastFrameRecovery{false};
 static NV_ENC_INITIALIZE_PARAMS g_initParams = {};
 static NV_ENC_CONFIG            g_encConfig  = {};
 static int                      g_encoderFps = 60;
-// Cached per-session frame dimensions set once in InitColorConversion.
-// Eliminates the per-frame COM GetDesc() round-trip in the EncodeFrame hot path.
+// Cached per-session ENCODER (output) dimensions, set once in
+// InitColorConversion. Eliminates the per-frame COM GetDesc() round-trip in the
+// EncodeFrame hot path.
 static UINT        g_encWidth   = 0;
 static UINT        g_encHeight  = 0;
-static DXGI_FORMAT g_captureFmt = DXGI_FORMAT_UNKNOWN;
+static DXGI_FORMAT g_captureFmt = DXGI_FORMAT_UNKNOWN; // initial guess; the real
+                                                       // one comes from the source
+                                                       // texture (see g_capFmt)
+
+// ── Capture geometry, decoupled from the encoder's ────────────────────────────
+//
+// The encoder ALWAYS runs at the session's negotiated size, because a Moonlight
+// client fixes its decoder's resolution and HDR profile when the session starts
+// — changing either mid-session corrupts it permanently (live 2026-08-10: black
+// frame with a green region, requiring an app relaunch on the client). What we
+// can capture, meanwhile, changes underneath a live session: the logon screen is
+// the physical monitor at its own resolution in SDR (a SYSTEM-fallback Worker
+// cannot drive the VDD at all — SetDisplayConfig is denied on the Winlogon
+// desktop), and the signed-in desktop is the VDD at the negotiated size.
+//
+// So the shim scales: the composite texture matches the SOURCE, and the YUV
+// conversion draw stretches it into the encoder-sized surface with an
+// aspect-preserving fit. This is also what permanently kills the "green frame"
+// bug class — the old code sized the composite to the ENCODER and relied on
+// CopyResource, which silently no-ops on a size/format mismatch and left the
+// texture uninitialised (that garbage is the green).
+//
+// Re-read from the source texture only when its identity changes (a capture
+// rebind allocates a new texture), keeping the hot path free of GetDesc.
+static ID3D11Texture2D* g_lastSrcTex = nullptr;
+static UINT             g_capWidth   = 0;
+static UINT             g_capHeight  = 0;
+static DXGI_FORMAT      g_capFmt     = DXGI_FORMAT_UNKNOWN;
+
+// Destination rect for the scaled image inside the encoder surface. Even-aligned
+// so the half-resolution UV pass lands on exact chroma sample boundaries.
+static UINT g_dstX = 0, g_dstY = 0, g_dstW = 0, g_dstH = 0;
+// True when the fit leaves bars (source and session aspect ratios differ), i.e.
+// the planes must be cleared to black before the draw.
+static bool g_letterboxed = false;
+
+// Recompute the aspect-preserving fit of g_capWidth x g_capHeight into
+// g_encWidth x g_encHeight. Equal aspect ratios (the common 16:9 → 16:9 case)
+// produce a full-surface rect and no clears.
+static void UpdateScaleRect() {
+    if (!g_capWidth || !g_capHeight || !g_encWidth || !g_encHeight) {
+        g_dstX = g_dstY = 0;
+        g_dstW = g_encWidth;
+        g_dstH = g_encHeight;
+        g_letterboxed = false;
+        return;
+    }
+    // Scale by the tighter of the two axes, in integer math to avoid a
+    // rounding disagreement between width and height.
+    const uint64_t byW = (uint64_t)g_encWidth  * g_capHeight;
+    const uint64_t byH = (uint64_t)g_encHeight * g_capWidth;
+    UINT w, h;
+    if (byW <= byH) {           // width-limited → pillarbox-free, bars top/bottom
+        w = g_encWidth;
+        h = (UINT)(byW / g_capWidth);
+    } else {                    // height-limited → bars left/right
+        h = g_encHeight;
+        w = (UINT)(byH / g_capHeight);
+    }
+    // Even-align size and offset: the UV pass runs at exactly half these values.
+    w &= ~1u; h &= ~1u;
+    if (w == 0) w = 2;
+    if (h == 0) h = 2;
+    g_dstW = w;
+    g_dstH = h;
+    g_dstX = ((g_encWidth  - w) / 2) & ~1u;
+    g_dstY = ((g_encHeight - h) / 2) & ~1u;
+    g_letterboxed = (w != g_encWidth) || (h != g_encHeight);
+}
 
 // ==================== HDR GLOBALS ====================
 static int                    g_encoderCodec     = 0;    // 0=H264, 1=HEVC, 2=AV1
@@ -279,14 +368,75 @@ float2 ps_hdr_uv(VS_OUT i) : SV_TARGET {
     float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, src.SampleLevel(smp,i.uv,0).rgb)));
     return float2(yuv.y + 0.5f, yuv.z + 0.5f);
 }
+
+// ── Cross-conversions: capture colour space != session colour space ──────
+// These exist because the capture backend and the SESSION are independent:
+// a client can negotiate HDR10 while the only thing capturable is an SDR
+// BGRA8 surface (the logon screen on a SYSTEM-fallback Worker, which cannot
+// drive the VDD into FP16 — SetDisplayConfig is denied on the Winlogon
+// desktop). The session's format is fixed when the client builds its decoder,
+// so the SHIM adapts, never the stream.
+
+// sRGB EOTF. Written with step()/lerp() rather than a vector ?: so it
+// compiles identically on every fxc version.
+float3 srgb_to_linear(float3 c) {
+    float3 lo = c / 12.92f;
+    float3 hi = pow(max(c + 0.055f, 0.0f) / 1.055f, 2.4f);
+    return lerp(lo, hi, step(0.04045f, c));
+}
+float3 linear_to_srgb(float3 c) {
+    float3 lo = c * 12.92f;
+    float3 hi = 1.055f * pow(max(c, 0.0f), 1.0f/2.4f) - 0.055f;
+    return lerp(lo, hi, step(0.0031308f, c));
+}
+
+// scRGB units: 1.0 == 80 nits. BT.2408 puts HDR reference white (i.e. what
+// SDR paper-white should map to inside an HDR container) at 203 nits, which
+// is also roughly where Windows composites SDR content under Advanced Color.
+static const float kSdrWhiteScRGB = 203.0f / 80.0f;
+
+// ── SDR BGRA8 capture → HDR10 P010 (BT.2020 NCL PQ, full range) ──────────
+float3 sdr_src_to_scrgb(float2 uv) {
+    return srgb_to_linear(src.SampleLevel(smp, uv, 0).rgb) * kSdrWhiteScRGB;
+}
+float  ps_sdr2hdr_y (VS_OUT i) : SV_TARGET {
+    float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, sdr_src_to_scrgb(i.uv))));
+    return yuv.x;
+}
+float2 ps_sdr2hdr_uv(VS_OUT i) : SV_TARGET {
+    float3 yuv = mul(BT2020_to_YUV, PQ(mul(scRGB_to_BT2020, sdr_src_to_scrgb(i.uv))));
+    return float2(yuv.y + 0.5f, yuv.z + 0.5f);
+}
+
+// ── HDR FP16 capture → SDR NV12 (BT.709 limited range) ───────────────────
+// scRGB shares BT.709 primaries, so this is just a white-level rescale, a
+// clamp, and the sRGB OETF — no gamut matrix needed.
+float3 hdr_src_to_srgb(float2 uv) {
+    float3 lin = src.SampleLevel(smp, uv, 0).rgb / kSdrWhiteScRGB;
+    return linear_to_srgb(saturate(lin));
+}
+float  ps_hdr2sdr_y (VS_OUT i) : SV_TARGET {
+    float3 c = hdr_src_to_srgb(i.uv);
+    return 16.0/255.0 + (219.0/255.0)*(0.2126*c.r + 0.7152*c.g + 0.0722*c.b);
+}
+float2 ps_hdr2sdr_uv(VS_OUT i) : SV_TARGET {
+    float3 c = hdr_src_to_srgb(i.uv);
+    float Cb = 128.0/255.0 + (112.0/255.0)*(-0.1146*c.r - 0.3854*c.g + 0.5000*c.b);
+    float Cr = 128.0/255.0 + (112.0/255.0)*( 0.5000*c.r - 0.4542*c.g - 0.0458*c.b);
+    return float2(Cb, Cr);
+}
 )";
 
 // YUV conversion shader objects (shared by SDR and HDR, compiled once in InitColorConversion).
-static ID3D11VertexShader* g_yuvVS     = nullptr;
-static ID3D11PixelShader*  g_sdrYPS    = nullptr;  // BGRA8 → R8_UNORM    Y
-static ID3D11PixelShader*  g_sdrUVPS   = nullptr;  // BGRA8 → R8G8_UNORM  UV
-static ID3D11PixelShader*  g_hdrYPS    = nullptr;  // FP16  → R16_UNORM   Y
-static ID3D11PixelShader*  g_hdrUVPS   = nullptr;  // FP16  → R16G16_UNORM UV
+static ID3D11VertexShader* g_yuvVS       = nullptr;
+static ID3D11PixelShader*  g_sdrYPS      = nullptr;  // BGRA8 → R8_UNORM    Y
+static ID3D11PixelShader*  g_sdrUVPS     = nullptr;  // BGRA8 → R8G8_UNORM  UV
+static ID3D11PixelShader*  g_hdrYPS      = nullptr;  // FP16  → R16_UNORM   Y
+static ID3D11PixelShader*  g_hdrUVPS     = nullptr;  // FP16  → R16G16_UNORM UV
+static ID3D11PixelShader*  g_sdr2hdrYPS  = nullptr;  // BGRA8 → R16_UNORM   Y  (SDR capture in an HDR session)
+static ID3D11PixelShader*  g_sdr2hdrUVPS = nullptr;  // BGRA8 → R16G16_UNORM UV
+static ID3D11PixelShader*  g_hdr2sdrYPS  = nullptr;  // FP16  → R8_UNORM    Y  (HDR capture in an SDR session)
+static ID3D11PixelShader*  g_hdr2sdrUVPS = nullptr;  // FP16  → R8G8_UNORM  UV
 
 // Typed RTVs on the planar output textures.
 // D3D11 selects the correct plane via format: R8→plane0, R8G8→plane1 on NV12;
@@ -854,6 +1004,11 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
     g_encWidth   = (UINT)width;
     g_encHeight  = (UINT)height;
     g_captureFmt = is_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    // Force the next EncodeFrame to re-read the source texture's real geometry
+    // and recompute the scale rect — the capture may be a completely different
+    // size/format from this encoder (see the g_capWidth block's comment).
+    g_lastSrcTex = nullptr;
+    UpdateScaleRect();
     if (!device || !g_context) {
         ShimLog("❌ InitColorConversion: device=%p context=%p — null pointer (Session 0 D3D11 failure?)\n",
             device, g_context);
@@ -968,12 +1123,18 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
         };
 
         ID3DBlob *vsBlob=nullptr, *sdrYBlob=nullptr, *sdrUVBlob=nullptr,
-                 *hdrYBlob=nullptr, *hdrUVBlob=nullptr;
-        bool ok = compile_shader("vs_main",   "vs_5_0", &vsBlob)
-               && compile_shader("ps_sdr_y",  "ps_5_0", &sdrYBlob)
-               && compile_shader("ps_sdr_uv", "ps_5_0", &sdrUVBlob)
-               && compile_shader("ps_hdr_y",  "ps_5_0", &hdrYBlob)
-               && compile_shader("ps_hdr_uv", "ps_5_0", &hdrUVBlob);
+                 *hdrYBlob=nullptr, *hdrUVBlob=nullptr,
+                 *s2hYBlob=nullptr, *s2hUVBlob=nullptr,
+                 *h2sYBlob=nullptr, *h2sUVBlob=nullptr;
+        bool ok = compile_shader("vs_main",       "vs_5_0", &vsBlob)
+               && compile_shader("ps_sdr_y",      "ps_5_0", &sdrYBlob)
+               && compile_shader("ps_sdr_uv",     "ps_5_0", &sdrUVBlob)
+               && compile_shader("ps_hdr_y",      "ps_5_0", &hdrYBlob)
+               && compile_shader("ps_hdr_uv",     "ps_5_0", &hdrUVBlob)
+               && compile_shader("ps_sdr2hdr_y",  "ps_5_0", &s2hYBlob)
+               && compile_shader("ps_sdr2hdr_uv", "ps_5_0", &s2hUVBlob)
+               && compile_shader("ps_hdr2sdr_y",  "ps_5_0", &h2sYBlob)
+               && compile_shader("ps_hdr2sdr_uv", "ps_5_0", &h2sUVBlob);
 
         if (ok) {
             device->CreateVertexShader(vsBlob->GetBufferPointer(),
@@ -986,7 +1147,16 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
                                       hdrYBlob->GetBufferSize(), nullptr, &g_hdrYPS);
             device->CreatePixelShader(hdrUVBlob->GetBufferPointer(),
                                       hdrUVBlob->GetBufferSize(), nullptr, &g_hdrUVPS);
-            ShimLog("✅ YUV conversion shaders compiled (SDR: BT.709 lim-range; HDR: BT.2020 PQ full-range)\n");
+            device->CreatePixelShader(s2hYBlob->GetBufferPointer(),
+                                      s2hYBlob->GetBufferSize(), nullptr, &g_sdr2hdrYPS);
+            device->CreatePixelShader(s2hUVBlob->GetBufferPointer(),
+                                      s2hUVBlob->GetBufferSize(), nullptr, &g_sdr2hdrUVPS);
+            device->CreatePixelShader(h2sYBlob->GetBufferPointer(),
+                                      h2sYBlob->GetBufferSize(), nullptr, &g_hdr2sdrYPS);
+            device->CreatePixelShader(h2sUVBlob->GetBufferPointer(),
+                                      h2sUVBlob->GetBufferSize(), nullptr, &g_hdr2sdrUVPS);
+            ShimLog("✅ YUV conversion shaders compiled (SDR BT.709 lim-range, HDR BT.2020 PQ "
+                    "full-range, + SDR↔HDR cross-conversions for capture/session mismatches)\n");
         } else {
             ShimLog("❌ YUV shader compilation failed — video output will be corrupted\n");
         }
@@ -995,6 +1165,10 @@ extern "C" __declspec(dllexport) int InitColorConversion(ID3D11Device* device, i
         if (sdrUVBlob) sdrUVBlob->Release();
         if (hdrYBlob)  hdrYBlob->Release();
         if (hdrUVBlob) hdrUVBlob->Release();
+        if (s2hYBlob)  s2hYBlob->Release();
+        if (s2hUVBlob) s2hUVBlob->Release();
+        if (h2sYBlob)  h2sYBlob->Release();
+        if (h2sUVBlob) h2sUVBlob->Release();
     }
 
     // ── Create typed RTVs on the NVENC input texture (SDR) ───────────────────
@@ -1382,8 +1556,35 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // always current for the session.
     const UINT        fw         = g_encWidth;
     const UINT        fh         = g_encHeight;
-    const DXGI_FORMAT captureFmt = g_captureFmt;
-    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)fw, (int)fh, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
+
+    // Re-read the SOURCE geometry whenever the capture hands us a different
+    // texture (a rebind: backend swap, VDD activation, resolution change).
+    // Same-pointer frames — the overwhelming majority — skip the COM call.
+    if (dxgiFrame != g_lastSrcTex) {
+        D3D11_TEXTURE2D_DESC srcDesc = {};
+        dxgiFrame->GetDesc(&srcDesc);
+        const bool changed = (srcDesc.Width != g_capWidth) || (srcDesc.Height != g_capHeight)
+                          || (srcDesc.Format != g_capFmt);
+        g_capWidth  = srcDesc.Width;
+        g_capHeight = srcDesc.Height;
+        g_capFmt    = srcDesc.Format;
+        g_lastSrcTex = dxgiFrame;
+        if (changed) {
+            UpdateScaleRect();
+            ShimLog("🔭 Capture %ux%u fmt=0x%X → encoder %ux%u fmt=0x%X: dst rect %ux%u at (%u,%u)%s\n",
+                    g_capWidth, g_capHeight, (unsigned)g_capFmt, fw, fh,
+                    (unsigned)(g_isHdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12),
+                    g_dstW, g_dstH, g_dstX, g_dstY,
+                    g_letterboxed ? " (letterboxed)" : "");
+        }
+    }
+
+    // The composite matches the SOURCE, never the encoder — CopyResource below
+    // requires an exact size+format match and silently no-ops otherwise (that
+    // no-op, leaving an uninitialised texture, is the historical "green frame").
+    // Scaling to the encoder's size happens in the conversion draw.
+    const DXGI_FORMAT captureFmt = g_capFmt;
+    if (!EnsureSizedTexture(&g_compositeTex, &g_compositeRTV, (int)g_capWidth, (int)g_capHeight, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, captureFmt)) {
         return 0;
     }
 
@@ -1443,11 +1644,32 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         }
         ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
-        const float W = (float)fw, H = (float)fh;
+        // Pick the conversion for the CAPTURE's colour space. An HDR session
+        // whose capture is plain SDR BGRA8 (the logon screen — a
+        // SYSTEM-fallback Worker can't put the VDD into FP16) goes through the
+        // sRGB→BT.2020-PQ path instead, so the session's format never has to
+        // change underneath the client's decoder.
+        const bool srcIsFp16 = (g_capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        ID3D11PixelShader* yPS  = srcIsFp16 ? g_hdrYPS  : g_sdr2hdrYPS;
+        ID3D11PixelShader* uvPS = srcIsFp16 ? g_hdrUVPS : g_sdr2hdrUVPS;
+        if (!yPS || !uvPS) {
+            ShimLog("⚠️  HDR: no conversion shader for capture fmt 0x%X — frame dropped\n",
+                    (unsigned)g_capFmt);
+            return 0;
+        }
 
         // Unbind any lingering RTV (cursor overlay).
         ID3D11RenderTargetView* nullRTV = nullptr;
         g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
+
+        // Aspect-ratio bars, when the capture's shape differs from the
+        // session's. Full-range PQ black is Y=0, neutral chroma is 0.5.
+        if (g_letterboxed) {
+            const float blackY[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const float neutral[4] = { 0.5f, 0.5f, 0.0f, 0.0f };
+            g_context->ClearRenderTargetView(g_p010YRtv,  blackY);
+            g_context->ClearRenderTargetView(g_p010UVRtv, neutral);
+        }
 
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->IASetInputLayout(nullptr);
@@ -1455,18 +1677,26 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->PSSetShaderResources(0, 1, &srcSRV);
         g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
 
+        // The viewport IS the scaler: the fullscreen triangle's [0,1] UV span
+        // is rasterised across exactly this rect, so a linear-sampled capture
+        // of any size lands scaled into the session-sized surface.
+        const float dx = (float)g_dstX, dy = (float)g_dstY;
+        const float dw = (float)g_dstW, dh = (float)g_dstH;
+
         // Y plane pass — full resolution.
-        D3D11_VIEWPORT vp = { 0, 0, W, H, 0.0f, 1.0f };
+        D3D11_VIEWPORT vp = { dx, dy, dw, dh, 0.0f, 1.0f };
         g_context->RSSetViewports(1, &vp);
         g_context->OMSetRenderTargets(1, &g_p010YRtv, nullptr);
-        g_context->PSSetShader(g_hdrYPS, nullptr, 0);
+        g_context->PSSetShader(yPS, nullptr, 0);
         g_context->Draw(3, 0);
 
-        // UV plane pass — half resolution.
-        vp.Width = W * 0.5f; vp.Height = H * 0.5f;
+        // UV plane pass — half resolution (4:2:0). The rect is even-aligned, so
+        // halving it stays on exact chroma sample boundaries.
+        vp.TopLeftX = dx * 0.5f; vp.TopLeftY = dy * 0.5f;
+        vp.Width    = dw * 0.5f; vp.Height   = dh * 0.5f;
         g_context->RSSetViewports(1, &vp);
         g_context->OMSetRenderTargets(1, &g_p010UVRtv, nullptr);
-        g_context->PSSetShader(g_hdrUVPS, nullptr, 0);
+        g_context->PSSetShader(uvPS, nullptr, 0);
         g_context->Draw(3, 0);
 
         // Unbind before encode — RTV/SRV hazard.
@@ -1493,11 +1723,31 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         }
         ID3D11ShaderResourceView* srcSRV = g_compositeSRV;
 
-        const float W = (float)fw, H = (float)fh;
+        // Mirror of the HDR path: convert from whatever the capture actually
+        // is. FP16 here means an SDR session reading an HDR (Advanced Color)
+        // surface — rescale from HDR reference white and re-encode as sRGB.
+        const bool srcIsFp16 = (g_capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        ID3D11PixelShader* yPS  = srcIsFp16 ? g_hdr2sdrYPS  : g_sdrYPS;
+        ID3D11PixelShader* uvPS = srcIsFp16 ? g_hdr2sdrUVPS : g_sdrUVPS;
+        if (!yPS || !uvPS) {
+            ShimLog("⚠️  SDR: no conversion shader for capture fmt 0x%X — frame dropped\n",
+                    (unsigned)g_capFmt);
+            return 0;
+        }
 
         // Unbind any lingering RTV (cursor overlay) before setting new ones.
         ID3D11RenderTargetView* nullRTV = nullptr;
         g_context->OMSetRenderTargets(1, &nullRTV, nullptr);
+
+        // Aspect-ratio bars. BT.709 LIMITED range here, so black is Y=16/255
+        // and neutral chroma is 128/255 — clearing to 0 would give the
+        // "blacker than black" crush the limited-range decoder clips oddly.
+        if (g_letterboxed) {
+            const float blackY[4]  = { 16.0f/255.0f, 0.0f, 0.0f, 0.0f };
+            const float neutral[4] = { 128.0f/255.0f, 128.0f/255.0f, 0.0f, 0.0f };
+            g_context->ClearRenderTargetView(g_nv12YRtv,  blackY);
+            g_context->ClearRenderTargetView(g_nv12UVRtv, neutral);
+        }
 
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->IASetInputLayout(nullptr);
@@ -1505,18 +1755,23 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         g_context->PSSetShaderResources(0, 1, &srcSRV);
         g_context->PSSetSamplers(0, 1, &g_cursorSampler); // linear, clamp
 
+        // The viewport IS the scaler — see the HDR path's note.
+        const float dx = (float)g_dstX, dy = (float)g_dstY;
+        const float dw = (float)g_dstW, dh = (float)g_dstH;
+
         // Y plane pass — full resolution.
-        D3D11_VIEWPORT vp = { 0, 0, W, H, 0.0f, 1.0f };
+        D3D11_VIEWPORT vp = { dx, dy, dw, dh, 0.0f, 1.0f };
         g_context->RSSetViewports(1, &vp);
         g_context->OMSetRenderTargets(1, &g_nv12YRtv, nullptr);
-        g_context->PSSetShader(g_sdrYPS, nullptr, 0);
+        g_context->PSSetShader(yPS, nullptr, 0);
         g_context->Draw(3, 0);
 
         // UV plane pass — half resolution (4:2:0 chroma subsampling).
-        vp.Width = W * 0.5f; vp.Height = H * 0.5f;
+        vp.TopLeftX = dx * 0.5f; vp.TopLeftY = dy * 0.5f;
+        vp.Width    = dw * 0.5f; vp.Height   = dh * 0.5f;
         g_context->RSSetViewports(1, &vp);
         g_context->OMSetRenderTargets(1, &g_nv12UVRtv, nullptr);
-        g_context->PSSetShader(g_sdrUVPS, nullptr, 0);
+        g_context->PSSetShader(uvPS, nullptr, 0);
         g_context->Draw(3, 0);
 
         // Unbind to avoid RTV/SRV hazards on subsequent calls.
@@ -1694,6 +1949,10 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     if (g_sdrUVPS)  { g_sdrUVPS->Release();  g_sdrUVPS  = nullptr; }
     if (g_hdrYPS)   { g_hdrYPS->Release();   g_hdrYPS   = nullptr; }
     if (g_hdrUVPS)  { g_hdrUVPS->Release();  g_hdrUVPS  = nullptr; }
+    if (g_sdr2hdrYPS)  { g_sdr2hdrYPS->Release();  g_sdr2hdrYPS  = nullptr; }
+    if (g_sdr2hdrUVPS) { g_sdr2hdrUVPS->Release(); g_sdr2hdrUVPS = nullptr; }
+    if (g_hdr2sdrYPS)  { g_hdr2sdrYPS->Release();  g_hdr2sdrYPS  = nullptr; }
+    if (g_hdr2sdrUVPS) { g_hdr2sdrUVPS->Release(); g_hdr2sdrUVPS = nullptr; }
     if (g_nv12YRtv) { g_nv12YRtv->Release(); g_nv12YRtv = nullptr; }
     if (g_nv12UVRtv){ g_nv12UVRtv->Release();g_nv12UVRtv= nullptr; }
     if (g_p010YRtv) { g_p010YRtv->Release(); g_p010YRtv = nullptr; }
@@ -1733,5 +1992,13 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     g_encWidth         = 0;
     g_encHeight        = 0;
     g_captureFmt       = DXGI_FORMAT_UNKNOWN;
+    // Capture-side cache: the next session re-reads it from its own source
+    // texture (a stale pointer match here would skip that re-read).
+    g_lastSrcTex       = nullptr;
+    g_capWidth         = 0;
+    g_capHeight        = 0;
+    g_capFmt           = DXGI_FORMAT_UNKNOWN;
+    g_dstX = g_dstY = g_dstW = g_dstH = 0;
+    g_letterboxed      = false;
     return 0;
 }

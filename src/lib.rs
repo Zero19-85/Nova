@@ -67,15 +67,26 @@ fn get_local_ip() -> String {
     socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// Recreates the NVENC encoder to match the capturer's current dimensions
-/// (same device — the manager guarantees one D3D11 device for the process
-/// lifetime). Shared by the session-rebind path and the WGC↔DDA backend-swap
-/// path.
-fn recreate_encoder_for_capture(
+/// Recreates the NVENC encoder at `width`x`height` on the capturer's device
+/// (the manager guarantees one D3D11 device for the process lifetime).
+///
+/// **The size is the SESSION's, never the capturer's.** A Moonlight client
+/// fixes its decoder's resolution and HDR profile when the session starts, so
+/// changing the encoder's geometry mid-session corrupts it permanently. What
+/// we can capture, in contrast, changes freely underneath a live session — the
+/// logon screen is the physical monitor (a SYSTEM-fallback Worker cannot drive
+/// the VDD at all: SetDisplayConfig is denied on the Winlogon desktop), and the
+/// signed-in desktop is the VDD. The shim absorbs that difference by scaling
+/// the capture into the encoder's surface (aspect-preserving, black bars when
+/// the shapes differ) and cross-converting SDR↔HDR as needed — see shim.cpp's
+/// `UpdateScaleRect` and the `ps_sdr2hdr_*` / `ps_hdr2sdr_*` shaders.
+fn recreate_encoder_at(
     capturer: &capture::DesktopManager,
     enc: &mut Encoder,
+    width: i32,
+    height: i32,
 ) -> std::result::Result<(), String> {
-    println!("🔁 Capture resolution/device changed — recreating NVENC encoder ({}x{})",
+    println!("🔁 Recreating NVENC encoder at {width}x{height} (capture is {}x{})",
         capturer.width(), capturer.height());
     // Tear down the old encoder's shim-global NVENC/D3D state BEFORE creating
     // the replacement — otherwise Encoder::new() below overwrites those
@@ -84,8 +95,8 @@ fn recreate_encoder_for_capture(
     // instead, leaving g_nvEncoder/g_device null.
     enc.cleanup();
     match Encoder::new(capturer.device(), EncoderConfig {
-        width:        capturer.width() as i32,
-        height:       capturer.height() as i32,
+        width,
+        height,
         fps:          enc.config.fps,
         bitrate_kbps: enc.config.bitrate_kbps,
         codec:        enc.config.codec,
@@ -96,17 +107,47 @@ fn recreate_encoder_for_capture(
             Ok(())
         }
         Err(e) => {
-            eprintln!("❌ Failed to recreate encoder after capture change: {e}");
+            eprintln!("❌ Failed to recreate encoder: {e}");
             Err(e)
         }
     }
 }
 
+/// Idle/no-session helper: match the encoder to the capturer. Only correct
+/// when NO client session is live (nothing has fixed a decoder yet) — during a
+/// session use [`recreate_encoder_at`] with the session's negotiated size.
+fn recreate_encoder_for_capture(
+    capturer: &capture::DesktopManager,
+    enc: &mut Encoder,
+) -> std::result::Result<(), String> {
+    let (w, h) = (capturer.width() as i32, capturer.height() as i32);
+    recreate_encoder_at(capturer, enc, w, h)
+}
+
 /// Re-targets the capture manager to `target` (GDI device name, or `None` for
-/// the physical primary), recreating the encoder when the resolution changes.
-/// `is_hdr` sets the frame format: FP16 for HDR, BGRA8 for SDR. The manager
-/// routes the rebind to whichever backend matches the current input desktop
-/// (sessions land on WGC; a live secure-desktop DDA interlude retargets DDA).
+/// the physical primary). The manager routes the rebind to whichever backend
+/// matches the current input desktop (sessions land on WGC; a live
+/// secure-desktop DDA interlude retargets DDA).
+///
+/// The two size arguments are deliberately independent:
+/// * `wait_for_capture_size` — poll until the MONITOR reports this size before
+///   binding (a VDD mode change takes a moment to settle). Purely a capture-side
+///   hint; passing a size the monitor will never reach just burns its 3 s
+///   timeout, so it must be `None` whenever we aren't driving the VDD.
+/// * `enc_size` — pin the ENCODER to this (the session's negotiated geometry),
+///   regardless of what is actually being captured. `None` means "follow the
+///   capture", which is only correct outside a session. See
+///   [`recreate_encoder_at`] for why the session's geometry must never move.
+///
+/// The capture's pixel format follows the SOURCE DISPLAY's actual state
+/// (`capture_hdr`), never the encoder's. Asking DXGI for FP16 from a display
+/// that is not in Advanced Color yields scRGB with SDR white pinned at 1.0
+/// (= 80 nits), which the HDR shader then renders at a third of reference
+/// white — and when the FP16 request fails outright, DDA silently falls back
+/// to BGRA8, so the two paths alternate and the picture visibly pulses between
+/// dim and bright (reported live 2026-08-11 as brightness flashing on mouse
+/// movement). An SDR capture in an HDR session is fine and expected now: the
+/// shim's sRGB→BT.2020-PQ path maps SDR white to 203 nits, stably.
 ///
 /// Synchronous — WGC session creation and CCD calls block briefly; this is
 /// called while holding the `client_info` mutex where `.await` is unsound.
@@ -114,12 +155,27 @@ fn rebind_capture_and_encoder(
     capturer: &mut capture::DesktopManager,
     enc: &mut Encoder,
     target: Option<&str>,
-    expected_size: Option<(u32, u32)>,
+    wait_for_capture_size: Option<(u32, u32)>,
+    enc_size: Option<(u32, u32)>,
+    capture_hdr: Option<bool>,
 ) -> std::result::Result<(), String> {
-    match capturer.rebind(target, enc.config.is_hdr, expected_size) {
+    // `None` = "same as the encoder", the pre-scaling assumption. Correct on
+    // the monolithic path, where an HDR session always means the VDD really is
+    // in Advanced Color.
+    let capture_hdr = capture_hdr.unwrap_or(enc.config.is_hdr);
+    match capturer.rebind(target, capture_hdr, wait_for_capture_size) {
         Ok(needs_new_encoder) => {
-            if needs_new_encoder {
-                recreate_encoder_for_capture(capturer, enc)?;
+            match enc_size {
+                // In a session: hold the negotiated geometry. Recreate only
+                // when the encoder isn't already there (a capture change alone
+                // no longer forces one — the shim rescales instead).
+                Some((w, h)) => {
+                    if enc.config.width != w as i32 || enc.config.height != h as i32 {
+                        recreate_encoder_at(capturer, enc, w as i32, h as i32)?;
+                    }
+                }
+                None if needs_new_encoder => recreate_encoder_for_capture(capturer, enc)?,
+                None => {}
             }
             // Keep input.rs's mouse-mapping rect in sync even when the
             // resolution didn't change — rebind() can move the captured
@@ -914,27 +970,6 @@ fn desktop_is_secure() -> bool {
     )
 }
 
-/// True when this Worker cannot possibly produce `cs`'s geometry, so taking
-/// the session over would change the stream's resolution/profile underneath a
-/// client that has already built its decoder — which corrupts it permanently
-/// (live 2026-08-10: black frame with a green region; the green is the shim's
-/// `CopyResource` no-op'ing on a size mismatch and leaving the composite
-/// texture uninitialised).
-///
-/// Only a SYSTEM-fallback Worker can hit this, and only for a session that was
-/// negotiated while a full Worker was live (i.e. the user signed OUT
-/// mid-stream). New sessions can't: Master clamps them to what the live Worker
-/// reported via `ControlMsg::WorkerCapabilities`.
-///
-/// The caller leaves the client alone rather than serving it garbage —
-/// `media_supervisor`'s 1 Hz keepalive keeps retransmitting the last good IDR,
-/// so the client holds a frozen frame (still connected) until someone signs
-/// back in and a full Worker adopts the session at its original geometry.
-fn cannot_serve_session(cs: &ipc::ConfigureStart, capturer: &capture::DesktopManager) -> bool {
-    service::is_system_fallback()
-        && (cs.width != capturer.width() || cs.height != capturer.height())
-}
-
 fn apply_configure_start(
     cs: &ipc::ConfigureStart,
     vd: &mut virtual_display::VirtualDisplay,
@@ -953,8 +988,8 @@ fn apply_configure_start(
         enc.config.is_hdr = false; // reset; re-armed below if HDR is also confirmed
         enc.cleanup();
         *enc = Encoder::new(capturer.device(), EncoderConfig {
-            width: capturer.width() as i32,
-            height: capturer.height() as i32,
+            width: cs.width as i32,
+            height: cs.height as i32,
             fps: enc.config.fps,
             bitrate_kbps: enc.config.bitrate_kbps,
             codec,
@@ -981,25 +1016,27 @@ fn apply_configure_start(
     // while this atomic tracks what is CURRENTLY applied.
     encoder::set_stream_bitrate_kbps(cs.bitrate_kbps as i32);
 
-    // A SYSTEM-fallback (pre-login) Worker's token lacks whatever privilege
-    // real VDD/CCD topology changes need — confirmed live (2026-08-06):
-    // SetDisplayConfig(SDC_TOPOLOGY_EXTEND) and the "atomic headless
-    // transition" both failed with error 5 (ACCESS_DENIED), every attempt,
-    // burning a 3s CCD timeout plus a 1s retry sleep for nothing before
-    // falling back anyway. Skip straight to that same fallback (stream the
-    // physical primary via DDA/WGC, whichever is available) instead of
-    // paying that cost and spamming repeated failed topology-change calls —
-    // a real user token picks the VDD back up on the very next
-    // ConfigureStart once someone signs in and the Worker upgrades.
     let system_fallback = service::is_system_fallback();
-    // Also defer VDD activation while the secure desktop is up: the CCD calls
-    // are denied there (error 5) and half-activating produces a green/garbled
-    // frame — see desktop_is_secure(). The Worker's capture loop re-runs this
+    // Defer VDD activation while the SECURE desktop is up: SetDisplayConfig is
+    // denied there (error 5) for every identity, and half-activating garbles
+    // the frame — see desktop_is_secure(). The capture loop re-runs this
     // ConfigureStart the moment the desktop returns to Default (post-login), so
     // the VDD comes up cleanly then instead.
+    //
+    // The DESKTOP is the gate, not the Worker's identity. The old code also
+    // skipped the VDD whenever this was the SYSTEM-fallback Worker, on the
+    // strength of a 2026-08-06 observation of error 5 — but that observation
+    // was made pre-login, i.e. on the secure desktop, so it was really this
+    // same restriction. Excluding SYSTEM outright turned out to be load-bearing
+    // in the worst way: when the signed-in user is a STANDARD account the
+    // elevated Worker can never start (ERROR_ELEVATION_REQUIRED — live
+    // 2026-08-11), so the SYSTEM Worker is the ONLY Worker that session will
+    // ever have, and refusing to let it drive the VDD left those users with a
+    // dead screen. If the CCD calls really are denied here, the existing Err
+    // arm below logs it and streams the physical display instead — no worse
+    // than skipping, and now it can actually succeed.
     let defer_for_secure = desktop_is_secure();
     if app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps)
-        && !system_fallback
         && !defer_for_secure
     {
         println!("🖥️  Activating virtual display for upcoming session ({}x{}@{}fps{})",
@@ -1014,21 +1051,34 @@ fn apply_configure_start(
                         println!("⚠️  Monitor rename: {e}");
                     }
                 }
-                rebind_capture_and_encoder(capturer, enc, vd.active_device_name(), Some((cs.width, cs.height)))?;
+                // The VDD is up but not yet in Advanced Color — that flip (and
+                // the FP16 rebind that follows it) happens in the HDR block below.
+                rebind_capture_and_encoder(capturer, enc, vd.active_device_name(),
+                    Some((cs.width, cs.height)), Some((cs.width, cs.height)), Some(false))?;
             }
             Err(e) => {
                 println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display");
             }
         }
     } else {
-        if defer_for_secure
-            && app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps)
-            && !system_fallback
-        {
-            println!("🖥️  VDD activation deferred — secure desktop up; will activate on return to \
-                the interactive desktop (post-login)");
+        if app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps) {
+            if defer_for_secure {
+                println!("🖥️  VDD activation deferred — secure desktop up; will activate on return \
+                    to the interactive desktop (post-login). Streaming the physical display, \
+                    scaled to the session's {}x{}.", cs.width, cs.height);
+            } else if system_fallback {
+                println!("🖥️  No VDD on this host (pre-login SYSTEM fallback) — streaming the \
+                    physical display, scaled to the session's {}x{}.", cs.width, cs.height);
+            }
         }
-        rebind_capture_and_encoder(capturer, enc, None, None)?;
+        // No wait-for-monitor hint (nothing is driving the VDD to that size),
+        // but the ENCODER still holds the session's geometry — the shim scales
+        // the physical capture up into it. This is what makes the logon screen
+        // a full-frame 4K stream instead of a small image in the corner.
+        // Physical display, which is not in Advanced Color — capture SDR and let
+        // the shim convert. See rebind_capture_and_encoder's capture_hdr note.
+        rebind_capture_and_encoder(capturer, enc, None, None,
+            Some((cs.width, cs.height)), Some(false))?;
     }
 
     // Launch the session's app HERE — in the Worker (user session), AFTER the
@@ -1045,35 +1095,53 @@ fn apply_configure_start(
         app_launcher::launch_app(cs.app_id);
     }
 
-    // HDR10 activation gate — mirrors the monolithic path's PLAY-time block.
-    // Also skipped under SYSTEM-fallback — same futile-CCD-call reasoning.
-    let hdr_ok = !system_fallback && (cfg.stream.enable_hdr || vd.is_advanced_color_supported());
-    // While deferred (secure desktop), do NOT switch the encoder to HDR/4K:
-    // HDR needs the VDD in FP16 mode, which can't be activated on the secure
-    // desktop. Stay SDR at the physical lock-screen resolution; the post-login
-    // re-activation sets up HDR/4K cleanly. Skipping this (and the re-snap
-    // below) is what prevents the green/garbled half frame.
-    if !defer_for_secure && cs.hdr_confirmed && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr && hdr_ok {
-        println!("🎨 HEVC Main10/HDR10 encoder active (VDD switching to FP16 mode)");
-        let _ = vd.set_active_display_hdr(true);
+    // HDR10 gate. The ENCODER's HDR-ness is fixed by the session (the client
+    // built a Main10/PQ decoder), so it follows `cs.hdr_confirmed` alone —
+    // never the capture. Putting the VDD into FP16/Advanced Color is a separate,
+    // best-effort quality step: when it isn't possible (no VDD on this host, or
+    // the secure desktop is denying CCD calls) the capture stays SDR BGRA8 and
+    // the shim's sRGB→BT.2020-PQ path converts it, so the stream is still valid
+    // HDR10 the client can decode without ever renegotiating.
+    // Advanced Color is only reachable when the VDD is actually up (same CCD
+    // restriction as the activation above — desktop-gated, not identity-gated).
+    let vdd_hdr_possible = !defer_for_secure
+        && vd.active_device_name().is_some()
+        && (cfg.stream.enable_hdr || vd.is_advanced_color_supported());
+    if cs.hdr_confirmed && enc.config.codec == encoder::Codec::Hevc && !enc.config.is_hdr {
+        if vdd_hdr_possible {
+            println!("🎨 HEVC Main10/HDR10 encoder active (VDD switching to FP16 mode)");
+            let _ = vd.set_active_display_hdr(true);
+        } else {
+            println!("🎨 HEVC Main10/HDR10 encoder active — capture stays SDR for now \
+                (no VDD/Advanced Color here); the shim converts sRGB → BT.2020 PQ");
+        }
         enc.config.is_hdr = true;
         enc.cleanup();
         *enc = Encoder::new(capturer.device(), EncoderConfig {
-            width: capturer.width() as i32,
-            height: capturer.height() as i32,
+            width: cs.width as i32,
+            height: cs.height as i32,
             fps: enc.config.fps,
             bitrate_kbps: enc.config.bitrate_kbps,
             codec: enc.config.codec,
             is_hdr: true,
         }).map_err(|e| format!("Failed to recreate NVENC for HDR: {e}"))?;
-        rebind_capture_and_encoder(capturer, enc, vd.active_device_name(), Some((cs.width, cs.height)))?;
+        // Only wait on the monitor when we actually drove it. `capture_hdr`
+        // tracks whether Advanced Color is genuinely on: FP16 frames only exist
+        // when it is, and asking for them otherwise is what made the picture
+        // pulse between dim and bright.
+        let wait = if vdd_hdr_possible { Some((cs.width, cs.height)) } else { None };
+        let target = if vdd_hdr_possible { vd.active_device_name() } else { None };
+        rebind_capture_and_encoder(capturer, enc, target, wait,
+            Some((cs.width, cs.height)), Some(vdd_hdr_possible))?;
     } else if !cs.hdr_confirmed && enc.config.is_hdr {
-        // Client did not confirm HDR (or Master re-sent a config without it) —
-        // the H.264/SDR encoder path cannot process FP16 frames.
-        println!("⚠️  Reverting VDD to SDR/BGRA8 (HDR not confirmed for this session)");
+        // Client did not confirm HDR (or Master re-sent a config without it).
+        println!("⚠️  Reverting to SDR (HDR not confirmed for this session)");
         let _ = vd.set_active_display_hdr(false);
         enc.config.is_hdr = false;
-        rebind_capture_and_encoder(capturer, enc, vd.active_device_name(), Some((cs.width, cs.height)))?;
+        let wait = if vdd_hdr_possible { Some((cs.width, cs.height)) } else { None };
+        let target = if vdd_hdr_possible { vd.active_device_name() } else { None };
+        rebind_capture_and_encoder(capturer, enc, target, wait,
+            Some((cs.width, cs.height)), Some(false))?;
     }
 
     // Resolution guard — if wait_for_display_resolution timed out inside
@@ -1096,19 +1164,23 @@ fn apply_configure_start(
     // extends the worst-case wait for a slow-to-settle VDD instead of
     // giving up and streaming the wrong resolution.
     // Also skipped while deferred: forcing the VDD to cs.width×height is exactly
-    // the CCD call that's denied on the secure desktop, and re-snapping toward
-    // the client's 4K while capturing the physical lock screen at its native
-    // size is what produced the encoder/capture mismatch (green half). Leave the
-    // encoder at the physical resolution until the post-login re-activation.
-    if !system_fallback && !defer_for_secure {
+    // the CCD call that's denied on the secure desktop.
+    //
+    // Note this now compares the CAPTURE, not the encoder — the encoder is
+    // always already at the session's size. A capture that doesn't match is no
+    // longer a correctness problem (the shim scales it), just a sharpness one,
+    // so this is a quality retry rather than the mismatch guard it used to be.
+    if !defer_for_secure && vd.active_device_name().is_some() {
         for attempt in 1..=3 {
-            if enc.config.width as u32 == cs.width && enc.config.height as u32 == cs.height {
+            if capturer.width() == cs.width && capturer.height() == cs.height {
                 break;
             }
-            println!("📐 Resolution re-snap (attempt {attempt}/3): encoder={}x{} target={}x{}@{}fps — retrying VDD force",
-                enc.config.width, enc.config.height, cs.width, cs.height, cs.fps);
+            println!("📐 Resolution re-snap (attempt {attempt}/3): capture={}x{} target={}x{}@{}fps — retrying VDD force",
+                capturer.width(), capturer.height(), cs.width, cs.height, cs.fps);
             vd.re_snap_resolution(cs.width, cs.height, cs.fps);
-            rebind_capture_and_encoder(capturer, enc, vd.active_device_name(), Some((cs.width, cs.height)))?;
+            rebind_capture_and_encoder(capturer, enc, vd.active_device_name(),
+                Some((cs.width, cs.height)), Some((cs.width, cs.height)),
+                Some(vdd_hdr_possible && enc.config.is_hdr))?;
         }
     }
 
@@ -2134,16 +2206,6 @@ pub async fn run_worker() -> Result<()> {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(WorkerCommand::Stop) | None => break 'outer,
-                        Some(WorkerCommand::Configure(cs)) if cannot_serve_session(&cs, &capturer) => {
-                            println!("⏸️  Worker: cannot serve this session ({}x{} — this host has \
-                                no VDD and captures {}x{}). Leaving the client on its last frame \
-                                rather than changing the stream geometry mid-session; a full \
-                                Worker will take it over at sign-in.",
-                                cs.width, cs.height, capturer.width(), capturer.height());
-                            let _ = reply_tx.send(ipc::ControlMsg::WorkerError(format!(
-                                "cannot serve {}x{} without a VDD (capture is {}x{})",
-                                cs.width, cs.height, capturer.width(), capturer.height())));
-                        }
                         Some(WorkerCommand::Configure(cs)) => {
                             match apply_configure_start(&cs, &mut vd, &mut capturer, &mut enc, &cfg) {
                                 Ok(applied) => {
@@ -2168,7 +2230,6 @@ pub async fn run_worker() -> Result<()> {
                                     pending_configure = Some(cs.clone());
                                     vdd_activation_pending = app_launcher::uses_virtual_display(
                                             cs.app_id, cfg.stream.headless_for_all_apps)
-                                        && !service::is_system_fallback()
                                         && desktop_is_secure();
                                     frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                                     next_frame_time = Instant::now();
@@ -2211,17 +2272,6 @@ pub async fn run_worker() -> Result<()> {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 WorkerCommand::Stop => break 'outer,
-                // See the select!-arm twin above: never change a live session's
-                // geometry — hold the client on its last frame instead.
-                WorkerCommand::Configure(cs) if cannot_serve_session(&cs, &capturer) => {
-                    println!("⏸️  Worker: cannot serve this session ({}x{} — this host has \
-                        no VDD and captures {}x{}). Leaving the client on its last frame; \
-                        a full Worker will take it over at sign-in.",
-                        cs.width, cs.height, capturer.width(), capturer.height());
-                    let _ = reply_tx.send(ipc::ControlMsg::WorkerError(format!(
-                        "cannot serve {}x{} without a VDD (capture is {}x{})",
-                        cs.width, cs.height, capturer.width(), capturer.height())));
-                }
                 WorkerCommand::Configure(cs) => {
                     match apply_configure_start(&cs, &mut vd, &mut capturer, &mut enc, &cfg) {
                         Ok(applied) => {
@@ -2240,7 +2290,6 @@ pub async fn run_worker() -> Result<()> {
                             pending_configure = Some(cs.clone());
                             vdd_activation_pending = app_launcher::uses_virtual_display(
                                     cs.app_id, cfg.stream.headless_for_all_apps)
-                                && !service::is_system_fallback()
                                 && desktop_is_secure();
                             frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                             next_frame_time = Instant::now();
@@ -2277,14 +2326,13 @@ pub async fn run_worker() -> Result<()> {
         }
 
         if client_connected {
-            if let Some(resized) = capturer.maybe_swap_backend() {
-                if resized {
-                    if recreate_encoder_for_capture(&capturer, &mut enc).is_err() {
-                        break;
-                    }
-                } else {
-                    enc.request_idr();
-                }
+            if let Some(_resized) = capturer.maybe_swap_backend() {
+                // A backend swap can change the capture's size and format, but
+                // NOT the encoder's — the client's decoder is fixed for the
+                // session, and the shim rescales/reconverts the new capture into
+                // the same output surface. Just force a keyframe so the client
+                // decodes cleanly from the first post-swap frame.
+                enc.request_idr();
                 let (ox, oy) = capturer.origin();
                 input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
             }
@@ -3004,7 +3052,7 @@ pub async fn run() -> Result<()> {
                     // the server stays alive and the capturer recovers via WGC's
                     // internal ACCESS_LOST handling or the next
                     // activate_for_stream rebind when a new client connects.
-                    if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc, None, None) {
+                    if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc, None, None, None, None) {
                         eprintln!("⚠️  Capture rebind after deferred cancel failed ({e}) — staying in idle loop");
                     }
                 }
@@ -3052,7 +3100,8 @@ pub async fn run() -> Result<()> {
                                         Err(e) => println!("⚠️  Monitor rename: {e}"),
                                     }
                                 }
-                                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((width, height))).is_err() {
+                                if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(),
+                                    Some((width, height)), Some((width, height)), None).is_err() {
                                     break;
                                 }
                                 // Enable Advanced Color (HDR/scRGB) during the /launch→PLAY gap
@@ -3262,7 +3311,7 @@ pub async fn run() -> Result<()> {
                                 reverting VDD to SDR/BGRA8 (H.264 cannot process FP16 frames)");
                             let _ = vd.set_active_display_hdr(false);
                             if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc,
-                                vd.active_device_name(), Some((client.width, client.height))) {
+                                vd.active_device_name(), Some((client.width, client.height)), Some((client.width, client.height)), None) {
                                 eprintln!("⚠️  SDR rebind after HDR revert: {e}");
                             }
                         }
@@ -3281,8 +3330,9 @@ pub async fn run() -> Result<()> {
                             enc.config.is_hdr = true;
                             enc.cleanup();
                             match encoder::Encoder::new(capturer.device(), encoder::EncoderConfig {
-                                width:        capturer.width() as i32,
-                                height:       capturer.height() as i32,
+                                // Session geometry, not the capture's — see recreate_encoder_at.
+                                width:        client.width as i32,
+                                height:       client.height as i32,
                                 fps:          enc.config.fps,
                                 bitrate_kbps: enc.config.bitrate_kbps,
                                 codec:        enc.config.codec,
@@ -3298,7 +3348,7 @@ pub async fn run() -> Result<()> {
                             // FP16→P010 VP output. Advanced Color is already on so no
                             // ACCESS_LOST expected — this is a clean re-DuplicateOutput.
                             if rebind_capture_and_encoder(&mut capturer, &mut enc,
-                                vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                vd.active_device_name(), Some((client.width, client.height)), Some((client.width, client.height)), None).is_err() {
                                 break;
                             }
                         }
@@ -3332,7 +3382,7 @@ pub async fn run() -> Result<()> {
                                 ({}x{} {})", client.width, client.height,
                                 if enc.config.is_hdr { "FP16/HDR10" } else { "BGRA8/SDR" });
                             if rebind_capture_and_encoder(&mut capturer, &mut enc,
-                                vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                vd.active_device_name(), Some((client.width, client.height)), Some((client.width, client.height)), None).is_err() {
                                 break;
                             }
                         } else if app_launcher::uses_virtual_display(client.app_id, cfg.stream.headless_for_all_apps) {
@@ -3347,7 +3397,7 @@ pub async fn run() -> Result<()> {
                                             Err(e) => println!("⚠️  Monitor rename: {e}"),
                                         }
                                     }
-                                    if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                                    if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height)), Some((client.width, client.height)), None).is_err() {
                                         break;
                                     }
                                 }
@@ -3362,8 +3412,10 @@ pub async fn run() -> Result<()> {
                             }
                         } else {
                             // headless_for_all_apps=false and non-VD app: capture stays on
-                            // the physical primary display. Just rebind to whatever is current.
-                            if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None).is_err() {
+                            // the physical primary display, scaled by the shim into the
+                            // session's negotiated geometry.
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc, None, None,
+                                Some((client.width, client.height)), None).is_err() {
                                 break;
                             }
                         }
@@ -3373,11 +3425,14 @@ pub async fn run() -> Result<()> {
                         // (common for 4K@120fps modes that take >3 s to settle), the VDD
                         // may have landed at 1080p instead of 4K. Give it one more
                         // re-snap and rebind attempt now, while the client is waiting.
-                        if enc.config.width as u32 != client.width || enc.config.height as u32 != client.height {
-                            println!("📐 Resolution re-snap: encoder={}x{}  client={}x{}@{}fps — retrying VDD force",
-                                enc.config.width, enc.config.height, client.width, client.height, client.fps);
+                        // Compares the CAPTURE now — the encoder is always already at the
+                        // session's geometry, and a mismatched capture is a sharpness
+                        // issue (the shim scales it), not a correctness one.
+                        if capturer.width() != client.width || capturer.height() != client.height {
+                            println!("📐 Resolution re-snap: capture={}x{}  client={}x{}@{}fps — retrying VDD force",
+                                capturer.width(), capturer.height(), client.width, client.height, client.fps);
                             vd.re_snap_resolution(client.width, client.height, client.fps);
-                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height))).is_err() {
+                            if rebind_capture_and_encoder(&mut capturer, &mut enc, vd.active_device_name(), Some((client.width, client.height)), Some((client.width, client.height)), None).is_err() {
                                 break;
                             }
                         }

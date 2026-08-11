@@ -67,17 +67,13 @@ pub struct WorkerCaps {
 /// side effects; the Worker performs those once it receives the resulting
 /// `ConfigureStart` IPC message built from this.
 ///
-/// `caps` constrains the result to what the Worker that will actually serve
-/// this session can do. A Moonlight client fixes its decoder's resolution and
-/// HDR profile when the session starts; changing either mid-session wrecks it
-/// (live 2026-08-10: black frame + green region after a lock-screen session
-/// was upgraded to 4K/HDR at sign-in). A SYSTEM-fallback Worker can never
-/// drive the VDD (`SetDisplayConfig` is denied on the Winlogon desktop), so a
-/// session negotiated while one is live is pinned to the physical monitor's
-/// native size in SDR — and STAYS there for its whole life, including after
-/// the sign-in handoff to a full Worker. Reconnecting once signed in
-/// negotiates a fresh, unconstrained (4K/HDR) session.
+/// `caps` is informational only (Master logs what the live Worker can capture).
+/// It does NOT constrain the result: the shim decouples the encoder's geometry
+/// and colour space from the capture's, so any Worker can serve any session —
+/// which is precisely what makes a mid-session Worker handoff invisible to the
+/// client's decoder.
 pub fn negotiate(client: &ClientInfo, cfg: &StreamConfig, caps: Option<WorkerCaps>) -> NegotiatedParams {
+    let _ = caps;
     // Derive codec from /launch videoFormat. Old-protocol clients (Xbox
     // Moonlight <= 1.18.0) never set videoFormat — it arrives as 0. For
     // those, use bitStreamFormat from the ANNOUNCE SDP instead: set by
@@ -98,41 +94,20 @@ pub fn negotiate(client: &ClientInfo, cfg: &StreamConfig, caps: Option<WorkerCap
     // would otherwise land on H264 — NEVER use hdr_requested alone, it
     // reflects user intent, not decode capability (forcing HEVC on a client
     // with no HEVC decoder is a guaranteed 10s watchdog timeout).
-    // A Worker that can't drive the VDD can't produce HDR either: HDR10 needs
-    // the VDD flipped into FP16/Advanced Color, which is the same denied
-    // SetDisplayConfig call. Pin such a session to SDR up front rather than
-    // letting the Worker silently serve SDR into a session the client built an
-    // HDR decoder for.
-    let constrained = caps.is_some_and(|c| !c.vdd_capable);
-    let hdr_confirmed = !constrained && (client.dynamic_range_mode == 1 || cfg.enable_hdr);
+    let hdr_confirmed = client.dynamic_range_mode == 1 || cfg.enable_hdr;
     let codec = if hdr_confirmed && raw_codec == Codec::H264 {
         Codec::Hevc
     } else {
         raw_codec
     };
 
-    // Pin the session to what the serving Worker can actually capture. Never
-    // UPscale the request (a client asking for 720p on a 1440p monitor still
-    // gets 720p — the VDD-less path just captures the monitor and the encoder
-    // follows the capture, so only the "client wants more than the monitor
-    // has" direction needs clamping).
-    let (width, height) = match caps {
-        Some(c) if !c.vdd_capable && c.native_width > 0 && c.native_height > 0 => {
-            let w = client.width.min(c.native_width);
-            let h = client.height.min(c.native_height);
-            if (w, h) != (client.width, client.height) {
-                println!(
-                    "📐 Master: session pinned to {w}x{h} SDR — the live Worker has no VDD \
-                     (logon screen); this geometry holds for the whole session so a sign-in \
-                     handoff can't break the client's decoder. Reconnect once signed in for \
-                     {}x{}/HDR.",
-                    client.width, client.height
-                );
-            }
-            (w, h)
-        }
-        _ => (client.width, client.height),
-    };
+    // The client always gets exactly the geometry it asked for. What the host
+    // can capture at any given moment (the physical monitor at the logon
+    // screen, the VDD once signed in) is now independent of it: the shim scales
+    // the capture into the encoder's session-sized surface and cross-converts
+    // SDR↔HDR as needed. That decoupling is what lets a Worker handoff happen
+    // mid-session without touching the client's decoder.
+    let (width, height) = (client.width, client.height);
 
     // H264 Level 5.2 fps cap: Xbox Moonlight 1.18.0 (corever=1) hardwires
     // H264 and cannot negotiate HEVC server-side; at 4K/1440p@120fps that
@@ -224,44 +199,27 @@ mod tests {
         assert_eq!(n.codec, Codec::Av1);
     }
 
-    /// A Worker with no VDD (the SYSTEM fallback covering the logon screen)
-    /// can only serve the physical monitor in SDR. The session must be pinned
-    /// to that up front, because a Moonlight client fixes its decoder at
-    /// session start and a later change wrecks it (live 2026-08-10).
+    /// The client's requested geometry and HDR profile survive regardless of
+    /// what the serving Worker can capture. A VDD-less Worker (the SYSTEM
+    /// fallback covering the logon screen) captures the physical monitor in
+    /// SDR, and the shim scales + converts it into the session's 4K HDR10
+    /// surface — so the session is NOT downgraded, which is what allows a
+    /// Worker handoff mid-session without disturbing the client's decoder.
     #[test]
-    fn vdd_less_worker_pins_session_to_its_native_size_and_sdr() {
+    fn worker_capability_never_downgrades_the_session() {
         let mut client = base_client(); // 3840x2160
         client.video_format = 0x0002; // HEVC
-        client.dynamic_range_mode = 1; // client confirmed HDR...
+        client.dynamic_range_mode = 1; // ANNOUNCE-confirmed HDR
         let caps = WorkerCaps { vdd_capable: false, native_width: 2560, native_height: 1440 };
         let n = negotiate(&client, &StreamConfig::default(), Some(caps));
-        assert_eq!((n.width, n.height), (2560, 1440), "clamped to the monitor");
-        assert!(!n.hdr_confirmed, "...but HDR needs the VDD in FP16 — pin to SDR");
-        assert_eq!(n.codec, Codec::Hevc, "codec choice is unaffected by the clamp");
-    }
+        assert_eq!((n.width, n.height), (3840, 2160), "session keeps the client's geometry");
+        assert!(n.hdr_confirmed, "session keeps HDR — the shim converts an SDR capture");
+        assert_eq!(n.codec, Codec::Hevc);
 
-    /// The clamp only ever reduces: a client asking for LESS than the monitor
-    /// keeps its own smaller request (the VDD-less path captures the monitor
-    /// and the encoder follows the capture).
-    #[test]
-    fn vdd_less_worker_never_upscales_a_smaller_request() {
-        let mut client = base_client();
-        client.width = 1280;
-        client.height = 720;
-        let caps = WorkerCaps { vdd_capable: false, native_width: 2560, native_height: 1440 };
-        let n = negotiate(&client, &StreamConfig::default(), Some(caps));
-        assert_eq!((n.width, n.height), (1280, 720));
-    }
-
-    /// A full Worker imposes no constraint — the client's request stands.
-    #[test]
-    fn vdd_capable_worker_leaves_the_request_alone() {
-        let mut client = base_client();
-        client.video_format = 0x0002;
-        client.dynamic_range_mode = 1;
+        // A fully-capable Worker must of course reach the same conclusion.
         let caps = WorkerCaps { vdd_capable: true, native_width: 2560, native_height: 1440 };
-        let n = negotiate(&client, &StreamConfig::default(), Some(caps));
-        assert_eq!((n.width, n.height), (3840, 2160));
-        assert!(n.hdr_confirmed);
+        let full = negotiate(&client, &StreamConfig::default(), Some(caps));
+        assert_eq!((full.width, full.height), (n.width, n.height));
+        assert_eq!(full.hdr_confirmed, n.hdr_confirmed);
     }
 }
