@@ -858,7 +858,16 @@ async fn media_supervisor(
                         let (tx, rx) = mpsc::unbounded_channel();
                         reader_task = Some(tokio::spawn(media_reader_loop(pipe, tx)));
                         frame_rx = Some(rx);
-                        video_learned = false;
+                        // Seed from whether a target is ALREADY known rather than
+                        // clearing to false: on a mid-session Worker swap the
+                        // client never went away, so its address never changes
+                        // again and the learn ticker's change-detector would
+                        // never re-open this gate — the freeze this whole
+                        // handoff exists to avoid. See RtpSender::has_target.
+                        video_learned = rtp_sender.lock().unwrap().has_target();
+                        // Still require a fresh IDR to open the new Worker's
+                        // stream: its encoder is brand new, so its P-frames
+                        // reference nothing the client holds.
                         first_idr_forwarded = false;
                     }
                     None => return,
@@ -915,7 +924,14 @@ async fn media_supervisor(
                 }
             }
             _ = learn_ticker.tick() => {
-                let learned_now = rtp_sender.lock().unwrap().try_learn_target().is_some();
+                // Drain pings (also keeps a stale backlog from latching the next
+                // session onto a dead port — see try_learn_target), then gate on
+                // whether a target is KNOWN, not on whether it just changed.
+                let learned_now = {
+                    let mut tx = rtp_sender.lock().unwrap();
+                    tx.try_learn_target();
+                    tx.has_target()
+                };
                 if learned_now && !video_learned {
                     video_learned = true;
                     println!("🎯 Master: learned client video target");
@@ -2233,6 +2249,13 @@ pub async fn run_worker() -> Result<()> {
                                         && desktop_is_secure();
                                     frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                                     next_frame_time = Instant::now();
+                                    // "Thaw" keyframe: this Worker may be ADOPTING a session that is
+                                    // already live on the client (sign-in/sign-out handoff). Its encoder
+                                    // is brand new, so nothing it emits references frames the client
+                                    // still holds -- force an IDR now rather than waiting for the
+                                    // first-frame check to notice, so the decoder resumes on the very
+                                    // next frame instead of showing a frozen image for one more slot.
+                                    enc.request_idr();
                                     let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
                                 }
                                 Err(e) => println!("❌ apply_configure_start failed: {e}"),
@@ -2293,6 +2316,13 @@ pub async fn run_worker() -> Result<()> {
                                 && desktop_is_secure();
                             frame_interval = Duration::from_secs_f64(1.0 / applied.fps.max(1) as f64);
                             next_frame_time = Instant::now();
+                            // "Thaw" keyframe: this Worker may be ADOPTING a session that is
+                            // already live on the client (sign-in/sign-out handoff). Its encoder
+                            // is brand new, so nothing it emits references frames the client
+                            // still holds -- force an IDR now rather than waiting for the
+                            // first-frame check to notice, so the decoder resumes on the very
+                            // next frame instead of showing a frozen image for one more slot.
+                            enc.request_idr();
                             let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
                         }
                         Err(e) => println!("❌ apply_configure_start failed: {e}"),

@@ -198,6 +198,22 @@ impl RtpSender {
         self.last_sent_index
     }
 
+    /// Whether a client video target is currently known — i.e. frames sent now
+    /// would actually go somewhere.
+    ///
+    /// Distinct from [`try_learn_target`], which reports only a CHANGE of
+    /// address. Callers gating frame forwarding must use THIS: a Worker
+    /// respawn mid-session (sign-in/sign-out handoff) leaves the client's
+    /// address unchanged, so the change-detector returns `None` forever and a
+    /// gate keyed on it never re-opens — every frame from the replacement
+    /// Worker was silently dropped and the client froze until it gave up
+    /// (confirmed live 2026-08-11: the ConfigureStart replay and the Worker's
+    /// `worker configured` both succeeded, yet not one `📊 RTP/s` line
+    /// followed).
+    pub fn has_target(&self) -> bool {
+        self.target.is_some()
+    }
+
     /// Non-blocking drain of all queued "ping" packets, keeping the most recent
     /// sender. GameStream clients ping the video port every ~500ms for the WHOLE
     /// session (not just after PLAY), so this must be called every loop iteration
@@ -937,6 +953,35 @@ mod tests {
 
         sender.reset();
         assert_eq!(sender.last_sent_index(), 0, "fresh session must restart at index 1");
+    }
+
+    /// The frame-forwarding gate must key on "a target is KNOWN"
+    /// (`has_target`), never on "the target just CHANGED"
+    /// (`try_learn_target`). A Worker respawn mid-session re-adopts a client
+    /// that never went away, so its address never changes again — a gate keyed
+    /// on the change-detector stays shut forever and every frame from the
+    /// replacement Worker is dropped (the live 2026-08-11 sign-in freeze).
+    #[test]
+    fn target_stays_known_after_the_learning_edge_passes() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert!(!sender.has_target(), "nothing learned yet");
+
+        ping(&client, dst, 1);
+        assert!(sender.try_learn_target().is_some(), "first ping is the learning edge");
+        assert!(sender.has_target());
+
+        // Same client keeps pinging: no CHANGE, so the edge detector goes quiet
+        // — but the target is still perfectly well known.
+        ping(&client, dst, 1);
+        assert!(sender.try_learn_target().is_none(), "no change ⇒ no edge");
+        assert!(sender.has_target(), "…yet frames must still be forwardable");
+
+        // A genuine session end clears it, so the next session re-learns.
+        sender.reset();
+        assert!(!sender.has_target());
     }
 
     /// Draining must keep the most recent sender when pings from an old and a

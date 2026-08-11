@@ -1359,6 +1359,36 @@ impl VirtualDisplay {
         // the devnode toggle.
         if crate::service::should_skip_vdd_cycle() {
             println!("🕶️  VDD devnode cycle already done by a sibling host this boot — skipping");
+            // ...but DO heal an orphaned virtual display before returning.
+            //
+            // A Worker that dies without completing `deactivate_after_stream`
+            // (sign-out kills it, a crash, a hard TerminateProcess after the
+            // grace period) leaves the VDD enabled and still PRIMARY, with the
+            // physical outputs parked — the "true headless" topology. The
+            // replacement Worker used to return straight from here, so it
+            // inherited that topology and captured a virtual display that
+            // nothing renders to any more: a black screen with only the mouse
+            // cursor on it, exactly as reported live (2026-08-11) after signing
+            // out. Restoring the physical topology and parking the devnode is
+            // the same work `deactivate_after_stream` would have done.
+            //
+            // Costs nothing in the normal case: a Worker that shut down
+            // cleanly already left the devnode disabled, so `is_enabled()` is
+            // false and this is a single cheap query with no visible change.
+            if self.is_enabled() {
+                println!("🩹 VDD devnode was left enabled by a previous host — restoring the \
+                    physical display topology before capture starts");
+                let orphan = Self::wait_for_virtual_display_device_name();
+                Self::isolate_virtual_display_at_boot(orphan.as_deref());
+                self.set_enabled(false).unwrap_or_else(|e| {
+                    println!("⚠️  Could not park the orphaned VDD devnode (non-fatal): {e}")
+                });
+                match Self::cleanup_phantom_monitors() {
+                    Ok(0) => {}
+                    Ok(n) => println!("🧹 Removed {n} phantom virtual-monitor devnode(s)"),
+                    Err(e) => println!("⚠️  Phantom-monitor sweep: {e}"),
+                }
+            }
             return Ok(None);
         }
 
