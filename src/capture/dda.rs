@@ -73,7 +73,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows::Win32::System::StationsAndDesktops::{
@@ -441,12 +441,25 @@ unsafe fn setup_duplication(target: Option<&str>, is_hdr: bool) -> Result<Duplic
         origin_x: r.left,
         origin_y: r.top,
     };
+    // Report the format DXGI ACTUALLY gave us, not the one we asked for. The
+    // request is only a hint: DuplicateOutput1 can decline it, and the legacy
+    // DuplicateOutput fallback ignores it entirely and hands back the desktop's
+    // native format (FP16 on an Advanced Color display). Logging the request
+    // made a BGRA8-labelled session that was really delivering FP16 look
+    // impossible, which is exactly the confusion that hid this for a session.
+    let dup_desc: DXGI_OUTDUPL_DESC = dup.GetDesc();
+    let actual = dup_desc.ModeDesc.Format;
     println!(
-        "✅ DDA duplication active on {} ({}x{} {})",
+        "✅ DDA duplication active on {} ({}x{} fmt=0x{:X}{})",
         device_name_of(&out_desc),
         geometry.width,
         geometry.height,
-        if is_hdr { "FP16/HDR" } else { "BGRA8/SDR" },
+        actual.0,
+        if actual == requested_format {
+            String::new()
+        } else {
+            format!(" — REQUESTED 0x{:X}, DXGI declined", requested_format.0)
+        },
     );
 
     Ok(DuplicationSession { dup, device, geometry })
@@ -474,6 +487,16 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
     let mut cursor_x = 0i32;
     let mut cursor_y = 0i32;
     let mut cursor_visible = false;
+
+    // Capture-format flip tracking. A duplication is supposed to deliver ONE
+    // format for its lifetime; live logs (2026-08-11) show ~39 BGRA8↔FP16 flips
+    // in a 16 s UAC interlude, clustered exactly when frames were arriving
+    // (none while the desktop was static). Each flip re-runs a different
+    // conversion shader in the shim and reallocates the composite — the
+    // hover-flicker signature. Logged from the source of truth: the acquired
+    // frame's own descriptor.
+    let mut last_fmt: Option<DXGI_FORMAT> = None;
+    let mut fmt_flips: u32 = 0;
 
     while !shared.stop.load(Ordering::Acquire) {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -535,6 +558,18 @@ unsafe fn run_acquire_loop(shared: &DdaShared, session: &DuplicationSession) {
                 if let Some(mut frame) =
                     copy_frame_to_cpu(&session.device, &tex, &mut staging, &mut staging_dims)
                 {
+                    if last_fmt != Some(frame.format) {
+                        if let Some(prev) = last_fmt {
+                            fmt_flips += 1;
+                            println!(
+                                "🎨 DDA capture format changed 0x{:X} → 0x{:X} (flip #{fmt_flips} \
+                                 this session) — the shim must re-convert; investigate if this \
+                                 repeats",
+                                prev.0, frame.format.0
+                            );
+                        }
+                        last_fmt = Some(frame.format);
+                    }
                     if cursor_visible {
                         if let Some(c) = &cursor {
                             blend_cursor(&mut frame, c, cursor_x, cursor_y);
@@ -663,13 +698,21 @@ fn blend_cursor(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
 }
 
 /// FP16 (scRGB, HDR) variant of [`blend_cursor`]. The cursor shape is 8-bit
-/// sRGB; convert it to linear and blend into the half-float channels. SDR white
-/// (sRGB 255) maps to scRGB 1.0, matching how DWM composites the SDR secure
-/// desktop, so the cursor sits at the same brightness as the screen behind it.
+/// sRGB; convert it to linear and blend into the half-float channels.
+///
+/// SDR white (sRGB 255) maps to the DISPLAY's SDR white level, not to scRGB 1.0
+/// — 1.0 is 80 nits, while Windows composites the SDR secure desktop at the
+/// display's "SDR content brightness" (160 nits on the dev box). Hardcoding 1.0
+/// drew the cursor at half the brightness of the desktop behind it, and the
+/// inverted (XOR) shapes — the ones used over clickable elements — inverted
+/// around the wrong midpoint. Same value the conversion shaders use, so the
+/// cursor matches whichever path the frame took.
 fn blend_cursor_fp16(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
     const MONOCHROME: u32 = 1;
     const COLOR: u32 = 2;
     const MASKED_COLOR: u32 = 4;
+
+    let white = crate::encoder::sdr_white_level();
 
     let (fw, fh) = (frame.width as i32, frame.height as i32);
     let rp = frame.row_pitch as usize;
@@ -695,14 +738,17 @@ fn blend_cursor_fp16(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
                     }
                     let (sb, sg, sr, sa) =
                         (c.bytes[s], c.bytes[s + 1], c.bytes[s + 2], c.bytes[s + 3]);
-                    let (lr, lg, lb) =
-                        (srgb8_to_linear(sr), srgb8_to_linear(sg), srgb8_to_linear(sb));
+                    let (lr, lg, lb) = (
+                        srgb8_to_linear(sr) * white,
+                        srgb8_to_linear(sg) * white,
+                        srgb8_to_linear(sb) * white,
+                    );
                     if c.shape_type == COLOR {
                         blend_px_fp16(&mut frame.bytes, d, lr, lg, lb, sa as f32 / 255.0);
                     } else if sa == 0 {
                         blend_px_fp16(&mut frame.bytes, d, lr, lg, lb, 1.0);
                     } else {
-                        invert_px_fp16(&mut frame.bytes, d);
+                        invert_px_fp16(&mut frame.bytes, d, white);
                     }
                 }
             }
@@ -734,9 +780,9 @@ fn blend_cursor_fp16(frame: &mut CpuFrame, c: &CursorShape, px: i32, py: i32) {
                     }
                     match (and_bit, xor_bit) {
                         (0, 0) => blend_px_fp16(&mut frame.bytes, d, 0.0, 0.0, 0.0, 1.0),
-                        (0, 1) => blend_px_fp16(&mut frame.bytes, d, 1.0, 1.0, 1.0, 1.0),
+                        (0, 1) => blend_px_fp16(&mut frame.bytes, d, white, white, white, 1.0),
                         (1, 0) => {} // transparent
-                        _ => invert_px_fp16(&mut frame.bytes, d),
+                        _ => invert_px_fp16(&mut frame.bytes, d, white),
                     }
                 }
             }
@@ -759,11 +805,14 @@ fn blend_px_fp16(bytes: &mut [u8], d: usize, r: f32, g: f32, b: f32, a: f32) {
 }
 
 /// Invert an FP16 pixel (approximates the GDI XOR/invert cursor operation).
-fn invert_px_fp16(bytes: &mut [u8], d: usize) {
+/// `white` is SDR white in scRGB units: the inversion pivots around it, because
+/// inverting around 1.0 on a display whose SDR white is above 80 nits drives
+/// every desktop pixel negative and clamps the whole shape to black.
+fn invert_px_fp16(bytes: &mut [u8], d: usize, white: f32) {
     for ch in 0..3 {
         let o = d + ch * 2;
         let v = f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
-        let iv = f32_to_f16((1.0 - v).clamp(0.0, 1.0));
+        let iv = f32_to_f16((white - v).clamp(0.0, white));
         bytes[o..o + 2].copy_from_slice(&iv.to_le_bytes());
     }
 }
@@ -975,6 +1024,15 @@ fn duplicate_output(
                         );
                     } else if e.code() == E_ACCESSDENIED {
                         return Err(format!("DuplicateOutput1 failed: {}", describe(&e)));
+                    } else {
+                        // Was silent. The legacy fallback below ignores the
+                        // requested format, so this is the moment an SDR-
+                        // requested session can start delivering FP16.
+                        println!(
+                            "⚠️  DDA: BGRA8 DuplicateOutput1 failed ({}) — falling back to \
+                             DuplicateOutput, which returns the desktop's native format",
+                            describe(&e)
+                        );
                     }
                 }
             }
@@ -985,5 +1043,41 @@ fn duplicate_output(
             .map_err(|e| format!("IDXGIOutput1 unavailable: {e:?}"))?;
         out1.DuplicateOutput(device)
             .map_err(|e| format!("DuplicateOutput failed: {}", describe(&e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The FP16 cursor inversion must pivot around the display's SDR white, not
+    /// scRGB 1.0. On a 160-nit display (white = 2.0) every desktop pixel sits
+    /// above 1.0, so the old `1.0 - v` went negative and clamped the whole
+    /// inverted shape — the I-beam/XOR cursors used over clickable elements —
+    /// to solid black.
+    #[test]
+    fn fp16_cursor_inversion_pivots_around_sdr_white() {
+        let white = 2.0f32; // 160 nits
+        let mut px = [0u8; 8];
+        // A mid-grey desktop pixel at half of SDR white.
+        for ch in 0..3 {
+            px[ch * 2..ch * 2 + 2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        }
+        invert_px_fp16(&mut px, 0, white);
+        for ch in 0..3 {
+            let v = f16_to_f32(u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]));
+            assert!((v - 1.0).abs() < 0.01, "channel {ch}: expected ~1.0, got {v}");
+        }
+
+        // A white pixel inverts to black, not to a clamped negative.
+        let mut w = [0u8; 8];
+        for ch in 0..3 {
+            w[ch * 2..ch * 2 + 2].copy_from_slice(&f32_to_f16(white).to_le_bytes());
+        }
+        invert_px_fp16(&mut w, 0, white);
+        for ch in 0..3 {
+            let v = f16_to_f32(u16::from_le_bytes([w[ch * 2], w[ch * 2 + 1]]));
+            assert!(v < 0.01, "channel {ch}: expected ~0, got {v}");
+        }
     }
 }

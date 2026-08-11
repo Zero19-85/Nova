@@ -1,5 +1,5 @@
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 // ── Congestion-control state ─────────────────────────────────────────────────
@@ -149,7 +149,24 @@ pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nit
 /// the capture path switches (a UAC prompt swapping WGC/FP16 for DDA/BGRA8).
 /// Applied to the next encoded frame; safe to call from any thread.
 pub fn set_sdr_white_level(scrgb_units: f32) {
+    SDR_WHITE_SCRGB.store(scrgb_units.to_bits(), Ordering::Relaxed);
     unsafe { SetSdrWhiteLevel(scrgb_units) }
+}
+
+/// Rust-side mirror of the shim's `g_sdrWhiteScRGB`, so CPU-side compositing can
+/// use the same white level as the conversion shaders. The DDA cursor blend is
+/// the one such consumer: it writes 8-bit sRGB cursor pixels straight into an
+/// FP16 scRGB frame, and hardcoding 1.0 there (80 nits) drew the cursor at half
+/// the brightness of the 160-nit desktop behind it.
+static SDR_WHITE_SCRGB: AtomicU32 = AtomicU32::new(0);
+
+/// SDR white in scRGB units (nits / 80), or BT.2408 reference white (203 nits)
+/// until `set_sdr_white_level` has run — matching the shim's own default.
+pub fn sdr_white_level() -> f32 {
+    match SDR_WHITE_SCRGB.load(Ordering::Relaxed) {
+        0 => 203.0 / 80.0,
+        bits => f32::from_bits(bits),
+    }
 }
 
 /// Thread-safe IDR trigger callable from any thread (e.g. the control-stream
