@@ -268,14 +268,27 @@ pub fn emergency_restore_for_shutdown() {
     // 1. Physical topology back first (the user-visible part). restore_topology
     //    falls back to SDC_FORCE_MODE_ENUMERATION on error 87, which rebuilds
     //    the topology from what is physically connected — exactly right here.
-    match VirtualDisplay::restore_topology(&snap.topology, Some(&snap.device_name)) {
-        Ok(()) => println!("🖥️  Emergency: physical display topology restored"),
-        Err(e) => println!("⚠️  Emergency topology restore: {e}"),
+    //
+    //    Skipped when the secure desktop already owns the input: SetDisplayConfig
+    //    is denied there (error 5 — seen live 2026-08-11 on every sign-out), so
+    //    the call can only burn time and print a diagnostic dump on a path that
+    //    is often blocking a session teardown. The devnode disable below still
+    //    runs, and whichever Worker starts next restores the topology from the
+    //    Default desktop where it actually works.
+    if crate::capture::desktop_switch::current_input_desktop()
+        == crate::capture::desktop_switch::InputDesktop::Secure
+    {
+        println!("⏭️  Emergency: secure desktop owns the input — skipping the CCD restore \
+            (denied there); parking the devnode instead");
+    } else {
+        match VirtualDisplay::restore_topology(&snap.topology, Some(&snap.device_name)) {
+            Ok(()) => println!("🖥️  Emergency: physical display topology restored"),
+            Err(e) => println!("⚠️  Emergency topology restore: {e}"),
+        }
+        // Let DWM commit the path change before the devnode disappears — same
+        // settle deactivate_after_stream uses to avoid the error-87 race.
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-
-    // Let DWM commit the path change before the devnode disappears — same
-    // settle deactivate_after_stream uses to avoid the error-87 race.
-    std::thread::sleep(std::time::Duration::from_millis(250));
 
     // 2. Hardware-disable the VDD devnode so the next boot cannot resurrect
     //    the headless topology from the CCD database.

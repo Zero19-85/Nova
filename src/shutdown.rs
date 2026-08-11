@@ -41,8 +41,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::SetProcessShutdownParameters;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    PostQuitMessage, RegisterClassW, TranslateMessage, MSG, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+    PostQuitMessage, RegisterClassW, TranslateMessage, ENDSESSION_LOGOFF, MSG, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
 };
 
 /// SHUTDOWN_NORETRY for `SetProcessShutdownParameters` (winbase.h) — don't
@@ -56,7 +56,14 @@ const SHUTDOWN_NORETRY: u32 = 0x0000_0001;
 /// also complete.
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
-        ct if ct == CTRL_CLOSE_EVENT || ct == CTRL_LOGOFF_EVENT || ct == CTRL_SHUTDOWN_EVENT => {
+        // Sign-out: audio only, same reasoning as the WM_ENDSESSION handler —
+        // the display work is denied on the incoming secure desktop and the
+        // successor Worker heals the topology where it actually works.
+        ct if ct == CTRL_LOGOFF_EVENT => {
+            crate::audio::emergency_restore_default_endpoint();
+            BOOL(0)
+        }
+        ct if ct == CTRL_CLOSE_EVENT || ct == CTRL_SHUTDOWN_EVENT => {
             crate::virtual_display::emergency_restore_for_shutdown();
             BOOL(0)
         }
@@ -92,11 +99,36 @@ unsafe extern "system" fn session_monitor_wndproc(
         }
         WM_ENDSESSION => {
             // wparam == TRUE ⇒ the session IS ending (FALSE = another app
-            // vetoed it). Windows may terminate us the moment this returns,
-            // so the restore must complete synchronously first.
+            // vetoed it). Windows BLOCKS the sign-out/shutdown on this message,
+            // so whatever runs here is added directly to the user's wait.
             if wparam.0 != 0 {
-                println!("🛑 WM_ENDSESSION — restoring display state before termination");
-                crate::virtual_display::emergency_restore_for_shutdown();
+                let logoff = (lparam.0 as u32 & ENDSESSION_LOGOFF) != 0;
+                let started = std::time::Instant::now();
+                if logoff {
+                    // A SIGN-OUT, not an OS shutdown. Deliberately do NOT touch
+                    // the display here:
+                    //   * the desktop is already switching to Winlogon, where
+                    //     SetDisplayConfig is denied — the restore fails with
+                    //     error 5 every time (seen live 2026-08-11), so the
+                    //     work is pure latency on a blocking message;
+                    //   * a replacement Worker starts in the new session within
+                    //     seconds and heals the topology properly from the
+                    //     Default desktop (see ensure_enabled_at_boot's
+                    //     orphaned-VDD branch), which is where the CCD calls
+                    //     actually succeed.
+                    // Audio IS restored here: it's fast, and leaving the host
+                    // muted through a sign-out is immediately noticeable.
+                    println!("🛑 WM_ENDSESSION (sign-out) — restoring audio; the next session's \
+                        Worker restores the display topology");
+                    crate::audio::emergency_restore_default_endpoint();
+                } else {
+                    // Real shutdown/restart: no successor Worker will ever run,
+                    // so this is the last chance to hand the physical monitors
+                    // back. Windows may terminate us the moment this returns.
+                    println!("🛑 WM_ENDSESSION (shutdown) — restoring display state before termination");
+                    crate::virtual_display::emergency_restore_for_shutdown();
+                }
+                println!("⏱️  WM_ENDSESSION handled in {} ms", started.elapsed().as_millis());
             }
             LRESULT(0)
         }
