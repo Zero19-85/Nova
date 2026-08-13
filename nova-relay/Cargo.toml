@@ -9,7 +9,10 @@ nova-core = { path = "../nova-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 rustls-pki-types = { workspace = true }
-tokio-rustls = { workspace = true }
+# Dev tooling that only ever runs on a desktop, so it takes the same provider
+# the host does. The TLS crates carry no default features workspace-wide (see
+# the root manifest), so the provider has to be named here.
+tokio-rustls = { workspace = true, features = ["tls12", "logging", "aws_lc_rs"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }

@@ -128,12 +128,14 @@ pub(crate) fn client_auth_tls_config() -> Option<ServerConfig> {
     let (cert_der, key_der) = SERVER_IDENTITY.get()?;
     let cert = CertificateDer::from(cert_der.clone());
     let key = PrivateKeyDer::Pkcs8(key_der.clone().into());
-    match ServerConfig::builder_with_protocol_versions(&[
-        &rustls::version::TLS13,
-        &rustls::version::TLS12,
-    ])
-    .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
-    .with_single_cert(vec![cert], key)
+    // Provider named explicitly rather than taken from rustls's process-global
+    // default — see `nova_core::identity::provider` for why that default is not
+    // always unambiguous in this workspace.
+    match ServerConfig::builder_with_provider(nova_core::identity::provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("TLS 1.2/1.3 must be supported by the configured provider")
+        .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
+        .with_single_cert(vec![cert], key)
     {
         Ok(cfg) => Some(cfg),
         Err(e) => {
@@ -741,7 +743,9 @@ pub async fn start_pairing_server(
     // Client certs are REQUIRED on 47984 (AcceptAnyClientCert, Sunshine's
     // SSL_VERIFY_FAIL_IF_NO_PEER_CERT equivalent) — the accept loop below
     // authorizes each connection against the trusted store.
-    let mut tls_config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+    let mut tls_config = ServerConfig::builder_with_provider(nova_core::identity::provider())
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("TLS 1.2 must be supported by the configured provider")
         .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
         .with_single_cert(vec![cert], key)
         .expect("Failed to build TLS config");

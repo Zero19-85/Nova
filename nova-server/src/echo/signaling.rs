@@ -240,7 +240,13 @@ pub fn build_client_tls(
     };
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::Pkcs8(key_der.to_vec().into());
-    ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    // The provider is named rather than taken from rustls's process-global
+    // default: a `--workspace` build compiles both providers (the host uses
+    // aws-lc-rs, echo-android uses ring) and rustls has no unambiguous default
+    // in that case. See `nova_core::identity::provider`.
+    ClientConfig::builder_with_provider(nova_core::identity::provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| format!("client TLS versions: {e}"))?
         .dangerous() // "dangerous" = custom verifier; the pin IS the verification
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(vec![cert], key)
@@ -838,9 +844,11 @@ mod tests {
         let nova_fp = hex::encode(sha256(&nova_cert));
 
         // Relay side: require a client certificate, then report which one it saw.
-        let server_cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ])
+        let server_cfg = rustls::ServerConfig::builder_with_provider(
+            nova_core::identity::provider(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 must be supported by the configured provider")
         .with_client_cert_verifier(crate::pairing::test_accept_any_client_cert())
         .with_single_cert(
             vec![CertificateDer::from(relay_cert.clone())],
@@ -926,9 +934,11 @@ mod tests {
         let (other_cert, _) = self_signed("localhost");
         let (nova_cert, nova_key) = self_signed("nova");
 
-        let server_cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ])
+        let server_cfg = rustls::ServerConfig::builder_with_provider(
+            nova_core::identity::provider(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 must be supported by the configured provider")
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(relay_cert)],

@@ -19,7 +19,23 @@
 # genuinely common is the wire format and the identity model — that is what
 # nova-core holds.
 [workspace]
-members = ["nova-core", "nova-server", "echo-client", "nova-relay"]
+members = ["nova-core", "nova-server", "echo-client", "echo-android", "nova-relay"]
+
+# `echo-android` is a member (so `cargo check --workspace` and `cargo test
+# --workspace` compile the JNI bridge on the dev box — a signature typo is
+# otherwise an UnsatisfiedLinkError on a phone) but NOT a default member.
+#
+# The distinction is about binary size, and it is not theoretical: Cargo unifies
+# features across whatever it is asked to build, so a bare `cargo build
+# --release` that included echo-android would enable `nova-core/ring` alongside
+# the host's `aws-lc-rs` and link *both* crypto providers into nova-server.exe.
+# The host would gain a second copy of a TLS backend it never calls, which is
+# exactly the kind of drift this project's footprint goal exists to prevent.
+#
+# So: deployment builds (`cargo build --release`) skip it, verification builds
+# (`--workspace`) include it, and the Android build targets it directly with
+# `cargo ndk … -p echo-android`.
+default-members = ["nova-core", "nova-server", "echo-client", "nova-relay"]
 resolver = "2"
 
 # Single source of version truth for anything more than one member uses, so a
@@ -28,8 +44,13 @@ resolver = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustls = "0.23.40"
-tokio-rustls = "0.26.4"
+# No default features on the TLS crates: their defaults hard-wire the
+# `aws_lc_rs` provider, which builds C and assembly through cmake and is the one
+# dependency that fights an Android cross-build. Each member names the provider
+# it wants instead (see nova-core's [features]). `nova-server` keeps its own
+# direct, default-featured rustls, so the host build is unaffected either way.
+rustls = { version = "0.23.40", default-features = false }
+tokio-rustls = { version = "0.26.4", default-features = false }
 rustls-pki-types = "1.14.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }

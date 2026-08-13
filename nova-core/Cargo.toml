@@ -4,6 +4,26 @@ version = "0.1.0"
 edition = "2021"
 description = "Protocol and identity shared by the Nova host and the Echo client"
 
+# The TLS crypto provider, chosen at build time. Provider selection is local and
+# invisible on the wire, so a `ring` client and an `aws-lc-rs` host interoperate
+# normally — this is a build-system concern, not a protocol one.
+#
+# `aws-lc-rs` stays the default so the shipping host build is exactly what it
+# was. Android uses `ring`: `aws-lc-sys` compiles C and assembly through cmake
+# and needs bindgen on targets without prebuilt bindings, which is precisely the
+# fight to avoid in a Windows-host → Android cross-build. `ring` is already in
+# this tree — rcgen 0.14 defaults to it — and cross-compiles with nothing but
+# the NDK clang.
+#
+# Both may end up enabled at once in a `--workspace` build, because Cargo
+# unifies features across the graph. That is handled rather than prevented: see
+# `identity::provider`, which names the provider explicitly instead of relying
+# on rustls's process-global default.
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
+ring = ["rustls/ring", "tokio-rustls/ring"]
+
 # Deliberately free of Windows APIs, capture, encoding, and host state: this
 # crate is compiled into the Xbox/Android client as well as the host, so
 # anything platform-specific belongs on one side of it, never inside it.
@@ -11,8 +31,8 @@ description = "Protocol and identity shared by the Nova host and the Echo client
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
+rustls = { workspace = true, features = ["std", "tls12", "logging"] }
+tokio-rustls = { workspace = true, features = ["tls12", "logging"] }
 rustls-pki-types = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

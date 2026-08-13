@@ -27,7 +27,7 @@
 //!   trusting every public CA.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use sha2::{Digest, Sha256};
@@ -124,8 +124,45 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+#[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+compile_error!(
+    "nova-core needs a TLS crypto provider: enable feature `aws-lc-rs` (the default, used by \
+     the host) or `ring` (used by the Android build, which cannot easily build aws-lc-sys)."
+);
+
+/// The TLS crypto provider this build uses.
+///
+/// Named explicitly at every call site rather than relying on rustls's
+/// *process-default* provider, and that distinction is load-bearing rather than
+/// stylistic. A workspace build can legitimately compile both providers at once
+/// — `nova-server` enables `aws-lc-rs` while `echo-android` enables `ring`, and
+/// Cargo unifies features across the graph — and with two providers linked and
+/// no default installed, `ConfigBuilder` panics at runtime. Passing the
+/// provider in makes our configuration independent of process-global state and
+/// of whatever else happens to be linked into the binary.
+///
+/// The choice is purely local: provider selection is not visible on the wire, so
+/// a `ring` client and an `aws-lc-rs` host interoperate normally.
+pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            // aws-lc-rs wins when both are compiled, so a workspace build keeps
+            // the host on exactly the provider it ships with.
+            #[cfg(feature = "aws-lc-rs")]
+            {
+                Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+            }
+            #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+            {
+                Arc::new(rustls::crypto::ring::default_provider())
+            }
+        })
+        .clone()
+}
+
 fn provider_algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
-    rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
+    provider().signature_verification_algorithms
 }
 
 /// Server-side policy: a client certificate is **required**, any certificate
@@ -268,7 +305,9 @@ fn to_rustls(identity: &Identity) -> (CertificateDer<'static>, PrivateKeyDer<'st
 /// `server_pin`.
 pub fn client_config_pinned(identity: &Identity, server_pin: [u8; 32]) -> Result<ClientConfig, String> {
     let (cert, key) = to_rustls(identity);
-    ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| format!("client TLS versions: {e}"))?
         .dangerous() // "dangerous" = custom verifier; the pin IS the verification
         .with_custom_certificate_verifier(Arc::new(PinnedCert::new(server_pin)))
         .with_client_auth_cert(vec![cert], key)
@@ -279,7 +318,9 @@ pub fn client_config_pinned(identity: &Identity, server_pin: [u8; 32]) -> Result
 /// certificate, leaving authorization to the caller.
 pub fn server_config_require_client_cert(identity: &Identity) -> Result<ServerConfig, String> {
     let (cert, key) = to_rustls(identity);
-    ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| format!("server TLS versions: {e}"))?
         .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
         .with_single_cert(vec![cert], key)
         .map_err(|e| format!("server TLS config: {e}"))

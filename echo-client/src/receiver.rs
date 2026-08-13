@@ -117,6 +117,10 @@ pub struct ReceiveStats {
     /// number worth watching on a WAN link: rising with `frames_incomplete`
     /// flat means FEC is doing its job at the current percentage.
     pub frames_recovered_by_fec: u64,
+    /// Frames withheld from the sink because no keyframe had arrived yet (see
+    /// [`crate::gate`]). Zero on a healthy session, because Nova starts one with
+    /// an IDR; a persistent nonzero count means it did not.
+    pub frames_dropped_before_keyframe: u64,
 }
 
 struct PartialFrame {
@@ -394,6 +398,12 @@ impl FrameSink for LoggingSink {
 /// instead (the punch already established it), so the pings are here purely to
 /// hold the NAT mapping open — without them the pinhole lapses during a quiet
 /// moment and the stream stops for reasons that look like packet loss.
+///
+/// Frames pass a [`KeyframeGate`] before reaching `sink`, so a sink is
+/// guaranteed to see a keyframe first and never to receive a P-frame whose
+/// references it does not hold. That guarantee belongs here rather than in each
+/// sink: it is a property of the stream, and re-deriving it per consumer is how
+/// one consumer ends up without it.
 pub async fn run_receiver(
     socket: &tokio::net::UdpSocket,
     peer: std::net::SocketAddr,
@@ -403,6 +413,7 @@ pub async fn run_receiver(
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<ReceiveStats> {
     let mut depack = VideoDepacketizer::new(keys);
+    let mut gate = crate::gate::KeyframeGate::new();
     let mut keepalive = tokio::time::interval(std::time::Duration::from_millis(500));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stop = stop;
@@ -410,7 +421,7 @@ pub async fn run_receiver(
     loop {
         tokio::select! {
             _ = stop.changed() => {
-                if *stop.borrow() { return Ok(depack.stats); }
+                if *stop.borrow() { return Ok(finalize(depack.stats, &gate)); }
             }
             _ = keepalive.tick() => {
                 // NAT keepalive only. Deliberately not sent before a session
@@ -425,14 +436,25 @@ pub async fn run_receiver(
                 match datagram {
                     Some(d) => {
                         if let Some(frame) = depack.push(&d) {
-                            sink.on_frame(frame);
+                            // The gate, not the sink, decides whether a frame is
+                            // decodable yet — see this function's docs.
+                            if gate.admit(&frame) {
+                                sink.on_frame(frame);
+                            }
                         }
                     }
-                    None => return Ok(depack.stats), // demultiplexer stopped
+                    // demultiplexer stopped
+                    None => return Ok(finalize(depack.stats, &gate)),
                 }
             }
         }
     }
+}
+
+/// The depacketiser counts what it parsed; the gate counts what it withheld.
+/// Joining them at the exit keeps the gate's tally out of the hot path.
+fn finalize(stats: ReceiveStats, gate: &crate::gate::KeyframeGate) -> ReceiveStats {
+    ReceiveStats { frames_dropped_before_keyframe: gate.dropped(), ..stats }
 }
 
 /// Sole reader of the punched socket, splitting it into the streams that share

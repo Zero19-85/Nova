@@ -1,0 +1,31 @@
+[package]
+name = "echo-android"
+version = "0.1.0"
+edition = "2021"
+description = "JNI bridge exposing the Echo client to Kotlin"
+
+# `cdylib` is what Android loads via System.loadLibrary. `rlib` is here so the
+# crate has unit tests and so `cargo check --workspace` on a desktop compiles the
+# bridge — a JNI signature typo is otherwise a runtime UnsatisfiedLinkError on a
+# phone, which is the slowest possible place to discover it. The `jni` crate
+# links nothing (it only ever receives a JNIEnv pointer it was handed), so this
+# builds on Windows exactly as it does on Android.
+[lib]
+name = "echo_android"
+crate-type = ["cdylib", "rlib"]
+
+# `ring`, not aws-lc-rs — see nova-core's manifest. `default-features = false`
+# also drops clap: an argument parser is dead weight in a .so.
+[dependencies]
+echo-client = { path = "../echo-client", default-features = false, features = ["ring"] }
+nova-core = { path = "../nova-core", default-features = false, features = ["ring"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+jni = "0.21"
+
+# Routes Rust's `log` to logcat. Android-only: on a desktop check-build there is
+# no logcat to route to, and pulling it in unconditionally would add an
+# Android-only dependency to a target that cannot use it.
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+log = "0.4"

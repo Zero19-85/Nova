@@ -4,19 +4,42 @@ version = "0.1.0"
 edition = "2021"
 description = "Echo — Nova's native client (headless CLI)"
 
-# No video decode, no UI, no platform code yet: this iteration exists to prove
-# the connection path. Everything it needs lives in nova-core, which is exactly
-# the crate that will compile for Xbox and Android later.
+# A library plus a thin CLI over it, rather than one binary. The library half is
+# what `echo-android` links: the connection sequence, the depacketiser, and the
+# keyframe gate are identical on every platform, and the only way to keep them
+# identical is for there to be one copy. It also means a desktop `echo stream`
+# exercises the same code an Android session will, which is the cheapest
+# validation available for a stack that has not met real hardware yet.
+#
+# The binary is declared rather than inferred so it can carry
+# `required-features`: without that, an Android build (`--no-default-features
+# --features ring`) would still try to compile a CLI whose argument parser is
+# no longer in the dependency graph.
+[[bin]]
+name = "echo-client"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Forwarded straight through to nova-core; see its manifest for why the provider
+# is a build-time choice. `clap` and the CLI live behind `cli`, which the
+# Android build turns off — an argument parser is dead weight in a .so.
+[features]
+default = ["aws-lc-rs", "cli"]
+aws-lc-rs = ["nova-core/aws-lc-rs", "tokio-rustls/aws_lc_rs"]
+ring = ["nova-core/ring", "tokio-rustls/ring"]
+cli = ["dep:clap"]
+
 [dependencies]
-nova-core = { path = "../nova-core" }
+nova-core = { path = "../nova-core", default-features = false }
 tokio = { workspace = true }
 serde_json = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, optional = true }
 hex = { workspace = true }
 # Echo's control-channel client (control.rs). Already in the tree via
 # nova-core's mutual-TLS helpers — this only makes the dependency direct so the
-# connector and server-name types can be named here.
-tokio-rustls = { workspace = true }
+# connector and server-name types can be named here. The provider comes from
+# this crate's own feature table, which forwards to nova-core's.
+tokio-rustls = { workspace = true, features = ["tls12", "logging"] }
 rustls-pki-types = { workspace = true }
 # Client-side FEC reconstruction (receiver.rs). Must be the SAME crate and
 # major version the host encodes with (nova-server), because Reed-Solomon
