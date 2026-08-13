@@ -317,6 +317,9 @@ impl Progress for ConsoleProgress {
             Event::PublicAddress { mapped, via } => {
                 println!("🌐 Our public address {mapped} (via {via})")
             }
+            Event::LocalCandidate { addr } => {
+                println!("🏠 Our address on this network {addr} (offered for same-LAN peers)")
+            }
             Event::Mapping { behavior } => report_behavior(behavior),
             Event::RelayConnected { authority } => println!("📡 Connected to relay {authority}"),
             Event::HostCandidates { addrs } => println!(

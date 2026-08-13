@@ -146,6 +146,49 @@ pub struct WanCandidate {
     pub via: SocketAddr,
 }
 
+/// The address this machine would use to reach the outside world, paired with
+/// `port` — a **host candidate** in ICE's vocabulary.
+///
+/// ## Why this exists, and why reflexive candidates alone are not enough
+///
+/// Two peers on the *same* network see the same public address. Offering only
+/// server-reflexive candidates therefore asks each of them to reach the other by
+/// sending to their shared public IP, which only works if the router implements
+/// NAT hairpinning — many consumer routers do not, and those that do often add
+/// latency doing it.
+///
+/// That case is not an edge case for Echo. "Phone on the same Wi-Fi as the
+/// gaming PC" is the *most common* way this client will be used, and without a
+/// host candidate it is the one case that depends on router behaviour nobody
+/// controls. Real ICE always gathers host candidates first for exactly this
+/// reason.
+///
+/// ## How the address is found
+///
+/// By `connect`ing a throwaway UDP socket toward a public address and reading
+/// back its local address. No packet is sent — a UDP `connect` only fixes the
+/// default destination — so this costs one syscall pair, needs no network, and
+/// needs no interface-enumeration dependency. What it returns is the address of
+/// whichever interface the routing table would actually use, which is precisely
+/// the one a peer on that network can reach.
+///
+/// Returns `None` when there is no route at all (an offline machine has no
+/// useful host candidate to advertise).
+pub fn local_host_candidate(port: u16) -> Option<SocketAddr> {
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    // Any routable address works; this one is never contacted.
+    probe.connect(("8.8.8.8", 53)).ok()?;
+    let local = probe.local_addr().ok()?;
+    match local.ip() {
+        // A loopback answer means no real route was resolved. Advertising
+        // 127.0.0.1 to a peer would be noise at best and misleading at worst.
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
+}
+
 // ── Wire codec ──────────────────────────────────────────────────────────────
 
 /// A fresh, cryptographically-random transaction ID.
@@ -464,6 +507,31 @@ pub async fn classify_mapping(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_host_candidate_carries_our_media_port_and_a_routable_address() {
+        // On a machine with a route this must produce the address a same-LAN
+        // peer can reach us on. On one without, `None` is the correct answer
+        // rather than a loopback address nobody can use.
+        let Some(candidate) = local_host_candidate(58015) else {
+            return; // no route configured; nothing to assert
+        };
+        assert_eq!(candidate.port(), 58015, "must carry the media socket's port");
+        match candidate.ip() {
+            std::net::IpAddr::V4(ip) => {
+                assert!(!ip.is_loopback(), "loopback is not reachable by a peer");
+                assert!(!ip.is_unspecified(), "0.0.0.0 is not an address a peer can use");
+            }
+            other => panic!("expected IPv4, got {other}"),
+        }
+    }
+
+    #[test]
+    fn the_host_candidate_is_stable_across_calls() {
+        // The offer is built once but the value is read separately from the
+        // socket bind; if this drifted, we would advertise an address our
+        // socket is not on.
+        assert_eq!(local_host_candidate(1234), local_host_candidate(1234));
+    }
 
     #[test]
     fn binding_request_has_the_rfc_header_shape() {

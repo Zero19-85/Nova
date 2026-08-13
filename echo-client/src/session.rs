@@ -52,6 +52,9 @@ pub enum Event {
     Identity { fingerprint: String },
     SocketBound { local: SocketAddr },
     PublicAddress { mapped: SocketAddr, via: SocketAddr },
+    /// Our address on the local network, offered so a peer on the *same*
+    /// network can reach us without NAT hairpinning.
+    LocalCandidate { addr: SocketAddr },
     Mapping { behavior: MappingBehavior },
     RelayConnected { authority: String },
     HostCandidates { addrs: Vec<SocketAddr> },
@@ -84,6 +87,9 @@ impl Event {
             Event::SocketBound { local } => json!({"type": "socket_bound", "local": local.to_string()}),
             Event::PublicAddress { mapped, via } => {
                 json!({"type": "public_address", "mapped": mapped.to_string(), "via": via.to_string()})
+            }
+            Event::LocalCandidate { addr } => {
+                json!({"type": "local_candidate", "addr": addr.to_string()})
             }
             Event::Mapping { behavior } => json!({
                 "type": "mapping",
@@ -256,9 +262,23 @@ pub async fn open_path(
     }
     progress.event(Event::HostCandidates { addrs: host_candidates.clone() });
 
+    // Offer a host candidate alongside the reflexive ones. Without it, a peer
+    // on the *same* network as us can only be reached via our shared public
+    // address, which needs NAT hairpinning — and "phone on the same Wi-Fi as
+    // the PC" is the most common way this client gets used, so that would make
+    // the commonest case the one that depends on router behaviour nobody
+    // controls. See `stun::local_host_candidate`.
+    let mut offered = candidates_json(&mine);
+    if let Some(local) = stun::local_host_candidate(local.port()) {
+        if !mine.iter().any(|c| c.mapped == local) {
+            progress.event(Event::LocalCandidate { addr: local });
+            offered.push(json!({ "addr": local.to_string(), "via": "host" }));
+        }
+    }
+
     let mut params = identity_params(identity);
     params.insert("host".into(), json!(opts.host_fingerprint));
-    params.insert("candidates".into(), Value::Array(candidates_json(&mine)));
+    params.insert("candidates".into(), Value::Array(offered));
     conn.call("offer", params).await.map_err(|e| format!("relay offer: {e}"))?;
     progress.event(Event::Offered);
 
