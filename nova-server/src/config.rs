@@ -10,6 +10,7 @@ pub struct NovaConfig {
     pub audio:   AudioConfig,
     pub network: NetworkConfig,
     pub hdr:     HdrConfig,
+    pub echo:    EchoConfig,
 }
 
 // ── Sub-tables ────────────────────────────────────────────────────────────────
@@ -86,6 +87,44 @@ pub struct HdrConfig {
     pub max_fall_nits: u16,
 }
 
+/// Echo side-channel (`echo_rpc.rs`) — the control/telemetry RPC for Nova's
+/// native client. Absent from an existing `nova.toml` is fine: the whole table
+/// is `#[serde(default)]`, so upgrading an install picks up the defaults below
+/// without any config migration.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct EchoConfig {
+    /// Run the Echo RPC listener at all.
+    pub enabled: bool,
+    /// TCP port for the newline-delimited JSON control channel (mutual TLS).
+    pub port: u16,
+    /// WAN signaling relay — see [`SignalingConfig`]. Absent = LAN only.
+    pub signaling: SignalingConfig,
+}
+
+/// Signaling relay used for zero-config WAN connections (`echo::signaling`).
+///
+/// Entirely opt-in: with no `url` Nova never contacts anything, and Echo works
+/// on the LAN exactly as before.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SignalingConfig {
+    /// `https://` URL of the signaling relay. Empty disables WAN signaling.
+    /// Plaintext is refused — the connection carries Nova's identity
+    /// certificate.
+    pub url: String,
+    /// SHA-256 (64 hex chars) of the relay's TLS certificate.
+    ///
+    /// Required whenever `url` is set: the relay is authenticated by pin, not
+    /// by a public CA, so trust is one key we operate rather than every CA on
+    /// the internet. Rotating the relay's certificate means shipping a new
+    /// pin.
+    pub relay_cert_sha256: String,
+    /// How long the relay may hold a long-poll open. Clamped to 5–55 s —
+    /// middleboxes commonly cut idle HTTP requests around 60 s.
+    pub poll_timeout_secs: u32,
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 impl Default for NovaConfig {
@@ -95,6 +134,23 @@ impl Default for NovaConfig {
             audio:   AudioConfig::default(),
             network: NetworkConfig::default(),
             hdr:     HdrConfig::default(),
+            echo:    EchoConfig::default(),
+        }
+    }
+}
+
+impl Default for EchoConfig {
+    fn default() -> Self {
+        Self { enabled: true, port: 48011, signaling: SignalingConfig::default() }
+    }
+}
+
+impl Default for SignalingConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            relay_cert_sha256: String::new(),
+            poll_timeout_secs: 30,
         }
     }
 }
@@ -164,6 +220,23 @@ fec_percentage = 5      # Reed-Solomon FEC parity % (0 = disabled).
                         # Pure overhead on top of the video bitrate — 5% suits
                         # wired/stable LANs. Raise for lossy links (WiFi,
                         # powerline); 20% at 4K120 added ~20 Mbps of parity.
+
+[echo]
+# Echo side-channel — the control/telemetry RPC for Nova's native client.
+# Newline-delimited JSON over mutual TLS: a client authenticates with the SAME
+# certificate it paired with (nova_paired.json), so pairing is the only way in
+# and "Clear Paired Devices" revokes this port too. No shared secret to manage.
+enabled = true
+port    = 48011
+
+[echo.signaling]
+# Zero-config WAN connections. Leave url empty for LAN-only operation — Nova
+# then never contacts any external service. The relay is authenticated by
+# certificate PIN (not a public CA), and Nova authenticates to it with the same
+# certificate it pairs clients with.
+url               = ""   # https:// URL of the signaling relay ("" = disabled)
+relay_cert_sha256 = ""   # SHA-256 of the relay's TLS cert, 64 hex chars
+poll_timeout_secs = 30   # long-poll hold time (clamped to 5-55)
 
 [hdr]
 # HDR10 HEVC SEI luminance parameters — tune to your TV's spec sheet.

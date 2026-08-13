@@ -8,6 +8,30 @@ use rusty_enet as enet;
 use crate::ipc::{ControlMsg, WorkerLink};
 use crate::rtsp::ClientInfo;
 
+/// Set when the host wants the live client disconnected — currently only the
+/// tray's "End Stream" (see `tray::TrayAction::EndStream`).
+///
+/// An atomic rather than a channel because the ENet `Host` is owned exclusively
+/// by [`start_control_server`]'s thread and is not `Sync`: every peer operation
+/// has to happen inside that loop. The loop already wakes every 4 ms, so a flag
+/// it checks per tick costs one relaxed load and disconnects the client within
+/// one tick of the request.
+static KICK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the control thread to disconnect whatever client is connected.
+///
+/// Ending the session in `ClientInfo` on its own would stop the video, but the
+/// client would sit on a live control connection watching a dead stream until
+/// its own 10-30 s timeout. A graceful ENet disconnect makes Moonlight tear
+/// down immediately and return to its app list.
+///
+/// Call this AFTER marking the session ended in `ClientInfo`, so the disconnect
+/// event this produces can't be read as the client leaving a session that is
+/// still considered live.
+pub fn request_peer_kick() {
+    KICK_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Moonlight's "control stream" is ENet (reliable UDP), not TCP — this is what
 /// was failing with "error 11 / check UDP 47999" after the RTSP handshake
 /// completed. We host a single-peer ENet server here; the library handles the
@@ -83,6 +107,30 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
                 }
             }
         }
+
+        // Host-initiated end of session (tray "End Stream"). `disconnect`, not
+        // `reset`: this sends a real ENet DISCONNECT so the client tears down
+        // and returns to its app list, where reset() would silently drop the
+        // peer and leave Moonlight staring at a stream that stopped.
+        //
+        // The Disconnect event this eventually produces lands in handle_event
+        // like any other, which is harmless — the caller has already marked the
+        // session ended, and that arm only ever clears `streaming_active`.
+        if KICK_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let live: Vec<(enet::PeerID, String)> = host
+                .connected_peers()
+                .map(|p| (p.id(), p.address().map(|a| a.to_string()).unwrap_or_else(|| "?".to_string())))
+                .collect();
+            if live.is_empty() {
+                println!("🎮 Control stream: end-of-session requested with no peer connected — nothing to disconnect");
+            }
+            for (id, addr) in live {
+                println!("🎮 Control stream: disconnecting peer {} (session ended by the host)", addr);
+                host.peer_mut(id).disconnect(0);
+                peer_generation.remove(&id);
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(4));
     }
 }

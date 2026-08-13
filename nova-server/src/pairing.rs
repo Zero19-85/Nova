@@ -84,6 +84,150 @@ pub struct PairedClient {
 /// request handlers (pair/unpair mutations).
 type TrustedClients = Arc<Mutex<HashMap<String, PairedClient>>>;
 
+/// The live trust store, published once `start_pairing_server` builds it.
+///
+/// Exists solely so the tray's "Clear Paired Devices" can revoke access without
+/// threading a handle from `start_pairing_server` through `start_master_network`
+/// and `control_supervisor` purely to reach it. Clearing the JSON file alone
+/// would revoke NOTHING — this map is what every HTTPS connection is
+/// authorised against, and the next successful pair writes it straight back to
+/// disk.
+static TRUSTED_STORE: std::sync::OnceLock<TrustedClients> = std::sync::OnceLock::new();
+
+/// Nova's own TLS identity — `(cert DER, PKCS#8 key DER)` — published once
+/// `start_pairing_server` has loaded or generated it.
+///
+/// Exists so other Master-side listeners can present the SAME server identity
+/// and authenticate against the SAME trust store, rather than inventing a
+/// parallel one. Concretely: `echo_rpc.rs` (port 48011) is a command channel
+/// that can reconfigure the host's displays, and the only defensible answer to
+/// "who may issue those commands" is "a device the user already paired". That
+/// makes an Echo client's identity *be* its pairing identity — one enrolment
+/// flow, one revocation point (`clear_all_paired` covers both ports the
+/// instant it runs, since authorization is per-connection).
+///
+/// Published rather than re-derived because loading is not idempotent: on a
+/// fresh install `NovaCrypto` GENERATES the cert, so a second loader racing
+/// the pairing server could mint a different identity and break every existing
+/// pairing.
+static SERVER_IDENTITY: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+
+/// A rustls `ServerConfig` presenting Nova's server certificate and REQUIRING
+/// a client certificate, using the same accept-any-cert-then-authorize policy
+/// as port 47984 (see [`AcceptAnyClientCert`]): the handshake proves the peer
+/// holds the private key for the cert it presents, and the caller then matches
+/// that cert's fingerprint against the trust store.
+///
+/// `None` until the pairing server has published the identity — callers should
+/// wait rather than fall back to an unauthenticated listener.
+///
+/// Unlike 47984 this allows TLS 1.3 as well as 1.2 and sets no ALPN: the 1.2
+/// pin and `http/1.1` advertisement there work around Qt/OpenSSL Moonlight
+/// client quirks, and Echo is a client we ship ourselves with no such history.
+pub(crate) fn client_auth_tls_config() -> Option<ServerConfig> {
+    let (cert_der, key_der) = SERVER_IDENTITY.get()?;
+    let cert = CertificateDer::from(cert_der.clone());
+    let key = PrivateKeyDer::Pkcs8(key_der.clone().into());
+    match ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+        &rustls::version::TLS12,
+    ])
+    .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new()))
+    .with_single_cert(vec![cert], key)
+    {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            println!("❌ Could not build client-auth TLS config: {e}");
+            None
+        }
+    }
+}
+
+/// The paired device name for a client-certificate fingerprint, or `None` if
+/// that certificate is not in the trust store.
+///
+/// This is the authorization decision itself, shared by every listener that
+/// authenticates by client certificate. Reads the LIVE store (not the file),
+/// so a "Clear Paired Devices" takes effect on the very next connection.
+pub(crate) fn trusted_device_name(fingerprint: &str) -> Option<String> {
+    TRUSTED_STORE
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(fingerprint)
+        .map(|pc| pc.name.clone())
+}
+
+/// SHA-256 fingerprint (lowercase hex) of a certificate's DER bytes — the key
+/// the trust store is keyed by.
+pub(crate) fn fingerprint_of_cert(der: &[u8]) -> String {
+    cert_fingerprint_hex(der)
+}
+
+/// Nova's own `(certificate DER, PKCS#8 key DER)`, once published.
+///
+/// Used by `echo::signaling` to present this host's pairing identity as a
+/// *client* certificate to the signaling relay — the same identity, in the
+/// other TLS role. `None` until the pairing server has started.
+pub(crate) fn server_identity() -> Option<(Vec<u8>, Vec<u8>)> {
+    SERVER_IDENTITY.get().cloned()
+}
+
+/// Test-only access to the accept-any-then-authorize client verifier, so other
+/// modules' tests can stand up a TLS server with the same client-auth policy
+/// Nova uses without duplicating the implementation.
+#[cfg(test)]
+pub(crate) fn test_accept_any_client_cert() -> Arc<dyn ClientCertVerifier> {
+    Arc::new(AcceptAnyClientCert::new())
+}
+
+/// Forget every paired device, in memory and on disk.
+///
+/// Returns how many devices were removed. Runs in whichever process hosts
+/// pairing (the Master under the split, `run()` monolithically) — never in a
+/// process that only has the file.
+///
+/// Already-established connections are NOT torn down: their TLS session was
+/// authorised when it opened, and a client mid-stream keeps streaming until the
+/// session ends. Revocation applies to every connection attempted afterwards,
+/// which is what "revoke access" means for a per-connection trust check.
+pub fn clear_all_paired() -> usize {
+    let removed = match TRUSTED_STORE.get() {
+        Some(store) => {
+            // Poison-proof: a panic in some other pairing task must not make
+            // the trust store permanently unrevokable.
+            let mut map = store.lock().unwrap_or_else(|e| e.into_inner());
+            let n = map.len();
+            map.clear();
+            n
+        }
+        None => {
+            // No pairing server in this process (shouldn't happen — the caller
+            // is Master-side). Fall back to the on-disk count so the log is
+            // still honest about what was removed.
+            println!("⚠️  Clear paired devices: no live trust store in this process — clearing the file only");
+            load_paired_json().len()
+        }
+    };
+
+    let path = data_file(PAIRED_PATH);
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("🗑️  Cleared {removed} paired device(s) — removed {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("🗑️  Cleared {removed} paired device(s) — no {} on disk", path.display());
+        }
+        Err(e) => {
+            // Deleting failed (file locked, permissions): overwrite it with an
+            // empty store instead, so a restart cannot resurrect the devices we
+            // just revoked in memory.
+            println!("⚠️  Could not delete {} ({e}) — writing an empty store instead", path.display());
+            save_paired_json(&HashMap::new());
+        }
+    }
+    println!("🔒 All devices must pair again with a new PIN before they can connect");
+    removed
+}
+
 /// Identity attached to an HTTPS connection whose client certificate matched
 /// the trusted store — Nova's equivalent of Apollo's `get_verified_cert()`.
 #[derive(Clone)]
@@ -560,6 +704,9 @@ pub async fn start_pairing_server(
     // Per-device trust store: cert fingerprint → paired device record.
     // This — not any global flag — is what authorizes a client connection.
     let trusted: TrustedClients = Arc::new(Mutex::new(load_paired_json()));
+    // Publish it for `clear_all_paired` (tray "Clear Paired Devices"). Only the
+    // first pairing server in a process wins; there is only ever one.
+    let _ = TRUSTED_STORE.set(trusted.clone());
     {
         let lock = trusted.lock().unwrap();
         if lock.is_empty() {
@@ -576,6 +723,12 @@ pub async fn start_pairing_server(
     // Build from the cert that was just loaded/generated above. plaincert (sent
     // during HTTP pairing) and the TLS identity are guaranteed to be the same
     // bytes because both come from the same crypto.cert_der.
+    // Publish the identity for the other listeners that authenticate against
+    // this same trust store (echo_rpc.rs — see SERVER_IDENTITY). Done here,
+    // after the cert is definitely loaded/generated, so nobody can race the
+    // generation path on a fresh install.
+    let _ = SERVER_IDENTITY.set((crypto.cert_der.clone(), crypto.private_key_der.clone()));
+
     let cert = CertificateDer::from(crypto.cert_der.clone());
     let key = PrivateKeyDer::Pkcs8(crypto.private_key_der.clone().into());
     // Restrict to TLS 1.2: Sunshine negotiates TLS 1.2 via OpenSSL.  Some Qt/OpenSSL

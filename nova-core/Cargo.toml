@@ -1,0 +1,28 @@
+[package]
+name = "nova-core"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol and identity shared by the Nova host and the Echo client"
+
+# Deliberately free of Windows APIs, capture, encoding, and host state: this
+# crate is compiled into the Xbox/Android client as well as the host, so
+# anything platform-specific belongs on one side of it, never inside it.
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+rcgen = { workspace = true }
+# Echo media encryption (media_crypto.rs). Already compiled in this workspace
+# for nova-server's control-stream cipher, so this adds an edge rather than a
+# crate; pure Rust, so it stays clear of the NVENC/DXGI link line.
+aes-gcm = { workspace = true }

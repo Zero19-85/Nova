@@ -323,6 +323,31 @@ struct DisplaySnapshot {
     position: (i32, i32),
 }
 
+/// One display in the Worker's view of the live desktop topology, produced by
+/// [`VirtualDisplay::enumerate_displays`]. See that method for why only the
+/// Worker can build this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayInfo {
+    /// GDI device name (`\\.\DISPLAY1`) — the stable targeting key, and
+    /// exactly what `DesktopCapture::rebind` already takes.
+    pub device_name: String,
+    /// Human-readable adapter/device string for a client's UI.
+    pub label: String,
+    /// Committed source-mode size (what the desktop renders at).
+    pub width: u32,
+    pub height: u32,
+    /// Committed refresh in whole Hz; 0 when the path reports none.
+    pub refresh_hz: u32,
+    /// This display's source sits at the desktop origin.
+    pub is_primary: bool,
+    /// This is Nova's virtual display (MttVDD), not a physical monitor.
+    pub is_virtual: bool,
+    /// Advanced Color currently on.
+    pub hdr_active: bool,
+    /// Advanced Color supported.
+    pub hdr_capable: bool,
+}
+
 /// Owns the lifecycle of the virtual display device for the duration of the
 /// Nova process. One instance, created at startup, reused across
 /// connect/disconnect cycles.
@@ -2089,6 +2114,125 @@ impl VirtualDisplay {
     /// `IDXGIOutput`.
     pub fn active_device_name(&self) -> Option<&str> {
         self.active_device_name.as_deref()
+    }
+
+    /// One display as the Worker sees it — the unit of the inventory the
+    /// Master needs in order to offer Echo a targetable list of seats.
+    ///
+    /// Deliberately a `virtual_display`-owned type rather than the IPC wire
+    /// struct: this module knows CCD, not the pipe format, and `lib.rs`
+    /// converts — the same layering `NegotiatedParams` → `ConfigureStart`
+    /// already uses.
+    ///
+    /// Only the **Worker** can produce this. `QueryDisplayConfig` reports the
+    /// display state of the *calling session*, so the Master (Session 0) would
+    /// enumerate its own headless desktop and confidently report monitors that
+    /// nobody is looking at.
+    pub fn enumerate_displays(&self) -> Vec<DisplayInfo> {
+        let Ok((paths, modes)) = Self::query_active_topology() else {
+            return Vec::new();
+        };
+        let vdd_name = Self::find_virtual_display_device_name();
+        let mut out: Vec<DisplayInfo> = Vec::new();
+
+        for path in &paths {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+                continue;
+            }
+            let adapter_id = path.sourceInfo.adapterId;
+            let source_id = path.sourceInfo.id;
+            let Some(device_name) = Self::gdi_device_name_for_source(adapter_id, source_id) else {
+                continue;
+            };
+            // A clone/duplicate topology puts two active paths on one source;
+            // the seat is the source, so keep the first and skip repeats.
+            if out.iter().any(|d| d.device_name.eq_ignore_ascii_case(&device_name)) {
+                continue;
+            }
+
+            // Geometry comes from the SOURCE mode (what the desktop is
+            // actually rendering at) rather than the target's signal mode,
+            // which is what the capture layer sees.
+            let mut width = 0u32;
+            let mut height = 0u32;
+            let mut is_primary = false;
+            for m in &modes {
+                if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                    && m.adapterId.HighPart == adapter_id.HighPart
+                    && m.adapterId.LowPart == adapter_id.LowPart
+                    && m.id == source_id
+                {
+                    let sm = unsafe { &m.Anonymous.sourceMode };
+                    width = sm.width;
+                    height = sm.height;
+                    // The primary is by definition the display whose source
+                    // origin is the desktop origin.
+                    is_primary = sm.position.x == 0 && sm.position.y == 0;
+                    break;
+                }
+            }
+            if width == 0 || height == 0 {
+                continue; // no committed source mode — not a usable seat
+            }
+
+            let num = path.targetInfo.refreshRate.Numerator as f64;
+            let den = path.targetInfo.refreshRate.Denominator as f64;
+            let refresh_hz = if num > 0.0 && den > 0.0 {
+                (num / den).round() as u32
+            } else {
+                0
+            };
+
+            let (hdr_capable, hdr_active) =
+                Self::query_advanced_color_info(adapter_id, path.targetInfo.id)
+                    .unwrap_or((false, false));
+
+            let is_virtual = vdd_name
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(&device_name));
+
+            out.push(DisplayInfo {
+                label: Self::display_label(&device_name).unwrap_or_else(|| device_name.clone()),
+                device_name,
+                width,
+                height,
+                refresh_hz,
+                is_primary,
+                is_virtual,
+                hdr_active,
+                hdr_capable,
+            });
+        }
+        out
+    }
+
+    /// The monitor's human-readable device string (`EnumDisplayDevicesW`'s
+    /// `DeviceString` for the adapter behind a GDI device name), e.g.
+    /// "NVIDIA GeForce RTX 4090". `None` if the name doesn't enumerate.
+    fn display_label(device_name: &str) -> Option<String> {
+        unsafe {
+            let mut index = 0u32;
+            loop {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0).as_bool() {
+                    return None;
+                }
+                let name = String::from_utf16_lossy(&device.DeviceName)
+                    .trim_end_matches('\0')
+                    .to_string();
+                if name.eq_ignore_ascii_case(device_name) {
+                    let label = String::from_utf16_lossy(&device.DeviceString)
+                        .trim_end_matches('\0')
+                        .trim()
+                        .to_string();
+                    return (!label.is_empty()).then_some(label);
+                }
+                index += 1;
+            }
+        }
     }
 
     /// Record that the VDD is now idle-but-active (client disconnected

@@ -1,0 +1,1004 @@
+//! Echo session lifecycle — turning a punched UDP path into a live media
+//! session, and refusing to do so when that would trample an existing one.
+//!
+//! ## The problem this exists to solve
+//!
+//! [`crate::echo::wan`] ends with a confirmed path: a peer address that
+//! answered a STUN blast, recorded and deliberately *not* installed as
+//! `RtpSender`'s media target. That restraint is the reason this module is
+//! needed rather than optional — reachability and entitlement are different
+//! questions, and conflating them means anyone who can complete a punch can
+//! redirect an in-flight stream. A punch says "packets can reach here". A
+//! session says "and they should".
+//!
+//! ## The handoff gate
+//!
+//! Nova has exactly one capture pipeline, one encoder, and one RTP sender, so
+//! exactly one client can be served at a time (multi-seat is N pipelines, not a
+//! targeting change — see `echo::rpc`'s `PRIMARY_SEAT`). The gate enforces that
+//! as an explicit ownership question rather than a race:
+//!
+//! - **A live Moonlight session wins.** If `ClientInfo::streaming_active` is
+//!   set, an Echo start is refused outright. Not deferred, not queued: refused,
+//!   with a reason the client can show a user. Someone is watching that stream.
+//! - **A live Echo session wins against another device.** The second device is
+//!   refused; the *same* device restarting is treated as a restart, because
+//!   that is a client that lost its socket and came back, not a competitor.
+//! - **Media ownership is published**, so the Moonlight path can see it too.
+//!   Without that, the guard is one-directional: a Moonlight PLAY arriving
+//!   during an Echo session would reconfigure the Worker and re-point the
+//!   stream, which is the very hijack this module refuses in the other
+//!   direction.
+//!
+//! ## What a grant contains
+//!
+//! Starting a session mints fresh [`SessionKeys`] and returns them to the
+//! client over the RPC — which is mutual TLS against the pairing trust store,
+//! so the key is delivered on an already-authenticated channel and never
+//! touches the UDP path. See [`nova_core::media_crypto`] for why the sealing
+//! itself is frame-level.
+//!
+//! ## Scope note, stated plainly
+//!
+//! This module owns the *decision* and the *retargeting*. Frame sealing is
+//! implemented and tested in `nova-core`, and [`EchoSession::seal_video`] is
+//! its host-side entry point — but the media path does not call it yet, and
+//! `media_supervisor` still forwards frames verbatim. Inserting an encryption
+//! transform into the live frame path before any receiver can decrypt would
+//! break a working stream in exchange for nothing. The call site is marked in
+//! `lib.rs`; flipping it on is a one-line change once Echo's decoder exists.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use nova_core::media_crypto::{SessionKeys, STREAM_VIDEO};
+
+use crate::echo::rpc::EchoIdentity;
+use crate::encoder::Codec;
+use crate::ipc::{self, ControlMsg, WireCodec, WorkerLink};
+use crate::rtsp::ClientInfo;
+use crate::session_negotiate::WorkerCaps;
+
+/// Who currently owns the capture/encode/RTP pipeline.
+///
+/// Published by the manager so both session paths consult one answer. A
+/// boolean ("is Echo streaming") would have been enough today and wrong
+/// tomorrow: the interesting question is *which* owner, because the refusal
+/// message differs and multi-seat turns this into a set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaOwner {
+    /// Nothing is streaming.
+    Idle,
+    /// A GameStream/Moonlight client holds the pipeline.
+    Moonlight,
+    /// An Echo client holds the pipeline.
+    Echo,
+}
+
+/// Why a handoff was refused. Each variant maps to a stable RPC error code, so
+/// a client can branch on the reason rather than parse prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffError {
+    /// A Moonlight client is mid-stream. The anti-hijack rule.
+    MoonlightActive,
+    /// Another Echo device holds the session.
+    HeldByAnotherDevice { device: String },
+    /// No punch has completed, so there is nowhere to send media. Reaching
+    /// this usually means the client called `start_session` before its own
+    /// punch finished, or from a network where punching cannot succeed.
+    NoPathLatched,
+    /// The Worker cannot serve this session (none connected, or one too
+    /// degraded — the SYSTEM fallback at the logon screen).
+    WorkerUnavailable(String),
+    /// The request itself was invalid.
+    BadRequest(String),
+    /// Stop/modify attempted by a device that does not hold the session.
+    NotTheOwner,
+}
+
+impl HandoffError {
+    /// Stable machine-readable code for the RPC layer.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MoonlightActive => "moonlight_active",
+            Self::HeldByAnotherDevice { .. } => "session_held",
+            Self::NoPathLatched => "no_path",
+            Self::WorkerUnavailable(_) => "worker_unavailable",
+            Self::BadRequest(_) => "bad_request",
+            Self::NotTheOwner => "not_the_owner",
+        }
+    }
+}
+
+impl std::fmt::Display for HandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MoonlightActive => write!(
+                f,
+                "a Moonlight client is streaming right now; Echo will not take the pipeline \
+                 out from under it. Disconnect that client and retry."
+            ),
+            Self::HeldByAnotherDevice { device } => {
+                write!(f, "the session is held by \"{device}\"")
+            }
+            Self::NoPathLatched => write!(
+                f,
+                "no network path to this device has been confirmed — complete a hole punch \
+                 first (the host records the peer only after a successful punch)"
+            ),
+            Self::WorkerUnavailable(why) => write!(f, "{why}"),
+            Self::BadRequest(why) => write!(f, "{why}"),
+            Self::NotTheOwner => write!(f, "this device does not hold the active session"),
+        }
+    }
+}
+
+/// What the client asked for. Validated into [`StreamParams`] before anything
+/// is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub hdr: bool,
+    pub codec: Codec,
+    pub bitrate_kbps: u32,
+    /// Nova app to launch (see `app_launcher`); 1 = Desktop.
+    pub app_id: u32,
+    /// Send host audio to the speakers as well as the client.
+    pub host_audio: bool,
+}
+
+impl Default for SessionRequest {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            hdr: false,
+            codec: Codec::Hevc,
+            bitrate_kbps: 20_000,
+            app_id: 1,
+            host_audio: false,
+        }
+    }
+}
+
+/// The negotiated shape of a live session. Distinct from [`SessionRequest`]
+/// because what the client asked for and what the host committed to are not
+/// the same thing, and the client is told which is which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamParams {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub hdr: bool,
+    pub codec: Codec,
+    pub bitrate_kbps: u32,
+    pub app_id: u32,
+    pub host_audio: bool,
+    /// Payload bytes per datagram — the value `rtp.rs` shards against.
+    pub packet_size: u32,
+    pub fec_percentage: u32,
+    pub min_fec_packets: u32,
+}
+
+/// Bounds mirroring `echo::rpc`'s display validation: a sanity envelope, not a
+/// capability claim.
+const MIN_DIMENSION: u32 = 640;
+const MAX_WIDTH: u32 = 7680;
+const MAX_HEIGHT: u32 = 4320;
+const MIN_FPS: u32 = 24;
+const MAX_FPS: u32 = 360;
+const MIN_BITRATE_KBPS: u32 = 500;
+const MAX_BITRATE_KBPS: u32 = 500_000;
+
+/// Datagram payload size for a WAN session.
+///
+/// Moonlight negotiates 1392 on a LAN and drops to 1024 for remote streaming,
+/// because a 1392-byte payload plus headers exceeds the effective MTU of many
+/// tunnels and PPPoE links, and IP fragmentation of a UDP video packet turns
+/// one lost fragment into a lost shard. Every Echo session today arrives over a
+/// punched WAN path, so it takes the conservative value rather than discovering
+/// the problem as unexplained loss.
+const WAN_PACKET_SIZE: u32 = 1024;
+const DEFAULT_FEC_PERCENTAGE: u32 = 5;
+const DEFAULT_MIN_FEC_PACKETS: u32 = 2;
+
+/// Largest datagram Echo will put on a WAN path.
+///
+/// 1400 is the conventional safe ceiling: below the 1500-byte Ethernet MTU with
+/// room for a PPPoE (8 B) or common tunnel (20-60 B) header. Exceeding it does
+/// not fail loudly — it fragments, and a fragmented UDP video packet turns one
+/// lost fragment into a lost shard, which shows up as inexplicable loss on
+/// exactly the links least able to absorb it.
+pub const WAN_MTU_BUDGET: usize = 1400;
+
+/// The size of the datagram a `WAN_PACKET_SIZE` session actually sends.
+///
+/// `rtp.rs` builds `packet_size + MAX_RTP_HEADER_SIZE(16)` bytes per datagram,
+/// of which 32 are headers. Neither of Echo's two additions changes this:
+///
+/// - The **demux tag** replaces byte 0 rather than being prepended (see
+///   `rtp::TxEngine::demux_tag`), so it costs zero bytes.
+/// - The **GCM tag** is 16 bytes per *frame*, not per packet. It is added
+///   before sharding, so its only effect is that a frame occasionally needs one
+///   more shard than it otherwise would — it can never make a datagram larger.
+///
+/// [`echo_datagrams_fit_the_wan_mtu`](tests) asserts the result rather than
+/// leaving it to this comment.
+pub const ECHO_DATAGRAM_SIZE: usize = WAN_PACKET_SIZE as usize + 16;
+
+impl SessionRequest {
+    fn validate(&self) -> Result<StreamParams, HandoffError> {
+        let bad = |why: String| HandoffError::BadRequest(why);
+
+        // NVENC requires even dimensions; round down rather than reject, for
+        // the same reason `echo::rpc::parse_display_request` does — a client
+        // that computed an odd width from a scale factor wants the nearest
+        // workable mode.
+        let width = self.width - self.width % 2;
+        let height = self.height - self.height % 2;
+        if width < MIN_DIMENSION || height < MIN_DIMENSION {
+            return Err(bad(format!("{width}x{height} is below the {MIN_DIMENSION}px minimum")));
+        }
+        if width > MAX_WIDTH || height > MAX_HEIGHT {
+            return Err(bad(format!("{width}x{height} exceeds {MAX_WIDTH}x{MAX_HEIGHT}")));
+        }
+        if !(MIN_FPS..=MAX_FPS).contains(&self.fps) {
+            return Err(bad(format!("{} fps is outside {MIN_FPS}-{MAX_FPS}", self.fps)));
+        }
+        if !(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS).contains(&self.bitrate_kbps) {
+            return Err(bad(format!(
+                "{} kbps is outside {MIN_BITRATE_KBPS}-{MAX_BITRATE_KBPS}",
+                self.bitrate_kbps
+            )));
+        }
+
+        // H.264 Level 5.2 caps 4K at 60 fps; the same cap `session_negotiate`
+        // applies to Moonlight sessions, applied here for the same reason —
+        // exceeding it crashes decoders rather than degrading them.
+        let mut fps = self.fps;
+        if self.codec == Codec::H264 && width * height > 1920 * 1080 && fps > 60 {
+            fps = 60;
+        }
+
+        Ok(StreamParams {
+            width,
+            height,
+            fps,
+            hdr: self.hdr,
+            codec: self.codec,
+            bitrate_kbps: self.bitrate_kbps,
+            app_id: self.app_id,
+            host_audio: self.host_audio,
+            packet_size: WAN_PACKET_SIZE,
+            fec_percentage: DEFAULT_FEC_PERCENTAGE,
+            min_fec_packets: DEFAULT_MIN_FEC_PACKETS,
+        })
+    }
+}
+
+/// A live Echo session.
+#[derive(Debug)]
+pub struct EchoSession {
+    /// Monotonic per-process id, echoed in logs and RPC replies so a client's
+    /// report can be matched to a host-side session without guessing.
+    pub id: u64,
+    /// Fingerprint of the device holding it — the ownership key.
+    pub device_fingerprint: String,
+    pub device_name: String,
+    /// The punched peer. Media goes here and nowhere else for this session's
+    /// lifetime (`RtpSender::pin_target`).
+    pub peer: SocketAddr,
+    pub params: StreamParams,
+    pub started: Instant,
+    /// Media key material. Private: a session hands its keys out exactly once,
+    /// at start, over TLS.
+    keys: SessionKeys,
+    /// The audio path still speaks GameStream's AES-CBC framing, which is keyed
+    /// by `rikey`/`rikeyid` rather than by [`SessionKeys`]. Generated fresh per
+    /// session and handed to the client with the grant.
+    rikey: [u8; 16],
+    rikeyid: u32,
+}
+
+impl EchoSession {
+    /// Seal one encoded video frame for this session.
+    ///
+    /// The host-side entry point for [`nova_core::media_crypto`]. Not yet
+    /// called by the media path — see the module's scope note — but it is the
+    /// exact function that path will call, so the nonce/AAD derivation lives
+    /// here rather than being re-derived at the call site later.
+    pub fn seal_video(&self, wire_index: u32, frame_type: u8, frame: &[u8]) -> Vec<u8> {
+        self.keys.seal(STREAM_VIDEO, wire_index, frame_type, frame)
+    }
+
+    fn grant(&self) -> SessionGrant {
+        SessionGrant {
+            session_id: self.id,
+            peer: self.peer,
+            params: self.params.clone(),
+            keys_hex: self.keys.to_hex(),
+            rikey_hex: hex::encode(self.rikey),
+            rikeyid: self.rikeyid,
+        }
+    }
+}
+
+/// What the client receives when a session starts: where media will arrive
+/// from, what shape it takes, and the keys to open it.
+#[derive(Debug, Clone)]
+pub struct SessionGrant {
+    pub session_id: u64,
+    pub peer: SocketAddr,
+    pub params: StreamParams,
+    /// Hex [`SessionKeys`] — see that type for why hex over a TLS channel is
+    /// the whole key exchange.
+    pub keys_hex: String,
+    pub rikey_hex: String,
+    pub rikeyid: u32,
+}
+
+/// The seam between "the session manager decided" and "the pipeline actually
+/// moved". A trait for the same two reasons `DisplayOrchestrator` is one: the
+/// gate is testable without a Worker or a socket, and multi-seat replaces an
+/// implementation rather than editing this logic.
+pub trait MediaPlane: Send + Sync + 'static {
+    /// Point the pipeline at `peer` and start encoding `params`.
+    ///
+    /// `device_name` is the paired name of the client, which the Worker uses to
+    /// label the virtual monitor — the same Phase 14.2 behaviour a Moonlight
+    /// session gets, so Device Manager shows "Xbox" rather than a generic tag.
+    fn begin(
+        &self,
+        peer: SocketAddr,
+        params: &StreamParams,
+        device_name: &str,
+        rikey: [u8; 16],
+        rikeyid: u32,
+    ) -> Result<(), HandoffError>;
+    /// Stop encoding and release the target.
+    fn end(&self);
+}
+
+/// Production plane: retargets `RtpSender` and configures the live Worker.
+pub struct WorkerMediaPlane {
+    rtp_sender: Arc<Mutex<crate::rtp::RtpSender>>,
+    worker_link: WorkerLink,
+    worker_caps: Arc<Mutex<Option<WorkerCaps>>>,
+}
+
+impl WorkerMediaPlane {
+    pub fn new(
+        rtp_sender: Arc<Mutex<crate::rtp::RtpSender>>,
+        worker_link: WorkerLink,
+        worker_caps: Arc<Mutex<Option<WorkerCaps>>>,
+    ) -> Self {
+        Self { rtp_sender, worker_link, worker_caps }
+    }
+}
+
+impl MediaPlane for WorkerMediaPlane {
+    fn begin(
+        &self,
+        peer: SocketAddr,
+        params: &StreamParams,
+        device_name: &str,
+        rikey: [u8; 16],
+        rikeyid: u32,
+    ) -> Result<(), HandoffError> {
+        // Refuse before touching anything if no Worker can serve this. A
+        // half-applied start (RTP retargeted, Worker never configured) would
+        // leave the sender pinned at a peer nothing ever encodes for.
+        if self.worker_caps.lock().unwrap().is_none() {
+            return Err(HandoffError::WorkerUnavailable(
+                "no worker has reported its capture capabilities yet".to_string(),
+            ));
+        }
+
+        // Ordering here is load-bearing:
+        //
+        //   1. `reset()` first — it clears the previous session's wire index,
+        //      sequence numbers, and any pin, and flushes stale pings out of
+        //      the receive buffer. It must come before the pin, because reset
+        //      deliberately clears pins (a finished session must never leave
+        //      the sender deaf to the next client).
+        //   2. `configure`/`set_fps`/`set_codec` next — parameters the send
+        //      thread needs before the first frame.
+        //   3. `pin_target` last, which is the instant this session becomes
+        //      the media destination.
+        //
+        // Every one of these is a message on the send thread's ordered command
+        // channel, so they land in this order relative to any frame already
+        // queued — the retarget can never split a frame across two peers.
+        {
+            let mut rtp = self.rtp_sender.lock().unwrap();
+            rtp.reset();
+            rtp.configure(
+                params.packet_size as usize,
+                params.fec_percentage as usize,
+                params.min_fec_packets as usize,
+            );
+            rtp.set_fps(params.fps);
+            rtp.set_codec(params.codec == Codec::Hevc, params.codec == Codec::Av1);
+            rtp.pin_target(peer);
+        }
+
+        self.worker_link.send(ControlMsg::ConfigureStart(ipc::ConfigureStart {
+            width: params.width,
+            height: params.height,
+            fps: params.fps,
+            codec: WireCodec::from(params.codec),
+            hdr_confirmed: params.hdr,
+            bitrate_kbps: params.bitrate_kbps,
+            app_id: params.app_id,
+            launch_app: params.app_id != 1, // Desktop needs no process started
+            device_name: device_name.to_string(),
+            rikey,
+            rikeyid,
+            host_audio: params.host_audio,
+            audio_encryption: true,
+            audio_packet_duration_ms: 5,
+            packet_size: params.packet_size,
+            min_fec_packets: params.min_fec_packets,
+            start_frame_index: 1,
+        }));
+        Ok(())
+    }
+
+    fn end(&self) {
+        // Deactivate first, then reset: the Worker stops producing frames
+        // before the sender forgets where they were going, so no frame is
+        // encoded into a sender with no target.
+        self.worker_link.send(ControlMsg::Deactivate { cancelled: true });
+        let mut rtp = self.rtp_sender.lock().unwrap();
+        rtp.reset(); // clears the pin — learning resumes for the next Moonlight client
+    }
+}
+
+/// Where a confirmed punch is published. `echo::wan::GatherHandle` writes it;
+/// this reads it.
+pub type LatchedPeer = Arc<Mutex<Option<SocketAddr>>>;
+
+/// Owns the one Echo session Nova can run, and the gate protecting it.
+pub struct SessionManager {
+    plane: Arc<dyn MediaPlane>,
+    client_info: Arc<Mutex<Option<ClientInfo>>>,
+    latched: LatchedPeer,
+    active: Mutex<Option<EchoSession>>,
+    next_id: AtomicU64,
+    /// Lock-free mirror of `active.is_some()`, for the frame path.
+    ///
+    /// `media_supervisor` consults this for every frame at up to 120 fps on a
+    /// stream that is usually Moonlight's. Taking the session mutex there would
+    /// put a lock on the hot path of the *legacy* stream purely to ask a
+    /// question whose answer is almost always "no" — the kind of tax that is
+    /// invisible in a test and measurable in frame pacing. Written only while
+    /// `active`'s mutex is held, so it can never disagree with it for longer
+    /// than one instruction.
+    echo_active: std::sync::atomic::AtomicBool,
+}
+
+impl SessionManager {
+    pub fn new(
+        plane: Arc<dyn MediaPlane>,
+        client_info: Arc<Mutex<Option<ClientInfo>>>,
+        latched: LatchedPeer,
+    ) -> Self {
+        Self {
+            plane,
+            client_info,
+            latched,
+            active: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            echo_active: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Seal one encoded video frame if an Echo session owns the pipeline.
+    ///
+    /// Returns `None` when it does not — which is the answer on every frame of
+    /// every Moonlight session, reached without taking a lock. Called from
+    /// `media_supervisor` immediately before the frame goes to `RtpSender`,
+    /// which is the correct place for exactly one reason: sealing must happen
+    /// **before** sharding, so Reed-Solomon parity is computed over the
+    /// ciphertext and the client can repair loss without holding the key. See
+    /// [`nova_core::media_crypto`].
+    pub fn seal_video(&self, wire_index: u32, frame_type: u8, frame: &[u8]) -> Option<Vec<u8>> {
+        if !self.echo_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let guard = self.active.lock().unwrap();
+        let session = guard.as_ref()?;
+        Some(session.seal_video(wire_index, frame_type, frame))
+    }
+
+    /// Who owns the pipeline right now.
+    ///
+    /// Moonlight is reported ahead of Echo when both look active, because the
+    /// gate below guarantees that cannot happen for long and reporting the
+    /// louder truth is the safer default during the overlap.
+    pub fn owner(&self) -> MediaOwner {
+        if self.moonlight_is_live() {
+            return MediaOwner::Moonlight;
+        }
+        if self.active.lock().unwrap().is_some() {
+            return MediaOwner::Echo;
+        }
+        MediaOwner::Idle
+    }
+
+    /// True while an Echo session holds the pipeline — the flag the Moonlight
+    /// path checks before configuring a Worker (see `lib.rs::session_watcher`).
+    pub fn echo_holds_media(&self) -> bool {
+        self.echo_active.load(Ordering::Relaxed)
+    }
+
+    fn moonlight_is_live(&self) -> bool {
+        self.client_info
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|i| i.streaming_active)
+    }
+
+    /// Summary for `get_status`, safe to serialise (never contains keys).
+    pub fn status(&self) -> Option<(u64, String, SocketAddr, StreamParams, u64)> {
+        let guard = self.active.lock().unwrap();
+        let s = guard.as_ref()?;
+        Some((
+            s.id,
+            s.device_name.clone(),
+            s.peer,
+            s.params.clone(),
+            s.started.elapsed().as_secs(),
+        ))
+    }
+
+    /// The handoff gate.
+    ///
+    /// Every refusal happens **before** anything is retargeted, so a denied
+    /// request leaves the pipeline byte-for-byte as it was. That is what makes
+    /// "deny while Moonlight is streaming" a real guarantee rather than a
+    /// window: there is no partial application to unwind.
+    pub fn start(
+        &self,
+        device: &EchoIdentity,
+        request: SessionRequest,
+    ) -> Result<SessionGrant, HandoffError> {
+        // 1. Validate before consulting any state — a malformed request should
+        //    not be able to report on whether someone else is streaming.
+        let params = request.validate()?;
+
+        // 2. Anti-hijack: a live Moonlight client owns the pipeline outright.
+        if self.moonlight_is_live() {
+            println!(
+                "⛔ Echo: \"{}\" asked to start a session while a Moonlight client is streaming — denied",
+                device.device_name
+            );
+            return Err(HandoffError::MoonlightActive);
+        }
+
+        // 3. One Echo session at a time. The same device asking again is a
+        //    restart (its socket died and it reconnected), which is a
+        //    materially different situation from a second device barging in.
+        let mut guard = self.active.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            if existing.device_fingerprint != device.fingerprint {
+                return Err(HandoffError::HeldByAnotherDevice {
+                    device: existing.device_name.clone(),
+                });
+            }
+            println!(
+                "🔁 Echo: \"{}\" restarting its session {} — ending the old one first",
+                device.device_name, existing.id
+            );
+            self.plane.end();
+            *guard = None;
+            self.echo_active.store(false, Ordering::Relaxed);
+        }
+
+        // 4. A path must already be proven. Reachability is not something this
+        //    layer can establish on demand — the punch either happened or it
+        //    did not.
+        let Some(peer) = *self.latched.lock().unwrap() else {
+            return Err(HandoffError::NoPathLatched);
+        };
+
+        // 5. Mint keys and apply. `begin` is the first line that changes any
+        //    state outside this struct.
+        let keys = SessionKeys::generate();
+        let (rikey, rikeyid) = generate_audio_key();
+        self.plane.begin(peer, &params, &device.device_name, rikey, rikeyid)?;
+
+        let session = EchoSession {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            device_fingerprint: device.fingerprint.clone(),
+            device_name: device.device_name.clone(),
+            peer,
+            params,
+            started: Instant::now(),
+            keys,
+            rikey,
+            rikeyid,
+        };
+        println!(
+            "🎬 Echo session {} started for \"{}\" → {} : {}x{}@{}fps {}{}",
+            session.id,
+            session.device_name,
+            peer,
+            session.params.width,
+            session.params.height,
+            session.params.fps,
+            session.params.codec.as_str(),
+            if session.params.hdr { "/HDR10" } else { "" },
+        );
+        let grant = session.grant();
+        *guard = Some(session);
+        // Ordered after the session is installed: the frame path reads this
+        // flag without the lock, so it must never say "yes" before there is a
+        // session to seal with.
+        self.echo_active.store(true, Ordering::Relaxed);
+        Ok(grant)
+    }
+
+    /// End the session held by `device`. Only its owner may — otherwise any
+    /// paired device could end anyone's stream, which is a denial-of-service
+    /// dressed up as a feature.
+    pub fn stop(&self, device: &EchoIdentity) -> Result<u64, HandoffError> {
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return Err(HandoffError::NotTheOwner);
+        };
+        if session.device_fingerprint != device.fingerprint {
+            return Err(HandoffError::NotTheOwner);
+        }
+        let id = session.id;
+        // Cleared before the session is dropped, so no frame is sealed with a
+        // key the client has already stopped listening for.
+        self.echo_active.store(false, Ordering::Relaxed);
+        self.plane.end();
+        *guard = None;
+        println!("🛑 Echo session {id} ended by \"{}\"", device.device_name);
+        Ok(id)
+    }
+
+    /// Drop the session without an owner check — for host-side teardown
+    /// (shutdown, a Worker that will never come back), never for a remote
+    /// request.
+    pub fn force_end(&self, why: &str) {
+        let mut guard = self.active.lock().unwrap();
+        self.echo_active.store(false, Ordering::Relaxed);
+        if let Some(session) = guard.take() {
+            println!("🛑 Echo session {} force-ended: {why}", session.id);
+            self.plane.end();
+        }
+    }
+}
+
+/// Fresh GameStream audio key for this session.
+fn generate_audio_key() -> ([u8; 16], u32) {
+    use rand::RngCore;
+    let mut rikey = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut rikey);
+    (rikey, rand::rngs::OsRng.next_u32())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records what the gate decided to do, so the decision can be asserted
+    /// without a Worker, a socket, or a capture pipeline.
+    #[derive(Default)]
+    struct MockPlane {
+        begun: Mutex<Vec<(SocketAddr, StreamParams)>>,
+        ended: Mutex<usize>,
+        fail: Option<HandoffError>,
+    }
+
+    impl MediaPlane for Arc<MockPlane> {
+        fn begin(
+            &self,
+            peer: SocketAddr,
+            params: &StreamParams,
+            _device_name: &str,
+            _rikey: [u8; 16],
+            _rikeyid: u32,
+        ) -> Result<(), HandoffError> {
+            if let Some(e) = &self.fail {
+                return Err(e.clone());
+            }
+            self.begun.lock().unwrap().push((peer, params.clone()));
+            Ok(())
+        }
+        fn end(&self) {
+            *self.ended.lock().unwrap() += 1;
+        }
+    }
+
+    fn device(name: &str, fp: u8) -> EchoIdentity {
+        EchoIdentity {
+            fingerprint: hex::encode([fp; 32]),
+            device_name: name.to_string(),
+        }
+    }
+
+    fn peer() -> SocketAddr {
+        "203.0.113.9:47998".parse().unwrap()
+    }
+
+    struct Fixture {
+        mgr: SessionManager,
+        plane: Arc<MockPlane>,
+        client_info: Arc<Mutex<Option<ClientInfo>>>,
+    }
+
+    fn fixture(latched: Option<SocketAddr>) -> Fixture {
+        let plane = Arc::new(MockPlane::default());
+        let client_info = Arc::new(Mutex::new(None));
+        let mgr = SessionManager::new(
+            Arc::new(plane.clone()),
+            client_info.clone(),
+            Arc::new(Mutex::new(latched)),
+        );
+        Fixture { mgr, plane, client_info }
+    }
+
+    #[test]
+    fn a_punched_path_becomes_a_session_with_keys() {
+        let f = fixture(Some(peer()));
+        let grant = f
+            .mgr
+            .start(&device("Xbox", 1), SessionRequest::default())
+            .expect("start");
+
+        assert_eq!(grant.peer, peer());
+        assert_eq!(f.mgr.owner(), MediaOwner::Echo);
+        // The plane was retargeted exactly once, at the punched address.
+        let begun = f.plane.begun.lock().unwrap();
+        assert_eq!(begun.len(), 1);
+        assert_eq!(begun[0].0, peer());
+        // A WAN session must not inherit the LAN packet size.
+        assert_eq!(begun[0].1.packet_size, WAN_PACKET_SIZE);
+
+        // The grant carries usable key material, and the session keeps its own
+        // copy — sealing with it must produce something the client can open.
+        let keys = SessionKeys::from_hex(&grant.keys_hex).expect("grant keys parse");
+        let sealed = f
+            .mgr
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .seal_video(1, 2, b"frame");
+        assert_eq!(keys.open(STREAM_VIDEO, 1, 2, &sealed).unwrap(), b"frame");
+    }
+
+    /// The anti-hijack rule, and the property that makes it meaningful: a
+    /// refusal must leave the pipeline untouched, not partially retargeted.
+    #[test]
+    fn a_live_moonlight_session_blocks_the_handoff_without_touching_the_pipeline() {
+        let f = fixture(Some(peer()));
+        *f.client_info.lock().unwrap() = Some(ClientInfo {
+            streaming_active: true,
+            ..Default::default()
+        });
+
+        let err = f
+            .mgr
+            .start(&device("Xbox", 1), SessionRequest::default())
+            .expect_err("must refuse");
+        assert_eq!(err, HandoffError::MoonlightActive);
+        assert_eq!(err.code(), "moonlight_active");
+        assert!(f.plane.begun.lock().unwrap().is_empty(), "nothing may be retargeted");
+        assert_eq!(f.mgr.owner(), MediaOwner::Moonlight);
+
+        // When that client disconnects, the same request succeeds.
+        f.client_info.lock().unwrap().as_mut().unwrap().streaming_active = false;
+        assert!(f.mgr.start(&device("Xbox", 1), SessionRequest::default()).is_ok());
+    }
+
+    #[test]
+    fn a_second_device_cannot_take_a_live_echo_session() {
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).expect("first");
+
+        let err = f
+            .mgr
+            .start(&device("Pixel", 2), SessionRequest::default())
+            .expect_err("must refuse");
+        assert_eq!(err, HandoffError::HeldByAnotherDevice { device: "Xbox".into() });
+        assert_eq!(f.plane.begun.lock().unwrap().len(), 1, "no second retarget");
+    }
+
+    /// A client whose socket died and reconnected is not a competitor. It gets
+    /// a clean restart — old session torn down first, so the pipeline is never
+    /// configured twice without an intervening stop.
+    #[test]
+    fn the_same_device_reconnecting_restarts_rather_than_being_refused() {
+        let f = fixture(Some(peer()));
+        let first = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let second = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert_ne!(first.session_id, second.session_id, "a restart is a new session");
+        assert_ne!(first.keys_hex, second.keys_hex, "…with fresh keys");
+        assert_eq!(*f.plane.ended.lock().unwrap(), 1, "the old session was ended");
+        assert_eq!(f.plane.begun.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_session_cannot_start_without_a_confirmed_path() {
+        let f = fixture(None);
+        let err = f
+            .mgr
+            .start(&device("Xbox", 1), SessionRequest::default())
+            .expect_err("no path");
+        assert_eq!(err, HandoffError::NoPathLatched);
+        assert!(f.plane.begun.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_the_owner_can_stop_a_session() {
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert_eq!(f.mgr.stop(&device("Pixel", 2)), Err(HandoffError::NotTheOwner));
+        assert_eq!(*f.plane.ended.lock().unwrap(), 0, "a stranger's stop is a no-op");
+
+        assert!(f.mgr.stop(&device("Xbox", 1)).is_ok());
+        assert_eq!(f.mgr.owner(), MediaOwner::Idle);
+        assert_eq!(*f.plane.ended.lock().unwrap(), 1);
+
+        // Stopping an already-stopped session is refused, not a panic.
+        assert_eq!(f.mgr.stop(&device("Xbox", 1)), Err(HandoffError::NotTheOwner));
+    }
+
+    #[test]
+    fn requests_are_validated_before_any_state_is_consulted() {
+        let f = fixture(None); // no path — but validation must fail first
+        let err = f
+            .mgr
+            .start(
+                &device("Xbox", 1),
+                SessionRequest { width: 100, height: 100, ..Default::default() },
+            )
+            .expect_err("invalid geometry");
+        assert!(matches!(err, HandoffError::BadRequest(_)));
+
+        for bad in [
+            SessionRequest { fps: 1000, ..Default::default() },
+            SessionRequest { bitrate_kbps: 1, ..Default::default() },
+            SessionRequest { width: 99_999, height: 4320, ..Default::default() },
+        ] {
+            assert!(matches!(
+                f.mgr.start(&device("Xbox", 1), bad),
+                Err(HandoffError::BadRequest(_))
+            ));
+        }
+    }
+
+    /// The same H.264 Level 5.2 ceiling `session_negotiate` applies to
+    /// Moonlight sessions: exceeding it crashes client decoders rather than
+    /// degrading them, so the cap belongs on every path that reaches NVENC.
+    #[test]
+    fn h264_above_1080p_is_capped_to_60fps() {
+        let f = fixture(Some(peer()));
+        let grant = f
+            .mgr
+            .start(
+                &device("Xbox", 1),
+                SessionRequest {
+                    width: 3840,
+                    height: 2160,
+                    fps: 120,
+                    codec: Codec::H264,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(grant.params.fps, 60);
+
+        // HEVC has no such limit and must not be capped.
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        let grant = f
+            .mgr
+            .start(
+                &device("Xbox", 1),
+                SessionRequest {
+                    width: 3840,
+                    height: 2160,
+                    fps: 120,
+                    codec: Codec::Hevc,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(grant.params.fps, 120);
+    }
+
+    /// The MTU claim, asserted rather than reasoned about in a comment.
+    ///
+    /// Fragmented UDP is the failure mode being avoided: a lost fragment
+    /// discards the whole datagram, so an over-MTU video packet turns ordinary
+    /// loss into shard loss on exactly the links least able to absorb it.
+    #[test]
+    fn echo_datagrams_fit_the_wan_mtu() {
+        assert!(
+            ECHO_DATAGRAM_SIZE <= WAN_MTU_BUDGET,
+            "an Echo datagram is {ECHO_DATAGRAM_SIZE} bytes, over the {WAN_MTU_BUDGET} budget"
+        );
+        // The demux tag replaces byte 0 rather than being prepended, so it must
+        // cost nothing at all. If someone later makes it a real prefix, this
+        // assertion is what should stop them silently eating the headroom.
+        assert_eq!(
+            ECHO_DATAGRAM_SIZE,
+            WAN_PACKET_SIZE as usize + 16,
+            "the demux tag must not add bytes to a datagram"
+        );
+        // Control shares the same budget and must also fit unfragmented.
+        assert!(nova_core::rudp::MAX_PAYLOAD + nova_core::rudp::HEADER_LEN <= WAN_MTU_BUDGET);
+    }
+
+    /// The GCM tag is per frame, so it can only ever change how many shards a
+    /// frame needs — never how big a datagram is. Worth pinning down, because
+    /// "the tag adds 16 bytes" invites exactly the opposite assumption.
+    #[test]
+    fn the_gcm_tag_costs_shards_not_datagram_size() {
+        let keys = SessionKeys::generate();
+        let frame = vec![0u8; 4000];
+        let sealed = keys.seal(STREAM_VIDEO, 1, 2, &frame);
+        assert_eq!(sealed.len(), frame.len() + 16);
+
+        let payload_per_packet = WAN_PACKET_SIZE as usize + 16 - 32;
+        let shards_plain = (frame.len() + 8).div_ceil(payload_per_packet);
+        let shards_sealed = (sealed.len() + 8).div_ceil(payload_per_packet);
+        assert!(
+            shards_sealed - shards_plain <= 1,
+            "sealing may cost at most one extra shard per frame"
+        );
+    }
+
+    /// The frame path asks this question up to 120 times a second on a stream
+    /// that is usually Moonlight's, so "no session" must be both correct and
+    /// free of the session lock.
+    #[test]
+    fn sealing_is_a_no_op_without_an_echo_session() {
+        let f = fixture(Some(peer()));
+        assert!(f.mgr.seal_video(1, 2, b"moonlight frame").is_none());
+
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let sealed = f.mgr.seal_video(1, 2, b"echo frame").expect("sealed while active");
+        assert_ne!(sealed, b"echo frame");
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        assert!(
+            f.mgr.seal_video(2, 2, b"moonlight again").is_none(),
+            "a finished session must stop sealing immediately"
+        );
+    }
+
+    /// A failure inside the media plane must not leave a phantom session
+    /// recorded — the manager would then refuse every future start while
+    /// nothing was actually streaming.
+    #[test]
+    fn a_plane_failure_leaves_no_session_behind() {
+        let plane = Arc::new(MockPlane {
+            fail: Some(HandoffError::WorkerUnavailable("no worker".into())),
+            ..Default::default()
+        });
+        let mgr = SessionManager::new(
+            Arc::new(plane.clone()),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(peer()))),
+        );
+
+        assert!(mgr.start(&device("Xbox", 1), SessionRequest::default()).is_err());
+        assert_eq!(mgr.owner(), MediaOwner::Idle);
+        assert!(!mgr.echo_holds_media());
+    }
+}

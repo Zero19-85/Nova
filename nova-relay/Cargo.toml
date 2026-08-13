@@ -1,0 +1,17 @@
+[package]
+name = "nova-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal signaling relay for Nova/Echo development"
+
+[dependencies]
+nova-core = { path = "../nova-core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }

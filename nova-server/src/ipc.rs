@@ -75,6 +75,10 @@ mod tag {
     pub const CAPTURE_RECT: u8 = 15;
     pub const INVALIDATE_REF_FRAMES: u8 = 16;
     pub const WORKER_CAPABILITIES: u8 = 17;
+    pub const END_SESSION: u8 = 18;
+    pub const CLEAR_PAIRED: u8 = 19;
+    pub const SET_DISPLAY_MODE: u8 = 20;
+    pub const DISPLAY_INVENTORY: u8 = 21;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -103,6 +107,20 @@ impl WireCodec {
             1 => Ok(WireCodec::Hevc),
             2 => Ok(WireCodec::Av1),
             other => Err(invalid_data(&format!("unknown WireCodec byte {other}"))),
+        }
+    }
+}
+
+/// The one place `encoder::Codec` becomes its wire form. Two session paths now
+/// build a `ConfigureStart` (Moonlight's `session_watcher` and Echo's
+/// `SessionManager`), and a second hand-written match is a second place for
+/// them to disagree.
+impl From<crate::encoder::Codec> for WireCodec {
+    fn from(c: crate::encoder::Codec) -> Self {
+        match c {
+            crate::encoder::Codec::H264 => WireCodec::H264,
+            crate::encoder::Codec::Hevc => WireCodec::Hevc,
+            crate::encoder::Codec::Av1 => WireCodec::Av1,
         }
     }
 }
@@ -153,6 +171,67 @@ pub struct WorkerConfigured {
     pub fps: u32,
     pub codec: WireCodec,
     pub is_hdr: bool,
+}
+
+/// One display in the Worker's report of the live desktop topology.
+///
+/// Mirrors `virtual_display::DisplayInfo` (that type stays free of any wire
+/// knowledge; `lib.rs` converts) — the same split as
+/// `NegotiatedParams` → [`ConfigureStart`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayEntry {
+    /// GDI device name (`\\.\DISPLAY1`) — the seat's targeting key.
+    pub device_name: String,
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    /// Committed refresh in whole Hz; 0 = unknown.
+    pub refresh_hz: u32,
+    pub is_primary: bool,
+    pub is_virtual: bool,
+    pub hdr_active: bool,
+    pub hdr_capable: bool,
+}
+
+impl DisplayEntry {
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        write_string(out, &self.device_name);
+        write_string(out, &self.label);
+        write_u32(out, self.width);
+        write_u32(out, self.height);
+        write_u32(out, self.refresh_hz);
+        // One flags byte rather than four: the boolean set here is expected to
+        // grow (per-seat capability bits), and a bitfield keeps that additive
+        // without re-laying-out the record each time.
+        let flags = (self.is_primary as u8)
+            | (self.is_virtual as u8) << 1
+            | (self.hdr_active as u8) << 2
+            | (self.hdr_capable as u8) << 3;
+        out.push(flags);
+    }
+
+    fn decode(bytes: &[u8], at: &mut usize) -> io::Result<Self> {
+        let device_name = read_string(bytes, at)?;
+        let label = read_string(bytes, at)?;
+        let width = read_u32(bytes, at)?;
+        let height = read_u32(bytes, at)?;
+        let refresh_hz = read_u32(bytes, at)?;
+        let flags = *bytes
+            .get(*at)
+            .ok_or_else(|| invalid_data("truncated DisplayEntry flags"))?;
+        *at += 1;
+        Ok(DisplayEntry {
+            device_name,
+            label,
+            width,
+            height,
+            refresh_hz,
+            is_primary: flags & 0b0001 != 0,
+            is_virtual: flags & 0b0010 != 0,
+            hdr_active: flags & 0b0100 != 0,
+            hdr_capable: flags & 0b1000 != 0,
+        })
+    }
 }
 
 /// Control-plane messages. Both directions share one enum — the message set
@@ -248,6 +327,62 @@ pub enum ControlMsg {
     /// process dying — confirmed live (2026-07-20): closing the app left
     /// the virtual display primary and the physical monitor dark.
     Deactivate { cancelled: bool },
+    /// Worker -> Master: the user picked "End Stream" on the tray menu — end
+    /// the live session now.
+    ///
+    /// The Worker cannot do this itself, and deliberately does not try. The
+    /// session lives in Master's `ClientInfo`, and a Worker that tore down its
+    /// own capture would leave the Master still holding an active session,
+    /// still sending it input, and replaying its `ConfigureStart` to the next
+    /// Worker that connects. Master instead marks the session cancelled and
+    /// lets the ORDINARY teardown path run (see `control_supervisor`), so this
+    /// takes exactly the same route as a client-initiated "Quit App".
+    EndSession,
+    /// Worker -> Master: the live desktop topology, as the Worker's session
+    /// sees it.
+    ///
+    /// The Master cannot obtain this itself at any privilege level:
+    /// `QueryDisplayConfig` describes the *calling session's* displays, and
+    /// Master runs in Session 0, whose desktop no human is looking at. So the
+    /// Worker enumerates and reports, and Master caches the result for
+    /// `echo_rpc`'s seat list.
+    ///
+    /// Sent on Worker startup and after anything that can change the topology
+    /// (session configure, VDD teardown), rather than polled: display changes
+    /// are events, and a poll would burn CCD queries on a TIME_CRITICAL
+    /// process for a list that changes a few times an hour.
+    DisplayInventory(Vec<DisplayEntry>),
+    /// Master -> Worker: an Echo client asked for a display mode change
+    /// (`echo_rpc.rs`'s `set_display`).
+    ///
+    /// Display state — the VDD, CCD topology, Advanced Color — is Worker-owned
+    /// and unreachable from Session 0, so an Echo command has to cross the pipe
+    /// exactly like a session does. Routing it through the same channel also
+    /// means it inherits the split's existing durability: a Worker that
+    /// respawns mid-command simply never applies it, and the client's next
+    /// `get_status` shows the unchanged mode rather than a lie.
+    ///
+    /// Deliberately NOT a `ConfigureStart`: that message starts a *client
+    /// session* (audio, input, rikey, wire-index continuity, app launch). This
+    /// one changes only the display the capture loop is bound to, which is
+    /// what makes it usable outside a session as well as inside one.
+    SetDisplayMode {
+        /// Which capture seat — `echo_rpc::PRIMARY_SEAT` today, a real seat id
+        /// once multi-seat exists.
+        display_id: String,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        hdr: bool,
+    },
+    /// Worker -> Master: the user picked "Clear Paired Devices" on the tray
+    /// menu — drop every entry from the trust store.
+    ///
+    /// Also Master-only work: `pairing.rs`'s trust store is the live
+    /// `TrustedClients` map in THAT process, and deleting `nova_paired.json`
+    /// from the Worker would revoke nothing (the Master keeps authorising from
+    /// memory and rewrites the file on the next successful pair).
+    ClearPaired,
 }
 
 fn write_u32(out: &mut Vec<u8>, v: u32) {
@@ -388,7 +523,26 @@ impl ControlMsg {
                 write_string(&mut out, device);
                 out
             }
+            ControlMsg::DisplayInventory(displays) => {
+                let mut out = vec![tag::DISPLAY_INVENTORY];
+                write_u32(&mut out, displays.len() as u32);
+                for d in displays {
+                    d.encode_into(&mut out);
+                }
+                out
+            }
+            ControlMsg::SetDisplayMode { display_id, width, height, refresh_hz, hdr } => {
+                let mut out = vec![tag::SET_DISPLAY_MODE];
+                write_string(&mut out, display_id);
+                write_u32(&mut out, *width);
+                write_u32(&mut out, *height);
+                write_u32(&mut out, *refresh_hz);
+                out.push(*hdr as u8);
+                out
+            }
             ControlMsg::Deactivate { cancelled } => vec![tag::DEACTIVATE, *cancelled as u8],
+            ControlMsg::EndSession => vec![tag::END_SESSION],
+            ControlMsg::ClearPaired => vec![tag::CLEAR_PAIRED],
             ControlMsg::OpenPairDialog => vec![tag::OPEN_PAIR_DIALOG],
             ControlMsg::SecureDesktopChanged { secure } => {
                 vec![tag::SECURE_DESKTOP_CHANGED, *secure as u8]
@@ -435,10 +589,39 @@ impl ControlMsg {
                 let device = read_string(rest, at)?;
                 Ok(ControlMsg::PinRelay { pin, device })
             }
+            tag::DISPLAY_INVENTORY => {
+                let at = &mut 0usize;
+                let count = read_u32(rest, at)?;
+                // A corrupt count must not make us pre-allocate wildly; the
+                // frame itself is already bounded by MAX_FRAME_LEN, and each
+                // entry costs at least 21 bytes on the wire.
+                if count as usize > rest.len() {
+                    return Err(invalid_data("DisplayInventory count exceeds payload"));
+                }
+                let mut displays = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    displays.push(DisplayEntry::decode(rest, at)?);
+                }
+                Ok(ControlMsg::DisplayInventory(displays))
+            }
+            tag::SET_DISPLAY_MODE => {
+                let at = &mut 0usize;
+                let display_id = read_string(rest, at)?;
+                let width = read_u32(rest, at)?;
+                let height = read_u32(rest, at)?;
+                let refresh_hz = read_u32(rest, at)?;
+                let hdr = *rest
+                    .get(*at)
+                    .ok_or_else(|| invalid_data("truncated SetDisplayMode"))?
+                    != 0;
+                Ok(ControlMsg::SetDisplayMode { display_id, width, height, refresh_hz, hdr })
+            }
             tag::DEACTIVATE => {
                 let cancelled = rest.first().copied().unwrap_or(0) != 0;
                 Ok(ControlMsg::Deactivate { cancelled })
             }
+            tag::END_SESSION => Ok(ControlMsg::EndSession),
+            tag::CLEAR_PAIRED => Ok(ControlMsg::ClearPaired),
             tag::OPEN_PAIR_DIALOG => Ok(ControlMsg::OpenPairDialog),
             tag::SECURE_DESKTOP_CHANGED => Ok(ControlMsg::SecureDesktopChanged {
                 secure: rest.first().copied().unwrap_or(0) != 0,
@@ -745,6 +928,56 @@ mod tests {
             ControlMsg::CaptureRect { origin_x: 0, origin_y: 0, width: 3840, height: 2160 },
             ControlMsg::CaptureRect { origin_x: -1920, origin_y: -300, width: 1920, height: 1080 },
             ControlMsg::InjectInput(vec![0x22, 0, 0, 0, 0x0c, 0, 0, 0]),
+            // Tray actions (Worker -> Master): payload-free, so the whole
+            // contract is that their tags stay distinct from every other
+            // variant's — which is exactly what this round-trip checks.
+            ControlMsg::EndSession,
+            ControlMsg::ClearPaired,
+            // Echo display command (echo_rpc.rs). The variable-length id sits
+            // before four fixed fields, so a framing slip here would decode as
+            // a plausible-but-wrong mode — worth pinning.
+            ControlMsg::SetDisplayMode {
+                display_id: "primary".to_string(),
+                width: 3840,
+                height: 2160,
+                refresh_hz: 120,
+                hdr: true,
+            },
+            ControlMsg::SetDisplayMode {
+                display_id: String::new(),
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+                hdr: false,
+            },
+            // Display inventory (Worker -> Master). Variable-length records in
+            // a variable-length list, with the booleans packed into a flags
+            // byte — the most framing-sensitive message on the pipe.
+            ControlMsg::DisplayInventory(vec![]),
+            ControlMsg::DisplayInventory(vec![
+                DisplayEntry {
+                    device_name: r"\\.\DISPLAY1".to_string(),
+                    label: "NVIDIA GeForce RTX 4090".to_string(),
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 165,
+                    is_primary: true,
+                    is_virtual: false,
+                    hdr_active: false,
+                    hdr_capable: true,
+                },
+                DisplayEntry {
+                    device_name: r"\\.\DISPLAY9".to_string(),
+                    label: "Virtual Display Driver".to_string(),
+                    width: 3840,
+                    height: 2160,
+                    refresh_hz: 120,
+                    is_primary: false,
+                    is_virtual: true,
+                    hdr_active: true,
+                    hdr_capable: true,
+                },
+            ]),
         ] {
             let decoded = ControlMsg::decode(&msg.encode()).expect("decode");
             assert_eq!(decoded, msg);

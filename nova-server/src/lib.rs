@@ -4,6 +4,11 @@ mod capture;
 mod config;
 mod control;
 pub mod debug; // pub so nova-server binary can call init_debug_logger() during --install/--uninstall
+/// Everything built for Echo, Nova's own native client: the control/telemetry
+/// RPC on port 48011 (`echo::rpc`) and WAN/NAT-traversal primitives
+/// (`echo::wan`). Master-side by necessity — see the module docs. Public so a
+/// future CLI/diagnostic mode can drive the same surfaces in-process.
+pub mod echo;
 mod encoder;
 mod input;
 /// Master↔Worker IPC transport (Session-Survival Architecture, Phase 1).
@@ -23,6 +28,10 @@ pub mod secure_desktop;
 /// `--install-service` / `--uninstall-service` subcommands can reach it.
 pub mod service;
 mod shutdown;
+/// Live session telemetry (resolution / fps / codec / bitrate) published by
+/// whichever capture loop is running and read by the tray's Server Stats
+/// window. Lock-free atomics — see the module docs for why it is not a channel.
+mod stats;
 pub mod tray;
 mod virtual_display;
 
@@ -232,11 +241,7 @@ impl MasterHandles {
 }
 
 fn to_wire_codec(c: encoder::Codec) -> WireCodec {
-    match c {
-        encoder::Codec::H264 => WireCodec::H264,
-        encoder::Codec::Hevc => WireCodec::Hevc,
-        encoder::Codec::Av1  => WireCodec::Av1,
-    }
+    WireCodec::from(c)
 }
 
 fn negotiated_to_configure_start(n: &session_negotiate::NegotiatedParams) -> ipc::ConfigureStart {
@@ -393,6 +398,11 @@ pub async fn start_master_network() -> MasterHandles {
     // the session's whole life — see session_negotiate::negotiate.
     let worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>> = Arc::new(Mutex::new(None));
 
+    // The Worker's reported display topology (ControlMsg::DisplayInventory),
+    // cached for echo_rpc's seat list. Master cannot enumerate displays itself
+    // — see that message's doc comment.
+    let display_seats: echo::rpc::SeatCache = Arc::new(Mutex::new(Vec::new()));
+
     let (control_pipe_tx, control_pipe_rx) = mpsc::unbounded_channel();
     tokio::spawn(control_supervisor(
         control_pipe_rx,
@@ -402,12 +412,87 @@ pub async fn start_master_network() -> MasterHandles {
         helper_tx,
         helper_ready,
         worker_caps.clone(),
+        client_info.clone(),
+        display_seats.clone(),
     ));
 
-    let (media_pipe_tx, media_pipe_rx) = mpsc::unbounded_channel();
-    tokio::spawn(media_supervisor(media_pipe_rx, rtp_sender.clone(), audio_tx.clone()));
+    // WAN: zero-config internet connections. Both halves start only when a
+    // relay is configured — with no relay there is no WAN path, and a LAN-only
+    // install must not emit STUN traffic to third-party servers every 25 s.
+    //
+    // The gatherer probes through `rtp_sender`'s media socket (so the NAT
+    // mapping it discovers is the one the stream will use) and keeps that
+    // pinhole open; the signaling client publishes the result, and only when
+    // it changes.
+    //
+    // Started BEFORE the Echo RPC because the session manager needs the
+    // gatherer's latched-peer cell: a session may only be granted over a path
+    // a punch has actually proven.
+    let echo_sessions: Option<Arc<echo::session::SessionManager>> =
+        if !cfg.echo.signaling.url.trim().is_empty() {
+            let wan_candidates: Arc<Mutex<Vec<echo::wan::WanCandidate>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let gather = echo::wan::spawn_gatherer(
+                rtp_sender.clone(),
+                wan_candidates.clone(),
+                echo::wan::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+            );
+            let manager = Arc::new(echo::session::SessionManager::new(
+                Arc::new(echo::session::WorkerMediaPlane::new(
+                    rtp_sender.clone(),
+                    worker_link.clone(),
+                    worker_caps.clone(),
+                )),
+                client_info.clone(),
+                gather.latched_handle(),
+            ));
+            echo::signaling::spawn(&cfg.echo.signaling, wan_candidates, gather);
+            Some(manager)
+        } else {
+            println!("📡 Signaling: no relay configured — Echo WAN connections are disabled (LAN only)");
+            None
+        };
 
-    tokio::spawn(session_watcher(client_info.clone(), worker_link.clone(), cfg, rtp_sender.clone(), audio_tx, worker_caps));
+    // Spawned after the WAN block because the frame path needs the session
+    // manager to seal Echo frames — see `media_supervisor`'s seal call.
+    let (media_pipe_tx, media_pipe_rx) = mpsc::unbounded_channel();
+    tokio::spawn(media_supervisor(
+        media_pipe_rx,
+        rtp_sender.clone(),
+        audio_tx.clone(),
+        echo_sessions.clone(),
+    ));
+
+    // Echo's command surface. Master-side because the Worker owns no sockets
+    // and is the process that dies on every sign-out — see echo::rpc's module
+    // docs. Display commands leave here as ControlMsg::SetDisplayMode on the
+    // same pipe everything else uses.
+    //
+    // ONE handler, two doors: the TCP listener below (LAN convenience) and the
+    // WAN tunnel over the punched path. Sharing the handler is what guarantees
+    // a command — and the anti-hijack gate in front of it — cannot behave
+    // differently depending on how a client arrived.
+    let echo_handler = echo::rpc::build_handler(
+        Arc::new(echo::rpc::WorkerOrchestrator::new(
+            worker_link.clone(),
+            worker_caps.clone(),
+            display_seats,
+        )),
+        client_info.clone(),
+        echo_sessions.clone(),
+    );
+    echo::rpc::spawn(&cfg.echo, echo_handler.clone());
+
+    // WAN control: mutual TLS over reliable UDP, on the socket the punch
+    // opened. Only when there is a session layer at all — with no relay
+    // configured there is no punched path for a tunnel to ride.
+    if let Some(sessions) = echo_sessions.clone() {
+        let (echo_tx, echo_rx) = mpsc::unbounded_channel();
+        rtp_sender.lock().unwrap().set_echo_inbox(echo_tx);
+        echo::transport::spawn(echo_rx, rtp_sender.clone(), echo_handler, sessions);
+    }
+
+    tokio::spawn(session_watcher(client_info.clone(), worker_link.clone(), cfg, rtp_sender.clone(), audio_tx, worker_caps, echo_sessions));
 
     println!("🎬 Master network stack ready — RTSP:48010 control:47999 pairing:47989/47984 RTP:47998");
 
@@ -432,6 +517,12 @@ async fn session_watcher(
     rtp_sender: Arc<Mutex<rtp::RtpSender>>,
     audio_tx: Arc<Mutex<audio::AudioTxState>>,
     worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>>,
+    // The other claimant on the one capture pipeline. `echo::session`'s gate
+    // refuses to start an Echo session while Moonlight is streaming; this is
+    // the same rule pointed the other way, and without it the protection is
+    // one-directional — a Moonlight PLAY would reconfigure the Worker and
+    // repoint the encoder out from under a live Echo client.
+    echo_sessions: Option<Arc<echo::session::SessionManager>>,
 ) {
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut configured_generation: Option<u64> = None;
@@ -455,6 +546,10 @@ async fn session_watcher(
     // cancelled flag flips true afterward (before any new session starts),
     // send a second Deactivate to upgrade the suspend into a full teardown.
     let mut suspended_generation: Option<u64> = None;
+    // The session we last logged an Echo-deferral for, so a Moonlight client
+    // waiting behind an Echo session produces one line rather than twenty a
+    // second.
+    let mut echo_blocked_generation: Option<u64> = None;
     loop {
         poll.tick().await;
         let Some(client) = client_info.lock().unwrap().clone() else { continue };
@@ -499,6 +594,24 @@ async fn session_watcher(
         active_generation = Some(client.session_generation);
         if configured_generation == Some(client.session_generation) {
             continue; // already sent ConfigureStart for this session/generation
+        }
+        // An Echo client holds the pipeline. Configuring the Worker now would
+        // re-point the encoder and (via RtpSender) the media target, blacking
+        // out a stream someone is watching — exactly what echo::session's gate
+        // refuses in the opposite direction. Logged once per generation
+        // (`configured_generation` is left unset, so this re-evaluates: if the
+        // Echo session ends while the Moonlight client is still trying, its
+        // session starts normally on the next poll).
+        if echo_sessions.as_ref().is_some_and(|m| m.echo_holds_media()) {
+            if echo_blocked_generation != Some(client.session_generation) {
+                echo_blocked_generation = Some(client.session_generation);
+                println!(
+                    "⛔ Master: session {} wants to stream, but an Echo session holds the \
+                     pipeline — deferring (it will start when Echo disconnects)",
+                    client.session_generation
+                );
+            }
+            continue;
         }
         let caps = *worker_caps.lock().unwrap();
         let negotiated = session_negotiate::negotiate(&client, &cfg.stream, caps);
@@ -587,6 +700,12 @@ async fn control_supervisor(
     helper_tx: mpsc::UnboundedSender<HelperCmd>,
     helper_ready: Arc<std::sync::atomic::AtomicBool>,
     worker_caps: Arc<Mutex<Option<session_negotiate::WorkerCaps>>>,
+    // Needed for ControlMsg::EndSession (tray "End Stream"): the session state
+    // the Worker is asking to end lives here, in Master, and ending it means
+    // marking it cancelled so the ORDINARY teardown path runs.
+    client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
+    // Cache of the Worker's ControlMsg::DisplayInventory, read by echo_rpc.
+    display_seats: echo::rpc::SeatCache,
 ) {
     // Mirrors the Worker's view of the input desktop (ControlMsg::
     // SecureDesktopChanged). While true AND a helper is live, input routes to
@@ -659,6 +778,22 @@ async fn control_supervisor(
                             vdd_capable, native_width, native_height,
                         });
                     }
+                    Some(Ok(ControlMsg::DisplayInventory(entries))) => {
+                        // Replaces wholesale rather than merging: this is the
+                        // Worker's complete current view, and a display that
+                        // vanished from it is a display that no longer exists.
+                        let seats: Vec<echo::rpc::DisplaySeat> =
+                            entries.iter().map(echo::rpc::DisplaySeat::from_entry).collect();
+                        println!("🖥️  Master: worker reported {} display(s):", seats.len());
+                        for s in &seats {
+                            println!("   • {} \"{}\" {}x{}@{}Hz{}{}{}",
+                                s.id, s.label, s.width, s.height, s.refresh_hz,
+                                if s.is_primary { " primary" } else { "" },
+                                if s.virtual_display { " virtual" } else { "" },
+                                if s.hdr_active { " HDR-on" } else if s.hdr_capable { " HDR-capable" } else { "" });
+                        }
+                        *display_seats.lock().unwrap() = seats;
+                    }
                     Some(Ok(msg @ ControlMsg::CaptureRect { .. })) => {
                         // Cached by the helper supervisor and replayed to each
                         // helper on connect — see ControlMsg::CaptureRect.
@@ -674,6 +809,50 @@ async fn control_supervisor(
                                 if secure { "starting" } else { "stopping" });
                             let _ = helper_tx.send(if secure { HelperCmd::Start } else { HelperCmd::Stop });
                         }
+                    }
+                    Some(Ok(ControlMsg::EndSession)) => {
+                        // Tray "End Stream". Deliberately does NOT tear anything
+                        // down directly: marking the session cancelled hands it
+                        // to session_watcher's existing active→inactive edge,
+                        // which resets the RTP timeline and sends
+                        // Deactivate{cancelled:true} — the identical path a
+                        // client's own "Quit App" takes, restoring the physical
+                        // monitor and releasing the DXGI/audio hooks. Reusing it
+                        // is the point: a second teardown path here would be a
+                        // second place for the VDD to get stranded.
+                        //
+                        // cancelled=true also clears `last_configure` (see the
+                        // outbound arm below), so no future Worker inherits a
+                        // session the user deliberately ended.
+                        let ended = {
+                            let mut guard = client_info.lock().unwrap();
+                            match guard.as_mut() {
+                                Some(info) if info.streaming_active => {
+                                    info.streaming_active = false;
+                                    info.cancelled = true;
+                                    Some(info.session_generation)
+                                }
+                                _ => None,
+                            }
+                        };
+                        match ended {
+                            Some(gen) => {
+                                println!("🛑 Master: tray \"End Stream\" — ending session {gen} \
+                                    (server stays up and listening)");
+                                // Ordered AFTER the flags above: the Disconnect
+                                // event this produces must never be able to read
+                                // as a client leaving a session still marked live.
+                                control::request_peer_kick();
+                            }
+                            None => println!("ℹ️  Master: tray \"End Stream\" with no active session — nothing to end"),
+                        }
+                    }
+                    Some(Ok(ControlMsg::ClearPaired)) => {
+                        // The trust store this revokes is Master-side state; see
+                        // pairing::clear_all_paired for why the Worker deleting
+                        // the JSON itself would revoke nothing.
+                        println!("🗑️  Master: tray \"Clear Paired Devices\" — wiping the trust store");
+                        pairing::clear_all_paired();
                     }
                     Some(Ok(ControlMsg::PinRelay { pin, device })) => {
                         // Same handshake point the monolithic host's tray uses:
@@ -817,6 +996,10 @@ async fn media_supervisor(
     mut pipe_rx: mpsc::UnboundedReceiver<NamedPipeServer>,
     rtp_sender: Arc<Mutex<rtp::RtpSender>>,
     audio_tx: Arc<Mutex<audio::AudioTxState>>,
+    // Present only when a relay is configured. Consulted per frame via a
+    // lock-free flag, so a Moonlight session pays one atomic load — see
+    // `SessionManager::seal_video`.
+    echo_sessions: Option<Arc<echo::session::SessionManager>>,
 ) {
     let mut learn_ticker = tokio::time::interval(Duration::from_millis(500));
     // Phase 4 — the actual "survive a Worker respawn" mechanism. Master's own
@@ -888,14 +1071,41 @@ async fn media_supervisor(
                         if !first_idr_forwarded && !is_idr {
                             continue; // don't open the stream with a P-frame
                         }
+                        // Encrypt for an Echo session, pass through for
+                        // Moonlight. This is the ONLY correct place for the
+                        // seal: after the Worker's encoder, before RtpSender
+                        // shards the frame — so Reed-Solomon parity covers
+                        // ciphertext and the client can repair lost shards
+                        // without the key, then authenticate once after
+                        // reassembly. Sealing per shard instead would cost a
+                        // 16-byte tag on every packet and hand an attacker a
+                        // per-packet oracle.
+                        //
+                        // `frame_index` is the AES-GCM counter, which is why
+                        // the wire index has to be the same number the encoder
+                        // stamped: a mismatch is an authentication failure on
+                        // the client, not a picture glitch.
+                        let sealed = echo_sessions
+                            .as_ref()
+                            .and_then(|s| s.seal_video(frame_index, frame_type, &data));
+                        let payload: &[u8] = sealed.as_deref().unwrap_or(&data);
+
                         // The Worker chose frame_index (== the NVENC timestamp);
                         // Master puts it straight on the wire so the index the
                         // client references matches what invalidation targets.
-                        let sent = rtp_sender.lock().unwrap().send_frame(frame_index, &data, frame_type);
+                        let sent = rtp_sender.lock().unwrap().send_frame(frame_index, payload, frame_type);
                         if sent {
                             first_idr_forwarded = true;
                             last_frame_at = Instant::now();
                             if is_idr {
+                                // Cache the PLAINTEXT frame, not the sealed
+                                // one: the keepalive retransmit below re-sends
+                                // it later, and re-sealing it then produces the
+                                // correct nonce for whatever index it goes out
+                                // under. Caching ciphertext would replay a
+                                // frame under a nonce the client has already
+                                // seen, which the tag check would (correctly)
+                                // reject.
                                 last_idr = Some((frame_index, data));
                             }
                         }
@@ -949,7 +1159,16 @@ async fn media_supervisor(
                         // Retransmit the cached IDR under its ORIGINAL index — a
                         // genuine retransmit, not a new frame; the client keeps
                         // the same reference timeline.
-                        let _ = rtp_sender.lock().unwrap().send_frame(*idx, data, 2);
+                        //
+                        // Re-sealed rather than cached sealed: the nonce is
+                        // derived from the index, and this goes out under the
+                        // same index, so re-sealing reproduces a byte-identical
+                        // datagram the client accepts as the retransmit it is.
+                        let sealed = echo_sessions
+                            .as_ref()
+                            .and_then(|s| s.seal_video(*idx, 2, data));
+                        let payload: &[u8] = sealed.as_deref().unwrap_or(data);
+                        let _ = rtp_sender.lock().unwrap().send_frame(*idx, payload, 2);
                     }
                 }
             }
@@ -1236,6 +1455,43 @@ fn apply_configure_start(
     })
 }
 
+/// Enumerate the Worker's live display topology and report it to Master.
+///
+/// Called at Worker startup and after anything that can change the topology
+/// (a session's VDD activation, a teardown). Only the Worker can produce this
+/// — see `ControlMsg::DisplayInventory` — and it is the foundation of Echo's
+/// targetable seat list.
+///
+/// Best-effort by design: a failed enumeration reports nothing rather than
+/// erroring a session path, and Master keeps its previous view. Sending an
+/// empty list would be worse than staying quiet, since "no displays" is
+/// indistinguishable from a genuinely headless box.
+fn publish_display_inventory(
+    reply_tx: &mpsc::UnboundedSender<ipc::ControlMsg>,
+    vd: &virtual_display::VirtualDisplay,
+) {
+    let displays = vd.enumerate_displays();
+    if displays.is_empty() {
+        return;
+    }
+    let entries: Vec<ipc::DisplayEntry> = displays
+        .iter()
+        .map(|d| ipc::DisplayEntry {
+            device_name: d.device_name.clone(),
+            label: d.label.clone(),
+            width: d.width,
+            height: d.height,
+            refresh_hz: d.refresh_hz,
+            is_primary: d.is_primary,
+            is_virtual: d.is_virtual,
+            hdr_active: d.hdr_active,
+            hdr_capable: d.hdr_capable,
+        })
+        .collect();
+    println!("🖥️  Worker: reporting {} display(s) to Master", entries.len());
+    let _ = reply_tx.send(ipc::ControlMsg::DisplayInventory(entries));
+}
+
 /// Applies a Master-sent `Deactivate`: mirrors the monolithic `run()`'s
 /// disconnect-teardown block (stop audio, stop virtual input, scorched-earth
 /// the encoder, then either fully deactivate the VDD — `cancelled` — or just
@@ -1262,6 +1518,10 @@ fn deactivate_worker(
     // PT_LOSS_STATS relay can't compute a reduction against a dead session
     // (mirrors the monolithic path's identical reset on disconnect).
     encoder::set_stream_bitrate_kbps(0);
+    // Tray goes back to its idle icon/tooltip. Done here rather than at the
+    // call sites so no future teardown path can leave the tray advertising a
+    // session that has already been torn down.
+    stats::session_ended();
 
     let was_hdr = enc.config.is_hdr;
     enc.config.is_hdr = false;
@@ -1860,8 +2120,14 @@ pub async fn run_worker() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_tx = Arc::new(shutdown_tx);
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel::<tray::TrayCmd>(32);
+    // Tray menu actions that only the Master can carry out (End Stream, Clear
+    // Paired Devices) — forwarded over the control pipe below. Bounded and
+    // small: these arrive at human cadence, and a full queue would mean the
+    // forwarder is wedged, which is worth a log line rather than unbounded
+    // growth.
+    let (tray_action_tx, tray_action_rx) = std::sync::mpsc::sync_channel::<tray::TrayAction>(8);
     let tray_global_pin: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((String::new(), String::new())));
-    tray::spawn(tray_rx, shutdown_tx.clone(), tray_global_pin.clone());
+    tray::spawn(tray_rx, shutdown_tx.clone(), tray_global_pin.clone(), tray_action_tx);
 
     input::check_vigem_driver_at_startup();
     audio::recover_stuck_sink();
@@ -2052,6 +2318,36 @@ pub async fn run_worker() -> Result<()> {
         }
     });
 
+    // Tray actions → Master. "End Stream" and "Clear Paired Devices" both act
+    // on state this process does not own (the client session; pairing's trust
+    // store) — see ControlMsg::EndSession / ControlMsg::ClearPaired for why
+    // doing either locally would be wrong rather than merely inconvenient.
+    //
+    // A dedicated OS thread, not a tokio task: the tray hands work over a
+    // blocking `std::sync::mpsc` receiver, and blocking a runtime worker on it
+    // would park one of the Worker's executor threads forever. Same shape as
+    // Master's `nova-pair-dialog-fwd`.
+    std::thread::Builder::new()
+        .name("nova-tray-action-fwd".into())
+        .spawn({
+            let reply_tx = reply_tx.clone();
+            move || {
+                // recv() only errors once the tray thread is gone (Quit /
+                // process teardown), so exiting then is correct.
+                while let Ok(action) = tray_action_rx.recv() {
+                    let msg = match action {
+                        tray::TrayAction::EndStream => ipc::ControlMsg::EndSession,
+                        tray::TrayAction::ClearPairedDevices => ipc::ControlMsg::ClearPaired,
+                    };
+                    println!("📨 Worker: relaying tray action {action:?} to Master");
+                    if reply_tx.send(msg).is_err() {
+                        return; // control thread gone — process is shutting down
+                    }
+                }
+            }
+        })
+        .expect("spawn nova-tray-action-fwd thread");
+
     // Tray "Quit Nova" → the same WorkerCommand::Stop path as every other
     // graceful-stop trigger (below). tray::spawn only knows how to signal a
     // watch<bool>, so this task's only job is translating that into a send
@@ -2144,6 +2440,21 @@ pub async fn run_worker() -> Result<()> {
                                         break; // main loop gone
                                     }
                                 }
+                                Some(Ok(ipc::ControlMsg::SetDisplayMode {
+                                    display_id, width, height, refresh_hz, hdr,
+                                })) => {
+                                    // Wire is live; applying it is the next step
+                                    // (graceful capture/encoder rebuild + the
+                                    // client-side format-change handshake). Logged
+                                    // rather than silently swallowed so an Echo
+                                    // client's command is visible end-to-end in
+                                    // nova.log before any of it can misbehave.
+                                    println!(
+                                        "🎛️  Worker: Echo set_display received for \"{display_id}\" \
+                                         → {width}x{height}@{refresh_hz}Hz hdr={hdr} — not applied \
+                                         yet (hot format change is not implemented)"
+                                    );
+                                }
                                 Some(Ok(ipc::ControlMsg::OpenPairDialog)) => {
                                     println!("🔑 Worker: Master requests the pair dialog — opening");
                                     // try_send: a full queue means dialogs are already
@@ -2211,6 +2522,9 @@ pub async fn run_worker() -> Result<()> {
     // ceiling, which is what produced the 12-second freeze sawtooth.
     let mut qos = QosController::new();
     let mut enc_rate_bytes = 0u64;
+    // Frames in the current 1 s window — the only per-frame cost the tray's
+    // telemetry adds anywhere (see stats.rs).
+    let mut enc_rate_frames = 0u32;
     let mut enc_rate_tick = Instant::now();
     let startup_frame_interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame_interval = startup_frame_interval;
@@ -2233,6 +2547,11 @@ pub async fn run_worker() -> Result<()> {
         println!("🧩 Worker capabilities: vdd={vdd_capable} native={}x{}",
             capturer.width(), capturer.height());
     }
+
+    // The display topology as it stands before any session — this is what
+    // makes Echo's `list_displays` a real, targetable list rather than the
+    // single inferred entry `WorkerCapabilities` can support.
+    publish_display_inventory(&reply_tx, &vd);
 
     'outer: loop {
         // Frame pacing, same shape as the monolithic path's loop, racing the
@@ -2283,13 +2602,27 @@ pub async fn run_worker() -> Result<()> {
                                     // first-frame check to notice, so the decoder resumes on the very
                                     // next frame instead of showing a frozen image for one more slot.
                                     enc.request_idr();
+                                    // Publish what the tray's Server Stats window
+                                    // reports. Taken from the ENCODER, not the
+                                    // request: apply_configure_start may land on a
+                                    // different geometry than was asked for.
+                                    stats::session_started(
+                                        applied.width, applied.height, applied.fps,
+                                        enc.config.codec, enc.config.is_hdr,
+                                        enc.config.bitrate_kbps.max(0) as u32,
+                                    );
                                     let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
+                                    // VDD activation can change the topology —
+                                    // refresh Master's Echo seat list.
+                                    publish_display_inventory(&reply_tx, &vd);
                                 }
                                 Err(e) => println!("❌ apply_configure_start failed: {e}"),
                             }
                         }
                         Some(WorkerCommand::Deactivate { cancelled }) => {
                             deactivate_worker(cancelled, &mut vd, &mut capturer, &mut enc, &mut audio_manager);
+                            // A VDD teardown changes the topology too.
+                            publish_display_inventory(&reply_tx, &vd);
                             client_connected = false;
                             first_idr_sent = false;
                             send_queue_drops = 0;
@@ -2350,13 +2683,23 @@ pub async fn run_worker() -> Result<()> {
                             // first-frame check to notice, so the decoder resumes on the very
                             // next frame instead of showing a frozen image for one more slot.
                             enc.request_idr();
+                            // See the select!-arm twin above.
+                            stats::session_started(
+                                applied.width, applied.height, applied.fps,
+                                enc.config.codec, enc.config.is_hdr,
+                                enc.config.bitrate_kbps.max(0) as u32,
+                            );
                             let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
+                            // See the select!-arm twin above.
+                            publish_display_inventory(&reply_tx, &vd);
                         }
                         Err(e) => println!("❌ apply_configure_start failed: {e}"),
                     }
                 }
                 WorkerCommand::Deactivate { cancelled } => {
                     deactivate_worker(cancelled, &mut vd, &mut capturer, &mut enc, &mut audio_manager);
+                    // See the select!-arm twin above.
+                    publish_display_inventory(&reply_tx, &vd);
                     client_connected = false;
                     first_idr_sent = false;
                     send_queue_drops = 0;
@@ -2380,6 +2723,36 @@ pub async fn run_worker() -> Result<()> {
                 enc.config.bitrate_kbps.max(0) as u32,
                 enc.config.fps.max(1) as u32,
             );
+        }
+
+        // ── 1 Hz telemetry tick ──────────────────────────────────────────────
+        // Deliberately in the loop body rather than inside the encode branch it
+        // used to live in: a capture that stalls mid-session stops producing
+        // frames entirely, and from inside the encode branch the tick would
+        // stop firing too — freezing the tray at the last healthy sample at
+        // exactly the moment someone opens the stats window to find out why the
+        // stream looks stuck. Out here a stall correctly reads as 0.0 fps.
+        //
+        // The log line keeps its old "only when frames were encoded" behaviour
+        // so an idle Worker doesn't write "0 Kbps" to nova.log every second.
+        {
+            let elapsed = enc_rate_tick.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                if enc_rate_frames > 0 {
+                    println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
+                }
+                if client_connected {
+                    stats::sample(
+                        enc_rate_frames,
+                        enc_rate_bytes,
+                        elapsed.as_millis() as u64,
+                        encoder::get_stream_bitrate_kbps().max(0) as u32,
+                    );
+                }
+                enc_rate_bytes = 0;
+                enc_rate_frames = 0;
+                enc_rate_tick = Instant::now();
+            }
         }
 
         if client_connected {
@@ -2415,7 +2788,17 @@ pub async fn run_worker() -> Result<()> {
                         let (ox, oy) = capturer.origin();
                         input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
                         enc.request_idr();
+                        // The VDD coming up can change the capture geometry, so
+                        // the stats window must be re-stamped, not left showing
+                        // the pre-activation size.
+                        stats::session_started(
+                            applied.width, applied.height, applied.fps,
+                            enc.config.codec, enc.config.is_hdr,
+                            enc.config.bitrate_kbps.max(0) as u32,
+                        );
                         let _ = reply_tx.send(ipc::ControlMsg::WorkerConfigured(applied));
+                        // The deferred activation just brought the VDD up.
+                        publish_display_inventory(&reply_tx, &vd);
                     }
                     Err(e) => println!("❌ deferred VDD activation failed: {e}"),
                 }
@@ -2478,12 +2861,11 @@ pub async fn run_worker() -> Result<()> {
                 if frames_encoded == 1 {
                     println!("🎬 First encoded frame: {} bytes", packet_size);
                 }
+                // Accumulate only — the 1 Hz report itself now runs from the
+                // loop body (see the telemetry tick above), so a stalled
+                // capture still reports.
                 enc_rate_bytes += packet_size as u64;
-                if enc_rate_tick.elapsed() >= Duration::from_secs(1) {
-                    println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
-                    enc_rate_bytes = 0;
-                    enc_rate_tick = Instant::now();
-                }
+                enc_rate_frames += 1;
                 if client_connected {
                     let data = &out_buffer[..packet_size as usize];
                     let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc;
@@ -2712,7 +3094,12 @@ pub async fn run() -> Result<()> {
     // pairing async task: the tray writes the 4-digit string here and the
     // pairing poll loop reads + clears it.
     let global_pin: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((String::new(), String::new())));
-    tray::spawn(tray_rx, shutdown_tx.clone(), global_pin.clone());
+    // Tray menu actions (End Stream / Clear Paired Devices). Monolithically
+    // every subsystem they touch is in THIS process, so the handler task below
+    // acts on `client_info` and the pairing store directly — no IPC leg, but
+    // the same observable behaviour as the split path.
+    let (tray_action_tx, tray_action_rx) = std::sync::mpsc::sync_channel::<tray::TrayAction>(8);
+    tray::spawn(tray_rx, shutdown_tx.clone(), global_pin.clone(), tray_action_tx);
     // Service-initiated graceful stop (Phase 15.5): when the SCM stops
     // NovaService (installer upgrade, manual `sc stop`, OS shutdown), the
     // service signals a named event instead of immediately terminating us.
@@ -2878,6 +3265,50 @@ pub async fn run() -> Result<()> {
         move || rtsp::start_rtsp_server(48010, info)
     });
 
+    // Tray actions — the monolithic twin of the Worker's `nova-tray-action-fwd`
+    // thread. "End Stream" marks the session cancelled and disconnects the
+    // client; the capture loop's own `!streaming_active` branch below then runs
+    // the ordinary /cancel teardown (VDD released, physical monitor restored,
+    // audio endpoint returned), leaving every listener bound. A dedicated OS
+    // thread because the tray's receiver blocks.
+    std::thread::Builder::new()
+        .name("nova-tray-action".into())
+        .spawn({
+            let info = client_info.clone();
+            move || {
+                while let Ok(action) = tray_action_rx.recv() {
+                    match action {
+                        tray::TrayAction::EndStream => {
+                            let ended = {
+                                let mut guard = info.lock().unwrap_or_else(|e| e.into_inner());
+                                match guard.as_mut() {
+                                    Some(c) if c.streaming_active => {
+                                        c.streaming_active = false;
+                                        c.cancelled = true;
+                                        Some(c.session_generation)
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            match ended {
+                                Some(gen) => {
+                                    println!("🛑 Tray: ending session {gen} (server stays up and listening)");
+                                    // After the flags, never before — see
+                                    // control::request_peer_kick.
+                                    control::request_peer_kick();
+                                }
+                                None => println!("ℹ️  Tray: \"End Stream\" with no active session — nothing to end"),
+                            }
+                        }
+                        tray::TrayAction::ClearPairedDevices => {
+                            pairing::clear_all_paired();
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn nova-tray-action thread");
+
     // Control stream (ENet/reliable-UDP) on port 47999. `None`: the
     // monolithic path has no Worker to talk to — IDR/congestion/input calls
     // straight into encoder/input in-process, unchanged from before the
@@ -2970,6 +3401,8 @@ pub async fn run() -> Result<()> {
     // locally (works without any client connected), e.g. CBR overshooting
     // what the link/client can take.
     let mut enc_rate_bytes   = 0u64;
+    // Frames in the current 1 s window (see run_worker's twin).
+    let mut enc_rate_frames  = 0u32;
     let mut enc_rate_tick    = Instant::now();
     // Consecutive WGC iterations with no new frame (desktop unchanged).
     let mut timeout_streak = 0u32;
@@ -3608,6 +4041,19 @@ pub async fn run() -> Result<()> {
                         // split-seat gamepad passthrough (input.rs).
                         input::start_session();
                         client_connected = true;
+                        // Publish the session to the tray's Server Stats window
+                        // (monolithic twin of the Worker's ConfigureStart arm).
+                        // Read from the ENCODER and the CAPTURER, not from the
+                        // client's request: HDR/codec renegotiation and any
+                        // resolution re-snap have already landed by here.
+                        stats::session_started(
+                            capturer.width(),
+                            capturer.height(),
+                            enc.config.fps.max(1) as u32,
+                            enc.config.codec,
+                            enc.config.is_hdr,
+                            enc.config.bitrate_kbps.max(0) as u32,
+                        );
                         // Tell the service a client is active — see
                         // service::set_client_connected's doc comment. Defers
                         // a SYSTEM-fallback→interactive upgrade so entering
@@ -3634,6 +4080,9 @@ pub async fn run() -> Result<()> {
                 rtp_sender.reset();
                 audio_manager.stop_and_release();
                 input::stop_session();
+                // Tray back to idle — mirrors deactivate_worker's identical
+                // call on the split path.
+                stats::session_ended();
                 frame_interval  = startup_frame_interval;
                 next_frame_time = Instant::now();
                 client_connected    = false;
@@ -3733,6 +4182,30 @@ pub async fn run() -> Result<()> {
         // deployment while working here).
         if client_connected {
             qos.tick(congestion_stable_kbps, enc.config.fps.max(1) as u32);
+        }
+
+        // ── 1 Hz telemetry tick ──────────────────────────────────────────────
+        // Twin of run_worker's identical block — see it for why this lives in
+        // the loop body rather than inside the encode branch (a stalled capture
+        // must read as 0.0 fps in the tray, not freeze at the last good sample).
+        {
+            let elapsed = enc_rate_tick.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                if enc_rate_frames > 0 {
+                    println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
+                }
+                if client_connected {
+                    stats::sample(
+                        enc_rate_frames,
+                        enc_rate_bytes,
+                        elapsed.as_millis() as u64,
+                        encoder::get_stream_bitrate_kbps().max(0) as u32,
+                    );
+                }
+                enc_rate_bytes = 0;
+                enc_rate_frames = 0;
+                enc_rate_tick = Instant::now();
+            }
         }
 
         // ── Secure-desktop backend swap (Phase 15.2) ─────────────────────────
@@ -3864,12 +4337,10 @@ pub async fn run() -> Result<()> {
                     debug::debug_log(&format!("First frame {} bytes", packet_size));
                 }
 
+                // Accumulate only — the 1 Hz report runs from the loop body
+                // (see the telemetry tick above).
                 enc_rate_bytes += packet_size as u64;
-                if enc_rate_tick.elapsed() >= Duration::from_secs(1) {
-                    println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
-                    enc_rate_bytes = 0;
-                    enc_rate_tick  = Instant::now();
-                }
+                enc_rate_frames += 1;
 
                 if video_learned {
                     let data = &out_buffer[..packet_size as usize];

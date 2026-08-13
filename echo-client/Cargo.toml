@@ -1,0 +1,25 @@
+[package]
+name = "echo-client"
+version = "0.1.0"
+edition = "2021"
+description = "Echo — Nova's native client (headless CLI)"
+
+# No video decode, no UI, no platform code yet: this iteration exists to prove
+# the connection path. Everything it needs lives in nova-core, which is exactly
+# the crate that will compile for Xbox and Android later.
+[dependencies]
+nova-core = { path = "../nova-core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+# Echo's control-channel client (control.rs). Already in the tree via
+# nova-core's mutual-TLS helpers — this only makes the dependency direct so the
+# connector and server-name types can be named here.
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+# Client-side FEC reconstruction (receiver.rs). Must be the SAME crate and
+# major version the host encodes with (nova-server), because Reed-Solomon
+# implementations differ in their generator matrix — a mismatch reconstructs
+# confidently wrong data rather than failing.
+reed-solomon-erasure = "6"

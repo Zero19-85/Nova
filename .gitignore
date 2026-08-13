@@ -21,6 +21,12 @@ test.h264
 nova_cert.der
 nova_cert.pem
 nova_key.der
+# Echo/relay peer identities — Identity::load_or_create writes
+# <prefix>.cert.der / <prefix>.key.der into its data dir, which is the CWD by
+# default. Running echo-client or nova-relay from the repo root would otherwise
+# drop a private key into the working tree.
+*.cert.der
+*.key.der
 nova_cert.version
 nova_paired.txt
 nova_paired.json

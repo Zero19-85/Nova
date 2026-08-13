@@ -1,0 +1,120 @@
+[package]
+name = "nova-server"
+version = "0.1.0"
+edition = "2021"
+
+# Thin entry point — wires up the lib's run(). Declared explicitly with
+# test = false so `cargo test` doesn't build/run a (test-less) harness for
+# this target, which would inherit the requireAdministrator manifest
+# (rustc-link-arg-bin in build.rs) and fail with "requires elevation" since
+# cargo itself runs unelevated.
+[[bin]]
+name = "nova-server"
+path = "src/bin/nova-server.rs"
+test = false
+
+[dependencies]
+nova-core = { path = "../nova-core" }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+mdns-sd = "0.13"
+rcgen = "0.14"
+time = "0.3"
+ring = "0.17"
+aes = "0.8"
+# ring's AES-128-GCM only supports 96-bit nonces. Nvidia's "legacy" control
+# stream encryption (used when SS_ENC_CONTROL_V2 isn't negotiated) uses a
+# 16-byte IV, which only RustCrypto's generic aes-gcm can represent.
+aes-gcm = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+cipher = "0.4"
+hex = "0.4"
+url = "2"
+rusty_enet = "0.4"
+socket2 = "0.5"
+reed-solomon-erasure = "6"
+# Opus encoder for the GameStream audio stream (builds bundled libopus via cmake)
+audiopus = "0.2"
+clap = { version = "4", features = ["derive"] }
+# Virtual Xbox 360 controller via ViGEmBus, for split-seat gamepad passthrough
+# (input.rs). Requires the ViGEmBus driver to be installed on the host.
+vigem-client = "0.1"
+
+# Windows DXGI + NVENC + WGC
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Devices_Display",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_Media_Audio",
+    # timeBeginPeriod — 1 ms system timer resolution for frame-pacing sleeps
+    # (Phase 15 HEVC/HDR10 micro-stutter batch). Bindings only.
+    "Win32_Media",
+    # Windows Graphics Capture (WGC) — HDR-safe capture backend
+    "Graphics_Capture",                    # Direct3D11CaptureFramePool / GraphicsCaptureSession
+    "Graphics_DirectX",                    # DirectXPixelFormat
+    "Graphics_DirectX_Direct3D11",         # IDirect3DDevice / IDirect3DSurface / IDirect3DDxgiInterfaceAccess
+    "Win32_System_WinRT_Direct3D11",       # CreateDirect3D11DeviceFromDXGIDevice
+    "Win32_System_WinRT_Graphics_Capture", # IGraphicsCaptureItemInterop (HMONITOR → GraphicsCaptureItem)
+    "Win32_System_WinRT",                  # RoInitialize / RO_INIT_MULTITHREADED
+    # System tray + balloon notifications
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+    # DPI awareness: SetProcessDpiAwarenessContext (belt-and-suspenders alongside manifest)
+    "Win32_UI_HiDpi",
+    # File logger: CreateFileW for the log file, SetStdHandle to redirect println!
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    # Desktop-switch detection (Phase 15.1b, capture/desktop_switch.rs):
+    # SetWinEventHook/UnhookWinEvent for EVENT_SYSTEM_DESKTOPSWITCH…
+    "Win32_UI_Accessibility",
+    # …and OpenInputDesktop/GetUserObjectInformationW to name the input desktop
+    "Win32_System_StationsAndDesktops",
+    # SYSTEM launcher service (Phase 15.2c, service.rs):
+    #   SCM plumbing (StartServiceCtrlDispatcherW / RegisterServiceCtrlHandlerExW /
+    #   SetServiceStatus / CreateServiceW / OpenSCManagerW …)
+    "Win32_System_Services",
+    #   WTSGetActiveConsoleSessionId / WTSQueryUserToken — resolve the console
+    #   user's token so the host can be spawned into the interactive session
+    "Win32_System_RemoteDesktop",
+    #   CreateEnvironmentBlock — give the spawned host the user's environment
+    "Win32_System_Environment",
+] }
+# System tray icon + native right-click context menu (handles all Win32 quirks
+# — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).
+tray-icon = "0.14"
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+# Echo side-channel wire format (echo_rpc.rs). Pure Rust, no native linkage —
+# it does not touch the NVENC/DXGI link line. Used ONLY on the control channel
+# (human/UI cadence), never on the frame path; see echo_rpc's module docs for
+# why the RPC gets a real parser while the media paths stay hand-rolled.
+serde_json = "1"
+rsa = "0.9.10"
+rustls = "0.23.40"
+tokio-rustls = "0.26.4"
+rustls-pki-types = "1.14.1"
+# Already in the tree via rustls — direct dep only for EndEntityCert::verify_signature,
+# which checks the client's RSA signature over the pairing secret (Apollo crypto::verify256).
+rustls-webpki = { version = "0.103", features = ["aws-lc-rs"] }
+
+[build-dependencies]
+cc = "1.0"
+
+# Release profile tuning moved to the workspace root — Cargo only honours
+# [profile] there, and leaving a copy here would be silently ignored.

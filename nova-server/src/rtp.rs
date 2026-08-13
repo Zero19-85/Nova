@@ -110,6 +110,9 @@ fn spin_wait(d: Duration) {
 enum TxCmd {
     Frame { frame_index: u32, buf: Vec<u8>, frame_type: u8 },
     SetTarget(SocketAddr),
+    /// Byte 0 of every outgoing datagram: `None` = Moonlight's RTP version
+    /// byte, `Some(tag)` = an Echo demux tag. See `TxEngine::demux_tag`.
+    SetDemuxTag(Option<u8>),
     SetFps(u32),
     SetCodec { is_hevc: bool, is_av1: bool },
     Configure { packet_size: usize, fec_percentage: usize, min_parity_shards: usize },
@@ -136,6 +139,10 @@ pub struct RtpSender {
     recv_socket: UdpSocket,
     /// Capture-thread copy of the learned client address (session state).
     target: Option<SocketAddr>,
+    /// True when the target was set explicitly (an Echo session's punched peer)
+    /// rather than learned from inbound pings, in which case `try_learn_target`
+    /// must not overwrite it. See [`pin_target`](Self::pin_target).
+    pinned: bool,
     tx: SyncSender<TxCmd>,
     /// Frame payload buffers coming back from the worker for reuse.
     buf_rx: Receiver<Vec<u8>>,
@@ -149,6 +156,21 @@ pub struct RtpSender {
     /// timeline instead of restarting at 1 (which the client would discard
     /// forever — see ipc::ConfigureStart::start_frame_index).
     last_sent_index: u32,
+    /// Where STUN datagrams arriving on the media port are delivered, when
+    /// Echo's WAN layer has registered for them. `None` = no NAT traversal
+    /// configured, and STUN packets are simply not treated as client pings.
+    ///
+    /// This exists because a NAT mapping belongs to a *socket*: the binding
+    /// request that discovers Nova's public address has to leave from THIS
+    /// socket, so its response arrives here, mixed in with the client's pings.
+    /// See `echo::wan` for why the two can never be confused.
+    stun_inbox: Option<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>>,
+    /// Where Echo's own control datagrams go — a separate inbox from
+    /// `stun_inbox` because they have separate owners. The gatherer is the sole
+    /// consumer of STUN (two consumers would race for each other's punch
+    /// responses); the Echo transport is the sole consumer of control. Sharing
+    /// one channel would put both in the same race.
+    echo_inbox: Option<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>>,
 }
 
 impl RtpSender {
@@ -183,12 +205,98 @@ impl RtpSender {
         Ok(Self {
             recv_socket,
             target: None,
+            pinned: false,
             tx,
             buf_rx,
             spare_bufs: Vec::new(),
             bufs_in_flight: 0,
             last_sent_index: 0,
+            stun_inbox: None,
+            echo_inbox: None,
         })
+    }
+
+    /// Register a sink for STUN datagrams seen on the media port.
+    ///
+    /// Until this is called, [`try_learn_target`](Self::try_learn_target)
+    /// merely declines to mistake STUN for a client ping — nothing else
+    /// changes, so an install with no WAN configuration behaves exactly as
+    /// before.
+    pub fn set_stun_inbox(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>) {
+        self.stun_inbox = Some(tx);
+    }
+
+    /// Register a sink for Echo control datagrams seen on the media port.
+    ///
+    /// Same reasoning as [`set_stun_inbox`](Self::set_stun_inbox), one layer
+    /// up: Echo's control channel has to share the media socket because that
+    /// socket is the one with a punched hole through the NAT. Opening a second
+    /// socket for control would mean a second mapping to punch, keep alive, and
+    /// lose independently.
+    pub fn set_echo_inbox(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>) {
+        self.echo_inbox = Some(tx);
+    }
+
+    /// Send a datagram from the **media socket**, so it carries the same
+    /// source address the stream will.
+    ///
+    /// This is the whole point of routing NAT traversal through `RtpSender`
+    /// rather than a socket of its own: a binding request sent from anywhere
+    /// else discovers a mapping that belongs to that other socket and
+    /// evaporates with it. The send side is owned by the `nova-rtp-send`
+    /// worker thread, but `recv_socket` is a `try_clone` of the same
+    /// underlying socket — concurrent send/recv from different threads is
+    /// safe, and both share one 5-tuple, which is what makes the discovered
+    /// mapping the correct one.
+    ///
+    /// Deliberately NOT a path for media: it bypasses the worker's pacing and
+    /// FEC entirely. STUN-sized control datagrams only.
+    pub fn send_raw(&self, data: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.recv_socket.send_to(data, to)
+    }
+
+    /// Point the stream at an explicitly-known peer — an Echo session's
+    /// punched address — and stop learning the target from inbound traffic
+    /// until [`reset`](Self::reset) or [`unpin_target`](Self::unpin_target).
+    ///
+    /// ## Why pinning is required, and what race it closes
+    ///
+    /// GameStream has no way to tell Nova where to send video: the client's
+    /// media port is ephemeral and NAT-translated, so `try_learn_target` infers
+    /// it from whoever pings the media socket. That heuristic is correct for
+    /// Moonlight and actively wrong for Echo, whose address is already *known*
+    /// (the punch proved it) — and worse, the heuristic would fight the known
+    /// value. Every subsequent datagram from any other source retargets the
+    /// stream: a stale ping from the previous session still in the receive
+    /// queue, a Moonlight client reconnecting, or simply an internet scanner
+    /// touching port 47998, which now genuinely happens because the port is
+    /// reachable from the WAN. The failure mode is not a crash but a silent
+    /// misdelivery of the desktop to an arbitrary address.
+    ///
+    /// Pinning does NOT stop the drain: `try_learn_target` still empties the
+    /// socket every tick (STUN demux depends on it, and an unread socket fills
+    /// and drops the punch responses). It only stops the *adoption*.
+    ///
+    /// The retarget itself is race-free for a different reason, already built
+    /// in: the send thread owns transmission, and `SetTarget` travels the same
+    /// ordered channel as frames. A retarget therefore lands strictly between
+    /// two frames, never mid-frame, so no frame can be split across two
+    /// destinations no matter when this is called relative to the video loop.
+    pub fn pin_target(&mut self, addr: SocketAddr) {
+        self.target = Some(addr);
+        self.pinned = true;
+        // A pinned target IS an Echo session — the two are the same fact, so
+        // the demux tag is set here rather than through a separate call a
+        // future caller could forget to make.
+        let _ = self.tx.send(TxCmd::SetDemuxTag(Some(nova_core::demux::ECHO_MEDIA)));
+        let _ = self.tx.send(TxCmd::SetTarget(addr));
+    }
+
+    /// Resume learning the target from inbound pings (Moonlight's model).
+    /// The current target is left in place; the next ping from elsewhere
+    /// replaces it, exactly as before an Echo session pinned it.
+    pub fn unpin_target(&mut self) {
+        self.pinned = false;
     }
 
     /// Highest wire frame index queued this session; 0 when nothing has been
@@ -222,12 +330,56 @@ impl RtpSender {
     /// latches onto a dead source port (black screen on reconnect).
     /// Returns the address only when it changes.
     pub fn try_learn_target(&mut self) -> Option<SocketAddr> {
-        let mut buf = [0u8; 64];
+        // 1500 rather than the original 64: a STUN binding response carrying
+        // XOR-MAPPED-ADDRESS plus the SOFTWARE/alternate attributes real
+        // servers add exceeds 64 bytes easily, and on Windows `recv_from` with
+        // an undersized buffer FAILS the call (WSAEMSGSIZE) and discards the
+        // datagram — which would also have ended this drain loop early and
+        // left genuine pings sitting in the receive queue. An MTU-sized buffer
+        // removes that failure mode for every datagram, not just STUN.
+        let mut buf = [0u8; 1500];
         let mut latest = None;
-        while let Ok((_n, addr)) = self.recv_socket.recv_from(&mut buf) {
+        while let Ok((n, addr)) = self.recv_socket.recv_from(&mut buf) {
+            // STUN and RTP/ping traffic share this port. They are bitwise
+            // unambiguous — STUN's leading two bits are always 00, RTP carries
+            // version 2 (0x80) — and `is_stun_message` also checks the magic
+            // cookie, so a client ping can never be mistaken for a binding
+            // response or vice versa. See echo::wan::is_stun_message.
+            match nova_core::demux::classify(&buf[..n]) {
+                nova_core::demux::Class::Stun => {
+                    if let Some(inbox) = &self.stun_inbox {
+                        // Unbounded, non-blocking, and best-effort: a send
+                        // failure means the WAN task is gone, which must never
+                        // disturb the media path.
+                        let _ = inbox.send((buf[..n].to_vec(), addr));
+                    }
+                    // Never a ping: latching the client target onto a STUN
+                    // server's address would send the whole video stream to it.
+                    continue;
+                }
+                nova_core::demux::Class::EchoControl
+                | nova_core::demux::Class::EchoControlAck => {
+                    if let Some(inbox) = &self.echo_inbox {
+                        let _ = inbox.send((buf[..n].to_vec(), addr));
+                    }
+                    continue;
+                }
+                // Our own media echoed back by a misconfigured middlebox, or a
+                // spoof. Either way it is not a client ping and must not become
+                // the send target.
+                nova_core::demux::Class::EchoMedia => continue,
+                nova_core::demux::Class::Other => {}
+            }
             latest = Some(addr);
         }
         let addr = latest?;
+        // An Echo session's target came from a completed hole punch, not from
+        // guessing at whoever pinged us. Draining above was still required
+        // (STUN demux, and an unread socket drops punch traffic); adopting is
+        // not. See `pin_target`.
+        if self.pinned {
+            return None;
+        }
         if self.target != Some(addr) {
             self.target = Some(addr);
             let _ = self.tx.send(TxCmd::SetTarget(addr));
@@ -259,11 +411,22 @@ impl RtpSender {
     /// ephemeral video source port via `try_learn_target`).
     pub fn reset(&mut self) {
         // Flush pings buffered from the ending session so the next learn
-        // can't latch onto a stale source port.
-        let mut buf = [0u8; 64];
+        // can't latch onto a stale source port. MTU-sized for the same reason
+        // as try_learn_target's buffer — an undersized one errors instead of
+        // draining on Windows, defeating the flush.
+        let mut buf = [0u8; 1500];
         while self.recv_socket.recv_from(&mut buf).is_ok() {}
         self.target = None;
+        // A pin belongs to the session that set it. Clearing it here means a
+        // finished Echo session can never leave the sender deaf to the next
+        // Moonlight client's pings — reset is the one call every session
+        // teardown path already makes.
+        self.pinned = false;
         self.last_sent_index = 0; // next session's client expects frame 1 again
+        // Back to Moonlight's wire format: the next session may well be a
+        // GameStream client, which would discard datagrams carrying an Echo
+        // tag where it expects an RTP version.
+        let _ = self.tx.send(TxCmd::SetDemuxTag(None));
         let _ = self.tx.send(TxCmd::Reset);
     }
 
@@ -334,6 +497,7 @@ fn tx_worker(socket: UdpSocket, rx: Receiver<TxCmd>, buf_tx: SyncSender<Vec<u8>>
                 let _ = buf_tx.try_send(buf);
             }
             TxCmd::SetTarget(addr) => eng.target = Some(addr),
+            TxCmd::SetDemuxTag(tag) => eng.demux_tag = tag,
             TxCmd::SetFps(fps) => eng.fps = fps.max(1),
             TxCmd::SetCodec { is_hevc, is_av1 } => {
                 eng.is_hevc = is_hevc;
@@ -350,6 +514,19 @@ fn tx_worker(socket: UdpSocket, rx: Receiver<TxCmd>, buf_tx: SyncSender<Vec<u8>>
 /// The actual packetizer/sender — lives entirely on the `nova-rtp-send`
 /// thread; single-owner, no locks on any per-frame state.
 struct TxEngine {
+    /// Byte 0 of every datagram. `None` writes Moonlight's RTP version byte
+    /// (`0x90`); `Some(tag)` writes an Echo demux tag instead.
+    ///
+    /// This costs nothing, which is the point. Byte 0 is written *after*
+    /// Reed-Solomon parity is computed (parity runs with bytes 0..16 and 28..32
+    /// zeroed — Sunshine's layout), so it is outside FEC coverage: changing it
+    /// neither affects reconstruction nor is affected by it. And because the
+    /// tag replaces a byte rather than being prepended, the datagram size, the
+    /// shard size, and the MTU budget are all untouched. An Echo client is not
+    /// speaking RTP to anything, so the version field it displaces has no
+    /// reader. See `nova_core::demux` for why the tag values cannot collide
+    /// with STUN or RTP.
+    demux_tag: Option<u8>,
     socket: UdpSocket,
     sequence_number: u16,
     timestamp: u32,
@@ -404,6 +581,7 @@ impl TxEngine {
     fn new(socket: UdpSocket) -> Self {
         Self {
             socket,
+            demux_tag: None,
             sequence_number: 0,
             timestamp: 0,
             target: None,
@@ -592,12 +770,18 @@ impl TxEngine {
         };
 
         // ── Finalize per-packet fields and send (data + parity) ─────────────
-        // Split borrow: socket and shard_pool are separate fields.
+        // Split borrow: socket and shard_pool are separate fields. `first_byte`
+        // is hoisted for the same reason — reading `self.demux_tag` inside the
+        // loop would overlap the mutable borrow of `self.shard_pool`.
+        let first_byte = self.demux_tag.unwrap_or(0x80 | 0x10); // V=2, P=0, X=1, CC=0
         let socket = &self.socket;
         for x in 0..total_shards {
             let shard = &mut self.shard_pool[x];
-            // RTP header — X bit set (Sunshine's FLAG_EXTENSION) → 4B reserved
-            shard[0] = 0x80 | 0x10; // V=2, P=0, X=1, CC=0
+            // RTP header — X bit set (Sunshine's FLAG_EXTENSION) → 4B reserved.
+            // For an Echo session this same byte carries the demux tag; see
+            // `TxEngine::demux_tag` for why that is free rather than a
+            // compromise.
+            shard[0] = first_byte;
             shard[1] = 0;           // no packetType/marker on video
             let seq = self.sequence_number.wrapping_add(x as u16);
             shard[2..4].copy_from_slice(&seq.to_be_bytes());
@@ -955,6 +1139,56 @@ mod tests {
         assert_eq!(sender.last_sent_index(), 0, "fresh session must restart at index 1");
     }
 
+    /// The Echo WAN demux hook. Two properties matter, and the second is the
+    /// dangerous one: a STUN datagram arriving on the media port must be
+    /// handed to the WAN layer, and must NEVER be mistaken for a client ping —
+    /// latching the video target onto a STUN server's address would aim the
+    /// entire stream at Google.
+    #[test]
+    fn stun_on_the_media_port_is_demuxed_and_never_learned_as_the_client() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let (stun_tx, mut stun_rx) = tokio::sync::mpsc::unbounded_channel();
+        sender.set_stun_inbox(stun_tx);
+
+        // A "STUN server" and a real client, both sending to the media port.
+        let stun_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_port = client.local_addr().unwrap().port();
+
+        let txid = crate::echo::wan::new_transaction_id();
+        let binding = crate::echo::wan::build_binding_request(&txid);
+        stun_server.send_to(&binding, dst).unwrap();
+        ping(&client, dst, 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let learned = sender.try_learn_target().expect("the client must still be learned");
+        assert_eq!(learned.port(), client_port, "target must be the client, not the STUN peer");
+
+        let (payload, from) = stun_rx.try_recv().expect("STUN datagram routed to the WAN inbox");
+        assert!(crate::echo::wan::is_stun_message(&payload));
+        assert_eq!(from.port(), stun_server.local_addr().unwrap().port());
+        assert!(stun_rx.try_recv().is_err(), "exactly one STUN datagram");
+    }
+
+    /// With no WAN layer registered (every install today), STUN traffic is
+    /// still refused as a ping rather than corrupting the target — the hook
+    /// must be inert, not merely optional.
+    #[test]
+    fn stun_is_ignored_as_a_ping_even_with_no_inbox_registered() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let stun_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        stun_server
+            .send_to(&crate::echo::wan::build_binding_request(&[7u8; 12]), dst)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(sender.try_learn_target().is_none(), "STUN alone must learn nothing");
+        assert!(!sender.has_target());
+    }
+
     /// The frame-forwarding gate must key on "a target is KNOWN"
     /// (`has_target`), never on "the target just CHANGED"
     /// (`try_learn_target`). A Worker respawn mid-session re-adopts a client
@@ -1001,6 +1235,55 @@ mod tests {
         assert_eq!(
             sender.try_learn_target().unwrap().port(),
             b.local_addr().unwrap().port()
+        );
+    }
+
+    /// The Echo retargeting guard. An Echo session's peer is *known* from the
+    /// punch, so ping-learning must not be allowed to steal the stream — and
+    /// the thief here is not hypothetical: port 47998 is reachable from the
+    /// WAN once a pinhole is open, and internet scanners hit it (observed live
+    /// on 8443 during the tether test). Learning from one would aim the
+    /// desktop at a stranger.
+    ///
+    /// The drain itself must keep running while pinned, or STUN keepalives
+    /// stop being demuxed and the receive buffer fills — so this also checks
+    /// that a STUN datagram still reaches the WAN inbox during a pinned
+    /// session.
+    #[test]
+    fn a_pinned_target_ignores_ping_learning_but_still_drains() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let (stun_tx, mut stun_rx) = tokio::sync::mpsc::unbounded_channel();
+        sender.set_stun_inbox(stun_tx);
+
+        let echo_peer: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        sender.pin_target(echo_peer);
+        assert!(sender.has_target());
+
+        // An interloper pings the media port, and a STUN keepalive arrives.
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stun_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ping(&stranger, dst, 1);
+        stun_server
+            .send_to(&crate::echo::wan::build_binding_request(&[3u8; 12]), dst)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(sender.try_learn_target().is_none(), "a pinned session learns nothing");
+        assert!(sender.has_target(), "…and keeps the punched peer");
+        assert!(
+            stun_rx.try_recv().is_ok(),
+            "the socket must still be drained while pinned, or STUN demux dies"
+        );
+
+        // Session teardown returns the sender to Moonlight's learning model.
+        sender.reset();
+        assert!(!sender.has_target());
+        ping(&stranger, dst, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            sender.try_learn_target().is_some(),
+            "after reset the next client must be learnable again"
         );
     }
 }
