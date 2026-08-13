@@ -55,7 +55,9 @@ rustls-pki-types = "1.14.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
-sha2 = "0.10"
+# `oid` carries the DigestInfo object identifier that PKCS#1 v1.5 signatures
+# embed — without it `rsa`'s SigningKey<Sha256> has no way to name its own hash.
+sha2 = { version = "0.10", features = ["oid"] }
 hex = "0.4"
 rand = "0.8"
 url = "2"
@@ -63,6 +65,12 @@ rcgen = "0.14"
 socket2 = "0.5"
 clap = { version = "4", features = ["derive"] }
 aes-gcm = "0.10"
+# GameStream pairing crypto, shared by the host and by Echo's client-side
+# handshake. Pure Rust on both counts, so they cross-compile to Android without
+# a toolchain fight — which is why the pairing signature uses `rsa` rather than
+# whichever primitives the selected rustls provider happens to expose.
+rsa = "0.9.10"
+aes = "0.8"
 
 # Release tuning applies workspace-wide (profiles are only honoured at the
 # workspace root). Unchanged from the pre-workspace values — see the comments
@@ -71,3 +79,16 @@ aes-gcm = "0.10"
 lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
+
+# RSA-2048 key generation is unusably slow in an unoptimised build — the `rsa`
+# crate's own docs warn about it, and it is bignum arithmetic in a debug profile,
+# so "slow" means tens of seconds rather than a fraction of one. Echo generates
+# such a key on first run (GameStream pairing requires an RSA-2048 client
+# certificate), and the test suite generates several.
+#
+# Optimising just these two packages keeps `cargo test` and debug runs fast
+# while leaving our own crates fully debuggable.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

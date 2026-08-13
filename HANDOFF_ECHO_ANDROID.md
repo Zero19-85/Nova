@@ -229,7 +229,13 @@ as a Gradle task ordered before `mergeJniLibs`, with `android.ndkVersion` pinned
 
 ---
 
-## 5. The blocker to decide before coding: enrolment
+## 5. Enrolment — RESOLVED (option a, built 2026-08-13)
+
+Implemented in `echo-client/src/pairing.rs` + `echo-client pair --host <lan-ip>`.
+See §9 for what it cost and what it uncovered. The rest of this section is the
+original reasoning, kept because the rejected options are still rejected.
+
+### The original decision
 
 **There is no client-side pairing implementation.** `echo id` prints a
 fingerprint and instructs a human to trust it; nothing in `echo-client` speaks
@@ -263,14 +269,14 @@ once on the LAN, then stream over WAN."
 2. ~~**Provider feature**~~ — **DONE**, see §8. Still unproven against a real
    NDK: the feature *set* is verified, the cross-compile is not.
 3. ~~**`echo-android`** JNI surface~~ — **DONE**, see §8. Untested against a JVM.
-4. **Pairing** (§5, option a) — CLI-testable on the LAN with no Android
-   involved. **This is the next blocker and the recommended next task.**
-5. **Install the NDK** and run the first real cross-compile (§1). Everything up
-   to here was verified on the host target only.
-6. **Kotlin harness** — load the `.so`, connect, log frame sizes. Proves the
+4. ~~**Pairing**~~ — **DONE**, see §9.
+5. **Live desktop end-to-end run** — pair, punch, tunnel, frames. The next
+   thing owed, and the last checkpoint before Android. See §10.
+6. **Install the NDK** and run the first real cross-compile (§1).
+7. **Kotlin harness** — load the `.so`, connect, log frame sizes. Proves the
    bridge with no decoder in the way.
-7. **MediaCodec + SurfaceView.** First picture.
-8. **Foreground service, wake/wifi locks, reconnect.**
+8. **MediaCodec + SurfaceView.** First picture.
+9. **Foreground service, wake/wifi locks, reconnect.**
 
 ---
 
@@ -365,3 +371,101 @@ Carried forward from P2P handoff §4 Step 3, unchanged: **audio** (not on the
 punched socket yet), **input** (no client→host path exists), **hot format change**
 (frozen, `hot_format_change: false`), **HDR** (the `KEY_COLOR_STANDARD` /
 `HDR_STATIC_INFO` path is real but later), and **multi-seat**.
+
+---
+
+## 9. Client-side pairing (2026-08-13)
+
+Tests: **158 → 180 passing**, 8 ignored.
+
+| Change | Where |
+|---|---|
+| Four-phase GameStream PIN handshake | `echo-client/src/pairing.rs` |
+| `echo-client pair --host <lan-ip>` | `echo-client/src/main.rs` |
+| RSA-2048 identity + PKCS#1 signing + PEM/base64 | `nova-core/src/identity.rs` |
+| `rsa`/`num-bigint-dig` optimised in dev builds | root `Cargo.toml` |
+
+### The finding that reshaped the task: Echo's identity had to change
+
+Nova's `pairing.rs` does two things that are only satisfiable by an **RSA-2048**
+client certificate:
+
+```rust
+let cert_signature = &cert_der[cert_der.len() - 256..];        // exactly 256 bytes
+ee.verify_signature(RSA_PKCS1_2048_8192_SHA256, msg, sig)      // RSA, not ECDSA
+```
+
+Echo's identity was ECDSA P-256 (rcgen's default). It could never have paired,
+so `Identity::load_or_create_rsa2048` was a prerequisite for this feature rather
+than a refinement of it. Echo must use that **one identity for both pairing and
+TLS**, because Nova keys its trust store by the certificate it saw during pairing.
+
+Two consequences worth remembering:
+
+- **rcgen cannot generate RSA keys under the `ring` backend** — its own source
+  says "Ring doesn't have RSA key generation yet". It *signs* with a supplied
+  RSA key under either backend, so the key comes from the pure-Rust `rsa` crate
+  and the certificate is still built by rcgen. This keeps the Android build
+  working, which the obvious alternative (switch nova-core to aws-lc-rs) would
+  have quietly undone.
+- **A length check cannot detect a wrong key type.** An ECDSA certificate is
+  *larger* than 256 bytes, so slicing succeeds and returns certificate **body**
+  bytes. Pairing would then fail at phase 4 with a hash mismatch indistinguishable
+  from a wrong PIN. `cert_signature()` therefore validates the private key type,
+  not the certificate length — a test asserts the ECDSA certificate is big enough
+  to make the length check useless, so the test fails if anyone "simplifies" it.
+
+### What is verified
+
+- **The full handshake round trip**, real client against a mock host that
+  reimplements `nova-server/src/pairing.rs` — phase ordering, query-string shape,
+  hex/PEM encoding, both AES directions, both hash constructions, both signatures.
+- **A wrong PIN is refused** and nothing is trusted.
+- **An impostor host is refused**: a peer that learned the PIN but signs with its
+  own key fails verification 2. (Verification 1 alone would not catch it — it
+  would simply hash its own certificate's signature.)
+- **HTTP framing against the live Nova.** Confirmed by querying the running
+  host's `/serverinfo`: hyper honours `Connection: close`, so read-to-EOF is
+  correct framing and no `Content-Length` parsing is needed.
+
+Two defects were found by running the thing rather than by reading it:
+`TcpStream::connect` sat outside the timeout (an unreachable host hung for the
+OS TCP timeout, ~21 s, ignoring `--consent-secs`), and the mock host in the
+wrong-PIN test waited for a fourth request that a failed handshake never sends.
+
+### The limit of the mock
+
+The mock host encodes *this* reading of `nova-server/src/pairing.rs`. If the
+reading is wrong, the mock is wrong in the same direction and the test passes
+anyway. Only a live run against Nova settles it — which is §10.
+
+---
+
+## 10. The live desktop end-to-end run (owed)
+
+Nova is running on the dev box (service `Running`, 47989 listening), so this can
+be done immediately. It needs a human at the host to answer the PIN dialog.
+
+```
+# 1. Pair (LAN only; the dialog appears on the host)
+echo-client pair --host <nova-lan-ip>
+
+# 2. Stream over the LAN control port, no relay needed for a first proof
+echo-client stream --host <fingerprint printed by step 1> \
+                   --control <nova-lan-ip>:48011 --seconds 30
+```
+
+`pair` prints the exact `stream` command on success.
+
+**Expect:** a PIN box → Nova's tray dialog → `🔑 PIN accepted` → `🛡️ Host
+verified` → `✅ Confirmed over HTTPS` (that last line is the one that proves the
+trust store entry actually authorises Echo, which `paired=1` alone does not).
+Then from `stream`: `🔐 Control tunnel authenticated` → `🎬 Session N granted` →
+`🎞️ frame …`.
+
+**Watch for:** `frames_recovered_by_fec > 0` (FEC working), `frames_failed_auth
+== 0` (sealing correct), and `frames_dropped_before_keyframe == 0` — a nonzero
+value there means Nova did not start the session with an IDR, which is worth
+knowing before a decoder is attached to it.
+
+**Then** the WAN path with the relay, and only then the NDK.

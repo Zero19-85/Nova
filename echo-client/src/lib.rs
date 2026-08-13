@@ -41,5 +41,6 @@
 
 pub mod control;
 pub mod gate;
+pub mod pairing;
 pub mod receiver;
 pub mod session;

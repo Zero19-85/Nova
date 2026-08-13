@@ -25,8 +25,8 @@ required-features = ["cli"]
 # Android build turns off — an argument parser is dead weight in a .so.
 [features]
 default = ["aws-lc-rs", "cli"]
-aws-lc-rs = ["nova-core/aws-lc-rs", "tokio-rustls/aws_lc_rs"]
-ring = ["nova-core/ring", "tokio-rustls/ring"]
+aws-lc-rs = ["nova-core/aws-lc-rs", "tokio-rustls/aws_lc_rs", "rustls-webpki/aws-lc-rs"]
+ring = ["nova-core/ring", "tokio-rustls/ring", "rustls-webpki/ring"]
 cli = ["dep:clap"]
 
 [dependencies]
@@ -46,3 +46,13 @@ rustls-pki-types = { workspace = true }
 # implementations differ in their generator matrix — a mismatch reconstructs
 # confidently wrong data rather than failing.
 reed-solomon-erasure = "6"
+# GameStream PIN pairing (pairing.rs). AES-128-ECB is the handshake's cipher —
+# ECB is correct *here* and nowhere else: the protocol encrypts single
+# independent 16-byte blocks under a PIN-derived key, which is the one shape ECB
+# does not leak structure for. `rsa`/`sha2` produce the signature and hashes Nova
+# verifies; `rustls-webpki` verifies the host's signature back.
+aes = { workspace = true }
+rsa = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }

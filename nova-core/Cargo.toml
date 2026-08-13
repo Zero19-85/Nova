@@ -46,3 +46,9 @@ rcgen = { workspace = true }
 # for nova-server's control-stream cipher, so this adds an edge rather than a
 # crate; pure Rust, so it stays clear of the NVENC/DXGI link line.
 aes-gcm = { workspace = true }
+# RSA-2048 identities for GameStream pairing (`Identity::load_or_create_rsa2048`).
+# Needed as a separate crate because rcgen cannot *generate* RSA keys under the
+# `ring` backend — "Ring doesn't have RSA key generation yet" (rcgen
+# key_pair.rs) — though it signs happily with one we supply. Pure Rust, so it
+# cross-compiles to Android under either provider.
+rsa = { workspace = true }

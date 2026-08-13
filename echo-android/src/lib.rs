@@ -163,7 +163,7 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeIdentityFingerprint<'
             .get_string(&dir)
             .map_err(|e| format!("read directory argument: {e}"))?
             .into();
-        let identity = Identity::load_or_create(std::path::Path::new(&dir), "echo", "echo-android")?;
+        let identity = Identity::load_or_create_rsa2048(std::path::Path::new(&dir), "echo", "echo-android")?;
         Ok::<String, String>(identity.fingerprint)
     }));
 
@@ -429,7 +429,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         control: None,
     };
 
-    let identity = Identity::load_or_create(
+    let identity = Identity::load_or_create_rsa2048(
         std::path::Path::new(&identity_dir),
         "echo",
         "echo-android",

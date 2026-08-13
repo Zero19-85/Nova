@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use echo_client::pairing::{self, PairEvent, PairOptions};
 use echo_client::receiver::LoggingSink;
 use echo_client::session::{
     self, ConnectOptions, Event, Progress, StreamOptions,
@@ -37,6 +38,32 @@ enum Command {
 
     /// Discover this machine's public address and NAT behaviour.
     Probe,
+
+    /// Pair with a Nova host on the LAN, so it will trust this client.
+    ///
+    /// Run this once per host. Echo shows a PIN; type it into Nova's dialog on
+    /// the host machine. Pairing must happen over the LAN — it uses Nova's
+    /// unauthenticated HTTP port, which is exactly why the handshake carries its
+    /// own mutual proof. Streaming afterwards works from anywhere.
+    Pair {
+        /// The host's LAN address, without a port.
+        #[arg(long)]
+        host: String,
+        /// Use a specific PIN instead of a generated one.
+        #[arg(long)]
+        pin: Option<String>,
+        /// Name to suggest for this device. Nova uses whatever is typed into
+        /// its own dialog, so this is only a hint.
+        #[arg(long, default_value = "Echo")]
+        name: String,
+        /// How long to wait for someone to answer Nova's PIN dialog.
+        #[arg(long, default_value_t = 180)]
+        consent_secs: u64,
+        /// Skip the post-pairing HTTPS check that the host really authorises
+        /// this certificate.
+        #[arg(long)]
+        skip_verify: bool,
+    },
 
     /// Connect to a Nova host through the signaling relay and punch a path.
     Connect {
@@ -93,7 +120,11 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let identity = Identity::load_or_create(&args.data_dir, "echo", "echo-client")
+    // RSA-2048, not the faster ECDSA: GameStream pairing verifies the client
+    // certificate's signature as RSA, and Echo must pair and connect with the
+    // same identity — Nova's trust store is keyed by the certificate it saw
+    // during pairing. Costs about a second, once, on first run.
+    let identity = Identity::load_or_create_rsa2048(&args.data_dir, "echo", "echo-client")
         .map_err(|e| format!("identity: {e}"))?;
     let mut progress = ConsoleProgress;
 
@@ -117,6 +148,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("🌐 Public address {} (via {})", c.mapped, c.via);
             }
             report_behavior(behavior);
+        }
+
+        Command::Pair { host, pin, name, consent_secs, skip_verify } => {
+            let pin = pin.unwrap_or_else(pairing::generate_pin);
+            let opts = PairOptions {
+                device_name: name,
+                consent_timeout: Duration::from_secs(consent_secs),
+                ..PairOptions::new(&host, &pin)
+            };
+
+            println!("🪪 Echo identity: {}", identity.fingerprint);
+            println!("🔗 Pairing with Nova at {host}…");
+            println!();
+
+            let paired = pairing::pair(&identity, &opts, &mut render_pair_event).await?;
+
+            if skip_verify {
+                println!("⏭️  Skipping the HTTPS authorisation check (--skip-verify).");
+            } else {
+                println!("🔍 Confirming the host authorises this certificate…");
+                match pairing::verify_paired(&identity, &host, &paired.cert_der).await {
+                    Ok(()) => println!("✅ Confirmed over HTTPS — the trust store entry is live."),
+                    // The handshake did complete, so this is a warning rather
+                    // than a failure: it narrows the problem instead of hiding
+                    // it behind a "pairing failed" that would send someone back
+                    // to re-check the PIN they typed correctly.
+                    Err(e) => println!(
+                        "⚠️  Pairing completed, but the confirmation failed: {e}\n   \
+                         Try `stream` anyway; if it is refused, pair again."
+                    ),
+                }
+            }
+
+            println!();
+            println!("🎉 Paired. Nova's fingerprint:");
+            println!("   {}", paired.fingerprint);
+            println!();
+            println!("Stream over the LAN with:");
+            println!(
+                "   echo-client stream --host {} --control {}:48011 \\\n     --relay <url> --relay-pin <fp>",
+                paired.fingerprint, host
+            );
         }
 
         Command::Connect { relay, relay_pin, host, punch_secs } => {
@@ -208,6 +281,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Renders pairing progress. The PIN gets a box of its own because it is the
+/// one thing on screen the user has to act on.
+fn render_pair_event(event: PairEvent) {
+    match event {
+        PairEvent::AwaitingConsent { pin } => {
+            println!("   ┌────────────────┐");
+            println!("   │   PIN:  {pin}   │");
+            println!("   └────────────────┘");
+            println!();
+            println!("   Type this PIN into Nova's dialog on the host, then name the device.");
+            println!("   Waiting… (Nova's dialog has no timeout; this does)");
+        }
+        PairEvent::HostCertificate { fingerprint } => {
+            println!("📜 Host certificate received: {}…", &fingerprint[..16]);
+        }
+        PairEvent::ChallengeAccepted => println!("🔑 PIN accepted — challenge exchanged"),
+        PairEvent::HostVerified => {
+            println!("🛡️  Host verified — its hash matches and it holds the certificate's key")
+        }
+        PairEvent::Paired { .. } => println!("🤝 Handshake complete"),
+    }
 }
 
 /// Renders session events as the console output this tool has always produced.
