@@ -35,9 +35,10 @@
 //!
 //! ```kotlin
 //! object EchoNative {
-//!     init { System.loadLibrary("echo_android") }
+//!     init { System.loadLibrary("echo") }
 //!     external fun nativeInit()
 //!     external fun nativeIdentityFingerprint(dir: String): String
+//!     external fun nativePair(configJson: String): Long
 //!     external fun nativeConnect(configJson: String): Long
 //!     external fun nativePollEvent(handle: Long, timeoutMs: Int): String?
 //!     external fun nativeFillBuffer(handle: Long, buf: ByteBuffer, meta: LongArray, timeoutMs: Int): Int
@@ -57,6 +58,7 @@ use jni::objects::{JByteBuffer, JClass, JLongArray, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
+use echo_client::pairing;
 use echo_client::session::{self, ConnectOptions, Event, OpenPath, Progress, StreamOptions};
 use nova_core::identity::Identity;
 
@@ -175,6 +177,47 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeIdentityFingerprint<'
         Err(msg) => {
             throw(&mut env, &msg);
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// Pair with a Nova host on the LAN. Returns a handle immediately; progress
+/// arrives as events, exactly like `nativeConnect`.
+///
+/// Pairing is event-driven rather than blocking because its middle step is a
+/// human: Rust generates the PIN and emits `awaiting_consent`, the app shows it,
+/// and somebody walks over to the PC and types it into Nova's dialog. A blocking
+/// call would give the UI nothing to display during the one part of the flow
+/// that is entirely about display.
+///
+/// Config JSON:
+/// ```json
+/// { "identity_dir": "/data/…/files", "host": "10.0.0.205",
+///   "device_name": "Pixel 9 Pro", "consent_secs": 180 }
+/// ```
+///
+/// Must be on the LAN: this is Nova's unauthenticated HTTP port, which is
+/// exactly why the handshake carries its own mutual proof. Streaming afterwards
+/// works from anywhere.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativePair<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+) -> jlong {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let raw: String = env
+            .get_string(&config_json)
+            .map_err(|e| format!("read config argument: {e}"))?
+            .into();
+        start_pairing(&raw)
+    }));
+
+    match flatten(result) {
+        Ok(handle) => handle,
+        Err(msg) => {
+            throw(&mut env, &msg);
+            0
         }
     }
 }
@@ -473,6 +516,101 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
     Ok(Box::into_raw(handle) as jlong)
 }
 
+/// Build the runtime, run the pairing handshake, and hand back a boxed handle.
+///
+/// Shares [`EchoHandle`] with `nativeConnect` so Kotlin polls one event stream
+/// and closes one kind of handle. The frame queue goes unused here, which costs
+/// an empty `VecDeque` and buys the app a single lifecycle to reason about.
+fn start_pairing(config_json: &str) -> Result<jlong, String> {
+    let cfg: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
+
+    let identity_dir = str_field(&cfg, "identity_dir")?;
+    let host = str_field(&cfg, "host")?;
+    let device_name = cfg
+        .get("device_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Echo Android")
+        .to_string();
+    let consent = Duration::from_secs(
+        cfg.get("consent_secs").and_then(|v| v.as_u64()).unwrap_or(180),
+    );
+    // The PIN is generated here rather than accepted from the app: it must come
+    // from the OS CSPRNG, and a caller-supplied one is exactly how that
+    // guarantee gets quietly lost.
+    let pin = pairing::generate_pin();
+
+    let identity =
+        Identity::load_or_create_rsa2048(std::path::Path::new(&identity_dir), "echo", "echo-android")?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("echo-pair")
+        .build()
+        .map_err(|e| format!("start runtime: {e}"))?;
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+    let queue = Arc::new(FrameQueue::new());
+
+    runtime.spawn({
+        let queue = queue.clone();
+        async move {
+            let opts = pairing::PairOptions {
+                device_name,
+                consent_timeout: consent,
+                ..pairing::PairOptions::new(host.clone(), pin)
+            };
+            let tx = event_tx.clone();
+            let outcome = pairing::pair(&identity, &opts, &mut |e: pairing::PairEvent| {
+                let _ = tx.send(e.to_json().to_string());
+            })
+            .await;
+
+            match outcome {
+                Ok(paired) => {
+                    // `paired=1` means the handshake finished, not that the
+                    // trust store entry works. Confirming over the port that
+                    // actually enforces it turns "paired but unusable" into a
+                    // distinct, diagnosable outcome.
+                    match pairing::verify_paired(&identity, &host, &paired.cert_der).await {
+                        Ok(()) => {
+                            let _ = event_tx.send(
+                                serde_json::json!({
+                                    "type": "verified",
+                                    "fingerprint": paired.fingerprint,
+                                })
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(
+                                serde_json::json!({"type": "warning", "message": e}).to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(message) => {
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "error", "message": message}).to_string());
+                }
+            }
+            queue.close();
+            let _ = event_tx.send(serde_json::json!({"type": "closed"}).to_string());
+        }
+    });
+
+    let handle = Box::new(EchoHandle {
+        magic: MAGIC,
+        runtime: Some(runtime),
+        events: Mutex::new(event_rx),
+        frames: queue,
+        stop: stop_tx,
+    });
+    Ok(Box::into_raw(handle) as jlong)
+}
+
 /// Punch, then stream. Split out so the spawn body stays readable and every
 /// failure funnels into one `error` event.
 async fn run_session(
@@ -572,5 +710,24 @@ mod tests {
             std::panic::catch_unwind(|| panic!("boom"));
         let err = flatten(result).unwrap_err();
         assert!(err.contains("boom"), "the panic message should survive: {err}");
+    }
+}
+
+#[cfg(test)]
+mod pairing_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn a_pair_config_missing_the_host_is_refused_before_a_pin_is_shown() {
+        // Showing a PIN and then failing would send someone to the PC for
+        // nothing, so the config is validated before any event is emitted.
+        let err = start_pairing(r#"{"identity_dir":"."}"#).unwrap_err();
+        assert!(err.contains("host"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pair_and_connect_report_config_errors_the_same_way() {
+        assert!(start_pairing("nonsense").unwrap_err().contains("not valid JSON"));
+        assert!(start_session("nonsense").unwrap_err().contains("not valid JSON"));
     }
 }

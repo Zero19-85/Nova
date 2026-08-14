@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LAN pairing talks plain HTTP to Nova's port 47989 — that port is
+  unauthenticated by design, which is exactly why the pairing handshake carries
+  its own mutual proof (see echo-client/src/pairing.rs).
+
+  Strictly speaking this file is belt and braces: Android's cleartext policy is
+  enforced by the Java HTTP stacks, and Echo's pairing client is a raw TCP socket
+  in Rust that never consults it. It is here so the app's intent is declared
+  rather than implied, and so nothing breaks if that ever moves to an HTTP
+  library.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.0.0</domain>
+        <domain includeSubdomains="false">192.168.0.0</domain>
+        <domain includeSubdomains="false">172.16.0.0</domain>
+    </domain-config>
+</network-security-config>

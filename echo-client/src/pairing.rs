@@ -133,6 +133,27 @@ pub enum PairEvent {
     Paired { fingerprint: String },
 }
 
+impl PairEvent {
+    /// The event as JSON, for the Android bridge. Same discriminated shape as
+    /// [`crate::session::Event`], so Kotlin reads both streams with one `when`.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            PairEvent::AwaitingConsent { pin } => {
+                json!({"type": "awaiting_consent", "pin": pin})
+            }
+            PairEvent::HostCertificate { fingerprint } => {
+                json!({"type": "host_certificate", "fingerprint": fingerprint})
+            }
+            PairEvent::ChallengeAccepted => json!({"type": "challenge_accepted"}),
+            PairEvent::HostVerified => json!({"type": "host_verified"}),
+            PairEvent::Paired { fingerprint } => {
+                json!({"type": "paired", "fingerprint": fingerprint})
+            }
+        }
+    }
+}
+
 /// Generate a PIN of the shape Nova's dialog expects.
 ///
 /// Uniform over 0000–9999 rather than assembled from digits, so every PIN is

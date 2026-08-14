@@ -46,3 +46,11 @@ nova.toml
 # OS generated files
 .DS_Store
 Thumbs.db
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/
+echo-data/
+relay-data/

@@ -10,8 +10,9 @@ description = "JNI bridge exposing the Echo client to Kotlin"
 # phone, which is the slowest possible place to discover it. The `jni` crate
 # links nothing (it only ever receives a JNIEnv pointer it was handed), so this
 # builds on Windows exactly as it does on Android.
+# Produces `libecho.so`, loaded as System.loadLibrary("echo").
 [lib]
-name = "echo_android"
+name = "echo"
 crate-type = ["cdylib", "rlib"]
 
 # `ring`, not aws-lc-rs — see nova-core's manifest. `default-features = false`
