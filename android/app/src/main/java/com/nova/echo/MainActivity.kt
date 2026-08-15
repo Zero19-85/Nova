@@ -1,5 +1,6 @@
 package com.nova.echo
 
+import android.content.Context
 import android.os.Bundle
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -15,6 +16,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -75,13 +77,30 @@ private fun EchoScreen(controller: EchoController) {
     }
 }
 
+/**
+ * A text field backed by SharedPreferences.
+ *
+ * `rememberSaveable` alone survives rotation but not a process restart, and
+ * during bring-up the app gets killed and relaunched constantly. Retyping a
+ * 64-character fingerprint on a phone keyboard each time is not a reasonable
+ * thing to ask of anyone.
+ */
+@Composable
+private fun rememberPref(key: String, default: String): MutableState<String> {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("echo", Context.MODE_PRIVATE) }
+    val state = rememberSaveable { mutableStateOf(prefs.getString(key, default) ?: default) }
+    LaunchedEffect(state.value) { prefs.edit().putString(key, state.value).apply() }
+    return state
+}
+
 @Composable
 private fun ControlPanel(controller: EchoController, state: UiState) {
-    var host by rememberSaveable { mutableStateOf("10.0.0.205") }
-    var deviceName by rememberSaveable { mutableStateOf("Echo Android") }
-    var relayUrl by rememberSaveable { mutableStateOf("https://10.0.0.205:8443/v1/signal") }
-    var relayPin by rememberSaveable { mutableStateOf("") }
-    var hostFp by rememberSaveable { mutableStateOf("") }
+    var host by rememberPref("host", "10.0.0.205")
+    var deviceName by rememberPref("device_name", "Echo Android")
+    var relayUrl by rememberPref("relay_url", "https://10.0.0.205:8443/v1/signal")
+    var relayPin by rememberPref("relay_pin", "")
+    var hostFp by rememberPref("host_fp", "")
 
     // Once pairing succeeds the fingerprint is known; carry it into the stream
     // field so nobody has to copy 64 hex characters by hand.
@@ -154,9 +173,23 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
             label = { Text("Nova fingerprint") },
             singleLine = true,
         )
+        // A disabled button that does not say why is a dead end, and this one
+        // has two independent preconditions. Naming the missing ones turns
+        // "nothing happens" into an instruction.
+        val missing = buildList {
+            if (hostFp.isBlank()) add("Nova's fingerprint — pair first")
+            if (relayPin.isBlank()) add("the relay's fingerprint — nova-relay prints it at startup")
+        }
+        if (missing.isNotEmpty()) {
+            Text(
+                "Stream needs ${missing.joinToString(" and ")}.",
+                color = MaterialTheme.colorScheme.secondary,
+                fontSize = 12.sp,
+            )
+        }
         Button(
             onClick = { controller.connect(relayUrl, relayPin, hostFp) },
-            enabled = hostFp.isNotBlank() && relayPin.isNotBlank(),
+            enabled = missing.isEmpty(),
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Stream") }
 
