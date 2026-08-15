@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -31,11 +30,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
 
-    // The Rust build drops libecho.so straight in here.
-    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+    // `src/main/jniLibs` is already the default location AGP looks in, and it is
+    // where cargo-ndk writes libecho.so, so no sourceSets override is needed.
 
     packaging {
         // Keep the .so uncompressed and page-aligned. Required from Android 15
@@ -59,16 +57,20 @@ dependencies {
 // Building the native library from Gradle keeps one command ("build the app")
 // truthful. Without this, a Kotlin change would rebuild and silently ship the
 // previous libecho.so, which is the kind of staleness that costs an afternoon.
-val cargoNdk by tasks.registering(Exec::class) {
+val cargoNdk = tasks.register<Exec>("cargoNdk") {
     workingDir = rootProject.projectDir.parentFile   // the cargo workspace root
     val out = "android/app/src/main/jniLibs"
+    // `-P` (capital) is cargo-ndk's API level; lowercase `-p` is cargo's
+    // --package and is passed through after `build`. cargo-ndk 4.x reuses the
+    // lowercase form for packages too, so mixing them up reads as
+    // "unknown package: 26".
     val args = listOf(
         "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-p", "26",              // cargo-ndk: Android API level
+        "-P", "26",
         "-o", out,
         "build", "--release",
-        "-p", "echo-android",    // cargo: the package to build
+        "-p", "echo-android",
     )
     commandLine(
         if (System.getProperty("os.name").startsWith("Windows")) listOf("cmd", "/c") + args

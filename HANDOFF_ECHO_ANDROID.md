@@ -469,3 +469,67 @@ value there means Nova did not start the session with an IDR, which is worth
 knowing before a decoder is attached to it.
 
 **Then** the WAN path with the relay, and only then the NDK.
+
+---
+
+## 11. The APK builds (2026-08-14)
+
+`android/app/build/outputs/apk/debug/app-debug.apk` — 12.20 MB, containing
+`lib/arm64-v8a/libecho.so` (3,241,128 bytes, stored **uncompressed**, which is
+what `jniLibs.useLegacyPackaging = false` buys: the loader mmaps it instead of
+extracting, and it satisfies the 16 KB page-alignment requirement). A clean
+`gradlew clean assembleDebug` reproduces it.
+
+### Version reality, and how much of §1 it invalidates
+
+§1 was written from a May 2026 knowledge cutoff and its version pins were wrong.
+What is actually current, queried from the source of truth rather than guessed:
+
+| | §1 said | Reality |
+|---|---|---|
+| Android Studio JBR | JDK 21 | **JDK 25** |
+| Gradle | 8.9 | **9.7.0** |
+| AGP | 8.7.2 | **9.3.1** |
+| Kotlin | 2.0.21 | **2.4.10** |
+
+The advice to avoid JDK 25 was therefore backwards: Studio *ships* 25, and the
+current AGP/Gradle expect it. Query `services.gradle.org/versions/current` and
+Google's maven metadata rather than trusting any pinned number in this document.
+
+### Four things that broke, and why
+
+1. **`org.jetbrains.kotlin.android` is now an error, not redundancy.** AGP 9 has
+   built-in Kotlin support and rejects the standalone plugin outright. The
+   Compose compiler plugin is still applied separately.
+2. **`kotlinOptions { jvmTarget }` no longer exists** under built-in Kotlin.
+   Removed; the default follows `compileOptions`.
+3. **Gradle 9 fails the build on Kotlin DSL deprecations.** `tasks.registering`
+   and `sourceSets[...].jniLibs.srcDirs(...)` are deprecated and were compile
+   *errors*, not warnings. Use `tasks.register<T>("name")`; the jniLibs override
+   was redundant anyway, since `src/main/jniLibs` is already the default.
+4. **`local.properties` is a Java properties file.** `sdk.dir=C:\Users\…` fails
+   with a bare `java.io.IOException: Invalid file path`, because `\U` is an
+   invalid escape. Use forward slashes or double the backslashes.
+
+### cargo-ndk 4.x changed a flag
+
+`-P` (capital) is the Android API level. Lowercase `-p` is cargo's `--package`,
+passed through after `build`. Mixing them up reads as `unknown package: 26`.
+
+```
+cargo ndk -t arm64-v8a -P 26 -o android/app/src/main/jniLibs build --release -p echo-android
+```
+
+### The `ring` decision paid off
+
+`libecho.so` cross-compiled with nothing but the NDK — no cmake, no bindgen, no
+`aws-lc-sys`. That was the whole point of the provider feature in §1.3, and it is
+now confirmed rather than predicted.
+
+### Still not verified
+
+The APK has never been installed or run. The JNI symbols match the Kotlin
+declarations by name (checked mechanically), but no native method has ever been
+*called*, so `UnsatisfiedLinkError` from a signature mismatch remains possible.
+And the host still needs redeploying — the live binary has no WAN control
+transport, so the phone will hit the same `tls handshake eof` the CLI did.

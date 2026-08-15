@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -114,17 +115,45 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
 
-        OutlinedTextField(host, { host = it }, label = { Text("Host LAN address") }, singleLine = true)
-        OutlinedTextField(deviceName, { deviceName = it }, label = { Text("This device's name") }, singleLine = true)
+        // Named arguments throughout: OutlinedTextField has a TextFieldValue
+        // overload, and positional args let the compiler pick it, at which point
+        // the lambda's `it` no longer resolves.
+        OutlinedTextField(
+            value = host,
+            onValueChange = { host = it },
+            label = { Text("Host LAN address") },
+            singleLine = true,
+        )
+        OutlinedTextField(
+            value = deviceName,
+            onValueChange = { deviceName = it },
+            label = { Text("This device's name") },
+            singleLine = true,
+        )
         Button(onClick = { controller.pair(host, deviceName) }, Modifier.fillMaxWidth()) {
             Text("Pair (LAN only)")
         }
 
         HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
-        OutlinedTextField(relayUrl, { relayUrl = it }, label = { Text("Relay URL") }, singleLine = true)
-        OutlinedTextField(relayPin, { relayPin = it }, label = { Text("Relay fingerprint") }, singleLine = true)
-        OutlinedTextField(hostFp, { hostFp = it }, label = { Text("Nova fingerprint") }, singleLine = true)
+        OutlinedTextField(
+            value = relayUrl,
+            onValueChange = { relayUrl = it },
+            label = { Text("Relay URL") },
+            singleLine = true,
+        )
+        OutlinedTextField(
+            value = relayPin,
+            onValueChange = { relayPin = it },
+            label = { Text("Relay fingerprint") },
+            singleLine = true,
+        )
+        OutlinedTextField(
+            value = hostFp,
+            onValueChange = { hostFp = it },
+            label = { Text("Nova fingerprint") },
+            singleLine = true,
+        )
         Button(
             onClick = { controller.connect(relayUrl, relayPin, hostFp) },
             enabled = hostFp.isNotBlank() && relayPin.isNotBlank(),
