@@ -437,8 +437,31 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
         let (batch_last, batch_worst) = echo_client::input::batch_stats();
         let (rtt_last, rtt_best) = echo_client::session::rtt_stats();
         let mic = echo_client::mic::stats();
+        // Both halves of the audio story, because either alone misattributes a
+        // fault: the network counters say what arrived, the playout counters say
+        // what was done with it. Popping with clean network counters is a
+        // playout problem; the reverse is a path problem. Zeroes when no session
+        // has armed the buffer, so the overlay never has to special-case it.
+        let (play, net, highest) = session.audio.stats_or_zero();
         Ok::<String, String>(
             serde_json::json!({
+                // Playout side.
+                "audio_rendered": play.rendered,
+                "audio_concealed": play.concealed,
+                // The split that matters: `underran` means the buffer ran dry
+                // while the host was still sending — the fault. `paused` means
+                // the host went quiet — normal, and usually the larger number.
+                "audio_underran": play.underran,
+                "audio_paused": play.paused,
+                "audio_dropped": play.dropped_late,
+                "audio_depth": play.depth,
+                "audio_worst_depth": play.worst_depth,
+                // Network side.
+                "audio_accepted": net.accepted,
+                "audio_lost": net.lost(highest),
+                "audio_late": net.late,
+                "audio_reordered": net.reordered,
+                "audio_refused": net.rejected,
                 "mic_packets": mic.packets,
                 "mic_bytes": mic.bytes,
                 "mic_refused": mic.refused,

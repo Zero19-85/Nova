@@ -162,8 +162,35 @@ class GameAudioPlayer(
             val silence = ByteArray(BYTES_PER_FRAME)
             var samplesWritten = 0L
             var idleLogged = false
+            // Counted here rather than only in Rust because this is the side
+            // that knows what actually reached the hardware, and because a
+            // logcat line needs no overlay open to be read. Every 10 s of
+            // playout, matching the host's own audio reporting cadence.
+            var steps = 0L
+            var silences = 0L
+            var conceals = 0L
+            var dropped = 0L
+            var lastReport = System.nanoTime()
 
             while (running) {
+                // Drain BEFORE taking the next step, never after.
+                //
+                // This ordering is the whole correctness of the loop, and
+                // getting it backwards is audible. A packet queued at step N
+                // does not decode instantly — its PCM appears one or more
+                // iterations later. Silence, by contrast, is written straight to
+                // the track. So draining at the *bottom* let a silence step
+                // write itself ahead of the audio that preceded it:
+                //
+                //     step N    PACKET  -> queued; drain -> nothing yet
+                //     step N+1  SILENCE -> silence written; drain -> packet N
+                //     track gets [silence][packet N]  — transposed
+                //
+                // Two discontinuities per swap, which is a pop, and the audio
+                // drifts later each time. Draining first means every write
+                // leaves this loop in the order the host sent it.
+                drainDecoder(codec, info, track)
+
                 packet.clear()
                 when (val step = EchoNative.nativePollAudio(handle, packet, meta)) {
                     EchoNative.AUDIO_PACKET -> {
@@ -184,10 +211,16 @@ class GameAudioPlayer(
                             codec.queueInputBuffer(index, 0, size, ptsUs, 0)
                             samplesWritten += SAMPLES_PER_FRAME
                         }
-                        // No input buffer means the decoder is backed up. The
-                        // packet is dropped rather than queued late — stale
-                        // audio arriving after its moment is worse than a gap,
-                        // and the buffer has already moved on.
+                        else {
+                            // The decoder is backed up. The packet is dropped
+                            // rather than queued late — stale audio arriving
+                            // after its moment is worse than a gap, and the
+                            // buffer has already moved on. Counted, because a
+                            // rising number here is a decoder that cannot keep
+                            // up and looks identical to network loss from
+                            // anywhere else in the system.
+                            dropped++
+                        }
                     }
 
                     // A packet was lost. Real Opus PLC would extrapolate it;
@@ -197,6 +230,7 @@ class GameAudioPlayer(
                     // lands exactly here.
                     EchoNative.AUDIO_CONCEAL -> {
                         idleLogged = false
+                        conceals++
                         writeFully(track, silence)
                         samplesWritten += SAMPLES_PER_FRAME
                     }
@@ -205,6 +239,7 @@ class GameAudioPlayer(
                     // the track fed so the hardware does not underrun and click.
                     EchoNative.AUDIO_SILENCE -> {
                         idleLogged = false
+                        silences++
                         writeFully(track, silence)
                         samplesWritten += SAMPLES_PER_FRAME
                     }
@@ -241,7 +276,22 @@ class GameAudioPlayer(
                     }
                 }
 
-                drainDecoder(codec, info, track)
+                steps++
+                val now = System.nanoTime()
+                if (now - lastReport >= REPORT_NS) {
+                    // Both sides of the split, so a reader can tell a starved
+                    // buffer from a quiet host without opening the overlay.
+                    // `silence` high while the host is clearly playing audio is
+                    // the buffer running dry; `dropped` rising is the decoder
+                    // failing to keep up, which is a different fix entirely.
+                    Log.i(
+                        TAG,
+                        "audio/10s: $steps steps, $silences silence, $conceals concealed, " +
+                            "$dropped dropped at the decoder"
+                    )
+                    steps = 0; silences = 0; conceals = 0; dropped = 0
+                    lastReport = now
+                }
             }
         } catch (e: InterruptedException) {
             // stop() during the idle sleep. Normal.
@@ -387,5 +437,8 @@ class GameAudioPlayer(
          * within that is behind, and this packet is dropped.
          */
         const val DEQUEUE_TIMEOUT_US = FRAME_MS * 1000L
+
+        /** Playout report cadence, matching the host's own audio reporting. */
+        const val REPORT_NS = 10_000_000_000L
     }
 }

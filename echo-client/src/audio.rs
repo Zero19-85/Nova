@@ -361,6 +361,12 @@ impl AudioPlayout {
         Some((buf.stats(), net, highest))
     }
 
+    /// [`stats`](Self::stats) with zeroes when unarmed, so a caller rendering a
+    /// stats view never has to special-case "no session yet".
+    pub fn stats_or_zero(&self) -> (PlayoutStats, AudioStats, u32) {
+        self.stats().unwrap_or_default()
+    }
+
     /// Poison-proof: the mutex guards a buffer of audio, and a panic elsewhere
     /// must not take the audio thread down with it — the worst a recovered lock
     /// can cost here is one glitched frame.
