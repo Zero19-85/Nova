@@ -157,6 +157,9 @@ class GameAudioPlayer(
             // base address and refuses anything else rather than silently
             // falling back to a per-packet Java array.
             val packet = ByteBuffer.allocateDirect(MAX_OPUS_PACKET)
+            // Holds a packet the decoder had no input buffer for. One slot is
+            // enough: the loop refuses to take another until this one is placed.
+            val pending = ByteBuffer.allocate(MAX_OPUS_PACKET).apply { limit(0) }
             val meta = LongArray(1)
             val info = MediaCodec.BufferInfo()
             val silence = ByteArray(BYTES_PER_FRAME)
@@ -191,12 +194,48 @@ class GameAudioPlayer(
                 // leaves this loop in the order the host sent it.
                 drainDecoder(codec, info, track)
 
+                // A packet held from last iteration goes in before any new one,
+                // or the stream would play out of order.
+                if (pending.hasRemaining()) {
+                    val index = codec.dequeueInputBuffer(0)
+                    if (index >= 0) {
+                        val size = pending.remaining()
+                        codec.getInputBuffer(index)!!.apply { clear(); put(pending) }
+                        val ptsUs = samplesWritten * 1_000_000L / SAMPLE_RATE
+                        codec.queueInputBuffer(index, 0, size, ptsUs, 0)
+                        samplesWritten += SAMPLES_PER_FRAME
+                        pending.clear().limit(0)
+                    }
+                    // Still no buffer: hold it another iteration rather than
+                    // taking a second packet from the jitter buffer, which would
+                    // put this loop further behind the clock it is trying to
+                    // keep. Skipping the poll below is what lets it catch up.
+                    continue
+                }
+
                 packet.clear()
                 when (val step = EchoNative.nativePollAudio(handle, packet, meta)) {
                     EchoNative.AUDIO_PACKET -> {
                         idleLogged = false
                         val size = meta[0].toInt()
-                        val index = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+                        // Non-blocking, and that is the fix for the crackle.
+                        //
+                        // This used to wait up to a full frame here. With the
+                        // track write already blocking further down, that made
+                        // TWO serial waits per 20 ms of audio, so the loop could
+                        // not sustain 50 iterations a second — measured at 48.4,
+                        // with the jitter buffer never dry. A consumer running
+                        // below realtime starves the AudioTrack about 1.6 times
+                        // a second (the periodic click) and simultaneously backs
+                        // the jitter buffer up to MAX_DEPTH, where drop-oldest
+                        // discards a packet at the same rate (the stutter). One
+                        // cause, both symptoms.
+                        //
+                        // The track write must be the ONLY thing this loop ever
+                        // waits on: it is the one clock that is actually
+                        // realtime, and anything else that blocks steals from
+                        // the same 20 ms budget.
+                        val index = codec.dequeueInputBuffer(0)
                         if (index >= 0) {
                             val input = codec.getInputBuffer(index)!!
                             input.clear()
@@ -210,15 +249,17 @@ class GameAudioPlayer(
                             val ptsUs = samplesWritten * 1_000_000L / SAMPLE_RATE
                             codec.queueInputBuffer(index, 0, size, ptsUs, 0)
                             samplesWritten += SAMPLES_PER_FRAME
-                        }
-                        else {
-                            // The decoder is backed up. The packet is dropped
-                            // rather than queued late — stale audio arriving
-                            // after its moment is worse than a gap, and the
-                            // buffer has already moved on. Counted, because a
-                            // rising number here is a decoder that cannot keep
-                            // up and looks identical to network loss from
-                            // anywhere else in the system.
+                        } else {
+                            // No input buffer this instant. The packet is HELD,
+                            // not dropped: it has already been taken from the
+                            // jitter buffer, so discarding it here would be a
+                            // gap the network never caused — and the old code
+                            // did exactly that whenever the codec was saturated.
+                            pending.clear()
+                            packet.limit(size)
+                            packet.position(0)
+                            pending.put(packet)
+                            pending.flip()
                             dropped++
                         }
                     }
@@ -279,15 +320,30 @@ class GameAudioPlayer(
                 steps++
                 val now = System.nanoTime()
                 if (now - lastReport >= REPORT_NS) {
-                    // Both sides of the split, so a reader can tell a starved
-                    // buffer from a quiet host without opening the overlay.
-                    // `silence` high while the host is clearly playing audio is
-                    // the buffer running dry; `dropped` rising is the decoder
-                    // failing to keep up, which is a different fix entirely.
+                    // `steps` is the headline: this loop must sustain 500 per
+                    // 10 s to keep up with the host's 20 ms frames. Anything
+                    // meaningfully below that is a consumer running slower than
+                    // realtime, and it produces BOTH a periodic click (the track
+                    // starving) and a stutter (the jitter buffer backing up to
+                    // MAX_DEPTH and dropping) from that single cause.
+                    //
+                    // The last round could not see it: `steps` was there, but
+                    // nothing said what the target was, and the two counters
+                    // that corroborate it — the track's own underrun count and
+                    // the buffer's depth — were not reported at all.
+                    val underruns = runCatching { track.underrunCount }.getOrDefault(-1)
+                    val buf = runCatching {
+                        val j = org.json.JSONObject(EchoNative.nativeStats(handle))
+                        "depth ${j.optLong("audio_depth")}" +
+                            " (worst ${j.optLong("audio_worst_depth")})" +
+                            ", ${j.optLong("audio_dropped")} drift-dropped" +
+                            ", ${j.optLong("audio_lost")} lost"
+                    }.getOrDefault("buffer stats unavailable")
+
                     Log.i(
                         TAG,
-                        "audio/10s: $steps steps, $silences silence, $conceals concealed, " +
-                            "$dropped dropped at the decoder"
+                        "audio/10s: $steps/500 steps, $silences silence, $conceals concealed, " +
+                            "$dropped held for the decoder, $underruns track underruns | $buf"
                     )
                     steps = 0; silences = 0; conceals = 0; dropped = 0
                     lastReport = now
@@ -308,10 +364,22 @@ class GameAudioPlayer(
         }
     }
 
-    /** Write every decoded frame the codec has ready. Returns when it has none. */
+    /**
+     * Write every decoded frame the codec has ready. Returns when it has none.
+     *
+     * The first attempt waits [DRAIN_TIMEOUT_US]; later ones do not. That short
+     * wait is load-bearing in a way a zero timeout is not: retrieving an output
+     * buffer is also what RECYCLES the matching input buffer, so a drain that
+     * gives up instantly lets the codec saturate, which then blocks the input
+     * dequeue and pushes the whole loop below realtime. It is a fraction of a
+     * frame, far too small to become a second clock, and it disappears entirely
+     * in the steady state where output is already waiting.
+     */
     private fun drainDecoder(codec: MediaCodec, info: MediaCodec.BufferInfo, track: AudioTrack) {
+        var timeout = DRAIN_TIMEOUT_US
         while (true) {
-            val index = codec.dequeueOutputBuffer(info, 0)
+            val index = codec.dequeueOutputBuffer(info, timeout)
+            timeout = 0
             if (index < 0) return // TRY_AGAIN_LATER, or a format change we ignore
 
             try {
@@ -432,11 +500,14 @@ class GameAudioPlayer(
         const val SEEK_PREROLL_NS = 80_000_000L
 
         /**
-         * Zero would spin; a long wait would stall past the next frame. One
-         * frame is the natural bound — a decoder that cannot take a buffer
-         * within that is behind, and this packet is dropped.
+         * How long a drain waits for the first output buffer: a quarter of a
+         * frame.
+         *
+         * Long enough to recycle the codec's buffers reliably, short enough that
+         * it can never act as a second clock alongside the track write. The
+         * input dequeue, by contrast, waits **zero** — see the loop.
          */
-        const val DEQUEUE_TIMEOUT_US = FRAME_MS * 1000L
+        const val DRAIN_TIMEOUT_US = FRAME_MS * 1000L / 4
 
         /** Playout report cadence, matching the host's own audio reporting. */
         const val REPORT_NS = 10_000_000_000L
