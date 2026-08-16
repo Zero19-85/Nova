@@ -476,6 +476,7 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
                 "frames_dropped_overflow": q.dropped_overflow,
                 "frames_dropped_waiting_keyframe": q.dropped_waiting_keyframe,
                 "frame_age_ms": q.last_frame_age_ms,
+                "video_delay_ms": session.frames.delay_ms(),
                 "worst_frame_age_ms": q.worst_frame_age_ms,
             })
             .to_string(),
@@ -739,6 +740,38 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollAudio<'local>(
             AUDIO_BAD_HANDLE
         }
     }
+}
+
+/// Hold video frames `delayMs` past their arrival, to match audio's latency.
+///
+/// The A/V sync engine's one control, and it moves VIDEO because video is the
+/// side that can move. Audio latency is ~190 ms on the dev hardware and most of
+/// it is immovable: the device's output stage costs ~70 ms with the fast mixer
+/// path already granted, and the jitter buffer's 80 ms is burst insurance that
+/// was measured to be necessary. Video renders as soon as it decodes, so it is
+/// the half with slack.
+///
+/// Returns the value applied, which may be clamped. Zero disables the delay
+/// line completely and restores the original queue behaviour exactly.
+///
+/// **This trades input latency for sync**, and the trade is real rather than
+/// nominal: a delayed frame is a delayed view of your own mouse. Right for
+/// watching something, wrong for playing something, which is why it is a
+/// per-use toggle and not a default.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSetVideoDelay(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    delay_ms: jint,
+) -> jint {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return -1;
+        };
+        session.frames.set_delay_ms(delay_ms.max(0) as u32) as jint
+    }));
+    result.unwrap_or(-1)
 }
 
 /// End the session and free the handle.

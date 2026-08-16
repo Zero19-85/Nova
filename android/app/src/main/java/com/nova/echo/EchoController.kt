@@ -39,6 +39,16 @@ data class UiState(
     val audioActive: Boolean = false,
     /** Why game audio is not playing. Not an [error], for the same reason as [micProblem]. */
     val audioProblem: String? = null,
+    /**
+     * Whether video is being delayed to match audio.
+     *
+     * Off by default, and that default is a judgement rather than caution: this
+     * buys A/V sync with input latency, which is the wrong trade while playing
+     * and the right one while watching. Only the user knows which they are doing.
+     */
+    val syncEnabled: Boolean = false,
+    /** How much video is currently being held back, in milliseconds. */
+    val videoDelayMs: Int = 0,
 )
 
 /**
@@ -219,14 +229,73 @@ class EchoController(private val context: android.content.Context) {
         // microphone it simply starts with the stream. Safe here even though the
         // grant has only just landed: an unarmed buffer answers `AUDIO_IDLE` and
         // the loop idles until packets actually arrive.
-        val audio = GameAudioPlayer(context, h) { message ->
-            // Losing audio is not losing the session — the picture keeps
-            // running, so this reports in its own field rather than as `error`.
-            post { it.copy(audioActive = false, audioProblem = message) }
-        }
+        val audio = GameAudioPlayer(
+            context,
+            h,
+            onError = { message ->
+                // Losing audio is not losing the session — the picture keeps
+                // running, so this reports in its own field rather than as
+                // `error`.
+                post { it.copy(audioActive = false, audioProblem = message) }
+            },
+            onLatency = { measured -> onAudioLatency(h, measured) },
+        )
         gameAudio = audio
         val playing = audio.start()
         post { it.copy(audioActive = playing) }
+    }
+
+    // ── A/V sync engine ─────────────────────────────────────────────────────
+    //
+    // Audio is the late half and cannot be hurried: ~190 ms measured, of which
+    // the device's own output stage is ~70 ms with the fast mixer path already
+    // granted, and 80 ms is jitter insurance that measurement showed was needed.
+    // Video renders as soon as it decodes. So sync is reached by delaying video
+    // to meet audio, which is what every media player does and is the only
+    // direction with any slack in it.
+    //
+    // The cost is input latency — a delayed frame is a delayed view of your own
+    // mouse — so this is off by default and belongs to watching rather than
+    // playing.
+
+    /**
+     * Turn A/V sync on or off. Off restores undelayed rendering immediately.
+     */
+    fun setSyncEnabled(enabled: Boolean) {
+        post { it.copy(syncEnabled = enabled) }
+        if (!enabled) {
+            val h = synchronized(lock) { handle }
+            if (h != 0L) EchoNative.nativeSetVideoDelay(h, 0)
+            post { it.copy(videoDelayMs = 0) }
+        }
+        // Switching on applies at the next latency measurement rather than
+        // guessing a value now: the audio pipeline reports every 10 s, and a
+        // guessed delay that is then corrected is two visible steps instead of
+        // one.
+    }
+
+    /**
+     * The audio pipeline re-measured itself; match video to it.
+     *
+     * Subtracts the video pipeline's own cost, because the delay needed is the
+     * DIFFERENCE between the two paths, not audio's latency outright — video
+     * spends time in the decoder and the compositor too, and delaying by the
+     * full audio figure would overshoot by exactly that much.
+     */
+    private fun onAudioLatency(h: Long, audioMs: Int) {
+        if (!state.syncEnabled) return
+
+        val target = (audioMs - VIDEO_PIPELINE_MS).coerceIn(0, 350)
+        // Hysteresis. The measurement moves a few milliseconds every report as
+        // buffer depth breathes, and re-timing the video for that would be a
+        // visible hitch in exchange for a difference nobody can perceive.
+        if (kotlin.math.abs(target - state.videoDelayMs) < SYNC_HYSTERESIS_MS) return
+
+        val applied = EchoNative.nativeSetVideoDelay(h, target)
+        if (applied >= 0) {
+            Log.i(TAG, "A/V sync: audio ${audioMs}ms -> video delay ${applied}ms")
+            post { it.copy(videoDelayMs = applied) }
+        }
     }
 
     private fun stopGameAudio() {
@@ -373,5 +442,30 @@ class EchoController(private val context: android.content.Context) {
         state = update(state)
     }
 
-    private companion object { const val TAG = "EchoController" }
+    private companion object {
+        const val TAG = "EchoController"
+
+        /**
+         * What the video path costs after the delay line: decode, composite,
+         * and one display refresh.
+         *
+         * Subtracted from the audio measurement because sync needs the
+         * DIFFERENCE between the paths, not audio's figure outright. An
+         * estimate rather than a measurement — MediaCodec exposes no equivalent
+         * of `AudioTimestamp` for a Surface — which is the one soft number in
+         * this engine. If sync lands consistently off in one direction, this is
+         * the constant to correct, and being wrong by 10 ms here costs 10 ms of
+         * offset rather than anything structural.
+         */
+        const val VIDEO_PIPELINE_MS = 30
+
+        /**
+         * Ignore target changes smaller than this.
+         *
+         * The audio measurement breathes by a few milliseconds each report as
+         * jitter depth moves. Re-timing the video for that would be a visible
+         * hitch in exchange for a difference below anyone's perception.
+         */
+        const val SYNC_HYSTERESIS_MS = 25
+    }
 }

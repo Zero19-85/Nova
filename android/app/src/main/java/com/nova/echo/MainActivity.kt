@@ -231,6 +231,9 @@ private fun EchoScreen(controller: EchoController) {
                 touchAsPointer = touchAsPointer,
                 captureMouse = captureMouse,
                 micEnabled = state.micEnabled,
+                syncEnabled = state.syncEnabled,
+                videoDelayMs = state.videoDelayMs,
+                onSyncEnabled = { controller.setSyncEnabled(it) },
                 micActive = state.micActive,
                 micProblem = state.micProblem,
                 onMicEnabled = { wanted ->
@@ -284,6 +287,9 @@ private fun BoxScope.StreamOverlay(
     touchAsPointer: Boolean,
     captureMouse: Boolean,
     micEnabled: Boolean,
+    syncEnabled: Boolean,
+    videoDelayMs: Int,
+    onSyncEnabled: (Boolean) -> Unit,
     micActive: Boolean,
     micProblem: String?,
     onMicEnabled: (Boolean) -> Unit,
@@ -323,6 +329,20 @@ private fun BoxScope.StreamOverlay(
             OverlayToggle("Capture mouse (games)", captureMouse, onCaptureMouse)
             OverlayToggle("Touch moves PC pointer", touchAsPointer, onTouchAsPointer)
             OverlayToggle("Microphone → PC", micEnabled, onMicEnabled)
+            OverlayToggle("A/V sync (adds input lag)", syncEnabled, onSyncEnabled)
+
+            // The trade, said on screen rather than buried in a doc. Audio sits
+            // at a device-imposed floor that cannot be lowered, so sync is
+            // reached by holding video back to meet it — which is the right
+            // call while watching something and the wrong one while playing.
+            if (syncEnabled) {
+                Text(
+                    if (videoDelayMs > 0) "video held ${videoDelayMs}ms to match audio"
+                    else "measuring audio latency…",
+                    color = Color.White.copy(alpha = 0.65f),
+                    fontSize = 11.sp,
+                )
+            }
 
             // Switched on but not capturing. Said plainly, because the only
             // other evidence is the absence of a system microphone indicator —

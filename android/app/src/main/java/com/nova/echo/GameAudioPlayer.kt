@@ -75,6 +75,11 @@ class GameAudioPlayer(
     private val context: Context,
     private val handle: Long,
     private val onError: (String) -> Unit,
+    /// Called with this pipeline's measured total latency whenever it is
+    /// re-measured. The A/V sync engine drives the video delay from it, because
+    /// this is the only place the number is knowable — the device output term
+    /// cannot be derived, only read back from the track.
+    private val onLatency: (Int) -> Unit = {},
 ) {
 
     @Volatile private var running = false
@@ -479,6 +484,13 @@ class GameAudioPlayer(
                             "latency ${totalMs}ms = jitter ${jitterMs}ms + output ${outputMs}ms " +
                             "[track ${trackMs}ms, decoder ${decoderMs}ms, fastpath $fast]"
                     )
+                    // Hand the measured latency to the sync engine, but only
+                    // when it is real: `arrived 0` is the idle loop, and its
+                    // numbers are stale residue rather than a measurement. That
+                    // exact confusion cost a full round of this work, so it is
+                    // gated here rather than trusted downstream.
+                    if (totalMs > 0 && arrived > 0) onLatency(totalMs.toInt())
+
                     lastUnderruns = underruns.toLong()
                     steps = 0; silences = 0; conceals = 0; dropped = 0
                     lastReport = now

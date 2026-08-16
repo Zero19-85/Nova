@@ -141,6 +141,21 @@ object EchoNative {
      */
     external fun nativePollAudio(handle: Long, buf: ByteBuffer, meta: LongArray): Int
 
+    /**
+     * Hold video frames [delayMs] past arrival so they land with the audio.
+     *
+     * The A/V sync engine's one control. It moves **video** because video is the
+     * side with slack: audio latency is dominated by a device output stage that
+     * cannot be bypassed, while video renders as soon as it decodes.
+     *
+     * Returns the value actually applied — it is clamped, so do not assume.
+     * Zero restores undelayed rendering exactly.
+     *
+     * **Costs input latency.** A delayed frame is a delayed view of your own
+     * mouse, so this belongs to watching, not playing.
+     */
+    external fun nativeSetVideoDelay(handle: Long, delayMs: Int): Int
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
 
