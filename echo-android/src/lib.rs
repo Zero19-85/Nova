@@ -60,6 +60,7 @@ use jni::objects::{JByteBuffer, JClass, JLongArray, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
+use echo_client::audio::PlayoutStep;
 use echo_client::{input, pairing};
 use echo_client::session::{
     self, ConnectOptions, Event, OpenPath, Progress, StreamOptions, Uplink,
@@ -80,6 +81,23 @@ pub const FILL_TOO_SMALL: jint = -2;
 pub const FILL_ENDED: jint = -3;
 /// The handle was invalid, or the arguments could not be read.
 pub const FILL_BAD_HANDLE: jint = -4;
+
+// ── Return codes for nativePollAudio ─────────────────────────────────────────
+// Positive means "a packet is in the buffer", so the sign alone separates the
+// one case with a payload from the four without.
+/// An encoded Opus packet is in the buffer; `meta[0]` holds its length.
+pub const AUDIO_PACKET: jint = 1;
+/// A packet was lost in flight. Conceal one frame.
+pub const AUDIO_CONCEAL: jint = 0;
+/// Nothing to play yet — the buffer is filling. Write one frame of silence.
+pub const AUDIO_SILENCE: jint = -1;
+/// Nothing to play and nothing expected; the track may pause.
+pub const AUDIO_IDLE: jint = -2;
+/// The handle was invalid, or the arguments could not be read.
+pub const AUDIO_BAD_HANDLE: jint = -3;
+/// The packet does not fit the supplied buffer; `meta[0]` holds the size needed.
+/// Unreachable with a buffer sized to `audio_channel::MAX_PAYLOAD`.
+pub const AUDIO_TOO_SMALL: jint = -4;
 
 /// How long `nativeClose` waits for the session to tell the host it is done.
 ///
@@ -111,6 +129,13 @@ struct EchoHandle {
     /// different transports, and merging them would put a 20 ms audio packet
     /// behind whatever pointer burst happened to be queued.
     mic: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Downstream game audio, scheduled for playout.
+    ///
+    /// Held here rather than behind a channel because Kotlin *pulls* from it on
+    /// the audio device's clock: `AudioTrack` decides when the next 20 ms is
+    /// needed, and the buffer answers. A channel would invert that and make the
+    /// network the clock, which is how a jitter buffer stops being one.
+    audio: Arc<echo_client::audio::AudioPlayout>,
     /// The session task, so `close` can wait for it to unwind.
     ///
     /// Load-bearing: `Runtime::shutdown_timeout` only waits for *blocking*
@@ -613,6 +638,85 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendMic<'local>(
     u8::from(queued)
 }
 
+/// One playout step of downstream game audio.
+///
+/// Kotlin's audio thread calls this once per 20 ms of audio `AudioTrack` needs,
+/// so **the device is the clock** — this never blocks and never waits for the
+/// network. Returning promptly with "nothing yet" is a correct answer, not a
+/// failure; treating it as one is how a jitter buffer turns into a stutter.
+///
+/// Returns a step code, and for [`AUDIO_PACKET`] copies the encoded Opus packet
+/// into `buf` with its length in `meta[0]`:
+///
+/// | Code | Meaning | What Kotlin does |
+/// |---|---|---|
+/// | `AUDIO_PACKET` (>0) | a packet is in `buf` | decode it and write the PCM |
+/// | `AUDIO_CONCEAL` (0) | a packet was lost | conceal one frame |
+/// | `AUDIO_SILENCE` (-1) | buffer not ready | write one frame of silence |
+/// | `AUDIO_IDLE` (-2) | nothing expected | may pause the track |
+/// | `AUDIO_BAD_HANDLE` (-3) | closed or not a session | stop |
+///
+/// `AUDIO_CONCEAL` is distinct from `AUDIO_SILENCE` even though today's Android
+/// decoder renders both as silence: `MediaCodec` exposes no packet-loss
+/// concealment, so real Opus PLC — which the host's microphone path does have —
+/// is not available here. Keeping the codes apart is what stops `concealed` and
+/// `underran` collapsing into one number that cannot tell a lost packet from a
+/// quiet host, and it is the single place a real PLC decoder would slot in.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollAudio<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    buf: JByteBuffer<'local>,
+    meta: JLongArray<'local>,
+) -> jint {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return AUDIO_BAD_HANDLE;
+        };
+
+        match session.audio.next_step() {
+            PlayoutStep::Packet(packet) => {
+                let (Ok(addr), Ok(capacity)) =
+                    (env.get_direct_buffer_address(&buf), env.get_direct_buffer_capacity(&buf))
+                else {
+                    // Refused rather than copied through a Java array, for the
+                    // reason `nativeFillBuffer` and `nativeSendMic` refuse: a
+                    // silent fallback reintroduces a per-packet allocation on a
+                    // path that runs fifty times a second and hides that it did.
+                    return AUDIO_BAD_HANDLE;
+                };
+                let size = packet.len();
+                if size > capacity {
+                    // Cannot happen with a buffer sized to `MAX_PAYLOAD`, so
+                    // this reports rather than truncates: half an Opus packet is
+                    // not a quieter one, it is a decoder error.
+                    let _ = env.set_long_array_region(&meta, 0, &[size as jlong]);
+                    return AUDIO_TOO_SMALL;
+                }
+                // SAFETY: `addr`/`capacity` describe the direct buffer's
+                // storage, which the JVM keeps valid and pinned while the
+                // ByteBuffer is alive — it is, for this call, since Kotlin holds
+                // the reference across it. `size <= capacity` was just checked.
+                unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), addr, size) };
+                let _ = env.set_long_array_region(&meta, 0, &[size as jlong]);
+                AUDIO_PACKET
+            }
+            PlayoutStep::Conceal => AUDIO_CONCEAL,
+            PlayoutStep::Silence => AUDIO_SILENCE,
+            PlayoutStep::Idle => AUDIO_IDLE,
+        }
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            throw(&mut env, "panic while polling audio");
+            AUDIO_BAD_HANDLE
+        }
+    }
+}
+
 /// End the session and free the handle.
 ///
 /// Wakes anything blocked in `nativeFillBuffer`/`nativePollEvent` first, so a
@@ -725,12 +829,15 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let queue = Arc::new(FrameQueue::new());
+    let audio = Arc::new(echo_client::audio::AudioPlayout::new());
 
     let session = runtime.spawn({
         let queue = queue.clone();
+        let audio = audio.clone();
         async move {
             let mut progress = ChannelProgress(event_tx);
-            let uplink = Uplink { input: Some(input_rx), mic: Some(mic_rx) };
+            let uplink =
+                Uplink { input: Some(input_rx), mic: Some(mic_rx), audio: Some(audio) };
             let outcome =
                 run_session(&identity, connect, stream, &queue, &mut progress, stop_rx, uplink)
                     .await;
@@ -751,6 +858,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         stop: stop_tx,
         input: Some(input_tx),
         mic: Some(mic_tx),
+        audio,
         session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as jlong)
@@ -852,6 +960,10 @@ fn start_pairing(config_json: &str) -> Result<jlong, String> {
         // on a pairing handle.
         input: None,
         mic: None,
+        // Never armed, so it answers `Idle` to every poll. An audio thread that
+        // outlives a stream and lands on a pairing handle therefore renders
+        // silence rather than faulting.
+        audio: Arc::new(echo_client::audio::AudioPlayout::new()),
         // Pairing has nothing to say goodbye to, but sharing the handle type
         // means sharing the orderly close path.
         session: Mutex::new(Some(session)),

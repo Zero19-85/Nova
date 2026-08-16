@@ -510,6 +510,7 @@ pub async fn demultiplex(
     peer: std::net::SocketAddr,
     media_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     control_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // MTU-sized: an undersized buffer makes `recv_from` FAIL on Windows
@@ -549,17 +550,22 @@ pub async fn demultiplex(
                             // probing. Either way there is no receiver for it
                             // on this side.
                             Class::EchoInput | Class::EchoMic => {}
-                            // Downstream game audio. The host seals and sends
-                            // these as of Stage 1; nothing on this side opens
-                            // them yet, so they are dropped here deliberately
-                            // rather than by omission — Stage 2 routes this arm
-                            // to its own task and jitter buffer.
+                            // Downstream game audio goes to its OWN channel,
+                            // never the media one. Audio would otherwise be
+                            // depacketized, FEC-reconstructed and keyframe-gated
+                            // by a pipeline built for video — and, worse, its
+                            // decode cost would land inside the video path's
+                            // latency budget. That is the coupling that cost a
+                            // full round upstream (`learn_ticker`); it is not
+                            // being rebuilt here.
                             //
-                            // Dropping is the correct interim behaviour: the
-                            // channel is unreliable by design, so a client that
-                            // ignores it costs the host nothing and the stream
-                            // behaves exactly as it did before audio existed.
-                            Class::EchoAudio => {}
+                            // A closed channel is not fatal the way the media
+                            // one is: audio is optional in every direction, so a
+                            // client running without it drops these for the
+                            // price of a byte comparison.
+                            Class::EchoAudio => {
+                                let _ = audio_tx.send(buf[..n].to_vec());
+                            }
                             // The host's STUN keepalives and punch probes, plus
                             // internet noise.
                             Class::Stun | Class::Other => {}

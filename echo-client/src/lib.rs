@@ -39,6 +39,7 @@
 //! - [`receiver`] — the one socket reader, reassembly, FEC, and decryption.
 //! - [`gate`] — the keyframe gate that stands between the stream and a decoder.
 
+pub mod audio;
 pub mod control;
 pub mod gate;
 pub mod input;

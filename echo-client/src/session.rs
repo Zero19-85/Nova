@@ -242,6 +242,17 @@ pub struct Uplink {
     pub input: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     /// Encoded microphone packets — one Opus packet per item.
     pub mic: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Where downstream game audio is delivered.
+    ///
+    /// In `Uplink` despite travelling the other way, because it is the same kind
+    /// of thing: a one-shot resource the platform layer supplies, not a setting.
+    /// Held as an `Arc` rather than moved, since the platform's audio thread
+    /// polls the same handle this session arms.
+    ///
+    /// `None` = no audio playback (the headless CLI). The host still seals and
+    /// sends; the datagrams are dropped at the demultiplexer for the cost of a
+    /// channel send that goes nowhere.
+    pub audio: Option<std::sync::Arc<crate::audio::AudioPlayout>>,
 }
 
 impl Uplink {
@@ -422,18 +433,21 @@ pub async fn stream(
     // and they arrive here.
     let (media_tx, media_rx) = tokio::sync::mpsc::unbounded_channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
     let demux_task = tokio::spawn({
         let socket = socket.clone();
         let stop_rx = stop.clone();
         async move {
-            let _ = receiver::demultiplex(&socket, peer, media_tx, control_tx, stop_rx).await;
+            let _ = receiver::demultiplex(&socket, peer, media_tx, control_tx, audio_tx, stop_rx)
+                .await;
         }
     });
 
     // Any early return past this point must not leak the demultiplexer, so the
     // body runs in a helper and the abort happens exactly once, below.
     let outcome = stream_inner(
-        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, uplink,
+        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, audio_rx,
+        uplink,
     )
     .await;
     demux_task.abort();
@@ -452,9 +466,10 @@ async fn stream_inner(
     stop: tokio::sync::watch::Receiver<bool>,
     media_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
-    let Uplink { input: input_rx, mic: mic_rx } = uplink;
+    let Uplink { input: input_rx, mic: mic_rx, audio: playout } = uplink;
     let lan = match &opts.control {
         Some(addr) => Some(
             tokio::net::lookup_host(addr)
@@ -515,6 +530,42 @@ async fn stream_inner(
         height: control::field_u64(&grant, "height").unwrap_or(0),
         fps: control::field_u64(&grant, "fps").unwrap_or(0),
         codec: control::field_str(&grant, "codec").unwrap_or("?").to_string(),
+    });
+
+    // Downstream game audio gets its OWN task, off the video path entirely.
+    //
+    // Not merged into the receive loop, and not for tidiness: that loop is the
+    // one carrying every video frame, and a decode-and-schedule job running 50
+    // times a second inside it would make audio's cost part of video's latency
+    // budget. That is precisely the coupling that made input feel broken for a
+    // whole session upstream, and the rule earned there — a real-time path gets
+    // its own drain — applies unchanged here.
+    //
+    // Armed with the session keys only now, after the grant: the buffer cannot
+    // open anything before them, and arming earlier would mean holding a
+    // half-built session the platform's audio thread could already be polling.
+    let audio_task = playout.as_ref().map(|playout| {
+        playout.arm(keys.clone());
+        let playout = playout.clone();
+        let mut audio_rx = audio_rx;
+        tokio::spawn(async move {
+            // Rate-limited: a foreign key or a corrupted path fails on every
+            // packet, 50 times a second. The first line says what is wrong; the
+            // next thousand would only make the log useless.
+            let mut last_notice: Option<std::time::Instant> = None;
+            let mut refused = 0u64;
+            while let Some(datagram) = audio_rx.recv().await {
+                if let Err(why) = playout.accept(&datagram) {
+                    refused += 1;
+                    let due = last_notice
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(10));
+                    if due {
+                        eprintln!("⚠️  game audio datagram refused ({refused} so far): {why}");
+                        last_notice = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        })
     });
 
     // The sink's repair path. Nova's GOP is infinite, so a sink that loses its
@@ -745,6 +796,15 @@ async fn stream_inner(
     }
     if let Some(t) = mic_task {
         t.abort();
+    }
+    if let Some(t) = audio_task {
+        t.abort();
+    }
+    // Stop opening datagrams under keys that no longer describe a live session.
+    // Safe to skip on the error path above: `arm` replaces the buffer outright,
+    // so the next session cannot inherit this one's playout point.
+    if let Some(p) = &playout {
+        p.disarm();
     }
 
     // Always tell the host we are done. A session left open would block the

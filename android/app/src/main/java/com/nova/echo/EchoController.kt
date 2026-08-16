@@ -29,6 +29,16 @@ data class UiState(
      * the stream is fine, one optional feature is not.
      */
     val micProblem: String? = null,
+    /**
+     * Whether the host's game audio is playing.
+     *
+     * No `audioEnabled` beside it, unlike the microphone: downstream audio needs
+     * no permission and carries no privacy question, so there is nothing for a
+     * user to opt into. The device's own volume control is the off switch.
+     */
+    val audioActive: Boolean = false,
+    /** Why game audio is not playing. Not an [error], for the same reason as [micProblem]. */
+    val audioProblem: String? = null,
 )
 
 /**
@@ -59,6 +69,7 @@ class EchoController(private val context: android.content.Context) {
     private var poller: Thread? = null
     private var player: VideoPlayer? = null
     private var mic: MicCapture? = null
+    private var gameAudio: GameAudioPlayer? = null
 
     /**
      * Master switch for forwarding input. Read by the Activity's key dispatch
@@ -203,6 +214,25 @@ class EchoController(private val context: android.content.Context) {
         // this point would sit in a queue and then arrive as a burst of stale
         // speech the moment the stream came up.
         if (state.micEnabled) startMic(h)
+
+        // Game audio needs no permission and no user opt-in, so unlike the
+        // microphone it simply starts with the stream. Safe here even though the
+        // grant has only just landed: an unarmed buffer answers `AUDIO_IDLE` and
+        // the loop idles until packets actually arrive.
+        val audio = GameAudioPlayer(h) { message ->
+            // Losing audio is not losing the session — the picture keeps
+            // running, so this reports in its own field rather than as `error`.
+            post { it.copy(audioActive = false, audioProblem = message) }
+        }
+        gameAudio = audio
+        val playing = audio.start()
+        post { it.copy(audioActive = playing) }
+    }
+
+    private fun stopGameAudio() {
+        gameAudio?.stop()
+        gameAudio = null
+        post { it.copy(audioActive = false) }
     }
 
     // ── Microphone ──────────────────────────────────────────────────────────
@@ -309,6 +339,10 @@ class EchoController(private val context: android.content.Context) {
         // it, and a handle freed underneath a running thread is a use-after-free
         // the magic check would only sometimes catch.
         stopMic()
+        // Same hazard, other direction: the playback thread calls
+        // `nativePollAudio` with the handle, so it has to be joined before the
+        // pointer is freed or the poll lands on freed memory.
+        stopGameAudio()
         player?.stop()
         player = null
         // Clear the handle before closing, so the poller sees the change and a

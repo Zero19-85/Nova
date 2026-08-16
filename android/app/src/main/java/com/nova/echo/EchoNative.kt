@@ -109,6 +109,38 @@ object EchoNative {
      */
     external fun nativeSendMic(handle: Long, buf: ByteBuffer, offset: Int, size: Int): Boolean
 
+    // ── Downstream game audio ───────────────────────────────────────────────
+
+    /** An encoded Opus packet is in the buffer; `meta[0]` holds its length. */
+    const val AUDIO_PACKET = 1
+    /** A packet was lost in flight. Conceal one frame. */
+    const val AUDIO_CONCEAL = 0
+    /** Nothing to play yet — the buffer is filling. Write one frame of silence. */
+    const val AUDIO_SILENCE = -1
+    /** Nothing to play and nothing expected; the track may pause. */
+    const val AUDIO_IDLE = -2
+    /** Bad handle, or the buffer could not be read. Stop. */
+    const val AUDIO_BAD_HANDLE = -3
+    /** Packet larger than the supplied buffer; `meta[0]` holds the size needed. */
+    const val AUDIO_TOO_SMALL = -4
+
+    /**
+     * Take one playout step of downstream game audio.
+     *
+     * **Call this on the audio device's clock, once per 20 ms it needs** — the
+     * jitter buffer schedules against the caller, so making the network the
+     * clock instead is exactly how a jitter buffer stops being one. Never
+     * blocks; a `AUDIO_SILENCE` return is a normal answer, not a failure.
+     *
+     * [buf] must be a **direct** ByteBuffer of at least 1275 bytes (the largest
+     * packet Opus emits). Returns one of the `AUDIO_*` codes above.
+     *
+     * `AUDIO_CONCEAL` and `AUDIO_SILENCE` are rendered the same way today —
+     * MediaCodec has no packet-loss-concealment entry point — but they are
+     * reported apart so a lost packet never reads as a quiet host.
+     */
+    external fun nativePollAudio(handle: Long, buf: ByteBuffer, meta: LongArray): Int
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
 
