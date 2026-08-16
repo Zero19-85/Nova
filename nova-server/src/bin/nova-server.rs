@@ -105,6 +105,39 @@ fn main() {
             }
         }
 
+        // ── Microphone Stage 0 probe ──────────────────────────────────────────
+        // `--mic-probe <render|listen> <device> <seconds> <log path>`
+        //
+        // Answers whether the Master (LocalSystem, Session 0) may render audio
+        // that a user-session application can capture, which decides whether the
+        // microphone renderer needs an IPC hop to the Worker. Run twice — once
+        // as the user as a control, once as SYSTEM — because a null result on
+        // its own cannot distinguish session isolation from a broken probe.
+        //
+        // Takes a log path rather than printing: this binary has no console, and
+        // the run that matters has no session to show one in.
+        Some("--mic-probe") => {
+            let mode = args.get(2).map(String::as_str).unwrap_or("");
+            let device = args.get(3).cloned().unwrap_or_default();
+            let seconds = args.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(5);
+            let log = args.get(5).cloned().unwrap_or_else(|| {
+                format!("C:\\Windows\\Temp\\nova-mic-probe-{mode}.log")
+            });
+            let code = match mode {
+                "render" => nova_server::mic_probe::render(&device, seconds, &log),
+                "listen" => nova_server::mic_probe::listen(&device, seconds, &log),
+                // Drives the real renderer — Opus decode, jitter buffer, and
+                // all — rather than writing PCM straight to WASAPI.
+                "pipeline" => nova_server::mic_probe::pipeline(seconds, &log),
+                _ => {
+                    nova_server::debug::init_debug_logger();
+                    println!("usage: --mic-probe <render|listen> <device> <seconds> <log path>");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+
         // ── SYSTEM launcher service (Phase 15.2c) ─────────────────────────────
         // The service runs as LocalSystem and spawns the host (the no-arg mode
         // above) into the interactive console session with an elevated token.

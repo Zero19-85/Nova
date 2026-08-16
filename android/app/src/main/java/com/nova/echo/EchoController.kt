@@ -17,6 +17,18 @@ data class UiState(
     val streaming: Boolean = false,
     val error: String? = null,
     val log: List<String> = emptyList(),
+    /** The user's intent for the microphone; persists across sessions. */
+    val micEnabled: Boolean = false,
+    /** Whether audio is actually being captured right now. */
+    val micActive: Boolean = false,
+    /**
+     * Why the microphone is not running despite being switched on — no
+     * permission, no Opus encoder, no microphone.
+     *
+     * Separate from [error] because it must not present as a session failure:
+     * the stream is fine, one optional feature is not.
+     */
+    val micProblem: String? = null,
 )
 
 /**
@@ -46,6 +58,7 @@ class EchoController(private val context: android.content.Context) {
     private var handle: Long = 0
     private var poller: Thread? = null
     private var player: VideoPlayer? = null
+    private var mic: MicCapture? = null
 
     /**
      * Master switch for forwarding input. Read by the Activity's key dispatch
@@ -183,6 +196,69 @@ class EchoController(private val context: android.content.Context) {
         }.also { it.start() }
 
         post { it.copy(status = "Streaming ${width}x$height $codec", streaming = true) }
+
+        // The microphone starts only once a session exists. Its channel is
+        // created with the handle, but nothing drains it until the host grants
+        // the session and the transport has a key — so audio captured before
+        // this point would sit in a queue and then arrive as a burst of stale
+        // speech the moment the stream came up.
+        if (state.micEnabled) startMic(h)
+    }
+
+    // ── Microphone ──────────────────────────────────────────────────────────
+
+    /**
+     * Turn the microphone on or off.
+     *
+     * The switch is the user's *intent* and is remembered across sessions; the
+     * capture itself only exists while a session does. Turning it on outside a
+     * session is therefore not an error — it takes effect at the next grant.
+     */
+    fun setMicEnabled(enabled: Boolean) {
+        post { it.copy(micEnabled = enabled, micProblem = if (enabled) it.micProblem else null) }
+        if (enabled) {
+            val h = synchronized(lock) { handle }
+            if (h != 0L && state.streaming) startMic(h)
+        } else {
+            stopMic()
+        }
+    }
+
+    /**
+     * Re-evaluate after the user answers the permission dialog.
+     *
+     * Also restarts the foreground service, because its type is chosen at
+     * `startForeground` time: a service that came up before the permission
+     * existed is running as `mediaPlayback` alone and may not legally capture
+     * while backgrounded until it is started again.
+     */
+    fun onMicPermissionResult(granted: Boolean) {
+        if (!granted) {
+            post { it.copy(micEnabled = false, micProblem = "microphone permission denied") }
+            return
+        }
+        EchoService.start(context)
+        val h = synchronized(lock) { handle }
+        if (h != 0L && state.streaming && state.micEnabled) startMic(h)
+    }
+
+    private fun startMic(h: Long) {
+        if (mic?.isRunning == true) return
+        val capture = MicCapture(context, h) { message ->
+            // A microphone failure is not a session failure: the stream keeps
+            // running and only this feature goes quiet, so it is reported in
+            // its own field rather than as `error`.
+            post { it.copy(micActive = false, micProblem = message) }
+        }
+        mic = capture
+        val started = capture.start()
+        post { it.copy(micActive = started, micProblem = if (started) null else it.micProblem) }
+    }
+
+    private fun stopMic() {
+        mic?.stop()
+        mic = null
+        post { it.copy(micActive = false) }
     }
 
     // ── Input ───────────────────────────────────────────────────────────────
@@ -229,6 +305,10 @@ class EchoController(private val context: android.content.Context) {
         // otherwise leave that key held on the host with nothing left to
         // release it.
         releaseAllInput()
+        // Before the handle goes: the capture thread calls `nativeSendMic` with
+        // it, and a handle freed underneath a running thread is a use-after-free
+        // the magic check would only sometimes catch.
+        stopMic()
         player?.stop()
         player = null
         // Clear the handle before closing, so the poller sees the change and a

@@ -373,3 +373,289 @@ void CleanupAudio()
     if (g_pwfx)    { CoTaskMemFree(g_pwfx); g_pwfx   = nullptr; }
     printf("\xE2\x9C\x85 Audio cleanup complete.\n");
 }
+
+// ===========================================================================
+// Microphone passthrough â€” RENDER into a virtual cable, plus a probe capture
+// ===========================================================================
+//
+// Echo's client sends the phone's microphone to the host; the host decodes it
+// and renders it into VB-CABLE's input, so Windows applications can select
+// "CABLE Output" as their microphone.
+//
+// This is a RENDER path and it keeps its own COM state (g_mic*) rather than
+// sharing the loopback capture globals above. That separation is deliberate:
+// InitAudioCapture/CleanupAudio are process-global and guarded on the Rust side
+// by SHIM_CAPTURE_ACTIVE, which exists to stop two *capture* sessions
+// overlapping. The microphone neither participates in nor may interfere with
+// that lifecycle â€” a stream starting must never tear down the microphone, and
+// vice versa.
+//
+// Format: the client always sends 48 kHz mono, which is what Opus decodes to.
+// Rather than adopting the device mix format and converting by hand, the stream
+// is opened with AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM and the format we actually
+// have. WASAPI then does any rate and channel conversion inside the audio
+// engine, which is both better than a hand-rolled resampler and far less code
+// to get subtly wrong.
+
+static IMMDeviceEnumerator* g_micEnum   = nullptr;
+static IMMDevice*           g_micDev    = nullptr;
+static IAudioClient*        g_micClient = nullptr;
+static IAudioRenderClient*  g_micRender = nullptr;
+static UINT32               g_micBufFrames = 0;
+
+// 48 kHz mono 16-bit â€” what Opus decodes to, declared once for both directions.
+static void mic_format(WAVEFORMATEX* w)
+{
+    w->wFormatTag      = WAVE_FORMAT_PCM;
+    w->nChannels       = 1;
+    w->nSamplesPerSec  = 48000;
+    w->wBitsPerSample  = 16;
+    w->nBlockAlign     = (WORD)(w->nChannels * w->wBitsPerSample / 8);
+    w->nAvgBytesPerSec = w->nSamplesPerSec * w->nBlockAlign;
+    w->cbSize          = 0;
+}
+
+// Generalised endpoint lookup: `is_capture` selects eCapture instead of
+// eRender. Matches an exact endpoint id or a case-insensitive substring of the
+// friendly name. Returns 0 + id, 1 if no match, <0 on error.
+extern "C" __declspec(dllexport)
+int FindEndpointByName(const WCHAR* needle, int is_capture, WCHAR* out_id, int cch)
+{
+    if (!needle || !*needle) return 1;
+
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDeviceCollection* coll = nullptr;
+    int ret = 1;
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(hr))
+        hr = en->EnumAudioEndpoints(is_capture ? eCapture : eRender, DEVICE_STATE_ACTIVE, &coll);
+
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = coll->GetCount(&count);
+    if (FAILED(hr)) ret = -2;
+
+    for (UINT i = 0; SUCCEEDED(hr) && ret == 1 && i < count; ++i) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(coll->Item(i, &dev))) continue;
+
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(dev->GetId(&id)) && id) {
+            bool matched = (_wcsicmp(id, needle) == 0);
+            if (!matched) {
+                IPropertyStore* props = nullptr;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props))) {
+                    PROPVARIANT name;
+                    PropVariantInit(&name);
+                    if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) &&
+                        name.vt == VT_LPWSTR && name.pwszVal &&
+                        contains_icase(name.pwszVal, needle)) {
+                        matched = true;
+                        printf("\xF0\x9F\x8E\xA4 Endpoint matched (%s): %ls\n",
+                               is_capture ? "capture" : "render", name.pwszVal);
+                    }
+                    PropVariantClear(&name);
+                    props->Release();
+                }
+            }
+            if (matched && (int)wcslen(id) < cch) {
+                wcscpy_s(out_id, cch, id);
+                ret = 0;
+            }
+            CoTaskMemFree(id);
+        }
+        dev->Release();
+    }
+
+    if (coll) coll->Release();
+    if (en)   en->Release();
+    return ret;
+}
+
+// Opens `device_id` for rendering 48 kHz mono 16-bit PCM.
+//
+// Returns 0 on success, <0 on failure, with `out_hr` receiving the failing
+// HRESULT so a caller can report *why* rather than merely that it did not work
+// â€” which is the entire point when the open question is whether Session 0 is
+// permitted to do this at all.
+extern "C" __declspec(dllexport)
+int InitMicRender(const WCHAR* device_id, UINT32* out_buffer_frames, long* out_hr)
+{
+    if (out_hr) *out_hr = 0;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { if (out_hr) *out_hr = hr; return -1; }
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&g_micEnum);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -2; }
+
+    if (device_id && *device_id) hr = g_micEnum->GetDevice(device_id, &g_micDev);
+    else                         hr = g_micEnum->GetDefaultAudioEndpoint(eRender, eConsole, &g_micDev);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -3; }
+
+    hr = g_micDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&g_micClient);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -4; }
+
+    WAVEFORMATEX want;
+    mic_format(&want);
+
+    // 200 ms of device buffer. Large enough that a scheduling hiccup on the
+    // network side does not underrun, small enough that it adds nothing
+    // meaningful next to the jitter buffer in front of it.
+    const REFERENCE_TIME kBuffer = 2000000; // 200 ms, in 100 ns units
+    hr = g_micClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        kBuffer, 0, &want, nullptr);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -5; }
+
+    hr = g_micClient->GetBufferSize(&g_micBufFrames);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -6; }
+
+    hr = g_micClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_micRender);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -7; }
+
+    hr = g_micClient->Start();
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -8; }
+
+    if (out_buffer_frames) *out_buffer_frames = g_micBufFrames;
+    printf("\xF0\x9F\x8E\xA4 Mic render open: 48kHz mono s16, %u-frame buffer\n", g_micBufFrames);
+    return 0;
+}
+
+// Writes up to `frames` mono samples, returning how many were actually written
+// (fewer when the device buffer is full), or <0 on error.
+extern "C" __declspec(dllexport)
+int RenderMicFrames(const short* mono, UINT32 frames, long* out_hr)
+{
+    if (out_hr) *out_hr = 0;
+    if (!g_micClient || !g_micRender || !mono) return -1;
+
+    UINT32 padding = 0;
+    HRESULT hr = g_micClient->GetCurrentPadding(&padding);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -2; }
+
+    UINT32 room = (g_micBufFrames > padding) ? (g_micBufFrames - padding) : 0;
+    UINT32 want = (frames < room) ? frames : room;
+    if (want == 0) return 0;
+
+    BYTE* dst = nullptr;
+    hr = g_micRender->GetBuffer(want, &dst);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -3; }
+
+    memcpy(dst, mono, (size_t)want * sizeof(short));
+
+    hr = g_micRender->ReleaseBuffer(want, 0);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -4; }
+    return (int)want;
+}
+
+extern "C" __declspec(dllexport)
+void CleanupMicRender()
+{
+    if (g_micClient) g_micClient->Stop();
+    if (g_micRender) { g_micRender->Release(); g_micRender = nullptr; }
+    if (g_micClient) { g_micClient->Release(); g_micClient = nullptr; }
+    if (g_micDev)    { g_micDev->Release();    g_micDev    = nullptr; }
+    if (g_micEnum)   { g_micEnum->Release();   g_micEnum   = nullptr; }
+    g_micBufFrames = 0;
+    printf("\xF0\x9F\x8E\xA4 Mic render closed.\n");
+}
+
+// â”€â”€ Probe-only capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Opens a CAPTURE endpoint (e.g. "CABLE Output") and reports the loudest
+// sample seen. This exists to answer one question by measurement rather than by
+// reading documentation: does audio rendered by a Session 0 service actually
+// reach a capture endpoint in the interactive user's session? A successful
+// HRESULT on the render side proves only that the API accepted the call.
+
+static IMMDeviceEnumerator* g_probeEnum   = nullptr;
+static IMMDevice*           g_probeDev    = nullptr;
+static IAudioClient*        g_probeClient = nullptr;
+static IAudioCaptureClient* g_probeCap    = nullptr;
+
+extern "C" __declspec(dllexport)
+int InitProbeCapture(const WCHAR* device_id, long* out_hr)
+{
+    if (out_hr) *out_hr = 0;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { if (out_hr) *out_hr = hr; return -1; }
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&g_probeEnum);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -2; }
+
+    if (device_id && *device_id) hr = g_probeEnum->GetDevice(device_id, &g_probeDev);
+    else                         hr = g_probeEnum->GetDefaultAudioEndpoint(eCapture, eConsole, &g_probeDev);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -3; }
+
+    hr = g_probeDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&g_probeClient);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -4; }
+
+    WAVEFORMATEX want;
+    mic_format(&want);
+    hr = g_probeClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        2000000, 0, &want, nullptr);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -5; }
+
+    hr = g_probeClient->GetService(__uuidof(IAudioCaptureClient), (void**)&g_probeCap);
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -6; }
+
+    hr = g_probeClient->Start();
+    if (FAILED(hr)) { if (out_hr) *out_hr = hr; return -7; }
+    return 0;
+}
+
+// Drains whatever is available and reports the loudest absolute sample seen,
+// normalised to 0..1, plus how many frames were read â€” because "silence" and
+// "no data at all" are different answers to the question being asked.
+extern "C" __declspec(dllexport)
+int ProbeCapturePeak(float* out_peak, UINT32* out_frames)
+{
+    if (!g_probeCap) return -1;
+    float peak = 0.0f;
+    UINT32 total = 0;
+
+    for (;;) {
+        UINT32 packet = 0;
+        if (FAILED(g_probeCap->GetNextPacketSize(&packet)) || packet == 0) break;
+
+        BYTE* data = nullptr;
+        UINT32 frames = 0;
+        DWORD flags = 0;
+        if (FAILED(g_probeCap->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+
+        if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data) {
+            const short* s = (const short*)data;
+            for (UINT32 i = 0; i < frames; ++i) {
+                float v = (float)(s[i] < 0 ? -s[i] : s[i]) / 32768.0f;
+                if (v > peak) peak = v;
+            }
+        }
+        total += frames;
+        g_probeCap->ReleaseBuffer(frames);
+    }
+
+    if (out_peak)   *out_peak = peak;
+    if (out_frames) *out_frames = total;
+    return 0;
+}
+
+extern "C" __declspec(dllexport)
+void CleanupProbeCapture()
+{
+    if (g_probeClient) g_probeClient->Stop();
+    if (g_probeCap)    { g_probeCap->Release();    g_probeCap    = nullptr; }
+    if (g_probeClient) { g_probeClient->Release(); g_probeClient = nullptr; }
+    if (g_probeDev)    { g_probeDev->Release();    g_probeDev    = nullptr; }
+    if (g_probeEnum)   { g_probeEnum->Release();   g_probeEnum   = nullptr; }
+}
+

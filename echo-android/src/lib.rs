@@ -42,6 +42,8 @@
 //!     external fun nativeConnect(configJson: String): Long
 //!     external fun nativePollEvent(handle: Long, timeoutMs: Int): String?
 //!     external fun nativeFillBuffer(handle: Long, buf: ByteBuffer, meta: LongArray, timeoutMs: Int): Int
+//!     external fun nativeSendInput(handle: Long, kind: Int, a: Int, b: Int, c: Int, d: Int): Boolean
+//!     external fun nativeSendMic(handle: Long, buf: ByteBuffer, offset: Int, size: Int): Boolean
 //!     external fun nativeStats(handle: Long): String
 //!     external fun nativeClose(handle: Long)
 //! }
@@ -59,7 +61,9 @@ use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
 use echo_client::{input, pairing};
-use echo_client::session::{self, ConnectOptions, Event, OpenPath, Progress, StreamOptions};
+use echo_client::session::{
+    self, ConnectOptions, Event, OpenPath, Progress, StreamOptions, Uplink,
+};
 use nova_core::identity::Identity;
 
 use frames::{FrameQueue, QueueSink};
@@ -100,6 +104,13 @@ struct EchoHandle {
     stop: tokio::sync::watch::Sender<bool>,
     /// Where Kotlin posts GameStream input packets, when a session carries them.
     input: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Where Kotlin posts encoded microphone packets — one Opus packet each.
+    ///
+    /// Separate from [`Self::input`] rather than a shared "uplink" channel: they
+    /// are produced by different threads at different rates and consumed by
+    /// different transports, and merging them would put a 20 ms audio packet
+    /// behind whatever pointer burst happened to be queued.
+    mic: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     /// The session task, so `close` can wait for it to unwind.
     ///
     /// Load-bearing: `Runtime::shutdown_timeout` only waits for *blocking*
@@ -400,8 +411,13 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
         let q = session.frames.stats();
         let (batch_last, batch_worst) = echo_client::input::batch_stats();
         let (rtt_last, rtt_best) = echo_client::session::rtt_stats();
+        let mic = echo_client::mic::stats();
         Ok::<String, String>(
             serde_json::json!({
+                "mic_packets": mic.packets,
+                "mic_bytes": mic.bytes,
+                "mic_refused": mic.refused,
+                "mic_worst_gap_ms": mic.worst_gap_ms,
                 "input_batch": batch_last,
                 "input_batch_worst": batch_worst,
                 "rtt_ms": rtt_last,
@@ -522,6 +538,81 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendInput(
     u8::from(queued)
 }
 
+/// Post one encoded microphone packet to the host.
+///
+/// `buf` must be a **direct** `ByteBuffer` — in practice a MediaCodec *output*
+/// buffer, which is what makes this a single copy out of memory the encoder
+/// already owns. `offset` and `size` come straight from the codec's
+/// `BufferInfo`, because a MediaCodec output buffer is not required to start at
+/// position zero.
+///
+/// Returns `true` if the packet was queued. `false` means the handle was
+/// invalid, this is a pairing handle with no session, or the buffer could not be
+/// read — never that the host rejected it. Fire-and-forget for the same reason
+/// input is: a capture thread that blocks on the network overruns `AudioRecord`'s
+/// ring buffer, and audio lost at the source cannot be recovered anywhere else.
+///
+/// ## Kotlin must not send codec-config buffers
+///
+/// MediaCodec emits the Opus identification header, pre-skip, and seek pre-roll
+/// as `BUFFER_FLAG_CODEC_CONFIG` buffers ahead of the stream. Those are
+/// container metadata, not audio, and the host's decoder is fed raw Opus
+/// packets — so passing one here would put non-packet bytes into the audio
+/// stream. This is not hypothetical for this project: the AV1 rollout lost days
+/// to exactly this shape of bug, where the SDK encoder wrapped every frame in an
+/// IVF header and the client's decoder silently produced nothing. The filter
+/// lives in Kotlin, next to the flag, and [`MicCapture`] asserts it.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendMic<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    buf: JByteBuffer<'local>,
+    offset: jint,
+    size: jint,
+) -> jni::sys::jboolean {
+    let queued = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return false;
+        };
+        let Some(tx) = session.mic.as_ref() else {
+            return false; // a pairing handle carries no session
+        };
+        if offset < 0 || size <= 0 {
+            return false;
+        }
+        let (offset, size) = (offset as usize, size as usize);
+
+        let (Ok(addr), Ok(capacity)) =
+            (env.get_direct_buffer_address(&buf), env.get_direct_buffer_capacity(&buf))
+        else {
+            // Not a direct buffer. Refused rather than copied via a Java array,
+            // for the same reason `nativeFillBuffer` refuses: silently falling
+            // back would reintroduce a per-packet allocation on a path that runs
+            // fifty times a second, and hide that it had happened.
+            return false;
+        };
+        // The codec supplies both bounds, so this can only fail if Kotlin passed
+        // a `BufferInfo` belonging to a different buffer — a bug worth refusing
+        // rather than reading past the end of the mapping.
+        if offset.saturating_add(size) > capacity {
+            return false;
+        }
+
+        // SAFETY: `addr`/`capacity` describe the direct buffer's storage, which
+        // the JVM keeps valid and pinned for as long as the ByteBuffer object is
+        // alive — it is alive for this call, since Kotlin holds the reference
+        // across it. `offset + size <= capacity` was just checked.
+        let packet =
+            unsafe { std::slice::from_raw_parts(addr.add(offset) as *const u8, size) }.to_vec();
+
+        tx.send(packet).is_ok()
+    }))
+    .unwrap_or(false);
+
+    u8::from(queued)
+}
+
 /// End the session and free the handle.
 ///
 /// Wakes anything blocked in `nativeFillBuffer`/`nativePollEvent` first, so a
@@ -594,6 +685,11 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
     // or silently discarding input. The consumer only forwards to the control
     // channel, and a session that stops draining is ending anyway.
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // Unbounded for the same reason, with one difference worth stating: the
+    // microphone producer is a capture thread that must never block, because
+    // blocking it overruns `AudioRecord`'s ring buffer and loses audio at the
+    // source — where no amount of downstream cleverness can recover it.
+    let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let defaults = StreamOptions::default();
     let stream = StreamOptions {
@@ -634,8 +730,9 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         let queue = queue.clone();
         async move {
             let mut progress = ChannelProgress(event_tx);
+            let uplink = Uplink { input: Some(input_rx), mic: Some(mic_rx) };
             let outcome =
-                run_session(&identity, connect, stream, &queue, &mut progress, stop_rx, input_rx)
+                run_session(&identity, connect, stream, &queue, &mut progress, stop_rx, uplink)
                     .await;
             if let Err(message) = outcome {
                 progress.raw(serde_json::json!({"type": "error", "message": message}));
@@ -653,6 +750,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         frames: queue,
         stop: stop_tx,
         input: Some(input_tx),
+        mic: Some(mic_tx),
         session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as jlong)
@@ -749,9 +847,11 @@ fn start_pairing(config_json: &str) -> Result<jlong, String> {
         events: Mutex::new(event_rx),
         frames: queue,
         stop: stop_tx,
-        // Pairing accepts no input; a `None` here makes `nativeSendInput`
-        // refuse rather than silently discard on a pairing handle.
+        // Pairing accepts no input and no audio; `None` here makes
+        // `nativeSendInput`/`nativeSendMic` refuse rather than silently discard
+        // on a pairing handle.
         input: None,
+        mic: None,
         // Pairing has nothing to say goodbye to, but sharing the handle type
         // means sharing the orderly close path.
         session: Mutex::new(Some(session)),
@@ -768,7 +868,7 @@ async fn run_session(
     queue: &Arc<FrameQueue>,
     progress: &mut ChannelProgress,
     stop: tokio::sync::watch::Receiver<bool>,
-    input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    uplink: Uplink,
 ) -> Result<(), String> {
     let path: OpenPath = session::open_path(identity, &connect, progress).await?;
     let mut sink = QueueSink(queue.clone());
@@ -780,7 +880,7 @@ async fn run_session(
         &mut sink,
         progress,
         stop,
-        Some(input_rx),
+        uplink,
     )
     .await?;
     Ok(())

@@ -334,6 +334,13 @@ pub struct EchoSession {
     /// to the keys minted at `start`, so input sealed for a previous session
     /// cannot be replayed into this one.
     input: nova_core::input_channel::InputReceiver,
+    /// Deduplicating opener for this session's microphone datagrams.
+    ///
+    /// Per-session for the same two reasons as `input`, and keyed to the same
+    /// session keys — so audio sealed for a previous session cannot be replayed
+    /// into this one. Its window is separate from the input receiver's because
+    /// the two streams have independent sequence spaces.
+    mic: nova_core::mic_channel::MicReceiver,
 }
 
 impl EchoSession {
@@ -681,6 +688,7 @@ impl SessionManager {
             params,
             started: Instant::now(),
             input: nova_core::input_channel::InputReceiver::new(keys.clone()),
+            mic: nova_core::mic_channel::MicReceiver::new(keys.clone()),
             keys,
             rikey,
             rikeyid,
@@ -781,6 +789,42 @@ impl SessionManager {
             self.plane.inject_input(packet);
         }
         Ok(count)
+    }
+
+    /// Open a sealed microphone datagram that arrived on the media socket.
+    ///
+    /// Authorization works exactly as it does for
+    /// [`inject_sealed_input`](Self::inject_sealed_input), and for the same
+    /// reason: there is no TLS connection here and no `EchoIdentity` to
+    /// compare, so possession of the session key — minted at `start` and handed
+    /// to one device over mutual TLS — is what proves the sender.
+    ///
+    /// Returns the packet, or `None` when the datagram was authentic but
+    /// carried nothing new (a duplicate, or an arrival too late to place).
+    ///
+    /// Note what this does **not** do: render. The lock below is the same one
+    /// `seal_video` takes for every video frame, so this returns the packet and
+    /// lets the caller hand it to the renderer with nothing held — the same
+    /// discipline `inject_sealed_input` documents.
+    pub fn open_sealed_mic(
+        &self,
+        datagram: &[u8],
+    ) -> Result<Option<nova_core::mic_channel::MicPacket>, InputRejection> {
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return Err(InputRejection::NoSession);
+        };
+        session
+            .mic
+            .open(datagram)
+            .map_err(|e| InputRejection::Unopenable(e.to_string()))
+    }
+
+    /// Microphone-datagram counters for the live session, for diagnostics.
+    pub fn mic_stats(&self) -> Option<(nova_core::mic_channel::MicStats, u32)> {
+        let guard = self.active.lock().unwrap();
+        let session = guard.as_ref()?;
+        Some((session.mic.stats(), session.mic.highest_sequence()))
     }
 
     /// Input-datagram counters for the live session, for diagnostics.

@@ -15,6 +15,18 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Microphone passthrough: the phone's mic becomes the PC's mic. Requested
+         at runtime and entirely optional — a session runs perfectly without it,
+         so a refusal disables the feature rather than failing the stream.
+
+         FOREGROUND_SERVICE_MICROPHONE is separate from RECORD_AUDIO and is what
+         API 34+ requires to keep capturing while the app is not in front. Note
+         the matching rule that comes with it: a microphone-typed foreground
+         service may not be *started* from the background, which is why
+         EchoService is started while the activity is visible. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
@@ -41,10 +53,14 @@
 
         <!-- Keeps the keepalive threads scheduled while Echo is backgrounded.
              mediaPlayback is the honest type: this process is decoding and
-             presenting a live video stream. -->
+             presenting a live video stream. `microphone` is declared alongside
+             it because the same service covers the capture loop when the mic is
+             on — the type is chosen at startForeground time, so declaring both
+             here does not claim the microphone for a session that never uses
+             it. -->
         <service
             android:name=".EchoService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback|microphone" />
     </application>
 </manifest>

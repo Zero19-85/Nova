@@ -196,6 +196,17 @@ pub struct RtpSender {
     /// responses); the Echo transport is the sole consumer of control. Sharing
     /// one channel would put both in the same race.
     echo_inbox: Option<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>>,
+    /// Microphone datagrams, on their own channel rather than sharing
+    /// `echo_inbox`.
+    ///
+    /// Input shares the control inbox because `echo::transport`'s loop can
+    /// dispatch it in microseconds. Audio is different in kind: it is decoded
+    /// and handed to a renderer, at fifty packets a second, forever. Putting
+    /// that on the loop that also carries the reliable control tunnel and every
+    /// input packet would make the microphone's cost part of input's latency
+    /// budget — which is the shape of the bug that made the pointer lag half a
+    /// second (one drain, two rates, and the slower job set the pace).
+    mic_inbox: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl RtpSender {
@@ -240,6 +251,7 @@ impl RtpSender {
             last_sent_index: 0,
             stun_inbox: None,
             echo_inbox: None,
+            mic_inbox: None,
         })
     }
 
@@ -262,6 +274,18 @@ impl RtpSender {
     /// lose independently.
     pub fn set_echo_inbox(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>) {
         self.echo_inbox = Some(tx);
+    }
+
+    /// Where microphone datagrams go. Unset until the renderer starts, which is
+    /// what makes the microphone genuinely optional: with no VB-CABLE installed
+    /// nothing sets this, and mic datagrams are classified and dropped for the
+    /// cost of one byte comparison.
+    ///
+    /// The source address is deliberately **not** carried. Nothing downstream
+    /// may make a decision from it — the session key is the entire owner check
+    /// — so it is dropped here rather than passed along to be misused later.
+    pub fn set_mic_inbox(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+        self.mic_inbox = Some(tx);
     }
 
     /// Send a datagram from the **media socket**, so it carries the same
@@ -398,6 +422,21 @@ impl RtpSender {
                 | nova_core::demux::Class::EchoInput => {
                     if let Some(inbox) = &self.echo_inbox {
                         let _ = inbox.send((buf[..n].to_vec(), addr));
+                    }
+                    continue;
+                }
+                // Microphone audio goes to its own consumer, never to the
+                // control inbox: `echo::transport`'s accept loop treats an
+                // unrecognised datagram from a new address as the opening of a
+                // TLS tunnel, so routing audio there would have every mic
+                // packet from an unlatched peer attempt a handshake.
+                //
+                // With no renderer running the inbox is unset and the datagram
+                // is dropped here — which is how a host with no VB-CABLE
+                // installed pays nothing for a client that keeps sending.
+                nova_core::demux::Class::EchoMic => {
+                    if let Some(inbox) = &self.mic_inbox {
+                        let _ = inbox.send(buf[..n].to_vec());
                     }
                     continue;
                 }

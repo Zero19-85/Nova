@@ -10,7 +10,9 @@ import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -131,6 +133,15 @@ private fun EchoScreen(controller: EchoController) {
     var captureWhy by remember { mutableStateOf("") }
     var captureEverHeld by remember { mutableStateOf(false) }
 
+    // Requested on first use rather than at launch: a microphone prompt before
+    // the user has asked for a microphone is the kind of thing people decline
+    // reflexively, and a declined permission is much harder to recover from
+    // than an un-asked one.
+    val context = LocalContext.current
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> controller.onMicPermissionResult(granted) }
+
     Box(Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -219,6 +230,24 @@ private fun EchoScreen(controller: EchoController) {
                 inputEnabled = inputEnabled,
                 touchAsPointer = touchAsPointer,
                 captureMouse = captureMouse,
+                micEnabled = state.micEnabled,
+                micActive = state.micActive,
+                micProblem = state.micProblem,
+                onMicEnabled = { wanted ->
+                    val granted = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                        PackageManager.PERMISSION_GRANTED
+                    when {
+                        !wanted -> controller.setMicEnabled(false)
+                        // Record the intent first, so the capture starts by
+                        // itself the moment the permission callback returns —
+                        // otherwise the user has to flip the switch twice.
+                        granted -> controller.setMicEnabled(true)
+                        else -> {
+                            controller.setMicEnabled(true)
+                            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                        }
+                    }
+                },
                 onInputEnabled = { inputEnabled = it },
                 onTouchAsPointer = { touchAsPointer = it },
                 onCaptureMouse = { captureMouse = it },
@@ -254,6 +283,10 @@ private fun BoxScope.StreamOverlay(
     inputEnabled: Boolean,
     touchAsPointer: Boolean,
     captureMouse: Boolean,
+    micEnabled: Boolean,
+    micActive: Boolean,
+    micProblem: String?,
+    onMicEnabled: (Boolean) -> Unit,
     onInputEnabled: (Boolean) -> Unit,
     onTouchAsPointer: (Boolean) -> Unit,
     onCaptureMouse: (Boolean) -> Unit,
@@ -289,6 +322,19 @@ private fun BoxScope.StreamOverlay(
             OverlayToggle("Send input to PC", inputEnabled, onInputEnabled)
             OverlayToggle("Capture mouse (games)", captureMouse, onCaptureMouse)
             OverlayToggle("Touch moves PC pointer", touchAsPointer, onTouchAsPointer)
+            OverlayToggle("Microphone → PC", micEnabled, onMicEnabled)
+
+            // Switched on but not capturing. Said plainly, because the only
+            // other evidence is the absence of a system microphone indicator —
+            // and "my mic doesn't work" with nothing on screen to explain it is
+            // exactly the report that costs an evening to diagnose remotely.
+            if (micEnabled && !micActive) {
+                Text(
+                    micProblem ?: "microphone starting…",
+                    color = Color.White.copy(alpha = 0.65f),
+                    fontSize = 11.sp,
+                )
+            }
 
             // Whether capture actually engaged, not whether it was requested.
             // Two cursors with no explanation is what this line exists to end.

@@ -86,6 +86,29 @@ object EchoNative {
 
     external fun nativeSendInput(handle: Long, kind: Int, a: Int, b: Int, c: Int, d: Int): Boolean
 
+    // ── Microphone ──────────────────────────────────────────────────────────
+
+    /**
+     * Post one encoded Opus packet to the host.
+     *
+     * [buf] must be a **direct** ByteBuffer — in practice a MediaCodec *output*
+     * buffer, which makes this a single copy out of memory the encoder already
+     * owns. [offset] and [size] come from the codec's `BufferInfo`, because an
+     * output buffer is not required to start at position zero and the native
+     * side reads from the buffer's base address.
+     *
+     * Returns false for a bad handle, a pairing handle, or a buffer that could
+     * not be read — never that the host refused the audio. Fire-and-forget: a
+     * capture thread that blocks on the network overruns AudioRecord's ring
+     * buffer, and audio lost there cannot be recovered anywhere downstream.
+     *
+     * **Never pass a `BUFFER_FLAG_CODEC_CONFIG` buffer.** Those carry the Opus
+     * identification header and pre-skip — container metadata, not audio — and
+     * the host feeds what it receives straight to a decoder. [MicCapture] is
+     * where that filter lives.
+     */
+    external fun nativeSendMic(handle: Long, buf: ByteBuffer, offset: Int, size: Int): Boolean
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
 

@@ -73,6 +73,19 @@ pub const STREAM_AUDIO: u32 = 2;
 /// must not be able to replay it into the input path, and a distinct stream id
 /// makes the nonce and AAD differ so the tag check refuses it.
 pub const STREAM_INPUT: u32 = 3;
+/// Stream discriminator for client-to-host microphone audio.
+///
+/// The second stream travelling toward the host, and it needs its own value for
+/// the same reason [`STREAM_INPUT`] does — but the threat it closes is worth
+/// naming separately. Input datagrams and microphone datagrams are sealed with
+/// the *same session key* and arrive on the *same socket*; the only thing
+/// keeping a captured mic datagram from being replayed into the input path
+/// (where it would reach `SendInput` on a LocalSystem service) is that the
+/// nonce and AAD differ, so the tag check refuses it. Sharing a stream id
+/// between the two would turn "an attacker recorded you talking" into "an
+/// attacker can type", which is why this constant exists rather than a reused
+/// one.
+pub const STREAM_MIC: u32 = 4;
 
 /// Per-session media key material.
 ///
@@ -258,6 +271,28 @@ mod tests {
         assert_eq!(keys.open(STREAM_AUDIO, 7, 1, &sealed), Err(CryptoError::Authentication));
     }
 
+    /// The two client→host streams are sealed with the same key and arrive on
+    /// the same socket, so the stream id is the *only* thing stopping a
+    /// recorded microphone datagram from being replayed into the input path —
+    /// where it would reach `SendInput` on a LocalSystem service. Asserted
+    /// directly rather than left as a property of the nonce construction.
+    #[test]
+    fn a_microphone_datagram_cannot_be_replayed_as_input() {
+        let keys = SessionKeys::generate();
+        let mic = keys.seal(STREAM_MIC, 12, 0, b"a moment of speech");
+
+        assert!(keys.open(STREAM_MIC, 12, 0, &mic).is_ok());
+        assert_eq!(
+            keys.open(STREAM_INPUT, 12, 0, &mic),
+            Err(CryptoError::Authentication),
+            "audio must not be openable as input"
+        );
+
+        // …and the reverse: a captured keystroke must not become audio.
+        let input = keys.seal(STREAM_INPUT, 12, 0, b"a keystroke");
+        assert_eq!(keys.open(STREAM_MIC, 12, 0, &input), Err(CryptoError::Authentication));
+    }
+
     /// FEC repairs some losses; a shard it could not repair leaves a corrupt
     /// frame, and the tag is what stops that reaching the decoder.
     #[test]
@@ -283,7 +318,7 @@ mod tests {
     fn nonce_uniqueness() {
         let keys = SessionKeys::generate();
         let mut seen = std::collections::HashSet::new();
-        for stream in [STREAM_VIDEO, STREAM_AUDIO] {
+        for stream in [STREAM_VIDEO, STREAM_AUDIO, STREAM_INPUT, STREAM_MIC] {
             for counter in 0..5000u32 {
                 assert!(
                     seen.insert(keys.nonce(stream, counter)),

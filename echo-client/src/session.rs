@@ -223,6 +223,35 @@ const TAIL_REPEAT_DELAY: Duration = Duration::from_millis(25);
 /// keyboard must not keep a link busy.
 const TAIL_REPEATS: usize = 2;
 
+/// The client→host channels a session may carry.
+///
+/// A struct rather than two positional `Option<Receiver>` parameters, which is
+/// what this started as. Two arguments of the *same type*, adjacent, both
+/// optional, both meaning "a queue of bytes going to the host" is a swap
+/// waiting to happen — and a swapped pair would compile, run, and deliver
+/// microphone audio to `SendInput` (where the tag check would refuse it) while
+/// keystrokes went to the speaker. Naming them costs one struct and makes that
+/// mistake unrepresentable.
+///
+/// Receivers cannot be cloned, which is the other reason these live here rather
+/// than in [`StreamOptions`]: they are one-shot resources, not settings, and a
+/// session's input source is not something you would want copied.
+#[derive(Default)]
+pub struct Uplink {
+    /// GameStream input packets, built by the platform layer.
+    pub input: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Encoded microphone packets — one Opus packet per item.
+    pub mic: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+}
+
+impl Uplink {
+    /// Nothing travels toward the host. What the headless CLI uses: it exists
+    /// to prove the media path, not to drive the host.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// What to ask the host for.
 #[derive(Debug, Clone)]
 pub struct StreamOptions {
@@ -382,10 +411,7 @@ pub async fn stream(
     sink: &mut impl FrameSink,
     progress: &mut impl Progress,
     stop: tokio::sync::watch::Receiver<bool>,
-    // A one-shot resource rather than a setting, so it stays out of the
-    // `Clone`-able options struct — a receiver cannot be cloned, and a session's
-    // input source is not something you would want copied anyway.
-    input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
     let pin = parse_fingerprint(host_fingerprint).map_err(|e| format!("host fingerprint: {e}"))?;
     let OpenPath { socket, peer } = path;
@@ -407,7 +433,7 @@ pub async fn stream(
     // Any early return past this point must not leak the demultiplexer, so the
     // body runs in a helper and the abort happens exactly once, below.
     let outcome = stream_inner(
-        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, input_rx,
+        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, uplink,
     )
     .await;
     demux_task.abort();
@@ -426,8 +452,9 @@ async fn stream_inner(
     stop: tokio::sync::watch::Receiver<bool>,
     media_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
+    let Uplink { input: input_rx, mic: mic_rx } = uplink;
     let lan = match &opts.control {
         Some(addr) => Some(
             tokio::net::lookup_host(addr)
@@ -544,6 +571,15 @@ async fn stream_inner(
                 params.insert("peak_events_per_sec".into(), peak_rate.into());
                 params.insert("peak_samples_per_event".into(), peak_samples.into());
                 params.insert("capture_held".into(), capture.into());
+                // The client's half of the microphone measurement. Without it a
+                // silent host is ambiguous between "the encoder produced
+                // nothing" and "the path lost everything", and only this side
+                // can tell those apart — see `crate::mic`.
+                let mic = crate::mic::stats();
+                params.insert("mic_packets".into(), mic.packets.into());
+                params.insert("mic_bytes".into(), mic.bytes.into());
+                params.insert("mic_refused".into(), mic.refused.into());
+                params.insert("mic_worst_gap_ms".into(), mic.worst_gap_ms.into());
                 let _ = ctl.lock().await.notify("client_stats", params).await;
             }
         }
@@ -646,6 +682,57 @@ async fn stream_inner(
         })
     });
 
+    // The microphone goes out on its own unreliable datagrams, on the same
+    // punched socket, sealed under the same session key but a different stream
+    // id — so a captured mic datagram cannot be replayed into the input path.
+    //
+    // Note what this loop deliberately does *not* do, both of which the input
+    // task above does:
+    //
+    // - **No coalescing.** Batching would add the batch's own duration to every
+    //   packet in it, and a microphone's entire budget is latency. Input can
+    //   coalesce because merging two pointer deltas loses nothing; merging two
+    //   20 ms audio frames delays the first one by 20 ms.
+    // - **No tail repeat.** The input task repeats its last datagrams because
+    //   the final packet of a burst is typically a key-up, and losing it strands
+    //   a key held down on the host. Audio has no such packet: the last frame of
+    //   a sentence is just the end of the sentence, and repeating it would cost
+    //   uplink bandwidth to re-send speech the listener has already heard.
+    crate::mic::reset();
+    let mic_task = mic_rx.map(|mut rx| {
+        let socket = socket.clone();
+        let mut sender = nova_core::mic_channel::MicSender::new(keys.clone());
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                let datagram = match sender.datagram(&packet) {
+                    Ok(d) => d,
+                    Err(nova_core::mic_channel::MicError::Exhausted) => {
+                        // Only reachable after years in one session. Continuing
+                        // would repeat a GCM nonce, so the microphone stops
+                        // while the stream itself carries on.
+                        eprintln!("⚠️  microphone channel stopped: sequence space exhausted");
+                        return;
+                    }
+                    Err(e) => {
+                        // A payload the channel will not carry: an encoder bug,
+                        // not a network condition. Skip this packet and keep
+                        // going — one malformed frame must not end the call.
+                        crate::mic::record_refused();
+                        eprintln!("⚠️  microphone packet dropped: {e}");
+                        continue;
+                    }
+                };
+                // Best-effort, like input: there is no acknowledgement to wait
+                // for, and a send error means the socket is gone — which the
+                // receive loop is about to report properly.
+                if socket.send_to(&datagram, peer).await.is_err() {
+                    return;
+                }
+                crate::mic::record_sent(packet.len());
+            }
+        })
+    });
+
     let stats = receiver::run_receiver(socket, peer, media_rx, Some(keys), sink, stop, Some(idr_tx))
         .await
         .map_err(|e| format!("receive loop: {e}"))?;
@@ -654,6 +741,9 @@ async fn stream_inner(
     idr_task.abort();
     rtt_task.abort();
     if let Some(t) = input_task {
+        t.abort();
+    }
+    if let Some(t) = mic_task {
         t.abort();
     }
 

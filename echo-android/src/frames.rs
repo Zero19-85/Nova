@@ -234,7 +234,15 @@ mod tests {
     use std::sync::Arc;
 
     fn frame(index: u32, frame_type: u8, len: usize) -> DecodedFrame {
-        DecodedFrame { index, frame_type, data: vec![index as u8; len] }
+        DecodedFrame {
+            index,
+            frame_type,
+            data: vec![index as u8; len],
+            // "Arrived now" — these tests are about queue ordering and drop
+            // policy, not about age, and a frame built at test time is
+            // genuinely zero milliseconds old.
+            first_shard_at: std::time::Instant::now(),
+        }
     }
 
     #[test]

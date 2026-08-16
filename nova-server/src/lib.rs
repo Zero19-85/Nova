@@ -11,6 +11,12 @@ pub mod debug; // pub so nova-server binary can call init_debug_logger() during 
 pub mod echo;
 mod encoder;
 mod input;
+// Microphone passthrough: the client's Opus → VB-CABLE, rendered in the Master.
+mod mic;
+// pub so the binary's `--mic-probe` mode can drive it. Stage 0 of the
+// microphone work: measured whether a Session 0 service may render audio a
+// user-session application can capture — see the module docs.
+pub mod mic_probe;
 /// Master↔Worker IPC transport (Session-Survival Architecture, Phase 1).
 /// Public so the binary's `--worker` mode and `service.rs`'s Master-side
 /// spawn/accept logic can both reach it.
@@ -489,7 +495,8 @@ pub async fn start_master_network() -> MasterHandles {
     if let Some(sessions) = echo_sessions.clone() {
         let (echo_tx, echo_rx) = mpsc::unbounded_channel();
         rtp_sender.lock().unwrap().set_echo_inbox(echo_tx);
-        echo::transport::spawn(echo_rx, rtp_sender.clone(), echo_handler, sessions);
+        echo::transport::spawn(echo_rx, rtp_sender.clone(), echo_handler, sessions.clone());
+        spawn_mic_passthrough(&cfg.audio.endpoint_override, rtp_sender.clone(), sessions);
     }
 
     tokio::spawn(session_watcher(client_info.clone(), worker_link.clone(), cfg, rtp_sender.clone(), audio_tx, worker_caps, echo_sessions));
@@ -497,6 +504,101 @@ pub async fn start_master_network() -> MasterHandles {
     println!("🎬 Master network stack ready — RTSP:48010 control:47999 pairing:47989/47984 RTP:47998");
 
     MasterHandles { client_info, worker_link, control_pipe_tx, media_pipe_tx }
+}
+
+/// Start the microphone renderer and the task that feeds it.
+///
+/// Runs in the Master because that is where the socket is and — measured, not
+/// assumed — because a Session 0 LocalSystem process can render into VB-CABLE
+/// and have a user-session application capture it at full amplitude. See
+/// `mic_probe`. The Master is also the process that never restarts, so the
+/// microphone survives the Worker respawns a sign-out causes.
+///
+/// Optional in every direction: no VB-CABLE, no renderer, no inbox, and mic
+/// datagrams are dropped in `rtp.rs` for the cost of a byte comparison.
+fn spawn_mic_passthrough(
+    endpoint_override: &str,
+    rtp_sender: Arc<Mutex<rtp::RtpSender>>,
+    sessions: Arc<echo::session::SessionManager>,
+) {
+    let sink = match mic::start(Some(endpoint_override)) {
+        Ok(sink) => sink,
+        Err(why) => {
+            // Not an error: a host without a virtual cable simply has no
+            // microphone passthrough, and everything else works unchanged.
+            println!("🎤 {why}");
+            return;
+        }
+    };
+
+    let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    rtp_sender.lock().unwrap().set_mic_inbox(mic_tx);
+
+    tokio::spawn(async move {
+        // Rate-limited, like the input path's: a spray of forged datagrams must
+        // not turn this into a log-flooding amplifier, and a real failure is a
+        // steady condition rather than an event.
+        let mut last_notice: Option<std::time::Instant> = None;
+        let mut report = tokio::time::interval(Duration::from_secs(10));
+        report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                received = mic_rx.recv() => {
+                    let Some(datagram) = received else { break };
+                    match sessions.open_sealed_mic(&datagram) {
+                        // The session mutex is already released — `open_sealed_mic`
+                        // returns the packet rather than rendering, so nothing is
+                        // held across the handoff to the render thread. That same
+                        // mutex is taken by `seal_video` for every video frame.
+                        Ok(Some(packet)) => sink.submit(packet),
+                        // Authentic but not new: a duplicate or a late arrival.
+                        Ok(None) => {}
+                        Err(why) => {
+                            if last_notice.map_or(true, |t: std::time::Instant| {
+                                t.elapsed() > Duration::from_secs(10)
+                            }) {
+                                println!("🚫 Echo microphone datagram refused: {why}");
+                                last_notice = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                }
+                _ = report.tick() => {
+                    // Both halves in one line, because they answer different
+                    // questions and are useless apart: the channel counters say
+                    // what the *network* delivered, the render counters say what
+                    // the *renderer* did with it. Silence with healthy network
+                    // counters is a renderer problem; the reverse is a path
+                    // problem. Silent when nothing is arriving.
+                    let r = mic::stats();
+                    if let Some((s, highest)) = sessions.mic_stats() {
+                        if s.applied > 0 && !r.running {
+                            // Audio is arriving and being authenticated, but the
+                            // renderer is not running — so it died, and every
+                            // packet since is going nowhere. Said explicitly
+                            // because the alternative evidence is silence, which
+                            // is also what "nobody is talking" looks like.
+                            println!(
+                                "🎤 Echo mic: {} packets arriving but the renderer is STOPPED — \
+                                 audio is being discarded",
+                                s.applied
+                            );
+                        } else if s.applied > 0 {
+                            println!(
+                                "🎤 Echo mic: {} applied, {} lost, {} late, {} reordered, {} refused \
+                                 | rendered {}, concealed {}, underran {}, paused {}, dropped {}, \
+                                 depth {} (worst {})",
+                                s.applied, s.lost(highest), s.late, s.reordered, s.rejected,
+                                r.rendered, r.concealed, r.underran, r.paused, r.dropped_late,
+                                r.depth, r.worst_depth,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Polls `ClientInfo` for the RTSP PLAY transition (the same trigger the

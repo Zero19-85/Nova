@@ -705,6 +705,25 @@ impl Handler {
                     req.params.get("input_batch").and_then(|v| v.as_u64()).unwrap_or(0),
                     req.params.get("input_batch_worst").and_then(|v| v.as_u64()).unwrap_or(0),
                 );
+                // The microphone's client half, printed only while a microphone
+                // is actually running so an ordinary session logs nothing extra.
+                //
+                // `worst_gap_ms` is the reason this is here at all: the host can
+                // see what *arrived*, but a phone whose encoder stalls and a path
+                // that drops packets produce the identical host-side symptom —
+                // sequences that never show up. Only the client can tell them
+                // apart, and only if it says so.
+                let mic_packets =
+                    req.params.get("mic_packets").and_then(|v| v.as_u64()).unwrap_or(0);
+                if mic_packets > 0 {
+                    println!(
+                        "🎤 Echo client mic: {mic_packets} packets, {} KiB sent, \
+                         {} refused, worst gap {}ms",
+                        req.params.get("mic_bytes").and_then(|v| v.as_u64()).unwrap_or(0) / 1024,
+                        req.params.get("mic_refused").and_then(|v| v.as_u64()).unwrap_or(0),
+                        req.params.get("mic_worst_gap_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                    );
+                }
                 RpcResponse::ok(id, json!({}))
             }
             "start_session" => self.handle_start_session(id, &req.params, identity),

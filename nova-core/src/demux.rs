@@ -45,6 +45,17 @@ pub const ECHO_CONTROL_ACK: u8 = 0xE2;
 /// Echo input: sealed client-to-host input, unreliable and unordered (see
 /// [`crate::input_channel`]).
 pub const ECHO_INPUT: u8 = 0xE3;
+/// Echo microphone: sealed client-to-host audio, unreliable (see
+/// [`crate::mic_channel`]).
+///
+/// Separate from [`ECHO_INPUT`] rather than sharing its tag even though both
+/// travel the same direction and are sealed the same way. Two reasons, and the
+/// second is the load-bearing one: they are consumed by different subsystems at
+/// wildly different rates, so a shared tag would force one dispatcher to
+/// re-inspect every datagram to find out which it had; and a single tag would
+/// mean a single stream id, which would let a captured input datagram be
+/// replayed into the audio path and vice versa.
+pub const ECHO_MIC: u8 = 0xE4;
 
 /// What a datagram arriving on the shared socket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +70,8 @@ pub enum Class {
     EchoControlAck,
     /// Sealed input travelling client → host.
     EchoInput,
+    /// Sealed microphone audio travelling client → host.
+    EchoMic,
     /// Anything else: Moonlight RTP, a client ping, or noise. Deliberately one
     /// bucket — Nova's existing paths already know how to tell those apart,
     /// and this classifier must not start second-guessing them.
@@ -78,6 +91,7 @@ pub fn classify(buf: &[u8]) -> Class {
         Some(&ECHO_CONTROL) => Class::EchoControl,
         Some(&ECHO_CONTROL_ACK) => Class::EchoControlAck,
         Some(&ECHO_INPUT) => Class::EchoInput,
+        Some(&ECHO_MIC) => Class::EchoMic,
         Some(&b) if b & 0xC0 == 0 => {
             // Leading bits say "could be STUN"; only the cookie settles it.
             // Without this check a stray datagram starting with a low byte
@@ -100,7 +114,11 @@ pub fn classify(buf: &[u8]) -> Class {
 pub fn is_echo(buf: &[u8]) -> bool {
     matches!(
         classify(buf),
-        Class::EchoMedia | Class::EchoControl | Class::EchoControlAck | Class::EchoInput
+        Class::EchoMedia
+            | Class::EchoControl
+            | Class::EchoControlAck
+            | Class::EchoInput
+            | Class::EchoMic
     )
 }
 
@@ -114,7 +132,7 @@ mod tests {
     /// session command.
     #[test]
     fn tags_cannot_collide_with_stun_or_rtp() {
-        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT] {
+        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC] {
             assert_eq!(tag & 0xC0, 0xC0, "Echo tags must live above RTP's range");
             assert_ne!(tag & 0xC0, 0x00, "…and outside STUN's");
             assert_ne!(tag & 0xC0, 0x80, "…and outside RTP version 2's");
@@ -149,7 +167,9 @@ mod tests {
         assert_eq!(classify(&[ECHO_CONTROL, 0, 0]), Class::EchoControl);
         assert_eq!(classify(&[ECHO_CONTROL_ACK, 0, 0]), Class::EchoControlAck);
         assert_eq!(classify(&[ECHO_INPUT, 0, 0]), Class::EchoInput);
+        assert_eq!(classify(&[ECHO_MIC, 0, 0]), Class::EchoMic);
 
+        assert!(is_echo(&[ECHO_MIC]));
         assert!(is_echo(&[ECHO_INPUT]));
         assert!(is_echo(&[ECHO_MEDIA]));
         assert!(is_echo(&[ECHO_CONTROL]));

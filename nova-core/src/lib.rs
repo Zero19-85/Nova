@@ -26,6 +26,11 @@
 //!   wants neither ordering nor retransmission, and imposing both on it made
 //!   the pointer lag seconds behind the hand; it gets redundancy and
 //!   deduplication instead.
+//! - [`mic_channel`] — sealed, unreliable microphone datagrams. A sibling of
+//!   [`input_channel`] that deliberately drops two of its decisions: audio
+//!   carries no state to strand, so it needs no redundancy, and a reordered
+//!   audio packet is still good, so it gets a sliding window rather than a
+//!   high-water mark.
 //! - [`punch`] — UDP hole punching (simultaneous open). Symmetric by nature:
 //!   both peers run the identical algorithm, which is the mechanism itself.
 //! - [`relay`] — the signaling-relay client. Nova and Echo are *both* clients
@@ -49,6 +54,7 @@ pub mod envelope;
 pub mod identity;
 pub mod input_channel;
 pub mod media_crypto;
+pub mod mic_channel;
 pub mod rudp;
 pub mod punch;
 pub mod relay;

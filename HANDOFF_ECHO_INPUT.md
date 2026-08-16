@@ -23,7 +23,11 @@ video 4ms (worst 29ms)
 
 **No known open bugs in Echo's input or video path.**
 
-**Not started:** microphone passthrough, gamepad input, host→client audio.
+**Microphone passthrough is DONE and live-confirmed (2026-08-16)** — the user
+held a conversation through it. See §8, which is now a record of what was built
+rather than a plan.
+
+**Not started:** gamepad input, host→client game audio (§10).
 
 ---
 
@@ -301,41 +305,172 @@ rather than disabling candidates one at a time.
 
 ---
 
-## 8. Next: microphone passthrough (Phase 7)
+## 8. Microphone passthrough (Phase 7) — DONE
 
-**Deliberately not started** at the tail of a heavy debugging session — that was
-a joint decision, not an omission.
+Phone mic → Opus → sealed UDP → Nova Master → decode + jitter buffer → WASAPI →
+**VB-CABLE**, selectable in Windows as "CABLE Output".
 
-**The hard constraint.** The bundled Virtual Audio Driver (VAD by MTT,
-`ROOT\VirtualAudioDriver`) **cannot load — CM_PROB 52.** Its `.sys`/`.cat` are
-validly code-signed (SignPath/GlobalSign) but **not Microsoft attestation-signed**,
-and kernel-mode audio drivers require attestation under Secure Boot. MttVDD loads
-fine because IddCx is user-mode. **Do not enable test-signing or disable Secure
-Boot to work around this.**
+**Live result, real conversation (2026-08-16):** 6601 packets, 13 lost (0.2%),
+every loss concealed, 0 late, 0 reordered, 0 refused, **`dropped 0`** (the
+clock-drift correction never fired in over two minutes), buffer depth 1–2
+packets (20–40 ms).
 
-**Therefore: VB-CABLE** is the endpoint. It is already the fallback ghost sink on
-this box, and `[audio] endpoint_override` in `nova.toml` is wired
-(`FindAudioDeviceByName` → `audio::set_sink_override`).
+### 8.1 The constraint that shaped it
 
-**Shape of the work.**
-- **Client:** Android `AudioRecord` (`VOICE_COMMUNICATION` for AEC/NS), Opus
-  encode, `RECORD_AUDIO` runtime permission, and the foreground service already
-  exists (`EchoService`, `mediaPlayback` — likely needs `microphone` added to
-  `foregroundServiceType`).
-- **Transport:** a fourth stream id alongside video/audio/input.
-  **Copy `nova_core::input_channel`'s pattern** — sealed with `SessionKeys` under
-  a new `STREAM_MIC`, unreliable. Mic is real-time and loss-tolerant; it must not
-  go anywhere near `rudp`. Note the nonce rule: a distinct stream id is what
-  keeps a captured datagram from being replayed into another path.
-- **Host:** decode and render into VB-CABLE's *input* endpoint via WASAPI, so
-  Windows apps select "CABLE Output" as their microphone.
-- **Ownership:** `audio.rs` is the sole owner of default-endpoint state
-  (`ORIGINAL_ENDPOINT`, claim-once). The mic path must not introduce a second
-  owner — that exact bug (dual cache-and-restore) is what Phase 15.1 fixed.
+The bundled Virtual Audio Driver (VAD by MTT, `ROOT\VirtualAudioDriver`)
+**cannot load — CM_PROB 52.** Its `.sys`/`.cat` are validly code-signed
+(SignPath/GlobalSign) but **not Microsoft attestation-signed**, and kernel-mode
+audio drivers require attestation under Secure Boot. MttVDD loads because IddCx
+is user-mode. **Do not enable test-signing or disable Secure Boot to work around
+this.** VB-CABLE is attestation-signed and installs normally; it is the endpoint.
 
-**Watch out for:** the shim's `InitAudioCapture`/`CleanupAudio` are
-process-global behind `SHIM_CAPTURE_ACTIVE`; the mic is a *render* path and
-should not touch that gate.
+### 8.2 THE MEASURED FACT — do not re-litigate
+
+**A LocalSystem process in Session 0 CAN render WASAPI audio that a
+user-session application captures at full amplitude.**
+
+This is the one place Session 0 did *not* cripple a subsystem, and it is the
+opposite of what this project's history would lead you to guess — WGC's broker
+refuses SYSTEM, `SendInput` is session-local, and UIPI silently swallowed
+injected input while returning success. It was **measured, not assumed**:
+`--mic-probe render` under a SYSTEM scheduled task, with `--mic-probe listen` in
+the interactive session, plus a user-session control run. Both heard the tone at
+peak 0.3500, identical.
+
+So the renderer lives in the **Master**, with no Worker IPC hop — and it inherits
+a real benefit: the Master never restarts, so the microphone survives the Worker
+respawns that sign-out and lock-screen transitions cause.
+
+The probe is kept, deliberately: `--mic-probe <render|listen|pipeline>` tests the
+whole audio stack — endpoint resolution, Opus decode, jitter buffer, WASAPI —
+with **no phone, no session, and no network**. `pipeline` drives the real
+renderer with real Opus. It costs nothing unless invoked.
+
+### 8.3 Transport: a sibling of `input_channel`, not a copy
+
+`nova_core::mic_channel`, tag `ECHO_MIC = 0xE4`, sealed under `STREAM_MIC = 4`.
+Two of `input_channel`'s decisions are **deliberately reversed**:
+
+- **No redundancy.** Input repeats the last 3 packets because a lost key-up
+  strands a key held on the host. Audio carries no state — a lost 20 ms packet
+  is 20 ms of concealment and the next one is already correct. Tripling the cost
+  of a phone's uplink forever to insure a loss that heals itself in a twentieth
+  of a second is a bad trade.
+- **A 64-packet sliding window, not a high-water mark.** Dropping anything
+  behind the mark is right for a pointer (an older delta describes a superseded
+  position) and wrong for audio: a packet that arrives late but ahead of playout
+  is perfectly good, and discarding it manufactures a gap the network did not
+  cause. `reordered`, `late`, and `duplicates` are reported separately.
+
+**Window placement runs only after authentication.** Advancing it on an
+unverified sequence would let anyone who can write to the socket push `highest`
+forward and make every genuine packet read as late — a whole-session denial of
+service for one forged datagram. There is a test for it.
+
+`STREAM_MIC` being distinct from `STREAM_INPUT` is what stops a captured mic
+datagram being replayed into the input path, where it would reach `SendInput` on
+a LocalSystem service. Tested in both directions.
+
+### 8.4 The codec-config trap — the AV1/DKIF bug in another codec
+
+**MediaCodec emits the Opus identification header, pre-skip, and seek pre-roll as
+`BUFFER_FLAG_CODEC_CONFIG` buffers before any audio.** Those are container
+metadata, not audio. The host feeds what it receives straight to an Opus decoder,
+so passing one along corrupts the stream with nothing in any log to say why.
+
+This is the *identical shape* to the AV1 failure that cost days: the NVIDIA SDK
+wrapper prepended an IVF file header and a 12-byte frame header to every AV1
+frame, Moonlight handed the payload to its decoder unchanged, and every frame was
+undecodable while H.264 and HEVC worked perfectly. The filter lives in
+`MicCapture.drainEncoder`, next to the flag, and drops with a log line.
+**General rule: check what a codec wraps its output in before trusting the
+bytes.**
+
+### 8.5 Why Opus is encoded in Kotlin, not Rust
+
+`audiopus` builds libopus from C via cmake, and cross-compiling that under
+`cargo-ndk` is the same fight the workspace manifest documents about
+`aws-lc-rs` — for a codec Android has had in MediaCodec since **API 29**.
+Encoding in Kotlin keeps `libecho.so` free of a new native dependency. The host
+decodes with `audiopus`, which it already links for GameStream audio.
+
+Note the floor: `minSdk` is 26 but the Opus **encoder** needs API 29. On an older
+device `MicCapture` reports the refusal in the overlay and the stream carries on
+without a microphone.
+
+### 8.6 The jitter buffer — three failure modes, three answers
+
+- **Gap** (packet lost, later ones present) → Opus concealment. Better than
+  silence, much better than skipping ahead.
+- **Starved** (nothing at all) → silence, deliberately *not* concealment.
+  Extrapolating through a long absence smears into a robotic artefact; the honest
+  rendering of "they stopped talking" is quiet.
+- **Clock drift** → the one with no natural bound. Phone and endpoint disagree by
+  parts per million, so the buffer walks one way until it is empty or seconds
+  deep. Corrected at the bound by dropping the **oldest** packet: the newest is
+  what the speaker just said, and the backlog in front of it is pure latency.
+
+The renderer is a plain OS thread, not a tokio task — it holds COM state with
+thread affinity and sleeps in fixed steps, and putting that on the shared runtime
+would let a stalled render step delay unrelated network work. That is the same
+coupling `learn_ticker` caused in §3.5.
+
+### 8.7 Ownership and routing
+
+`audio.rs` remains the sole owner of default-endpoint state
+(`ORIGINAL_ENDPOINT`, claim-once). The mic path **never touches it** — it opens
+its endpoint *by name*, so there is no second owner by construction. The shim's
+mic render holds its own COM state (`g_mic*`) and never touches
+`SHIM_CAPTURE_ACTIVE`, which guards *capture*: a stream starting must not tear
+down the microphone, or vice versa.
+
+`rtp.rs` routes `Class::EchoMic` to **its own channel**, never the control inbox.
+Two reasons, and both matter: `echo::transport`'s accept loop treats an
+unrecognised datagram from a new address as the opening of a TLS tunnel, so every
+mic packet from an unlatched peer would attempt a handshake; and putting a
+50-per-second decode-and-render job on the loop that carries input would make the
+microphone's cost part of input's latency budget — §3.5 again.
+
+`SessionManager::open_sealed_mic` **returns** the packet rather than rendering
+it, so the session mutex — the one `seal_video` takes for every video frame — is
+released before the handoff by construction.
+
+### 8.8 Telemetry, and a metric that lied
+
+`nova-service.log`, every 10 s while audio flows:
+```
+🎤 Echo mic: <n> applied, <n> lost, <n> late, <n> reordered, <n> refused
+   | rendered <n>, concealed <n>, underran <n>, paused <n>, dropped <n>, depth <n> (worst <n>)
+🎤 Echo client mic: <n> packets, <n> KiB sent, <n> refused, worst gap <n>ms
+```
+
+Both halves on purpose: network counters say what arrived, renderer counters say
+what was done with it, and the client line says whether the phone produced it at
+all. Silence with healthy network counters is a renderer problem; the reverse is
+a path problem; a large client-side `worst gap` is the phone's encoder stalling,
+which looks *identical* to packet loss from the host.
+
+**The first version counted `starved` as one number and a healthy two-minute
+conversation reported 1115 of them** — because an empty buffer is exactly what a
+pause between sentences looks like. Now split: **`underran`** (empty steps
+followed by more audio — the client was still talking and the buffer ran dry;
+**this is the one that means something is wrong**) and **`paused`** (the run
+lasted until the renderer idled — somebody stopped speaking). A run cannot be
+classified while it is happening, only by how it ends, which is why
+`SilenceRun` exists.
+
+### 8.9 Footguns guarded in code
+
+- **`[audio] endpoint_override` pointing at CABLE Input is refused at startup**,
+  with the reason. It is a reasonable-looking choice — VB-CABLE *is* a virtual
+  sink — and it would render every sound the host makes into the same cable the
+  microphone feeds, so the remote user hears the game as their own mic input.
+- **No VB-CABLE installed** → one log line, no renderer, no inbox, and mic
+  datagrams are dropped in `rtp.rs` for the cost of a byte comparison. The
+  feature is optional in every direction.
+- **Mute fully releases `AudioRecord`** rather than gating the send: Android
+  keeps the mic indicator lit for an open recorder, and a muted app that keeps
+  the light on is lying to the user.
 
 ---
 
@@ -361,11 +496,68 @@ should not touch that gate.
 | `android/.../StreamSurfaceView.kt` | `onHoverEvent`, `emitRelativeSamples`, capture diagnosis, film attempts |
 | `android/.../MainActivity.kt` | capture state that survives the panel, telemetry line |
 
-**Tests:** 50 echo-client + 73 nova-core + 85 nova-server, all green.
-`cargo test --workspace` still fails on `echo-android` (Android-target cdylib run
-on the Windows host) — pre-existing, which is why it is excluded from
-`default-members`.
+### Microphone (Phase 7)
 
-**Deploy:** `cargo build --release -p nova-server`, stop `NovaService`, copy the
-exe, start it — **and assert the deployed timestamp matches the source**, which
-has silently shipped a stale binary once.
+| File | What |
+|---|---|
+| `nova-core/src/mic_channel.rs` | **new** — sealed unreliable mic datagrams, sliding window |
+| `nova-core/src/demux.rs` | `ECHO_MIC = 0xE4`, `Class::EchoMic` |
+| `nova-core/src/media_crypto.rs` | `STREAM_MIC = 4` |
+| `nova-server/shim/audio_shim.cpp` | `FindEndpointByName`, `InitMicRender`/`RenderMicFrames`/`CleanupMicRender`, probe capture |
+| `nova-server/src/mic.rs` | **new** — Opus decode, jitter buffer, drift correction, render thread |
+| `nova-server/src/mic_probe.rs` | **new** — `--mic-probe render\|listen\|pipeline` |
+| `nova-server/src/echo/session.rs` | `open_sealed_mic`, per-session `MicReceiver` |
+| `nova-server/src/rtp.rs` | `mic_inbox`, `Class::EchoMic` routing |
+| `nova-server/src/lib.rs` | `spawn_mic_passthrough`, `🎤 Echo mic` telemetry |
+| `nova-server/src/echo/rpc.rs` | client-side mic stats in `client_stats` |
+| `echo-client/src/mic.rs` | **new** — client counters, worst inter-packet gap |
+| `echo-client/src/session.rs` | `Uplink` struct, mic send task |
+| `echo-android/src/lib.rs` | `nativeSendMic` (direct ByteBuffer), mic channel |
+| `android/.../MicCapture.kt` | **new** — AudioRecord + MediaCodec Opus, codec-config filter |
+| `android/.../EchoController.kt`, `MainActivity.kt`, `EchoService.kt`, `AndroidManifest.xml` | lifecycle, toggle, permission, FGS type |
+
+**Tests:** 241 green across the workspace (13 echo-android + 51 echo-client +
+89 nova-core + 88 nova-server).
+
+⚠️ **Correction to an earlier note in this file.** It used to say
+`cargo test --workspace` fails on `echo-android` because an Android-target cdylib
+was being run on the Windows host. **That was wrong.** The real cause was a stale
+test fixture — `DecodedFrame.first_shard_at` was added to `echo-client` and
+`echo-android/src/frames.rs`'s helper was never updated. One line; its 13 tests
+now run on the host like any other crate. The crate is still excluded from
+`default-members`, but for the feature-unification reason the workspace manifest
+gives, not this one.
+
+**Deploy:** `cargo build --release -p nova-server`, stop `NovaService`, copy
+**both** `nova-server.exe` and `nova_shim.dll`, start it — **and assert the
+deployed timestamps match the source**, which has silently shipped a stale binary
+once. When the shim changes, also grep the built DLL for the new export names
+before trusting it.
+
+⚠️ **Do not deploy while a session is live.** Deploying restarts `NovaService`,
+which kills the stream — including a microphone conversation in progress.
+
+---
+
+## 10. Next: host game audio — the "House Party" bug
+
+The physical PC speakers blast game audio during a stream. The fix is a ghost
+sink: switch the default render endpoint so Windows migrates application streams
+off the speakers, and loopback-capture that sink for the stream. **This machinery
+already exists** (Phase 15.1/15.6: `audio::SinkGuard`, `arm_endpoint_restore`,
+`ORIGINAL_ENDPOINT` claim-once, `IPolicyConfig::SetDefaultEndpoint` across all
+three ERoles). Audit before re-implementing — that mistake was already made once.
+
+**The one hard rule this phase adds: the ghost sink must NOT be VB-CABLE.**
+The microphone renders *into* CABLE Input. Routing host audio there too puts the
+game into the same cable the phone's voice feeds, so the remote user hears the
+game as their own microphone — and with "Listen to this device" enabled anywhere,
+a feedback loop. `mic.rs::collides_with_ghost_sink` already refuses this at
+startup with an explanation; do not weaken it, and do not work around it.
+
+**Planned sink preference, in order:** `Steam Streaming Speakers` →
+`NVIDIA Virtual Audio` → anything the operator names in `[audio]
+endpoint_override`. Both of the first two are present on the dev box; the
+built-in list in `audio_shim.cpp` (`kVirtualSinkNames`) already carries Steam's
+and would need `CABLE Input` **removed** or the resolver taught to exclude the
+mic's endpoint, or the ghost sink will pick the cable by itself.

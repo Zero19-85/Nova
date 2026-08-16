@@ -245,9 +245,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut sink,
                 &mut progress,
                 stop_rx,
-                // The headless CLI has no window to read input from; it exists
-                // to prove the media path, not to drive the host.
-                None,
+                // The headless CLI has no window to read input from and no
+                // microphone to open; it exists to prove the media path, not to
+                // drive the host.
+                session::Uplink::none(),
             )
             .await?;
 

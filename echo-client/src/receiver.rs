@@ -543,11 +543,12 @@ pub async fn demultiplex(
                                     return Ok(());
                                 }
                             }
-                            // Input only ever travels client → host, so one
-                            // arriving here is our own datagram reflected by a
-                            // middlebox or someone probing. Either way there is
-                            // no receiver for it on this side.
-                            Class::EchoInput => {}
+                            // Input and microphone audio only ever travel
+                            // client → host, so one arriving here is our own
+                            // datagram reflected by a middlebox or someone
+                            // probing. Either way there is no receiver for it
+                            // on this side.
+                            Class::EchoInput | Class::EchoMic => {}
                             // The host's STUN keepalives and punch probes, plus
                             // internet noise.
                             Class::Stun | Class::Other => {}

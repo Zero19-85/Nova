@@ -43,7 +43,7 @@ class EchoService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // API 34+ requires the type at startForeground time, and it must be
             // covered by a matching <service android:foregroundServiceType>.
-            startForeground(ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            startForeground(ID, notification, foregroundTypes())
         } else {
             startForeground(ID, notification)
         }
@@ -51,6 +51,29 @@ class EchoService : Service() {
         // native handle anyway. Being restarted without one would put up a
         // notification for a stream that does not exist.
         return START_NOT_STICKY
+    }
+
+    /**
+     * The foreground types this service may legally claim right now.
+     *
+     * `microphone` is added only when `RECORD_AUDIO` has actually been granted.
+     * API 34+ throws a `SecurityException` for a type whose permission the app
+     * does not hold, so claiming it unconditionally would crash every session on
+     * a device where the user declined the microphone — turning an optional
+     * feature into a fatal one.
+     *
+     * The consequence worth knowing: a user who grants the permission *after*
+     * the service is running gets the upgraded type only when the service is
+     * started again, which [EchoController] does at that moment.
+     */
+    private fun foregroundTypes(): Int {
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        val granted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        return types
     }
 
     private fun buildNotification(): Notification {
