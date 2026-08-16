@@ -116,12 +116,18 @@ class GameAudioPlayer(
                 fail("this device cannot play 48 kHz stereo")
                 return
             }
-            // Four frames of headroom over the platform minimum. The track
-            // buffer is the shock absorber for *this thread's* scheduling, which
-            // is a separate problem from network jitter — that one is already
-            // absorbed in Rust. Sizing it much larger would only add latency
-            // that the jitter buffer has no way to claw back.
-            val bufferBytes = maxOf(minBuffer, BYTES_PER_FRAME * 4)
+            // Two frames over the platform minimum, down from four.
+            //
+            // This buffer is the shock absorber for *this thread's* scheduling
+            // only — network jitter is already absorbed in Rust — and every byte
+            // of it is A/V sync error, because video has no matching queue. Four
+            // frames was 80 ms of pure audio delay bought against a hazard the
+            // `new track underruns` counter says never materialised.
+            //
+            // Kept at two rather than one: the floor still has to cover a single
+            // missed wake-up, and an underrun is an audible click where 20 ms of
+            // extra delay is not.
+            val bufferBytes = maxOf(minBuffer, BYTES_PER_FRAME * 2)
 
             track = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -139,6 +145,22 @@ class GameAudioPlayer(
                 )
                 .setBufferSizeInBytes(bufferBytes)
                 .setTransferMode(AudioTrack.MODE_STREAM)
+                // Ask for the platform's fast mixer path.
+                //
+                // This is the largest single term in audio latency and the one
+                // least visible from inside the app: the ordinary mixer path
+                // adds output latency of its own — commonly 50-150 ms depending
+                // on the device — on top of everything this code can see. The
+                // fast path typically cuts that to tens of milliseconds.
+                //
+                // A request, not a guarantee: the platform grants it only for a
+                // track whose format matches the mixer's native rate and whose
+                // buffer is near the minimum, which is why the sizing above
+                // matters for more than just delay. If it is refused the track
+                // still works exactly as before, so there is no fallback to
+                // write — but `latency` in the 10 s report is how you tell,
+                // rather than assuming it was granted.
+                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .build()
 
             if (track.state != AudioTrack.STATE_INITIALIZED) {
@@ -342,6 +364,26 @@ class GameAudioPlayer(
                     // and "frozen" reads as "fine" at a glance. Rates are what
                     // this question is actually about.
                     val underruns = runCatching { track.underrunCount }.getOrDefault(-1)
+
+                    // Measured audio latency, end to end on this side.
+                    //
+                    // `getTimestamp` reports which frame the DAC is actually
+                    // playing, so the difference against what has been written
+                    // is everything downstream of this loop — the track buffer
+                    // AND the device output latency that no API exposes
+                    // directly. Add the jitter buffer's own depth and the total
+                    // is how far behind live the audio is, which is exactly the
+                    // number an A/V sync complaint is about.
+                    //
+                    // Measured rather than computed from the constants, because
+                    // the device term is unknown at build time and is usually
+                    // the largest of them.
+                    val outputMs = runCatching {
+                        val ts = android.media.AudioTimestamp()
+                        if (track.getTimestamp(ts)) {
+                            (samplesWritten - ts.framePosition) * 1000 / SAMPLE_RATE
+                        } else -1L
+                    }.getOrDefault(-1L)
                     var arrived = -1L
                     var drift = -1L
                     var depth = -1L
@@ -362,12 +404,19 @@ class GameAudioPlayer(
                     // playout consumed. Both should read 500. Which one is short
                     // says which side of the link to look at, and the previous
                     // report could not distinguish them at all.
+                    // Jitter depth is latency too — it is audio held back on
+                    // purpose — so the total is what to compare against video,
+                    // not the output term alone.
+                    val jitterMs = if (depth >= 0) depth * FRAME_MS else -1
+                    val totalMs = if (outputMs >= 0 && jitterMs >= 0) outputMs + jitterMs else -1
+
                     Log.i(
                         TAG,
                         "audio/10s: arrived $arrived/500, played $steps/500 | " +
                             "$silences silence, $conceals concealed, $dropped held, " +
                             "$drift drift-dropped, $shed shed, depth $depth, " +
-                            "${underruns - lastUnderruns} new track underruns"
+                            "${underruns - lastUnderruns} new track underruns | " +
+                            "latency ${totalMs}ms (output ${outputMs}ms + jitter ${jitterMs}ms)"
                     )
                     lastUnderruns = underruns.toLong()
                     steps = 0; silences = 0; conceals = 0; dropped = 0
