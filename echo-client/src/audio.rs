@@ -102,6 +102,21 @@ const QUIET_PACKET_BYTES: usize = 120;
 /// and a full buffer returns to target in a few seconds.
 const SHED_INTERVAL_STEPS: u64 = 25;
 
+/// How long to hold out for a genuinely quiet packet before shedding a loud
+/// one: 250 steps, five seconds.
+///
+/// The quiet-only policy is right but incomplete, and a live run proved it —
+/// `depth 12, shed 0` for a whole track, 240 ms of latency the shedder watched
+/// and never touched, because continuous music never produces a packet under
+/// [`QUIET_PACKET_BYTES`]. A rule that can only act during a lull cannot help
+/// content that has none.
+///
+/// So after this long above target, any packet will do. That trades a rare,
+/// single 20 ms discontinuity for a permanent quarter-second of delay, which is
+/// the right way round: the click happens once and is gone, while the latency
+/// stays for the length of the track and shows up as lip-sync error.
+const SHED_PATIENCE_STEPS: u64 = 250;
+
 /// Playout step: one host packet per step in the steady state.
 pub const STEP: Duration = Duration::from_millis(20);
 
@@ -340,10 +355,14 @@ impl AudioBuffer {
         // over a few seconds rather than jumping.
         self.steps_since_shed += 1;
         if self.packets.len() > TARGET_DEPTH && self.steps_since_shed >= SHED_INTERVAL_STEPS {
+            // Prefer a lull, but do not wait forever for one. Five seconds above
+            // target with no quiet packet means the content has none, and the
+            // latency is not going to shed itself.
+            let out_of_patience = self.steps_since_shed >= SHED_PATIENCE_STEPS;
             let quiet = self
                 .packets
                 .get(&self.next_seq)
-                .is_some_and(|p| p.len() <= QUIET_PACKET_BYTES);
+                .is_some_and(|p| p.len() <= QUIET_PACKET_BYTES || out_of_patience);
             if quiet {
                 self.packets.remove(&self.next_seq);
                 self.next_seq = self.next_seq.wrapping_add(1);
@@ -764,6 +783,38 @@ mod tests {
             buf.stats().shed,
             0,
             "latency must be paid rather than stolen from audible content"
+        );
+    }
+
+    /// ...but not forever. A live run sat at `depth 12, shed 0` for a whole
+    /// track: continuous music never produces a quiet packet, so a lull-only
+    /// shedder watched 240 ms of latency and never touched it. After
+    /// SHED_PATIENCE_STEPS the buffer sheds anyway — one 20 ms discontinuity
+    /// once, against a quarter-second of lip-sync error for the whole track.
+    #[test]
+    fn loud_audio_is_shed_eventually_rather_than_holding_the_latency_forever() {
+        let (mut tx, mut buf, _) = primed();
+        let loud = vec![0u8; QUIET_PACKET_BYTES + 1];
+
+        for _ in 0..MAX_DEPTH {
+            let d = tx.datagram(&loud).unwrap();
+            buf.accept(&d).unwrap();
+        }
+        let deep = buf.stats().depth;
+        assert!(deep as usize > TARGET_DEPTH);
+
+        // Long enough to run out of patience several times over.
+        for _ in 0..SHED_PATIENCE_STEPS * 4 {
+            let d = tx.datagram(&loud).unwrap();
+            buf.accept(&d).unwrap();
+            buf.next_step();
+        }
+
+        assert!(buf.stats().shed > 0, "the latency was never given back");
+        assert!(
+            buf.stats().depth < deep,
+            "depth {} did not fall from {deep}",
+            buf.stats().depth
         );
     }
 

@@ -1,5 +1,6 @@
 package com.nova.echo
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -71,6 +72,7 @@ import kotlin.concurrent.thread
  * a game-streaming client, and the reason it is not done.
  */
 class GameAudioPlayer(
+    private val context: Context,
     private val handle: Long,
     private val onError: (String) -> Unit,
 ) {
@@ -167,6 +169,41 @@ class GameAudioPlayer(
                 fail("could not open the audio output")
                 return
             }
+
+            // Now TRIM the buffer, because asking for a small one at build time
+            // does not get you one.
+            //
+            // Measured: we requested two frames (1920 frames, 40 ms) and the
+            // platform allocated 13440 frames — 280 ms — and reported the fast
+            // path granted anyway. `setBufferSizeInBytes` is a floor and an
+            // allocation hint, not a limit, so a small request is simply
+            // rounded up and silently ignored.
+            //
+            // `setBufferSizeInFrames` is the actual lever: it caps how much of
+            // the ALLOCATED buffer the client may fill, which is what the
+            // hardware drains and therefore what the latency is. It can only
+            // shrink, never grow past the allocation, so it is safe to ask for
+            // a small number and take what is given.
+            //
+            // The floor is the device's own burst size, not a figure of ours.
+            // Below one burst the mixer cannot be serviced without underrunning,
+            // and PROPERTY_OUTPUT_FRAMES_PER_BUFFER is the platform telling us
+            // exactly where that line is — the same number the fast path is
+            // built around. Two bursts, or two 20 ms frames, whichever is more.
+            val burst = runCatching {
+                val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                am.getProperty(android.media.AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+                    ?.toIntOrNull() ?: 0
+            }.getOrDefault(0)
+
+            val wanted = maxOf(SAMPLES_PER_FRAME * 2, burst * 2)
+            val granted = runCatching { track.setBufferSizeInFrames(wanted) }.getOrDefault(-1)
+            Log.i(
+                TAG,
+                "track buffer: allocated ${track.bufferCapacityInFrames} frames, " +
+                    "asked for $wanted (device burst $burst), now ${track.bufferSizeInFrames} " +
+                    "= ${track.bufferSizeInFrames * 1000 / SAMPLE_RATE}ms (setBufferSizeInFrames -> $granted)"
+            )
 
             codec = MediaCodec.createByCodecName(findOpusDecoder()!!)
             codec.configure(decoderFormat(), null, null, 0)

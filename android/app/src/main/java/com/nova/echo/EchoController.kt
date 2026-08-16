@@ -219,7 +219,7 @@ class EchoController(private val context: android.content.Context) {
         // microphone it simply starts with the stream. Safe here even though the
         // grant has only just landed: an unarmed buffer answers `AUDIO_IDLE` and
         // the loop idles until packets actually arrive.
-        val audio = GameAudioPlayer(h) { message ->
+        val audio = GameAudioPlayer(context, h) { message ->
             // Losing audio is not losing the session — the picture keeps
             // running, so this reports in its own field rather than as `error`.
             post { it.copy(audioActive = false, audioProblem = message) }
