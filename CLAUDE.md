@@ -1,5 +1,39 @@
 # Nova Project Documentation & Instructions
 
+## ⚠️ READ FIRST — this file covers the Nova HOST only
+
+The repo is a **Cargo workspace**, not a single crate: `nova-core`,
+`nova-server`, `nova-relay`, `echo-client`, `echo-android`, plus an `android/`
+Gradle project. Everything below describes the Nova host (`nova-server`) and is
+accurate for it.
+
+**Echo — Nova's own native client — is not documented here.** It has its own
+handoffs, and they are the authority for anything client-side:
+
+| Doc | Covers |
+|---|---|
+| `HANDOFF_ECHO_P2P.md` | hole punching, relay signalling, sealed media, RUDP |
+| `HANDOFF_ECHO_ANDROID.md` | the Android app, JNI surface, NDK toolchain |
+| `HANDOFF_ECHO_INPUT.md` | mouse/keyboard, latency diagnosis, microphone passthrough |
+| `HANDOFF_ECHO_AUDIO.md` | downstream game audio, ghost-sink isolation, A/V sync engine |
+
+**Host-side changes Echo made that ARE in this file's territory:**
+
+- **`audio_shim.cpp`'s ghost-sink resolver is now two lists** (2026-08-16).
+  `kGhostSinkNames` is an ordered preference for where host audio may be *sent*
+  (Steam Streaming Speakers → NVIDIA Virtual Audio); `kNotPlaybackNames` is a
+  superset used only negated, for where crash recovery may restore the default
+  output. **VB-CABLE is deliberately absent from the first and present in the
+  second** — the Echo microphone renders into it, and a ghost sink on the same
+  cable feeds game audio back to the remote user as their own microphone.
+  Deleting it from one shared list would have moved the bug, not fixed it.
+- **The Master forks audio at the `AudioFrame` hop** (`lib.rs`). The RTP:48000
+  path Moonlight uses is untouched; a sealed copy additionally goes to any live
+  Echo session. Capture and encode are shared wholesale — Echo added framing.
+- **Echo sessions negotiate 20 ms audio frames** where Moonlight negotiates 5.
+  This is per-Worker-session, so a Moonlight client sharing the pipeline gets
+  20 ms too — accepted deliberately over transcoding the same audio twice.
+
 ## Project Scope
 Nova is an ultra-low footprint, native Rust game-streaming host.
 **Goal:** Flawlessly mimic GeForce Experience so Moonlight clients can connect.
@@ -32,7 +66,22 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Phase 16 — **ALPHA 2.0** — Session-Survival Architecture: Master/Worker split, lock-screen streaming + remote PIN entry (2026-08-06)
+## Current Phase: Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
+
+Nova's own client now carries game audio downstream and the phone's microphone
+upstream, synchronised. Host-side impact is summarised at the top of this file;
+the engineering record is `HANDOFF_ECHO_AUDIO.md`. Nova host work is unchanged
+since Phase 16 below.
+
+Final measured audio latency on the reference device: **190 ms** — 60 jitter,
+40 track buffer, 20 decoder, ~70 device output stage. Most of that is a hardware
+floor, so **video is delayed to meet it** rather than audio hurried; the sync
+engine tracks the measurement automatically and is off by default because it
+buys sync with input latency.
+
+---
+
+## Phase 16 — **ALPHA 2.0** — Session-Survival Architecture: Master/Worker split, lock-screen streaming + remote PIN entry (2026-08-06)
 
 Alpha 2.0's headline: **reboot → connect from Moonlight → see the Windows login screen → type the PIN with the remote mouse/keyboard.** All items below are live-confirmed on the dev box unless marked otherwise.
 

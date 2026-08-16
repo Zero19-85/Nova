@@ -27,7 +27,11 @@ video 4ms (worst 29ms)
 held a conversation through it. See §8, which is now a record of what was built
 rather than a plan.
 
-**Not started:** gamepad input, host→client game audio (§10).
+**Host→client game audio and A/V sync are DONE (2026-08-16)** — see
+`HANDOFF_ECHO_AUDIO.md`. §10 below is kept as the record of what was predicted
+before that work started.
+
+**Not started:** gamepad input over Echo.
 
 ---
 
@@ -539,7 +543,20 @@ which kills the stream — including a microphone conversation in progress.
 
 ---
 
-## 10. Next: host game audio — the "House Party" bug
+## 10. Host game audio — the "House Party" bug — **DONE (2026-08-16)**
+
+> **This section is now history.** Downstream game audio, ghost-sink isolation
+> and the A/V sync engine all shipped and are live-confirmed — see
+> **`HANDOFF_ECHO_AUDIO.md`**, which supersedes everything below and records the
+> four bugs, the 190 ms latency budget, and the sync engine.
+>
+> The prediction below turned out correct on both counts: the ghost-sink
+> machinery *did* already exist and needed auditing rather than rebuilding, and
+> `CABLE Input` *was* still in `kVirtualSinkNames` and had to come out. What the
+> note did not anticipate is that removing it from that one list would have
+> **moved** the bug — `FindRealAudioDevice` selected by negating the same list,
+> so the cable would have become somewhere crash recovery restores the default
+> output onto. The list is now two lists.
 
 The physical PC speakers blast game audio during a stream. The fix is a ghost
 sink: switch the default render endpoint so Windows migrates application streams

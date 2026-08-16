@@ -2,8 +2,12 @@
 
 > **Historical document.** This is the original design blueprint, kept for reference.
 > The project has long since shipped past it — see [README.md](README.md) for current
-> status (Phase 15: HDR10, AV1, secure-desktop capture, SYSTEM service, lock-screen
-> streaming) and `CLAUDE.md` for the full engineering log.
+> status (Nova Phase 16: lock-screen streaming and remote PIN entry on a
+> Master/Worker split; Echo E9: its own Android client with input, two-way audio
+> and an A/V sync engine) and `CLAUDE.md` for the full engineering log.
+>
+> Echo, which appears below only as an ambition, now exists: `HANDOFF_ECHO_P2P.md`,
+> `HANDOFF_ECHO_ANDROID.md`, `HANDOFF_ECHO_INPUT.md`, `HANDOFF_ECHO_AUDIO.md`.
 
 **Target Ecosystem:** High-Performance, Ultra-Low Footprint Game-Streaming (GameStream/Moonlight)  
 **Core Language:** 100% Native Rust Engine with bare-metal C++ Hardware Shims

@@ -43,6 +43,61 @@ Alpha 2.0's headline feature is **full lock-screen streaming**: reboot the host,
 
 ---
 
+## Echo — Nova's own client
+
+Everything above is Nova serving **Moonlight**, and it still does. Echo is a
+second, parallel path: Nova's own native client, built so the host can be
+reached over the internet without port forwarding and so features Moonlight's
+protocol has no room for can exist at all.
+
+Echo runs over **one hole-punched UDP path**, with every datagram sealed under
+per-session AES-128-GCM keys exchanged over TLS. It shares Nova's capture,
+encoder and audio pipeline wholesale — Echo added framing, not media.
+
+| Capability | Status |
+|---|---|
+| NAT hole punching + relay signalling (no port forwarding) | ✅ Working |
+| Per-session sealed media (AES-128-GCM, FEC over ciphertext) | ✅ Working |
+| Android client — HEVC via MediaCodec onto a SurfaceView | ✅ Working |
+| GameStream PIN pairing from the client, RSA-2048 identity | ✅ Working |
+| Mouse (relative + absolute) and keyboard, own unreliable channel | ✅ Working |
+| **Microphone passthrough — the phone becomes the PC's mic** | ✅ Working |
+| **Game audio downstream — host → client, Opus, jitter-buffered** | ✅ Working |
+| **A/V sync engine — video delayed to meet audio's hardware floor** | ✅ Working |
+| Gamepad over Echo | 🔜 Planned |
+
+### Audio, both directions
+
+Upstream (**phone mic → PC**) renders into VB-CABLE and appears in Windows as
+"CABLE Output" — any application can select it. Downstream (**PC → phone**)
+carries the same Opus the GameStream path encodes, sealed onto Echo's own
+channel because an Echo client listens on nothing but its punched path.
+
+The two are kept apart by construction: the microphone renders into VB-CABLE,
+and the game-audio ghost sink resolver refuses to select it. Pointing both at
+one cable would feed the game back to the remote user as their own microphone.
+
+### A/V sync
+
+Audio latency on the reference device measures **190 ms** — 40 ms track buffer,
+20 ms decoder, ~70 ms device output stage, plus 60–80 ms of jitter buffer. Most
+of that is a hardware floor: the fast mixer path is already granted and the
+jitter depth is burst insurance that measurement showed was necessary.
+
+Audio cannot be pulled forward, so **video is pushed back** to meet it. The
+client holds each frame a measured interval past its arrival, tracking the audio
+pipeline's own latency reading automatically.
+
+**It is off by default**, because it buys sync with input latency — a delayed
+frame is a delayed view of your own mouse. Right for watching something, wrong
+for playing something. The toggle lives in the stream's control panel and says
+so.
+
+Details, and the bugs that shaped all of it, are in `HANDOFF_ECHO_AUDIO.md`,
+`HANDOFF_ECHO_INPUT.md`, `HANDOFF_ECHO_P2P.md` and `HANDOFF_ECHO_ANDROID.md`.
+
+---
+
 ## Architecture
 
 Nova runs as **three cooperating processes**, each holding exactly the privileges its job requires. This is not incidental complexity — Windows makes it mandatory, and each boundary below exists because a single-process design provably cannot cross it:
@@ -264,6 +319,9 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 - **Cursor on the secure desktop** is blended manually on the DDA path (all shape types, SDR + HDR); minor visual differences vs. DWM compositing are possible during UAC/lock-screen interludes.
 - **Bundled Virtual Audio Driver (MTT) cannot load** under Secure Boot — it is code-signed but not Microsoft attestation-signed (device problem code 52). Steam Streaming Speakers or VB-CABLE serve as the ghost sink instead; do not work around this by disabling Secure Boot.
 - **Scheduled-task deployment** (`--install`) still works but cannot capture the secure desktop or lock screen, and does not get the Master/Worker split — the service deployment is required for those.
+- **Echo's client has no Opus packet-loss concealment.** Android's `MediaCodec` exposes no concealment entry point, so a lost audio packet is a 20 ms gap rather than an extrapolated one. Loss is reported separately from silence so the two are never confused. Software PLC is on the backlog.
+- **Echo's A/V sync costs input latency** when enabled — it works by holding video back. Off by default; leave it off while playing.
+- **Echo game audio requires a virtual sink** (Steam Streaming Speakers or NVIDIA Virtual Audio). Without one the host has no ghost sink to capture and the stream is silent. VB-CABLE is deliberately excluded from that list — it is the microphone's endpoint.
 
 ---
 
@@ -282,3 +340,13 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 | 15 | Secure-desktop capture (WGC↔DDA), SYSTEM launcher service, audio single-owner, AV1 | ✅ Complete |
 | **16** | **Master/Worker split, lock-screen streaming + remote PIN entry (SYSTEM input helper), strict frame pacing, universal VDD app routing** | ✅ **Alpha 2.0** |
 | 17 | Sign-out stream recovery, AV1 Main10/HDR, attestation-signed audio driver | 🔜 Planned |
+
+Echo's own track, numbered separately because it is a parallel product:
+
+| Phase | Description | State |
+|---|---|---|
+| E1–E5 | Hole punching, relay signalling, sealed media, RUDP tunnel, keyframe gate | ✅ Complete |
+| E6 | Android client — JNI bridge, MediaCodec decode, PIN pairing | ✅ Complete |
+| E7 | Mouse + keyboard input, own unreliable channel; microphone passthrough | ✅ Complete |
+| **E8–E9** | **Ghost-sink isolation, downstream game audio, A/V sync engine** | ✅ **Complete** |
+| E10 | Gamepad over Echo; software Opus PLC on the client | 🔜 Planned |
