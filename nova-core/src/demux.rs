@@ -56,6 +56,18 @@ pub const ECHO_INPUT: u8 = 0xE3;
 /// mean a single stream id, which would let a captured input datagram be
 /// replayed into the audio path and vice versa.
 pub const ECHO_MIC: u8 = 0xE4;
+/// Echo game audio: sealed host-to-client audio, unreliable (see
+/// [`crate::audio_channel`]).
+///
+/// The only Echo tag that travels host → client besides media, and it is
+/// separate from [`ECHO_MEDIA`] rather than multiplexed into it for the reason
+/// the microphone is separate from input: a client that folded audio into the
+/// video path would pay audio's decode cost inside video's latency budget, and
+/// the two are consumed by different tasks at different rates. Separate from
+/// [`ECHO_MIC`] because they are opposite directions of travel sealed under
+/// different stream ids — sharing a tag would let a captured downstream frame be
+/// replayed upstream as microphone input.
+pub const ECHO_AUDIO: u8 = 0xE5;
 
 /// What a datagram arriving on the shared socket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +84,8 @@ pub enum Class {
     EchoInput,
     /// Sealed microphone audio travelling client → host.
     EchoMic,
+    /// Sealed game audio travelling host → client.
+    EchoAudio,
     /// Anything else: Moonlight RTP, a client ping, or noise. Deliberately one
     /// bucket — Nova's existing paths already know how to tell those apart,
     /// and this classifier must not start second-guessing them.
@@ -92,6 +106,7 @@ pub fn classify(buf: &[u8]) -> Class {
         Some(&ECHO_CONTROL_ACK) => Class::EchoControlAck,
         Some(&ECHO_INPUT) => Class::EchoInput,
         Some(&ECHO_MIC) => Class::EchoMic,
+        Some(&ECHO_AUDIO) => Class::EchoAudio,
         Some(&b) if b & 0xC0 == 0 => {
             // Leading bits say "could be STUN"; only the cookie settles it.
             // Without this check a stray datagram starting with a low byte
@@ -119,6 +134,7 @@ pub fn is_echo(buf: &[u8]) -> bool {
             | Class::EchoControlAck
             | Class::EchoInput
             | Class::EchoMic
+            | Class::EchoAudio
     )
 }
 
@@ -132,7 +148,7 @@ mod tests {
     /// session command.
     #[test]
     fn tags_cannot_collide_with_stun_or_rtp() {
-        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC] {
+        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO] {
             assert_eq!(tag & 0xC0, 0xC0, "Echo tags must live above RTP's range");
             assert_ne!(tag & 0xC0, 0x00, "…and outside STUN's");
             assert_ne!(tag & 0xC0, 0x80, "…and outside RTP version 2's");
@@ -168,13 +184,27 @@ mod tests {
         assert_eq!(classify(&[ECHO_CONTROL_ACK, 0, 0]), Class::EchoControlAck);
         assert_eq!(classify(&[ECHO_INPUT, 0, 0]), Class::EchoInput);
         assert_eq!(classify(&[ECHO_MIC, 0, 0]), Class::EchoMic);
+        assert_eq!(classify(&[ECHO_AUDIO, 0, 0]), Class::EchoAudio);
 
         assert!(is_echo(&[ECHO_MIC]));
+        assert!(is_echo(&[ECHO_AUDIO]));
         assert!(is_echo(&[ECHO_INPUT]));
         assert!(is_echo(&[ECHO_MEDIA]));
         assert!(is_echo(&[ECHO_CONTROL]));
         assert!(!is_echo(b"PING"));
         assert!(!is_echo(&[]));
+    }
+
+    /// Every tag must be distinct. Asserted rather than eyeballed because the
+    /// values are assigned by hand in a list that only ever grows, and a
+    /// duplicate would silently route one stream into another's decoder.
+    #[test]
+    fn every_echo_tag_is_unique() {
+        let tags = [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO];
+        let mut seen = tags.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), tags.len(), "two Echo tags share a value");
     }
 
     #[test]

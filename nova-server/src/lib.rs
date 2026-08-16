@@ -1168,6 +1168,10 @@ async fn media_supervisor(
     let mut frame_rx: Option<mpsc::UnboundedReceiver<std::io::Result<ipc::MediaMsg>>> = None;
     let mut video_learned = false;
     let mut first_idr_forwarded = false;
+    // Throttle for the Echo audio send-failure notice. A dead path fails on
+    // every packet, and at 50 packets a second an unthrottled log line is an
+    // amplifier rather than a diagnostic.
+    let mut audio_send_failed_at: Option<Instant> = None;
     loop {
         tokio::select! {
             maybe_pipe = pipe_rx.recv() => {
@@ -1258,6 +1262,39 @@ async fn media_supervisor(
                         // learned a target (via the client's audio pings on
                         // port 48000, independent of the video target).
                         audio_tx.lock().unwrap().send_frame(&data);
+
+                        // Fork, don't switch. The Worker captures the ghost sink
+                        // and encodes Opus once; both wires carry those same
+                        // bytes. Moonlight's path above is untouched, and an
+                        // Echo client gets the packet sealed on its punched path
+                        // because it listens on nothing else — port 48000 is a
+                        // socket it never opened.
+                        //
+                        // Unlike video, this is NOT sealed before RtpSender:
+                        // audio is one packet per frame with no sharding and no
+                        // FEC, so there is nothing for parity to cover and no
+                        // reassembly to authenticate after. It goes out whole.
+                        if let Some(sessions) = echo_sessions.as_ref() {
+                            // Seal under the lock, send outside it — the guard
+                            // is dropped by the time send_raw runs, so a slow
+                            // socket can never stall a video frame's seal.
+                            if let Some((datagram, peer)) = sessions.seal_audio(&data) {
+                                if let Err(e) =
+                                    rtp_sender.lock().unwrap().send_raw(&datagram, peer)
+                                {
+                                    // Rate-limited: a broken path fails on every
+                                    // packet 50 times a second, and the video
+                                    // stream's own telemetry will already be
+                                    // saying the same thing far more loudly.
+                                    if audio_send_failed_at
+                                        .is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(10))
+                                    {
+                                        println!("🔇 Echo audio send to {peer} failed: {e}");
+                                        audio_send_failed_at = Some(Instant::now());
+                                    }
+                                }
+                            }
+                        }
                     }
                     Some(Err(e)) => {
                         println!("🔌 Master: worker media pipe closed/errored ({e}) — waiting for next worker");

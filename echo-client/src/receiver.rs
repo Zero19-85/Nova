@@ -549,6 +549,17 @@ pub async fn demultiplex(
                             // probing. Either way there is no receiver for it
                             // on this side.
                             Class::EchoInput | Class::EchoMic => {}
+                            // Downstream game audio. The host seals and sends
+                            // these as of Stage 1; nothing on this side opens
+                            // them yet, so they are dropped here deliberately
+                            // rather than by omission — Stage 2 routes this arm
+                            // to its own task and jitter buffer.
+                            //
+                            // Dropping is the correct interim behaviour: the
+                            // channel is unreliable by design, so a client that
+                            // ignores it costs the host nothing and the stream
+                            // behaves exactly as it did before audio existed.
+                            Class::EchoAudio => {}
                             // The host's STUN keepalives and punch probes, plus
                             // internet noise.
                             Class::Stun | Class::Other => {}

@@ -443,7 +443,15 @@ impl RtpSender {
                 // Our own media echoed back by a misconfigured middlebox, or a
                 // spoof. Either way it is not a client ping and must not become
                 // the send target.
-                nova_core::demux::Class::EchoMedia => continue,
+                //
+                // Game audio belongs here for the same reason and one stronger:
+                // it only ever travels host → client, so a datagram carrying
+                // that tag ARRIVING at the host did not come from a legitimate
+                // Echo client. Dropped without reaching any inbox — there is no
+                // host-side receiver for it to reach, and letting it fall
+                // through to `latest` would let a replay of our own audio
+                // nominate the sender as the video target.
+                nova_core::demux::Class::EchoMedia | nova_core::demux::Class::EchoAudio => continue,
                 nova_core::demux::Class::Other => {}
             }
             latest = Some(addr);

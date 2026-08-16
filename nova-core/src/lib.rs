@@ -49,6 +49,7 @@
 //! run on, which is the practical reason the boundary is enforced rather than
 //! merely intended.
 
+pub mod audio_channel;
 pub mod demux;
 pub mod envelope;
 pub mod identity;

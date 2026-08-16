@@ -341,6 +341,15 @@ pub struct EchoSession {
     /// into this one. Its window is separate from the input receiver's because
     /// the two streams have independent sequence spaces.
     mic: nova_core::mic_channel::MicReceiver,
+    /// Sealer for this session's downstream game audio.
+    ///
+    /// Per-session like the two receivers above, and for one extra reason of its
+    /// own: it owns the sequence counter for the Echo audio wire, which is
+    /// deliberately **not** `audio::AudioTxState`'s. That one numbers the
+    /// GameStream stream on port 48000 and keeps advancing whenever a Moonlight
+    /// client is being served — sharing it would punch gaps in this stream that
+    /// the client reads as packet loss it never suffered.
+    audio: nova_core::audio_channel::AudioSender,
 }
 
 impl EchoSession {
@@ -352,6 +361,20 @@ impl EchoSession {
     /// here rather than being re-derived at the call site later.
     pub fn seal_video(&self, wire_index: u32, frame_type: u8, frame: &[u8]) -> Vec<u8> {
         self.keys.seal(STREAM_VIDEO, wire_index, frame_type, frame)
+    }
+
+    /// Seal one encoded audio packet for this session.
+    ///
+    /// Takes `&mut self` where [`seal_video`](Self::seal_video) does not, because
+    /// the sequence lives here rather than being supplied by the caller. Video's
+    /// wire index is chosen by the Worker's encoder and must be echoed exactly —
+    /// it is the NVENC timestamp reference invalidation targets. Audio has no
+    /// such external anchor, so this side owns the numbering.
+    fn seal_audio(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, nova_core::audio_channel::AudioError> {
+        self.audio.datagram(payload)
     }
 
     fn grant(&self) -> SessionGrant {
@@ -496,7 +519,23 @@ impl MediaPlane for WorkerMediaPlane {
             rikeyid,
             host_audio: params.host_audio,
             audio_encryption: true,
-            audio_packet_duration_ms: 5,
+            // 20 ms, where a Moonlight session negotiates 5 ms.
+            //
+            // GameStream picks 5 ms to keep audio latency under its FEC, and
+            // that is the right trade on a LAN socket with no per-packet crypto.
+            // Echo's audio is a sealed datagram: every packet pays a 16-byte GCM
+            // tag plus 6 bytes of header, so 5 ms frames would put 200
+            // datagrams/second on the punched path to carry roughly 80 bytes of
+            // Opus each — more overhead than payload. 20 ms matches what the
+            // microphone already proved comfortable in the other direction and
+            // cuts the packet rate fourfold.
+            //
+            // This is per-Worker-session, not per-client: a Moonlight client
+            // sharing the pipeline with an Echo session gets 20 ms frames too.
+            // Accepted deliberately — 20 ms is a normal Opus frame and
+            // moonlight-common-c handles it; the alternative is transcoding the
+            // same audio twice.
+            audio_packet_duration_ms: 20,
             packet_size: params.packet_size,
             min_fec_packets: params.min_fec_packets,
             start_frame_index: 1,
@@ -580,6 +619,41 @@ impl SessionManager {
         let guard = self.active.lock().unwrap();
         let session = guard.as_ref()?;
         Some(session.seal_video(wire_index, frame_type, frame))
+    }
+
+    /// Seal one encoded audio packet if an Echo session owns the pipeline,
+    /// returning it with the address to send it to.
+    ///
+    /// Returns `None` when no Echo session holds the pipeline — the answer on
+    /// every packet of every Moonlight session, reached without taking a lock.
+    ///
+    /// **Returns the datagram rather than sending it**, which is the same
+    /// discipline `open_sealed_mic` follows and for the same reason: the mutex
+    /// this takes is the one `seal_video` takes for every video frame, so
+    /// holding it across a socket write would put the network's worst moment
+    /// inside the frame path. The caller sends after the guard drops.
+    ///
+    /// The sealing itself stays inside the lock because it must: it advances the
+    /// session's sequence counter, and two callers interleaving there would
+    /// either reuse a GCM nonce or emit sequences out of order.
+    pub fn seal_audio(&self, payload: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+        if !self.echo_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut guard = self.active.lock().unwrap();
+        let session = guard.as_mut()?;
+        let peer = session.peer;
+        match session.seal_audio(payload) {
+            Ok(datagram) => Some((datagram, peer)),
+            Err(why) => {
+                // Reachable only for an empty or oversized payload — a bug in
+                // the encoder's output, not a network event. No sequence was
+                // consumed, so this shows up as a missing packet rather than as
+                // loss (see `AudioSender::datagram`).
+                println!("🔇 Echo audio packet not sealed: {why}");
+                None
+            }
+        }
     }
 
     /// Who owns the pipeline right now.
@@ -689,6 +763,7 @@ impl SessionManager {
             started: Instant::now(),
             input: nova_core::input_channel::InputReceiver::new(keys.clone()),
             mic: nova_core::mic_channel::MicReceiver::new(keys.clone()),
+            audio: nova_core::audio_channel::AudioSender::new(keys.clone()),
             keys,
             rikey,
             rikeyid,
@@ -1316,6 +1391,62 @@ mod tests {
             f.mgr.seal_video(2, 2, b"moonlight again").is_none(),
             "a finished session must stop sealing immediately"
         );
+    }
+
+    /// Audio sealing follows video's gate exactly: silent for Moonlight, active
+    /// for Echo, and stops the instant the session does.
+    #[test]
+    fn audio_sealing_is_a_no_op_without_an_echo_session() {
+        let f = fixture(Some(peer()));
+        assert!(f.mgr.seal_audio(b"moonlight opus").is_none());
+
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let (datagram, to) = f.mgr.seal_audio(b"echo opus").expect("sealed while active");
+        assert_eq!(datagram[0], nova_core::demux::ECHO_AUDIO);
+        assert_eq!(to, peer(), "audio must go to the session's punched peer");
+        assert!(
+            !datagram.windows(9).any(|w| w == b"echo opus"),
+            "the payload must not appear in the clear"
+        );
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        assert!(f.mgr.seal_audio(b"after the end").is_none());
+    }
+
+    /// The property the separate counter exists for, asserted end-to-end rather
+    /// than trusted: audio numbering must start at 1 and advance by 1 per packet
+    /// **regardless of how many video frames were sealed in between**. If the two
+    /// ever shared a counter, interleaving video would punch gaps in the audio
+    /// sequence, and the client would read those gaps as packet loss and conceal
+    /// audio that was never lost.
+    #[test]
+    fn audio_sequence_is_independent_of_the_video_wire() {
+        let f = fixture(Some(peer()));
+        let grant = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        // The client's own view: opened with the keys it was granted, so this
+        // exercises the real cross-process contract rather than internal state.
+        let keys = SessionKeys::from_hex(&grant.keys_hex).expect("grant keys parse");
+        let mut rx = nova_core::audio_channel::AudioReceiver::new(keys);
+
+        for wire_index in 1..=10u32 {
+            // A burst of video between every audio packet — the realistic ratio
+            // is roughly two video frames per 20 ms audio packet.
+            f.mgr.seal_video(wire_index, 1, b"a video frame").expect("echo session seals");
+            f.mgr.seal_video(wire_index + 100, 1, b"another").expect("echo session seals");
+
+            let (datagram, _) = f.mgr.seal_audio(b"opus packet").expect("sealed");
+            let opened = rx.open(&datagram).expect("opens").expect("is new");
+            assert_eq!(
+                opened.seq, wire_index,
+                "audio sequence must count audio packets, not video frames"
+            );
+        }
+
+        let stats = rx.stats();
+        assert_eq!(stats.accepted, 10);
+        assert_eq!(stats.lost(rx.highest_sequence()), 0, "a gap here is invented loss");
+        assert_eq!(stats.reordered, 0);
     }
 
     /// A failure inside the media plane must not leave a phantom session
