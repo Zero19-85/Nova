@@ -454,6 +454,7 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
                 "audio_underran": play.underran,
                 "audio_paused": play.paused,
                 "audio_dropped": play.dropped_late,
+                "audio_shed": play.shed,
                 "audio_depth": play.depth,
                 "audio_worst_depth": play.worst_depth,
                 // Network side.

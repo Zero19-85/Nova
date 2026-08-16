@@ -177,6 +177,7 @@ class GameAudioPlayer(
             // Previous cumulative reads, so the report can print rates.
             var lastAccepted = 0L
             var lastDropped = 0L
+            var lastShed = 0L
             var lastUnderruns = 0L
 
             while (running) {
@@ -344,13 +345,16 @@ class GameAudioPlayer(
                     var arrived = -1L
                     var drift = -1L
                     var depth = -1L
+                    var shed = -1L
                     runCatching {
                         val j = org.json.JSONObject(EchoNative.nativeStats(handle))
                         arrived = j.optLong("audio_accepted") - lastAccepted
                         drift = j.optLong("audio_dropped") - lastDropped
+                        shed = j.optLong("audio_shed") - lastShed
                         depth = j.optLong("audio_depth")
                         lastAccepted += arrived
                         lastDropped += drift
+                        lastShed += shed
                     }
 
                     // The two rates that answer everything, side by side.
@@ -362,7 +366,7 @@ class GameAudioPlayer(
                         TAG,
                         "audio/10s: arrived $arrived/500, played $steps/500 | " +
                             "$silences silence, $conceals concealed, $dropped held, " +
-                            "$drift drift-dropped, depth $depth, " +
+                            "$drift drift-dropped, $shed shed, depth $depth, " +
                             "${underruns - lastUnderruns} new track underruns"
                     )
                     lastUnderruns = underruns.toLong()

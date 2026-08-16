@@ -75,6 +75,33 @@ pub const START_DEPTH: usize = 4;
 /// listener pays for.
 pub const MAX_DEPTH: usize = 14;
 
+/// The depth playout tries to sit at once it is running.
+///
+/// [`START_DEPTH`] is where playout *begins*; this is where it *stays*. They are
+/// the same number, but they answer different questions and a later retune may
+/// want them apart.
+pub const TARGET_DEPTH: usize = START_DEPTH;
+
+/// Largest packet, in bytes, that counts as a quiet moment.
+///
+/// The host encodes with `Application::LowDelay` and never disables VBR, so
+/// libopus spends bits in proportion to what the audio is doing: a 20 ms frame
+/// of stereo at 128 kbps averages around 320 bytes, and near-silence collapses
+/// to a few dozen. Packet size is therefore a free, decoder-free proxy for
+/// loudness — which is what makes [`AudioBuffer::next_step`]'s latency shedding
+/// inaudible rather than merely infrequent.
+///
+/// Deliberately well under the average: this must never fire on ordinary
+/// content, only on a genuine lull.
+const QUIET_PACKET_BYTES: usize = 120;
+
+/// Shed at most one packet per this many steps: 500 ms.
+///
+/// Gradual on purpose. Shedding a whole backlog at once would be a large jump
+/// forward in the audio; spread out, each 20 ms of skipped quiet is inaudible
+/// and a full buffer returns to target in a few seconds.
+const SHED_INTERVAL_STEPS: u64 = 25;
+
 /// Playout step: one host packet per step in the steady state.
 pub const STEP: Duration = Duration::from_millis(20);
 
@@ -124,6 +151,13 @@ pub struct PlayoutStats {
     /// Packets discarded to claw back latency. A steadily rising count is clock
     /// drift; a burst is a network stall that delivered late.
     pub dropped_late: u64,
+    /// Quiet packets skipped to walk the buffer back down to [`TARGET_DEPTH`].
+    ///
+    /// Counted apart from [`Self::dropped_late`] because they are the opposite
+    /// kind of event: a drift drop is a hard 20 ms excision wherever it lands,
+    /// while these are chosen for being inaudible. A healthy session sheds a few
+    /// after each network hiccup and none the rest of the time.
+    pub shed: u64,
     /// Packets held right now.
     pub depth: u64,
     /// The deepest the buffer has ever been.
@@ -179,6 +213,9 @@ pub struct AudioBuffer {
     next_seq: u32,
     silence: SilenceRun,
     idle: bool,
+    /// Steps since the last quiet packet was shed, rate-limiting the walk back
+    /// down to [`TARGET_DEPTH`].
+    steps_since_shed: u64,
     stats: PlayoutStats,
 }
 
@@ -191,6 +228,7 @@ impl AudioBuffer {
             next_seq: 0,
             silence: SilenceRun::default(),
             idle: true,
+            steps_since_shed: 0,
             stats: PlayoutStats::default(),
         }
     }
@@ -283,6 +321,35 @@ impl AudioBuffer {
             self.stats.dropped_late += (stale - self.packets.len()) as u64;
             self.next_seq = start;
             self.playing = true;
+        }
+
+        // Latency shedding — the buffer's way back DOWN to target.
+        //
+        // Without this the depth only ever ratchets up. Arrival and playout
+        // rates are identical in the steady state, so whatever depth a burst or
+        // a loss event leaves behind is kept forever: a live run sat at 13 of a
+        // maximum 14 for eighty seconds, which is 260 ms of latency bought by
+        // one Wi-Fi hiccup a minute earlier and never given back. MAX_DEPTH is
+        // no help — it is a ceiling, not a spring.
+        //
+        // So when we are above target, and the packet due right now is quiet
+        // enough to be a lull, it is skipped and the next one plays in its
+        // place. That is a true splice: no hole is left behind, so nothing is
+        // concealed and the listener hears 20 ms less of a silence they were
+        // never attending to. Rate-limited so a deep buffer walks back to target
+        // over a few seconds rather than jumping.
+        self.steps_since_shed += 1;
+        if self.packets.len() > TARGET_DEPTH && self.steps_since_shed >= SHED_INTERVAL_STEPS {
+            let quiet = self
+                .packets
+                .get(&self.next_seq)
+                .is_some_and(|p| p.len() <= QUIET_PACKET_BYTES);
+            if quiet {
+                self.packets.remove(&self.next_seq);
+                self.next_seq = self.next_seq.wrapping_add(1);
+                self.stats.shed += 1;
+                self.steps_since_shed = 0;
+            }
         }
 
         if let Some(payload) = self.packets.remove(&self.next_seq) {
@@ -617,9 +684,13 @@ mod tests {
             buf.next_step();
         }
 
+        // Loud payloads, so latency shedding stays out of this test: it is about
+        // whether the WINDOW fits a burst, not about what the buffer does when
+        // it is deep and the music happens to be quiet.
+        let loud = vec![b'x'; QUIET_PACKET_BYTES + 1];
         for _ in 0..30 {
             for _ in 0..6 {
-                let d = tx.datagram(b"burst").unwrap();
+                let d = tx.datagram(&loud).unwrap();
                 buf.accept(&d).unwrap();
             }
             for _ in 0..6 {
@@ -632,6 +703,68 @@ mod tests {
 
         assert_eq!(buf.stats().dropped_late, 0, "and must never overflow it either");
         assert_eq!(buf.stats().concealed, 0);
+    }
+
+    /// A buffer left deep by a hiccup must walk back down to target on its own.
+    ///
+    /// The live failure: one Wi-Fi loss burst left depth at 13 of a maximum 14,
+    /// and it stayed there for eighty seconds — 260 ms of latency bought once
+    /// and never given back, because arrival and playout rates are identical and
+    /// MAX_DEPTH is a ceiling rather than a spring.
+    #[test]
+    fn a_deep_buffer_walks_back_down_to_target_during_quiet() {
+        let (mut tx, mut buf, _) = primed();
+        let quiet = vec![0u8; QUIET_PACKET_BYTES];
+
+        // A hiccup mid-playback: a stalled path delivers its backlog at once.
+        // Depth can only get deep this way — a buffer that starts fresh trims to
+        // START_DEPTH, so the deep state is always something that happens later.
+        for _ in 0..MAX_DEPTH {
+            let d = tx.datagram(&quiet).unwrap();
+            buf.accept(&d).unwrap();
+        }
+        assert!(buf.stats().depth as usize > TARGET_DEPTH, "the hiccup left it deep");
+
+        // Play on, one arrival per step, exactly as the steady state does.
+        for _ in 0..SHED_INTERVAL_STEPS * (MAX_DEPTH as u64) {
+            let d = tx.datagram(&quiet).unwrap();
+            buf.accept(&d).unwrap();
+            buf.next_step();
+        }
+
+        assert!(
+            buf.stats().depth as usize <= TARGET_DEPTH + 1,
+            "depth {} never came back to target {TARGET_DEPTH}",
+            buf.stats().depth,
+        );
+        assert!(buf.stats().shed > 0);
+        assert_eq!(buf.stats().concealed, 0, "shedding must leave no hole to conceal");
+    }
+
+    /// And the property that keeps it inaudible: it must NOT fire on real
+    /// content, however deep the buffer gets. A loud packet is never skipped.
+    #[test]
+    fn latency_shedding_never_touches_loud_audio() {
+        let (mut tx, mut buf, _) = primed();
+        let loud = vec![0u8; QUIET_PACKET_BYTES + 1];
+
+        for _ in 0..MAX_DEPTH {
+            let d = tx.datagram(&loud).unwrap();
+            buf.accept(&d).unwrap();
+        }
+        assert!(buf.stats().depth as usize > TARGET_DEPTH);
+
+        for _ in 0..SHED_INTERVAL_STEPS * 4 {
+            let d = tx.datagram(&loud).unwrap();
+            buf.accept(&d).unwrap();
+            buf.next_step();
+        }
+
+        assert_eq!(
+            buf.stats().shed,
+            0,
+            "latency must be paid rather than stolen from audible content"
+        );
     }
 
     /// The reversal `audio_channel` implements, proven at the buffer: a packet
