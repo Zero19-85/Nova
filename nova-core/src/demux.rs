@@ -42,6 +42,9 @@ pub const ECHO_MEDIA: u8 = 0xE0;
 pub const ECHO_CONTROL: u8 = 0xE1;
 /// Acknowledgement of a control frame.
 pub const ECHO_CONTROL_ACK: u8 = 0xE2;
+/// Echo input: sealed client-to-host input, unreliable and unordered (see
+/// [`crate::input_channel`]).
+pub const ECHO_INPUT: u8 = 0xE3;
 
 /// What a datagram arriving on the shared socket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,8 @@ pub enum Class {
     EchoControl,
     /// Acknowledgement of a control frame.
     EchoControlAck,
+    /// Sealed input travelling client → host.
+    EchoInput,
     /// Anything else: Moonlight RTP, a client ping, or noise. Deliberately one
     /// bucket — Nova's existing paths already know how to tell those apart,
     /// and this classifier must not start second-guessing them.
@@ -72,6 +77,7 @@ pub fn classify(buf: &[u8]) -> Class {
         Some(&ECHO_MEDIA) => Class::EchoMedia,
         Some(&ECHO_CONTROL) => Class::EchoControl,
         Some(&ECHO_CONTROL_ACK) => Class::EchoControlAck,
+        Some(&ECHO_INPUT) => Class::EchoInput,
         Some(&b) if b & 0xC0 == 0 => {
             // Leading bits say "could be STUN"; only the cookie settles it.
             // Without this check a stray datagram starting with a low byte
@@ -94,7 +100,7 @@ pub fn classify(buf: &[u8]) -> Class {
 pub fn is_echo(buf: &[u8]) -> bool {
     matches!(
         classify(buf),
-        Class::EchoMedia | Class::EchoControl | Class::EchoControlAck
+        Class::EchoMedia | Class::EchoControl | Class::EchoControlAck | Class::EchoInput
     )
 }
 
@@ -108,7 +114,7 @@ mod tests {
     /// session command.
     #[test]
     fn tags_cannot_collide_with_stun_or_rtp() {
-        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK] {
+        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT] {
             assert_eq!(tag & 0xC0, 0xC0, "Echo tags must live above RTP's range");
             assert_ne!(tag & 0xC0, 0x00, "…and outside STUN's");
             assert_ne!(tag & 0xC0, 0x80, "…and outside RTP version 2's");
@@ -142,7 +148,9 @@ mod tests {
         assert_eq!(classify(&[ECHO_MEDIA, 0, 0]), Class::EchoMedia);
         assert_eq!(classify(&[ECHO_CONTROL, 0, 0]), Class::EchoControl);
         assert_eq!(classify(&[ECHO_CONTROL_ACK, 0, 0]), Class::EchoControlAck);
+        assert_eq!(classify(&[ECHO_INPUT, 0, 0]), Class::EchoInput);
 
+        assert!(is_echo(&[ECHO_INPUT]));
         assert!(is_echo(&[ECHO_MEDIA]));
         assert!(is_echo(&[ECHO_CONTROL]));
         assert!(!is_echo(b"PING"));

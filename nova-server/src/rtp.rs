@@ -150,6 +150,31 @@ pub struct RtpSender {
     spare_bufs: Vec<Vec<u8>>,
     /// Buffers currently owned by the worker (queued or being sent).
     bufs_in_flight: usize,
+    /// Set while a newly-started Echo session is waiting for the Worker to
+    /// finish applying its `ConfigureStart`; frames are dropped until then.
+    ///
+    /// Retargeting is instant but reconfiguration is not: `pin_target` makes an
+    /// Echo peer the destination immediately, while the Worker still has to
+    /// rebind capture and rebuild NVENC. Frames encoded with the *previous*
+    /// session's settings are addressed to the new client in that window. Live
+    /// 2026-08-15: a 4K HDR10 Main10 Moonlight session handing over to a
+    /// 1080p SDR Echo session sent P010 frames to a decoder configured for 8-bit
+    /// NV12 — "blinding light and smearing of blue", clearing only on reconnect
+    /// (by which time the Worker had caught up).
+    ///
+    /// Holds the instant it was armed so the hold can **fail open** — a Worker
+    /// that never reports a matching config must not silence the stream forever.
+    config_hold: Option<Instant>,
+    /// Address and arrival time of the most recent datagram of ANY kind seen on
+    /// the media port.
+    ///
+    /// Echo's control tunnel needs this because a healthy Echo session is
+    /// *silent on the control channel*: its keepalive is a raw `b"PING"` on the
+    /// media socket, which classifies as `Other` and never reaches the control
+    /// inbox. Judging tunnel liveness by control traffic alone therefore reaps
+    /// sessions that are streaming perfectly — observed live 2026-08-15 as a
+    /// black screen exactly 30 s in. See `echo::transport`'s idle sweep.
+    last_rx: Option<(SocketAddr, Instant)>,
     /// Highest wire frame index queued this client session (0 = none yet).
     /// Master reads it to stamp `ConfigureStart::start_frame_index` so a
     /// replacement Worker adopted mid-session continues the client's frame
@@ -210,6 +235,8 @@ impl RtpSender {
             buf_rx,
             spare_bufs: Vec::new(),
             bufs_in_flight: 0,
+            config_hold: None,
+            last_rx: None,
             last_sent_index: 0,
             stun_inbox: None,
             echo_inbox: None,
@@ -340,6 +367,11 @@ impl RtpSender {
         let mut buf = [0u8; 1500];
         let mut latest = None;
         while let Ok((n, addr)) = self.recv_socket.recv_from(&mut buf) {
+            // Liveness is recorded for EVERY datagram, before classification and
+            // regardless of what it turns out to be — an Echo keepalive is a
+            // raw `b"PING"` that classifies as `Other`, and Echo's control
+            // tunnel judges its peer alive from exactly this.
+            self.last_rx = Some((addr, Instant::now()));
             // STUN and RTP/ping traffic share this port. They are bitwise
             // unambiguous — STUN's leading two bits are always 00, RTP carries
             // version 2 (0x80) — and `is_stun_message` also checks the magic
@@ -357,8 +389,13 @@ impl RtpSender {
                     // server's address would send the whole video stream to it.
                     continue;
                 }
+                // Input rides the same inbox as control. It is neither
+                // acknowledged nor ordered (see `nova_core::input_channel`), so
+                // it does not belong to the RUDP tunnel — `echo::transport`
+                // splits the two by class on arrival.
                 nova_core::demux::Class::EchoControl
-                | nova_core::demux::Class::EchoControlAck => {
+                | nova_core::demux::Class::EchoControlAck
+                | nova_core::demux::Class::EchoInput => {
                     if let Some(inbox) = &self.echo_inbox {
                         let _ = inbox.send((buf[..n].to_vec(), addr));
                     }
@@ -386,6 +423,67 @@ impl RtpSender {
             return Some(addr);
         }
         None
+    }
+
+    /// Longest a stream may be held waiting for `WorkerConfigured`. Generous
+    /// next to an observed reconfiguration (capture rebind + NVENC rebuild),
+    /// but short enough that failing open costs a moment of bad picture rather
+    /// than a dead session.
+    const CONFIG_HOLD_MAX: Duration = Duration::from_secs(5);
+
+    /// Drop frames until the Worker confirms it applied the new configuration.
+    ///
+    /// See [`config_hold`](Self::config_hold) for why. Dropping is the right
+    /// response rather than buffering: these frames are encoded wrong for this
+    /// client, so the best of them is worthless, and the client's own keyframe
+    /// gate already expects to wait for an IDR.
+    pub fn hold_until_configured(&mut self) {
+        self.config_hold = Some(Instant::now());
+    }
+
+    /// Release a [`hold_until_configured`](Self::hold_until_configured) hold.
+    ///
+    /// The caller MUST request an IDR after this: with an infinite GOP the
+    /// keyframe that followed reconfiguration may already have been dropped by
+    /// the hold, and the next one only arrives on request — so without it the
+    /// client waits forever on a keyframe that is never coming.
+    pub fn release_config_hold(&mut self) -> bool {
+        self.config_hold.take().is_some()
+    }
+
+    /// True while frames should be dropped. Fails open past
+    /// [`CONFIG_HOLD_MAX`].
+    fn config_held(&mut self) -> bool {
+        match self.config_hold {
+            Some(since) if since.elapsed() <= Self::CONFIG_HOLD_MAX => true,
+            Some(_) => {
+                println!(
+                    "⚠️  RTP: worker never confirmed its configuration within {}s — \
+                     releasing the hold and sending anyway",
+                    Self::CONFIG_HOLD_MAX.as_secs()
+                );
+                self.config_hold = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// How long since a datagram of any kind arrived from `peer`, or `None` if
+    /// the most recent one came from somewhere else.
+    ///
+    /// Deliberately reports only the single most recent sender rather than
+    /// keeping a per-address table: the media port is internet-reachable, so a
+    /// map keyed by source address is a memory footgun a scanner can pull. The
+    /// one caller (Echo's tunnel sweep) asks about a peer that pings every
+    /// 500 ms while its window of interest is 30 s, so "the last datagram was
+    /// somebody else's" is both rare and safe — it only falls back to the
+    /// stricter control-traffic test.
+    pub fn idle_since(&self, peer: SocketAddr) -> Option<Duration> {
+        match self.last_rx {
+            Some((addr, at)) if addr == peer => Some(at.elapsed()),
+            _ => None,
+        }
     }
 
     pub fn set_fps(&mut self, fps: u32) {
@@ -441,6 +539,15 @@ impl RtpSender {
     pub fn send_frame(&mut self, frame_index: u32, data: &[u8], frame_type: u8) -> bool {
         if data.is_empty() || self.target.is_none() {
             return true; // nothing to send / nobody to send to — not a drop
+        }
+
+        // This frame was encoded for the PREVIOUS session's configuration and
+        // would decode as garbage on the new client. Reported as sent, not as a
+        // drop: a `false` here makes the caller request an IDR, and an IDR
+        // encoded with the wrong configuration is exactly what we are trying to
+        // keep off the wire.
+        if self.config_held() {
+            return true;
         }
 
         // Harvest buffers the worker has finished with.
@@ -1008,6 +1115,50 @@ mod tests {
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
+    /// A granted Echo session is silent on its control tunnel — its only
+    /// heartbeat is a raw `b"PING"` on the media socket, which classifies as
+    /// `Other`. Echo's tunnel sweep asks `idle_since` whether the peer is alive,
+    /// so a pinned target (the state an Echo session puts this sender in) must
+    /// still record liveness even though it refuses to *adopt* the sender.
+    ///
+    /// Live regression: judging tunnel liveness by control traffic alone reaped
+    /// a perfectly working stream at exactly 30 s (2026-08-15).
+    #[test]
+    fn a_ping_from_a_pinned_echo_peer_still_counts_as_liveness() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let echo_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = echo_peer.local_addr().unwrap();
+
+        // An Echo session pins the target to its punched peer.
+        sender.pin_target(peer_addr);
+
+        assert!(
+            sender.idle_since(peer_addr).is_none(),
+            "nothing heard yet, so there is no liveness to report"
+        );
+
+        ping(&echo_peer, dst, 3);
+        assert!(
+            sender.try_learn_target().is_none(),
+            "a pinned sender must never re-adopt a target from inbound pings"
+        );
+
+        let idle = sender
+            .idle_since(peer_addr)
+            .expect("the peer's ping must register as liveness despite the pin");
+        assert!(
+            idle < Duration::from_secs(5),
+            "just-received ping should read as ~0s idle, got {idle:?}"
+        );
+
+        let stranger: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(
+            sender.idle_since(stranger).is_none(),
+            "liveness must be attributed to the sender we actually heard from"
+        );
+    }
+
     #[test]
     fn reconnect_learns_new_port_not_stale_backlog() {
         let mut sender = RtpSender::new(0).expect("bind ephemeral");
@@ -1113,6 +1264,68 @@ mod tests {
     /// permanent-black-after-sign-out/upgrade bug, live 2026-08-10). The
     /// keepalive retransmit of an OLD IDR must not walk it backwards, and
     /// `reset()` must return it to 0 so a fresh session starts at 1 again.
+    /// Retargeting is instant; the Worker's reconfiguration is not. Frames
+    /// encoded for the previous session must not reach the new client in that
+    /// window — live 2026-08-15, a 4K HDR10 Main10 session handing over to a
+    /// 1080p SDR Echo client produced "blinding light and smearing of blue"
+    /// (P010 decoded as 8-bit NV12).
+    #[test]
+    fn frames_encoded_before_the_worker_reconfigured_are_not_sent() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        sender.pin_target(peer);
+        sender.hold_until_configured();
+
+        // A stale-config IDR, exactly the frame that used to poison the decoder.
+        assert!(
+            sender.send_frame(1, &[0u8; 256], 2),
+            "a held frame must not report as a drop — a drop makes the caller \
+             request an IDR, which would be encoded with the same wrong config"
+        );
+        assert_eq!(
+            sender.last_sent_index(),
+            0,
+            "nothing may reach the wire while the worker is still reconfiguring"
+        );
+
+        assert!(sender.release_config_hold(), "the hold was armed, so releasing reports true");
+        assert!(
+            !sender.release_config_hold(),
+            "releasing twice must report false so the caller only requests one IDR"
+        );
+
+        assert!(sender.send_frame(2, &[0u8; 256], 2));
+        assert_eq!(
+            sender.last_sent_index(),
+            2,
+            "frames flow again once the worker has confirmed its configuration"
+        );
+    }
+
+    /// A Worker that never confirms must cost a moment of bad picture, not a
+    /// permanently silent stream.
+    #[test]
+    fn an_unconfirmed_configuration_hold_fails_open() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        sender.pin_target(peer);
+
+        // Arm the hold in the past, beyond the ceiling.
+        sender.config_hold =
+            Some(Instant::now() - RtpSender::CONFIG_HOLD_MAX - Duration::from_secs(1));
+
+        assert!(sender.send_frame(7, &[0u8; 256], 2));
+        assert_eq!(
+            sender.last_sent_index(),
+            7,
+            "an expired hold must release itself and let frames through"
+        );
+        assert!(
+            sender.config_hold.is_none(),
+            "the expired hold is cleared, not re-evaluated on every frame"
+        );
+    }
+
     #[test]
     fn last_sent_index_tracks_high_water_mark_and_resets() {
         let mut sender = RtpSender::new(0).expect("bind ephemeral");

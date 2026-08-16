@@ -35,7 +35,9 @@ data class UiState(
  * concurrency would be racy, so the handle is only ever read and cleared under
  * [lock].
  */
-class EchoController(private val filesDir: String) {
+class EchoController(private val context: android.content.Context) {
+
+    private val filesDir: String = context.filesDir.absolutePath
 
     var state by mutableStateOf(UiState())
         private set
@@ -45,8 +47,27 @@ class EchoController(private val filesDir: String) {
     private var poller: Thread? = null
     private var player: VideoPlayer? = null
 
-    /** Surface to decode onto, supplied by the SurfaceView once it is ready. */
+    /**
+     * Master switch for forwarding input. Read by the Activity's key dispatch
+     * as well as the surface view, so both must consult the same answer.
+     */
+    @Volatile var inputEnabled: Boolean = true
+
+    /**
+     * Surface to decode onto, supplied by the SurfaceView as one appears and
+     * disappears.
+     *
+     * Assigning this while a stream is live re-attaches the running decoder
+     * rather than being remembered for next time. A SurfaceView's Surface is
+     * destroyed on backgrounding, screen lock, and any move to another display;
+     * before this forwarded, the decoder kept rendering into the destroyed one
+     * and the picture froze while the network stayed perfectly healthy.
+     */
     @Volatile var surface: Surface? = null
+        set(value) {
+            field = value
+            player?.setSurface(value)
+        }
 
     fun init() {
         EchoNative.nativeInit()
@@ -99,6 +120,10 @@ class EchoController(private val filesDir: String) {
         }
 
         synchronized(lock) { handle = h }
+        // From here on the keepalive threads must survive backgrounding, and
+        // that includes pairing: waiting for someone to walk to the PC and type
+        // a PIN is exactly when the user switches away from the app.
+        EchoService.start(context)
         poller = thread(name = "echo-events") { pollLoop(h) }
     }
 
@@ -160,11 +185,50 @@ class EchoController(private val filesDir: String) {
         post { it.copy(status = "Streaming ${width}x$height $codec", streaming = true) }
     }
 
+    // ── Input ───────────────────────────────────────────────────────────────
+    // Fire-and-forget by design: the UI thread must never wait on a network
+    // round trip to report a keystroke. Rust queues the packet and returns.
+
+    private fun send(kind: Int, a: Int, b: Int = 0, c: Int = 0, d: Int = 0) {
+        val h = synchronized(lock) { handle }
+        if (h != 0L) EchoNative.nativeSendInput(h, kind, a, b, c, d)
+    }
+
+    fun mouseMove(dx: Int, dy: Int) = send(EchoNative.INPUT_MOUSE_MOVE, dx, dy)
+
+    fun mouseAbsolute(x: Int, y: Int, width: Int, height: Int) =
+        send(EchoNative.INPUT_MOUSE_ABS, x, y, width, height)
+
+    fun mouseButton(button: Int, down: Boolean) =
+        send(EchoNative.INPUT_MOUSE_BUTTON, button, if (down) 1 else 0)
+
+    fun scroll(amount: Int) = send(EchoNative.INPUT_SCROLL, amount)
+
+    /** Returns whether the key was recognised — unmapped keys must not be sent. */
+    fun key(androidKeyCode: Int, down: Boolean, metaState: Int): Boolean {
+        val vk = Keycodes.toWindows(androidKeyCode)
+        if (vk == 0) return false
+        send(EchoNative.INPUT_KEY, vk, if (down) 1 else 0, Keycodes.modifiers(metaState))
+        return true
+    }
+
+    /**
+     * Release every modifier and mouse button on the host.
+     *
+     * Cheap and idempotent, so it is sent generously: whenever input stops
+     * mid-gesture the key-up never went, and the host is left with a key held.
+     */
+    fun releaseAllInput() = send(EchoNative.INPUT_RELEASE_ALL, 0)
+
     fun stats(): String = synchronized(lock) {
         if (handle == 0L) "{}" else runCatching { EchoNative.nativeStats(handle) }.getOrDefault("{}")
     }
 
     fun stop() {
+        // Before the handle goes: a session that ends mid-keystroke would
+        // otherwise leave that key held on the host with nothing left to
+        // release it.
+        releaseAllInput()
         player?.stop()
         player = null
         // Clear the handle before closing, so the poller sees the change and a
@@ -173,6 +237,7 @@ class EchoController(private val filesDir: String) {
         if (h != 0L) EchoNative.nativeClose(h)
         poller?.join(1_500)
         poller = null
+        EchoService.stop(context)
         post { it.copy(streaming = false) }
     }
 

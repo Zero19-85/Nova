@@ -55,6 +55,13 @@ pub struct QueueStats {
     pub dropped_waiting_keyframe: u64,
     pub delivered: u64,
     pub depth: usize,
+    /// Milliseconds the most recent frame spent between its first shard
+    /// arriving and reaching the decoder.
+    pub last_frame_age_ms: u32,
+    /// The worst such figure this session. Kept because latency that builds and
+    /// then drains leaves no trace in an instantaneous reading — and "it lags,
+    /// then catches up when I stop" is exactly that shape.
+    pub worst_frame_age_ms: u32,
 }
 
 struct Inner {
@@ -62,6 +69,13 @@ struct Inner {
     gate: KeyframeGate,
     closed: bool,
     stats: QueueStats,
+    /// Set when the gate re-armed, cleared when the request has been passed on.
+    ///
+    /// Without this the gate is a trap rather than a guard: Nova runs an
+    /// infinite GOP, so "wait for the next keyframe" means "wait forever".
+    /// Live 2026-08-15: one overflow while the decoder warmed up froze the
+    /// picture on the first frame for the rest of the session.
+    keyframe_wanted: bool,
 }
 
 /// A bounded, drop-oldest frame queue with a blocking, timed pop.
@@ -92,9 +106,20 @@ impl FrameQueue {
                 gate: KeyframeGate::new(),
                 closed: false,
                 stats: QueueStats::default(),
+                keyframe_wanted: false,
             }),
             ready: Condvar::new(),
         }
+    }
+
+    /// Whether a drop has left this queue waiting for a keyframe, clearing the
+    /// flag so one request produces one ask.
+    ///
+    /// Repeatable by design: if the requested keyframe is itself lost, the next
+    /// overflow sets the flag again and recovery is retried.
+    pub fn take_keyframe_request(&self) -> bool {
+        let mut inner = self.lock();
+        std::mem::replace(&mut inner.keyframe_wanted, false)
     }
 
     /// Offer a frame. Never blocks — the receive loop must not be stalled by a
@@ -107,8 +132,10 @@ impl FrameQueue {
         if inner.frames.len() >= CAPACITY {
             inner.frames.pop_front();
             inner.stats.dropped_overflow += 1;
-            // The chain is broken; nothing is decodable until the next IDR.
+            // The chain is broken; nothing is decodable until the next IDR —
+            // and under an infinite GOP one only exists if we ask for it.
             inner.gate.close();
+            inner.keyframe_wanted = true;
         }
         if !inner.gate.admit(&frame) {
             inner.stats.dropped_waiting_keyframe += 1;
@@ -130,6 +157,17 @@ impl FrameQueue {
         loop {
             if let Some(frame) = inner.frames.pop_front() {
                 inner.stats.delivered += 1;
+                // How long this frame spent inside the client, from its first
+                // shard landing on the socket to being handed to the decoder.
+                //
+                // Reported because a pointer that trails the hand feels the
+                // same whether the delay is in the input path or in the video
+                // returning, and every previous attempt to tell those apart was
+                // a guess. This measures the video half on one clock, so it
+                // needs no agreement with the host about time.
+                let age = frame.first_shard_at.elapsed();
+                inner.stats.last_frame_age_ms = age.as_millis() as u32;
+                inner.stats.worst_frame_age_ms = inner.stats.worst_frame_age_ms.max(age.as_millis() as u32);
                 return Some(frame);
             }
             if inner.closed {
@@ -183,6 +221,10 @@ pub struct QueueSink(pub std::sync::Arc<FrameQueue>);
 impl FrameSink for QueueSink {
     fn on_frame(&mut self, frame: DecodedFrame) {
         self.0.push(frame);
+    }
+
+    fn take_keyframe_request(&mut self) -> bool {
+        self.0.take_keyframe_request()
     }
 }
 

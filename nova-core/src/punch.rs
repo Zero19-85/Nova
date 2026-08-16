@@ -47,6 +47,31 @@
 //! session, which is a separate piece of work.
 
 use std::net::SocketAddr;
+
+/// What kind of network path an address represents.
+///
+/// Exists because "my phone is on WiFi" and "my phone's traffic reaches the
+/// host over the LAN" are different claims, and only the second one determines
+/// latency. Diagnosing a laggy session without distinguishing them cost several
+/// rounds (2026-08-16): every measurement on both machines read fast while the
+/// path itself was ~425 ms, because the phone's default route was the carrier's
+/// even though WiFi was connected.
+pub fn describe_path(addr: &SocketAddr) -> &'static str {
+    let std::net::IpAddr::V4(ip) = addr.ip() else {
+        return "IPv6";
+    };
+    let [a, b, ..] = ip.octets();
+    match (a, b) {
+        (10, _) | (192, 168) => "LAN (direct)",
+        (172, 16..=31) => "LAN (direct)",
+        (169, 254) => "link-local",
+        (127, _) => "loopback",
+        // 100.64.0.0/10 — carrier-grade NAT. A phone with one of these is
+        // routing through its mobile operator, whatever its WiFi icon says.
+        (100, 64..=127) => "CARRIER NAT (mobile data — not your LAN)",
+        _ => "public internet",
+    }
+}
 use std::time::Duration;
 
 use tokio::net::UdpSocket;

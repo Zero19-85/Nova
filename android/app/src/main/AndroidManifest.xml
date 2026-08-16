@@ -22,15 +22,29 @@
         android:theme="@style/Theme.Echo"
         android:networkSecurityConfig="@xml/network_security_config">
 
+        <!-- resizeableActivity is what makes the window eligible for desktop
+             mode and secondary displays at all; several OEM implementations
+             refuse to place a non-resizeable activity on an external display,
+             which is why the app would not appear on the glasses. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|density"
+            android:resizeableActivity="true"
+            android:preferMinimalPostProcessing="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden|navigation|touchscreen|layoutDirection|fontScale"
             android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the keepalive threads scheduled while Echo is backgrounded.
+             mediaPlayback is the honest type: this process is decoding and
+             presenting a live video stream. -->
+        <service
+            android:name=".EchoService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

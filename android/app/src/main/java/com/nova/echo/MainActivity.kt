@@ -1,11 +1,15 @@
 package com.nova.echo
 
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -22,6 +26,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
 
@@ -33,7 +38,17 @@ class MainActivity : ComponentActivity() {
         // mid-session is never what they meant.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        controller = EchoController(filesDir.absolutePath).also { it.init() }
+        // API 33+ hides a foreground service's notification without this. The
+        // service itself still runs either way, so the request is best-effort
+        // and never gates streaming on an answer.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+
+        controller = EchoController(applicationContext).also { it.init() }
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -42,9 +57,56 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        // Leaving the app mid-keystroke means the key-up never sends. The
+        // session keeps running (the foreground service sees to that), so
+        // without this the host is left holding a key indefinitely.
+        controller.releaseAllInput()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         controller.stop()
+    }
+
+    /**
+     * Keyboard input is taken here rather than in the SurfaceView.
+     *
+     * A Compose `AndroidView` does not reliably hold focus — Compose owns the
+     * focus system, and an embedded View can sit unfocused for a whole session.
+     * Key events then never reach it and Android handles them as local
+     * shortcuts, which is why typing did nothing and stray keys opened the
+     * phone's own menus. `dispatchKeyEvent` sees every key the window receives,
+     * before focus is consulted at all.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (!controller.state.streaming || !controller.inputEnabled) {
+            return super.dispatchKeyEvent(event)
+        }
+        // Left with the system: Back is how the user escapes a fullscreen
+        // stream, and volume belongs to whatever is playing locally.
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_BACK,
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_VOLUME_MUTE,
+            KeyEvent.KEYCODE_POWER -> return super.dispatchKeyEvent(event)
+        }
+
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                // Android's auto-repeat is discarded: Windows generates its own
+                // from the held key, so forwarding both doubles the rate.
+                if (event.repeatCount == 0) {
+                    controller.key(event.keyCode, true, event.metaState)
+                }
+            }
+            KeyEvent.ACTION_UP -> controller.key(event.keyCode, false, event.metaState)
+        }
+        // Consumed either way. Letting an unmapped key fall through is what let
+        // the phone act on keys meant for the PC.
+        return true
     }
 }
 
@@ -55,11 +117,37 @@ private fun EchoScreen(controller: EchoController) {
     // SurfaceView rather than TextureView: it gets a hardware overlay plane, so
     // decoded frames reach the display without a GPU composite step. On a
     // latency-sensitive stream that difference is the point.
+    // Kept so the streaming overlay can hand the mouse back and forth.
+    var view by remember { mutableStateOf<StreamSurfaceView?>(null) }
+    var controlsVisible by rememberSaveable { mutableStateOf(false) }
+    var inputEnabled by rememberSaveable { mutableStateOf(true) }
+    var touchAsPointer by rememberSaveable { mutableStateOf(false) }
+    // Pointer capture is now opt-in. Grabbing it automatically hid the cursor
+    // and swallowed the touchscreen, which left no way to reach the controls.
+    var captureMouse by rememberSaveable { mutableStateOf(false) }
+    var lastSource by remember { mutableStateOf("none") }
+    // What the framework actually did, not what we asked for.
+    var captureHeld by remember { mutableStateOf(false) }
+    var captureWhy by remember { mutableStateOf("") }
+    var captureEverHeld by remember { mutableStateOf(false) }
+
     Box(Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
-                SurfaceView(ctx).apply {
+                StreamSurfaceView(ctx).apply {
+                    controller.let { this.controller = it }
+                    onDiagnostic = { lastSource = it }
+                    onCaptureChanged = {
+                        captureHeld = it
+                        // Remembered because the panel that displays this
+                        // releases capture to open, so the live value is always
+                        // false by the time it can be read. "It has worked at
+                        // least once" is the fact worth surviving that.
+                        if (it) captureEverHeld = true
+                    }
+                    onCaptureDiagnosis = { captureWhy = it }
+                    view = this
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(h: SurfaceHolder) {
                             controller.surface = h.surface
@@ -73,7 +161,207 @@ private fun EchoScreen(controller: EchoController) {
             },
         )
 
-        if (!state.streaming) ControlPanel(controller, state)
+        // Push the toggles down whenever they change. The controller carries
+        // the master switch because the Activity's key dispatch reads it too.
+        LaunchedEffect(view, inputEnabled, touchAsPointer) {
+            controller.inputEnabled = inputEnabled
+            view?.inputEnabled = inputEnabled
+            view?.touchAsPointer = touchAsPointer
+        }
+
+        // Turn capture on by itself when a mouse is actually attached. Leaving
+        // it to a switch the user has to find means the default experience is
+        // two cursors and a washed-out picture (Android's cursor overlay knocks
+        // the video off its hardware overlay plane, which changes how the frame
+        // is composited).
+        LaunchedEffect(state.streaming, view) {
+            // Retried rather than checked once: a Bluetooth mouse can finish
+            // enumerating seconds after the stream starts, and a single check at
+            // the wrong moment left capture switched off for the whole session
+            // with no indication why.
+            repeat(20) {
+                if (!state.streaming) return@LaunchedEffect
+                if (view?.hasCaptureCompatibleDevice() == true) {
+                    captureMouse = true
+                    return@LaunchedEffect
+                }
+                kotlinx.coroutines.delay(500)
+            }
+        }
+
+        // Capture only when asked, and never while the controls are open — a
+        // captured pointer cannot click them.
+        LaunchedEffect(state.streaming, view, controlsVisible, captureMouse) {
+            val v = view ?: return@LaunchedEffect
+            if (state.streaming && captureMouse && !controlsVisible) v.captureMouse()
+            else v.releaseMouse()
+        }
+
+        // Opening the controls stops input mid-gesture, so anything held has to
+        // be let go or it stays held on the host.
+        LaunchedEffect(controlsVisible, inputEnabled) {
+            if (controlsVisible || !inputEnabled) controller.releaseAllInput()
+        }
+
+        if (state.streaming) {
+            // Back is the natural "get me out" gesture, and it is the only one
+            // available once the pointer is captured and the panel is hidden.
+            BackHandler(enabled = true) {
+                if (controlsVisible) controller.stop() else controlsVisible = true
+            }
+            StreamOverlay(
+                visible = controlsVisible,
+                status = state.status,
+                lastSource = lastSource,
+                captureHeld = captureHeld,
+                captureWhy = captureWhy,
+                captureEverHeld = captureEverHeld,
+                inputEnabled = inputEnabled,
+                touchAsPointer = touchAsPointer,
+                captureMouse = captureMouse,
+                onInputEnabled = { inputEnabled = it },
+                onTouchAsPointer = { touchAsPointer = it },
+                onCaptureMouse = { captureMouse = it },
+                onToggle = { controlsVisible = !controlsVisible },
+                onStop = { controlsVisible = false; controller.stop() },
+                stats = { controller.stats() },
+            )
+        } else {
+            ControlPanel(controller, state)
+        }
+    }
+
+    // Leaving the stream must release the pointer, or the mouse is stuck.
+    LaunchedEffect(state.streaming) { if (!state.streaming) controlsVisible = false }
+}
+
+/**
+ * The only way out of a live stream.
+ *
+ * Before this existed the control panel — which holds Stop — was hidden for the
+ * whole session, so quitting was impossible from the UI and the stream simply
+ * carried on. Deliberately minimal: a small always-present handle that reveals
+ * a Stop button, rather than a bar that covers the picture.
+ */
+@Composable
+private fun BoxScope.StreamOverlay(
+    visible: Boolean,
+    status: String,
+    lastSource: String,
+    captureHeld: Boolean,
+    captureWhy: String,
+    captureEverHeld: Boolean,
+    inputEnabled: Boolean,
+    touchAsPointer: Boolean,
+    captureMouse: Boolean,
+    onInputEnabled: (Boolean) -> Unit,
+    onTouchAsPointer: (Boolean) -> Unit,
+    onCaptureMouse: (Boolean) -> Unit,
+    onToggle: () -> Unit,
+    onStop: () -> Unit,
+    stats: () -> String,
+) {
+    if (!visible) {
+        TextButton(onClick = onToggle, modifier = Modifier.align(Alignment.TopEnd)) {
+            Text("☰", color = Color.White.copy(alpha = 0.55f), fontSize = 22.sp)
+        }
+        return
+    }
+
+    Surface(
+        modifier = Modifier.align(Alignment.TopCenter).padding(12.dp),
+        color = Color.Black.copy(alpha = 0.9f),
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(status, color = Color.White, fontSize = 13.sp)
+                Button(onClick = onStop) { Text("Stop") }
+                TextButton(onClick = onToggle) { Text("Resume") }
+            }
+
+            OverlayToggle("Send input to PC", inputEnabled, onInputEnabled)
+            OverlayToggle("Capture mouse (games)", captureMouse, onCaptureMouse)
+            OverlayToggle("Touch moves PC pointer", touchAsPointer, onTouchAsPointer)
+
+            // Whether capture actually engaged, not whether it was requested.
+            // Two cursors with no explanation is what this line exists to end.
+            // Capture is deliberately released while this panel is open — a
+            // captured pointer cannot click these controls. Saying so matters:
+            // the panel is the only place the state is visible, so it always
+            // reads "off" here, and without this note that looks like a failure
+            // rather than the intended behaviour.
+            if (captureMouse) {
+                Text(
+                    (if (captureEverHeld) "capture WORKS — it has been granted this session.\n"
+                     else "capture has not been granted yet this session.\n") +
+                        "It is released while this panel is open (a grabbed mouse " +
+                        "can't tap these controls) — close it to grab the mouse.\n" +
+                        "last attempt: " + captureWhy.ifEmpty { "none yet" },
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 11.sp,
+                )
+            } else {
+                Text(
+                    "capture is off — the mouse works, but stops at the screen edges.",
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 11.sp,
+                )
+            }
+
+            // Names the device the last event came from. When something moves
+            // that nobody touched, this says what to blame.
+            Text(
+                "capture: ${if (captureHeld) "held" else "off"}   " +
+                    "last input source: $lastSource",
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+
+            // Live pipeline latency. The one number that separates "the host
+            // got my input late" from "the host reacted instantly and I saw it
+            // late" — two faults that feel identical while streaming, and which
+            // three rounds of guessing failed to tell apart.
+            var pipeline by remember { mutableStateOf("") }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    pipeline = runCatching {
+                        val j = JSONObject(stats())
+                        "video ${j.optInt("frame_age_ms")}ms (worst ${j.optInt("worst_frame_age_ms")}ms)  " +
+                            "drops ${j.optInt("frames_dropped_overflow")}\n" +
+                            "NETWORK round trip ${j.optInt("rtt_ms")}ms (best ${j.optInt("rtt_best_ms")}ms)\n" +
+                            "input batch ${j.optInt("input_batch")} (worst ${j.optInt("input_batch_worst")})"
+                    }.getOrDefault("")
+                    kotlinx.coroutines.delay(500)
+                }
+            }
+            if (pipeline.isNotEmpty()) {
+                Text(
+                    pipeline,
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverlayToggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Switch(checked = checked, onCheckedChange = onChange)
+        Text(label, color = Color.White, fontSize = 12.sp)
     }
 }
 

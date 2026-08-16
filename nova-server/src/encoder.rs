@@ -125,6 +125,17 @@ pub fn last_frame_was_rfi_recovery() -> bool {
 /// immediately after `debug::init_debug_logger()`, before `Encoder::new()`.
 pub fn init_shim_log(log_path_wide: *const u16) {
     unsafe { InitShimLog(log_path_wide); }
+    // The shim's handle is a CRT descriptor, which `SetStdHandle` does not
+    // reach — so after a log rotation it would keep writing into the file that
+    // was renamed away. Registering here means rotation re-points it too.
+    crate::debug::set_log_reopen_hook(reopen_shim_log);
+}
+
+/// Re-point the shim at the (freshly rotated) log. Must be a bare `fn` so it
+/// can be stored as a callback; it recomputes the path rather than capturing.
+fn reopen_shim_log() {
+    let wide = crate::debug::log_path_wide();
+    unsafe { InitShimLog(wide.as_ptr()); }
 }
 
 /// Push nova.toml [hdr] luminance parameters to the shim before the first

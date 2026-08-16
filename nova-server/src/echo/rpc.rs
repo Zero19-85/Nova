@@ -226,6 +226,15 @@ impl RpcResponse {
 // Error codes. Kept as constants so the set is greppable and a typo in one
 // arm can't silently invent a new code the client has never heard of.
 const E_BAD_REQUEST: &str = "bad_request";
+
+/// Ceiling on one input packet. The largest GameStream input packet is the
+/// multi-controller one at a few dozen bytes; 256 leaves room for protocol
+/// variants while keeping a hostile peer from pushing bulk data through a
+/// command that is supposed to carry a keystroke.
+const MAX_INPUT_PACKET: usize = 256;
+
+/// Ceiling on packets in one `input` command, matching the client's batch size.
+const MAX_INPUT_BATCH: usize = 64;
 const E_UNKNOWN_COMMAND: &str = "unknown_command";
 const E_UNKNOWN_DISPLAY: &str = "unknown_display";
 const E_SESSION_LOCKED: &str = "session_locked";
@@ -672,8 +681,36 @@ impl Handler {
                     "displays": self.orchestrator.seats(),
                 }),
             ),
+            // Telemetry from the client, logged beside the host's own numbers.
+            //
+            // Purely diagnostic and deliberately trusted for nothing: it is
+            // printed and discarded, never used to make a decision, so a client
+            // reporting nonsense can mislead a reader of the log and nothing
+            // else. It exists because every question about input latency has
+            // had one half of its answer on each machine.
+            "client_stats" => {
+                println!(
+                    "📱 Echo client \"{}\": rtt {}ms (best {}ms), capture {}, \
+                     input peak {}/s x{} samples, batch {} (worst {})",
+                    identity.device_name,
+                    req.params.get("rtt_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                    req.params.get("rtt_best_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                    if req.params.get("capture_held").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        "held"
+                    } else {
+                        "off"
+                    },
+                    req.params.get("peak_events_per_sec").and_then(|v| v.as_u64()).unwrap_or(0),
+                    req.params.get("peak_samples_per_event").and_then(|v| v.as_u64()).unwrap_or(0),
+                    req.params.get("input_batch").and_then(|v| v.as_u64()).unwrap_or(0),
+                    req.params.get("input_batch_worst").and_then(|v| v.as_u64()).unwrap_or(0),
+                );
+                RpcResponse::ok(id, json!({}))
+            }
             "start_session" => self.handle_start_session(id, &req.params, identity),
             "stop_session" => self.handle_stop_session(id, identity),
+            "request_idr" => self.handle_request_idr(id, identity),
+            "input" => self.handle_input(id, &req.params, identity),
             "list_displays" => {
                 let seats = self.orchestrator.seats();
                 if seats.is_empty() {
@@ -829,6 +866,104 @@ impl Handler {
             Ok(session_id) => RpcResponse::ok(id, json!({ "session_id": session_id, "stopped": true })),
             Err(e) => RpcResponse::err(id, handoff_code(&e), e.to_string()),
         }
+    }
+
+    /// The client's only repair path.
+    ///
+    /// With an infinite GOP nothing else will ever produce a keyframe, so a
+    /// client that loses its reference chain is stuck forever without this —
+    /// and its own keyframe gate will (correctly) refuse to feed the decoder
+    /// anything in the meantime.
+    fn handle_request_idr(&self, id: Option<u64>, identity: &EchoIdentity) -> RpcResponse {
+        let Some(mgr) = &self.sessions else {
+            return RpcResponse::err(id, E_NO_SESSION_LAYER, "no session layer on this host");
+        };
+        match mgr.request_idr(identity) {
+            Ok(session_id) => {
+                println!("🔑 Echo: \"{}\" requested a keyframe", identity.device_name);
+                RpcResponse::ok(id, json!({ "session_id": session_id, "requested": true }))
+            }
+            Err(e) => RpcResponse::err(id, handoff_code(&e), e.to_string()),
+        }
+    }
+
+    /// Forward a GameStream input packet to the injection stack.
+    ///
+    /// The payload is passed through **unparsed**. That is deliberate: the
+    /// Master's routing already inspects these bytes to decide between the
+    /// SYSTEM input helper (secure desktop) and the Worker (everything else,
+    /// including gamepads), and `input.rs` owns every question about what a
+    /// packet means. Re-deciding any of that here would create a second
+    /// injection path that could drift from Moonlight's.
+    ///
+    /// Owner-checked: injecting input is the most powerful thing this surface
+    /// can do, so it is restricted to the device that actually holds the
+    /// session — being paired is not enough.
+    fn handle_input(
+        &self,
+        id: Option<u64>,
+        params: &Map<String, Value>,
+        identity: &EchoIdentity,
+    ) -> RpcResponse {
+        let Some(mgr) = &self.sessions else {
+            return RpcResponse::err(id, E_NO_SESSION_LAYER, "no session layer on this host");
+        };
+
+        // Two shapes: a single `data` packet, or a `packets` array. The array
+        // exists because the control channel is one-command-at-a-time and
+        // pointer devices generate events far faster than a round trip — a
+        // burst has to cost one trip, not one each.
+        let encoded: Vec<&str> = match (params.get("packets"), params.get("data")) {
+            (Some(Value::Array(items)), _) => {
+                if items.len() > MAX_INPUT_BATCH {
+                    return RpcResponse::err(id, E_BAD_REQUEST, "too many packets in one batch");
+                }
+                match items.iter().map(Value::as_str).collect::<Option<Vec<_>>>() {
+                    Some(v) => v,
+                    None => {
+                        return RpcResponse::err(id, E_BAD_REQUEST, "\"packets\" must be hex strings")
+                    }
+                }
+            }
+            (_, Some(Value::String(one))) => vec![one.as_str()],
+            _ => {
+                return RpcResponse::err(
+                    id,
+                    E_BAD_REQUEST,
+                    "input needs a hex \"data\" field or a \"packets\" array",
+                )
+            }
+        };
+
+        // Decode and validate the whole batch BEFORE injecting any of it, so a
+        // malformed tail cannot leave half a burst applied — a half-applied
+        // batch can strand a mouse button or modifier key held down.
+        let mut packets = Vec::with_capacity(encoded.len());
+        for hexed in encoded {
+            let Ok(packet) = hex::decode(hexed) else {
+                return RpcResponse::err(id, E_BAD_REQUEST, "input packet is not valid hex");
+            };
+            // The injector reads a magic at bytes 4..8 and returns early below
+            // 8 bytes; refusing here makes a malformed sender an error it can
+            // see rather than input that silently does nothing.
+            if packet.len() < 8 {
+                return RpcResponse::err(id, E_BAD_REQUEST, "input packet is shorter than its header");
+            }
+            // Bounded so a hostile peer cannot push bulk data through a command
+            // expected to carry a keystroke.
+            if packet.len() > MAX_INPUT_PACKET {
+                return RpcResponse::err(id, E_BAD_REQUEST, "input packet is implausibly large");
+            }
+            packets.push(packet);
+        }
+
+        let count = packets.len();
+        for packet in packets {
+            if let Err(e) = mgr.inject_input(identity, packet) {
+                return RpcResponse::err(id, handoff_code(&e), e.to_string());
+            }
+        }
+        RpcResponse::ok(id, json!({ "accepted": count }))
     }
 
     fn handle_set_display(&self, id: Option<u64>, params: &Map<String, Value>) -> RpcResponse {
@@ -1165,11 +1300,23 @@ where
             continue; // keepalive newline
         }
 
-        let response = match serde_json::from_str::<RpcRequest>(trimmed) {
-            Ok(req) => handler.dispatch(req, identity),
-            Err(e) => RpcResponse::err(None, E_BAD_REQUEST, format!("malformed request: {e}")),
+        // A request with no id is a notification: acted on, not answered.
+        // Input rides this path, because a reply per pointer event serialises
+        // the client's whole input stream behind a round trip each.
+        let (expects_reply, response) = match serde_json::from_str::<RpcRequest>(trimmed) {
+            Ok(req) => {
+                let expects_reply = req.id.is_some();
+                (expects_reply, handler.dispatch(req, identity))
+            }
+            Err(e) => (true, RpcResponse::err(None, E_BAD_REQUEST, format!("malformed request: {e}"))),
         };
-        write_response(&mut write_half, &response).await?;
+
+        // Failures are always reported, even for notifications — an input burst
+        // refused for lack of a session must not vanish silently. The response
+        // carries no id, and the client skips such lines when matching replies.
+        if expects_reply || !response.ok {
+            write_response(&mut write_half, &response).await?;
+        }
     }
 }
 

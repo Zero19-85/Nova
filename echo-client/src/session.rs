@@ -177,6 +177,52 @@ pub struct ConnectOptions {
     pub punch_timeout: Duration,
 }
 
+/// How often the control round trip is measured.
+const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Most recent and best control round-trip time, in milliseconds.
+///
+/// The one quantity nothing else in the client can see. Every other measurement
+/// so far has been one-sided — the host times its own injection, the client
+/// times its own pipeline — and neither includes the wire. A pointer that
+/// trails the hand by a round trip looks exactly like a pointer delayed by
+/// software, and the only way to tell them apart is to measure the wire
+/// directly.
+///
+/// The *best* value matters as much as the last: it is the floor this path can
+/// achieve, which is the number that says whether the remaining lag is
+/// something to fix or something to route around.
+static RTT_LAST_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static RTT_BEST_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `(most recent, best seen)` control round trip in milliseconds; `0` for the
+/// best when nothing has been measured yet.
+pub fn rtt_stats() -> (u32, u32) {
+    use std::sync::atomic::Ordering;
+    let best = RTT_BEST_MS.load(Ordering::Relaxed);
+    (RTT_LAST_MS.load(Ordering::Relaxed), if best == u32::MAX { 0 } else { best })
+}
+
+/// Ceiling on packets drained into one batch.
+///
+/// Bounds the work per iteration without bounding the *queue*: a larger burst
+/// simply becomes two batches, so nothing is ever discarded.
+const MAX_INPUT_BATCH: usize = 64;
+
+/// Idle gap after which the last datagrams are repeated.
+///
+/// Long enough that it never fires during continuous movement (which is already
+/// protected by the redundancy in each new datagram), short enough that a
+/// trailing key-up is repeated well before a human notices a stuck key.
+const TAIL_REPEAT_DELAY: Duration = Duration::from_millis(25);
+
+/// How many times an idle tail is repeated.
+///
+/// Two extra copies spread over `TAIL_REPEAT_DELAY` each, which survives a
+/// burst loss long enough to matter and then goes completely silent — a resting
+/// keyboard must not keep a link busy.
+const TAIL_REPEATS: usize = 2;
+
 /// What to ask the host for.
 #[derive(Debug, Clone)]
 pub struct StreamOptions {
@@ -336,6 +382,10 @@ pub async fn stream(
     sink: &mut impl FrameSink,
     progress: &mut impl Progress,
     stop: tokio::sync::watch::Receiver<bool>,
+    // A one-shot resource rather than a setting, so it stays out of the
+    // `Clone`-able options struct — a receiver cannot be cloned, and a session's
+    // input source is not something you would want copied anyway.
+    input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<ReceiveStats, String> {
     let pin = parse_fingerprint(host_fingerprint).map_err(|e| format!("host fingerprint: {e}"))?;
     let OpenPath { socket, peer } = path;
@@ -357,7 +407,7 @@ pub async fn stream(
     // Any early return past this point must not leak the demultiplexer, so the
     // body runs in a helper and the abort happens exactly once, below.
     let outcome = stream_inner(
-        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx,
+        identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, input_rx,
     )
     .await;
     demux_task.abort();
@@ -376,6 +426,7 @@ async fn stream_inner(
     stop: tokio::sync::watch::Receiver<bool>,
     media_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<ReceiveStats, String> {
     let lan = match &opts.control {
         Some(addr) => Some(
@@ -439,14 +490,177 @@ async fn stream_inner(
         codec: control::field_str(&grant, "codec").unwrap_or("?").to_string(),
     });
 
-    let stats = receiver::run_receiver(socket, peer, media_rx, Some(keys), sink, stop)
+    // The sink's repair path. Nova's GOP is infinite, so a sink that loses its
+    // reference chain recovers only by asking — see `FrameSink::
+    // take_keyframe_request`. The channel exists so the request crosses from
+    // the receive loop to the control channel without either owning the other.
+    let (idr_tx, mut idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let ctl = std::sync::Arc::new(tokio::sync::Mutex::new(ctl));
+    let idr_task = tokio::spawn({
+        let ctl = ctl.clone();
+        async move {
+            while idr_rx.recv().await.is_some() {
+                // Best-effort: a failed request is retried by the next drop,
+                // and a lost session is about to end the loop anyway.
+                let _ = ctl
+                    .lock()
+                    .await
+                    .call("request_idr", serde_json::Map::new())
+                    .await;
+            }
+        }
+    });
+
+    // Measure the wire. `get_status` is the cheapest command the host answers
+    // and it touches no session state, so timing it is a clean round trip over
+    // the same punched path the input datagrams take.
+    let rtt_task = tokio::spawn({
+        let ctl = ctl.clone();
+        async move {
+            loop {
+                tokio::time::sleep(RTT_PROBE_INTERVAL).await;
+                let began = std::time::Instant::now();
+                let ok = ctl.lock().await.call("get_status", serde_json::Map::new()).await.is_ok();
+                if !ok {
+                    return; // the session is ending; the receive loop reports it
+                }
+                let ms = began.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                RTT_LAST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+                RTT_BEST_MS.fetch_min(ms, std::sync::atomic::Ordering::Relaxed);
+
+                // Send the client's own view of the session to the host, so it
+                // lands in the host log next to the host's measurements. Both
+                // halves of every question so far have lived on opposite
+                // machines, and correlating them meant asking the user to read
+                // numbers off a phone. A notification, so a failed report never
+                // delays input or blocks the session.
+                let (batch, batch_worst) = crate::input::batch_stats();
+                let (peak_rate, peak_samples, capture) = crate::input::ui_state();
+                let mut params = serde_json::Map::new();
+                params.insert("rtt_ms".into(), ms.into());
+                params.insert("rtt_best_ms".into(), rtt_stats().1.into());
+                params.insert("input_batch".into(), batch.into());
+                params.insert("input_batch_worst".into(), batch_worst.into());
+                params.insert("peak_events_per_sec".into(), peak_rate.into());
+                params.insert("peak_samples_per_event".into(), peak_samples.into());
+                params.insert("capture_held".into(), capture.into());
+                let _ = ctl.lock().await.notify("client_stats", params).await;
+            }
+        }
+    });
+
+    // Input goes out on its own unreliable datagrams, straight onto the punched
+    // socket — NOT through `ctl`.
+    //
+    // The control channel is reliable and ordered, and both properties are
+    // actively harmful here. Its window of eight unacknowledged messages is a
+    // rate ceiling a mouse exceeds, so the surplus queued and drained after the
+    // user stopped moving; and ordering means one lost datagram stalls every
+    // input behind it for a retransmit timeout. Live 2026-08-16 that read as a
+    // pointer that "drags heavily" even with the mouse's polling rate turned
+    // down. `nova_core::input_channel` gives up both guarantees and buys the
+    // one thing input actually needs — a lost key-up must not strand a key —
+    // with redundancy instead of acknowledgement.
+    let input_task = input_rx.map(|mut rx| {
+        let socket = socket.clone();
+        let mut sender = nova_core::input_channel::InputSender::new(keys.clone());
+        tokio::spawn(async move {
+            // The datagrams most recently sent, kept so the tail of a burst can
+            // be repeated. Redundancy only protects a packet while *later*
+            // datagrams still carry it, which leaves the last one of a burst
+            // unprotected — and the last packet of a burst is exactly the
+            // key-up, the button-release, or the release-all sent as the app is
+            // backgrounded. Repeating the tail while idle closes that hole for
+            // the price of a few bytes on a link that has gone quiet anyway.
+            let mut tail: Vec<Vec<u8>> = Vec::new();
+            let mut repeats_left = 0usize;
+
+            loop {
+                let next = if repeats_left > 0 {
+                    match tokio::time::timeout(TAIL_REPEAT_DELAY, rx.recv()).await {
+                        Ok(received) => received,
+                        Err(_) => {
+                            for datagram in &tail {
+                                let _ = socket.send_to(datagram, peer).await;
+                            }
+                            repeats_left -= 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    rx.recv().await
+                };
+                let Some(first) = next else { return };
+                // No delay before draining: this loop is **self-clocking**.
+                //
+                // It sends immediately, and whatever arrives while that send is
+                // in flight is drained and coalesced into the next one. Under a
+                // light load that means one datagram per event with no added
+                // latency; under a heavy one the batches grow by themselves and
+                // consecutive deltas merge. The rate limit emerges from how fast
+                // the loop can actually run rather than from a constant.
+                //
+                // There *was* a fixed window here, and it was justified when
+                // input rode the reliable control channel, whose eight-message
+                // send window made a burst fatal. On unreliable datagrams the
+                // cost of sending eagerly is about 83 bytes per event against a
+                // 20 Mbps video stream, and the cost of waiting is latency on
+                // every single movement. A second rate cap on top of Android's
+                // delivery rate bought nothing and hid how slow that rate was.
+                let mut batch = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    batch.push(next);
+                    if batch.len() >= MAX_INPUT_BATCH {
+                        break;
+                    }
+                }
+                crate::input::record_batch(batch.len());
+                let batch = crate::input::coalesce(batch);
+                if batch.is_empty() {
+                    continue;
+                }
+
+                let datagrams = match sender.datagrams(batch) {
+                    Ok(d) => d,
+                    // Only reachable if the 32-bit sequence space is exhausted,
+                    // which would take over a year in one session. Continuing
+                    // would mean repeating a GCM nonce, so input stops instead —
+                    // the stream itself is unaffected.
+                    Err(e) => {
+                        eprintln!("⚠️  input channel stopped: {e}");
+                        return;
+                    }
+                };
+                for datagram in &datagrams {
+                    // Best-effort by design: there is no acknowledgement to wait
+                    // for and nothing useful to do about a failed send. A send
+                    // error here means the socket is gone, which the receive
+                    // loop is about to report properly.
+                    if socket.send_to(datagram, peer).await.is_err() {
+                        return;
+                    }
+                }
+                tail = datagrams;
+                repeats_left = TAIL_REPEATS;
+            }
+        })
+    });
+
+    let stats = receiver::run_receiver(socket, peer, media_rx, Some(keys), sink, stop, Some(idr_tx))
         .await
         .map_err(|e| format!("receive loop: {e}"))?;
+
+    // Dropped senders end the task; abort covers a request in flight.
+    idr_task.abort();
+    rtt_task.abort();
+    if let Some(t) = input_task {
+        t.abort();
+    }
 
     // Always tell the host we are done. A session left open would block the
     // next client — including a Moonlight one, which is exactly the asymmetry
     // the host's gate exists to prevent.
-    if let Err(e) = ctl.call("stop_session", serde_json::Map::new()).await {
+    if let Err(e) = ctl.lock().await.call("stop_session", serde_json::Map::new()).await {
         // Not fatal: the host also releases the session when the control tunnel
         // closes, precisely so a client that vanishes cannot hold the pipeline.
         progress.event(Event::Warning {

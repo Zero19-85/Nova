@@ -58,7 +58,7 @@ use jni::objects::{JByteBuffer, JClass, JLongArray, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
-use echo_client::pairing;
+use echo_client::{input, pairing};
 use echo_client::session::{self, ConnectOptions, Event, OpenPath, Progress, StreamOptions};
 use nova_core::identity::Identity;
 
@@ -77,6 +77,12 @@ pub const FILL_ENDED: jint = -3;
 /// The handle was invalid, or the arguments could not be read.
 pub const FILL_BAD_HANDLE: jint = -4;
 
+/// How long `nativeClose` waits for the session to tell the host it is done.
+///
+/// Long enough for one RUDP round trip including a retransmit, short enough
+/// that quitting never feels stuck — this runs on a thread the UI is waiting on.
+const CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
 /// Distinguishes a live handle from a stale or fabricated `jlong`. A double
 /// `close()` from Kotlin is an ordinary bug; without this it would be a
 /// use-after-free reachable from managed code.
@@ -92,6 +98,18 @@ struct EchoHandle {
     events: Mutex<Receiver<String>>,
     frames: Arc<FrameQueue>,
     stop: tokio::sync::watch::Sender<bool>,
+    /// Where Kotlin posts GameStream input packets, when a session carries them.
+    input: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// The session task, so `close` can wait for it to unwind.
+    ///
+    /// Load-bearing: `Runtime::shutdown_timeout` only waits for *blocking*
+    /// tasks — async tasks are cancelled the instant the runtime drops. The
+    /// session's final act is telling the host `stop_session`, so without this
+    /// wait that call is killed mid-flight and the host holds the session until
+    /// its idle sweep reclaims it up to a minute later. Live 2026-08-15: every
+    /// session in the host log ended with `⌛ … reclaiming the slot`, never a
+    /// clean stop.
+    session: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EchoHandle {
@@ -380,12 +398,20 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let session = unsafe { EchoHandle::from_raw(handle) }.ok_or("invalid session handle")?;
         let q = session.frames.stats();
+        let (batch_last, batch_worst) = echo_client::input::batch_stats();
+        let (rtt_last, rtt_best) = echo_client::session::rtt_stats();
         Ok::<String, String>(
             serde_json::json!({
+                "input_batch": batch_last,
+                "input_batch_worst": batch_worst,
+                "rtt_ms": rtt_last,
+                "rtt_best_ms": rtt_best,
                 "queue_depth": q.depth,
                 "frames_delivered": q.delivered,
                 "frames_dropped_overflow": q.dropped_overflow,
                 "frames_dropped_waiting_keyframe": q.dropped_waiting_keyframe,
+                "frame_age_ms": q.last_frame_age_ms,
+                "worst_frame_age_ms": q.worst_frame_age_ms,
             })
             .to_string(),
         )
@@ -401,6 +427,99 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Post one input event to the host.
+///
+/// Takes decomposed integers rather than a byte array because it is called at
+/// pointer-motion rates: a `[u8]` per event would mean a JNI array allocation
+/// and copy for twelve bytes, tens of times a second. The packet is built on
+/// this side, by [`echo_client::input`], so Kotlin never encodes wire format.
+///
+/// `kind` selects the event; the remaining arguments mean different things per
+/// kind, documented on the Kotlin side in `EchoNative`:
+///
+/// | kind | meaning     | a          | b          | c      | d       |
+/// |------|-------------|------------|------------|--------|---------|
+/// | 1    | mouse move  | dx         | dy         | —      | —       |
+/// | 2    | mouse abs   | x          | y          | width  | height  |
+/// | 3    | mouse button| button 1-5 | 1=down     | —      | —       |
+/// | 4    | scroll      | amount     | —          | —      | —       |
+/// | 5    | key         | VK code    | 1=down     | mods   | —       |
+/// | 6    | release all | —          | —          | —      | —       |
+///
+/// Returns `true` if the event was queued. `false` means the handle was invalid
+/// or the packet was a no-op (a zero delta), never that the host rejected it —
+/// input is fire-and-forget, because blocking a UI thread on a network round
+/// trip per keystroke is not a thing anyone wants.
+/// Push the platform layer's input telemetry down so the session report can
+/// carry it. Rate and capture state are only visible in the View.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeReportUiState(
+    _env: JNIEnv,
+    _class: JClass,
+    peak_rate: jint,
+    peak_samples: jint,
+    capture_held: jni::sys::jboolean,
+) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        echo_client::input::record_ui_state(
+            peak_rate.max(0) as u32,
+            peak_samples.max(0) as u32,
+            capture_held != 0,
+        );
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendInput(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    kind: jint,
+    a: jint,
+    b: jint,
+    c: jint,
+    d: jint,
+) -> jni::sys::jboolean {
+    let queued = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(echo) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return false;
+        };
+        let Some(tx) = echo.input.as_ref() else {
+            return false; // a pairing handle has no session to inject into
+        };
+
+        // Saturating rather than wrapping: a flick of the wrist past i16 range
+        // should pin the pointer's motion, not reverse it.
+        let clamp = |v: jint| v.clamp(i16::MIN as jint, i16::MAX as jint) as i16;
+
+        let packet = match kind {
+            1 => input::mouse_move_relative(clamp(a), clamp(b)),
+            2 => input::mouse_move_absolute(clamp(a), clamp(b), clamp(c), clamp(d)),
+            3 => input::MouseButton::from_code(a as u8).map(|btn| input::mouse_button(btn, b == 1)),
+            4 => input::scroll(clamp(a)),
+            5 => Some(input::keyboard(a as u16, c as u8, b == 1)),
+            // Release everything held. Queued like any other input so it cannot
+            // overtake a key-down already in flight — arriving out of order
+            // would release a key before it was pressed and leave it stuck,
+            // which is the exact failure this exists to prevent.
+            6 => {
+                return input::release_all()
+                    .into_iter()
+                    .all(|p| tx.send(p).is_ok());
+            }
+            _ => None,
+        };
+
+        match packet {
+            Some(p) => tx.send(p).is_ok(),
+            None => false,
+        }
+    }))
+    .unwrap_or(false);
+
+    u8::from(queued)
 }
 
 /// End the session and free the handle.
@@ -429,11 +548,24 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeClose(
             (*ptr).magic = 0;
             let mut boxed = Box::from_raw(ptr);
 
-            // Order matters: signal the session to stop, wake the feeder, and
-            // only then shut the runtime down. Dropping the runtime first would
-            // block here waiting for tasks that were never told to finish.
+            // Order matters: signal the session to stop, wake the feeder, wait
+            // for the session to say goodbye to the host, and only then shut the
+            // runtime down. Dropping the runtime first would block here waiting
+            // for tasks that were never told to finish.
             let _ = boxed.stop.send(true);
             boxed.frames.close();
+
+            let session = boxed.session.lock().ok().and_then(|mut s| s.take());
+            if let (Some(runtime), Some(session)) = (boxed.runtime.as_ref(), session) {
+                // The session's last act is `stop_session`, which is a network
+                // round trip. `shutdown_timeout` would cancel it outright, so it
+                // is awaited here first — bounded, because teardown must never
+                // hang the caller (this runs on a UI-triggered thread).
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(CLOSE_GRACE, session).await;
+                });
+            }
+
             if let Some(runtime) = boxed.runtime.take() {
                 // Bounded rather than indefinite: teardown must not be able to
                 // hang the UI thread that called close().
@@ -457,6 +589,12 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         host_fingerprint: str_field(&cfg, "host_fingerprint")?,
         punch_timeout: Duration::from_secs(cfg.get("punch_secs").and_then(|v| v.as_u64()).unwrap_or(8)),
     };
+    // Unbounded, and that is a considered choice: the producer is the UI thread
+    // delivering pointer events, so any bound would mean either blocking the UI
+    // or silently discarding input. The consumer only forwards to the control
+    // channel, and a session that stops draining is ending anyway.
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
     let defaults = StreamOptions::default();
     let stream = StreamOptions {
         res: cfg.get("res").and_then(|v| v.as_str()).unwrap_or(&defaults.res).to_string(),
@@ -492,11 +630,13 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let queue = Arc::new(FrameQueue::new());
 
-    runtime.spawn({
+    let session = runtime.spawn({
         let queue = queue.clone();
         async move {
             let mut progress = ChannelProgress(event_tx);
-            let outcome = run_session(&identity, connect, stream, &queue, &mut progress, stop_rx).await;
+            let outcome =
+                run_session(&identity, connect, stream, &queue, &mut progress, stop_rx, input_rx)
+                    .await;
             if let Err(message) = outcome {
                 progress.raw(serde_json::json!({"type": "error", "message": message}));
             }
@@ -512,6 +652,8 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         events: Mutex::new(event_rx),
         frames: queue,
         stop: stop_tx,
+        input: Some(input_tx),
+        session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as jlong)
 }
@@ -554,7 +696,7 @@ fn start_pairing(config_json: &str) -> Result<jlong, String> {
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
     let queue = Arc::new(FrameQueue::new());
 
-    runtime.spawn({
+    let session = runtime.spawn({
         let queue = queue.clone();
         async move {
             let opts = pairing::PairOptions {
@@ -607,6 +749,12 @@ fn start_pairing(config_json: &str) -> Result<jlong, String> {
         events: Mutex::new(event_rx),
         frames: queue,
         stop: stop_tx,
+        // Pairing accepts no input; a `None` here makes `nativeSendInput`
+        // refuse rather than silently discard on a pairing handle.
+        input: None,
+        // Pairing has nothing to say goodbye to, but sharing the handle type
+        // means sharing the orderly close path.
+        session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as jlong)
 }
@@ -620,6 +768,7 @@ async fn run_session(
     queue: &Arc<FrameQueue>,
     progress: &mut ChannelProgress,
     stop: tokio::sync::watch::Receiver<bool>,
+    input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<(), String> {
     let path: OpenPath = session::open_path(identity, &connect, progress).await?;
     let mut sink = QueueSink(queue.clone());
@@ -631,6 +780,7 @@ async fn run_session(
         &mut sink,
         progress,
         stop,
+        Some(input_rx),
     )
     .await?;
     Ok(())

@@ -92,6 +92,16 @@ pub struct DecodedFrame {
     pub frame_type: u8,
     /// Annex-B NAL units (H.264/HEVC) or OBUs (AV1).
     pub data: Vec<u8>,
+    /// When this frame's **first shard** reached the client.
+    ///
+    /// Carried so the pipeline can report its own latency. Everything after
+    /// this point — waiting for the remaining shards, FEC repair, decryption,
+    /// the queue ahead of the decoder — is time the client added, measured on
+    /// one clock with no host synchronisation needed. That distinction is the
+    /// whole point: a pointer that trails the hand looks identical whether the
+    /// delay is in input or in video, and this measures the video half
+    /// directly instead of inferring it.
+    pub first_shard_at: std::time::Instant,
 }
 
 impl DecodedFrame {
@@ -133,6 +143,9 @@ struct PartialFrame {
     received: usize,
     /// Uniform datagram size for this frame.
     block_size: usize,
+    /// When the first shard of this frame arrived — see
+    /// [`DecodedFrame::first_shard_at`].
+    first_shard_at: std::time::Instant,
 }
 
 /// Reassembles datagrams into frames, then opens them.
@@ -206,6 +219,7 @@ impl VideoDepacketizer {
             data_shards,
             received: 0,
             block_size,
+            first_shard_at: std::time::Instant::now(),
         });
         // Every shard of a frame is the same size and describes the same shard
         // counts. A mismatch is a stale or forged packet reusing a live index,
@@ -331,7 +345,7 @@ impl VideoDepacketizer {
         if frame_type == 2 {
             self.stats.keyframes += 1;
         }
-        Some(DecodedFrame { index, frame_type, data })
+        Some(DecodedFrame { index, frame_type, data, first_shard_at: partial.first_shard_at })
     }
 }
 
@@ -357,6 +371,21 @@ fn reconstruct(partial: &mut PartialFrame) -> Result<(), ()> {
 /// knowing about the other.
 pub trait FrameSink {
     fn on_frame(&mut self, frame: DecodedFrame);
+
+    /// Whether the sink has lost its reference chain and needs a keyframe,
+    /// clearing the request as it reports it.
+    ///
+    /// Nova runs an **infinite GOP**: there is no scheduled IDR, so a sink that
+    /// re-arms a keyframe gate after a drop will wait forever unless somebody
+    /// asks. Live 2026-08-15: a 3-frame queue overflowed while the decoder was
+    /// warming up, closed its gate, and the picture stayed on the first frame
+    /// while the host streamed 3,600 more.
+    ///
+    /// Defaults to `false` for sinks that cannot lose sync — the headless
+    /// `LoggingSink` never drops anything, so it never needs to ask.
+    fn take_keyframe_request(&mut self) -> bool {
+        false
+    }
 }
 
 /// Counts and describes frames instead of decoding them — what the headless
@@ -411,6 +440,7 @@ pub async fn run_receiver(
     keys: Option<SessionKeys>,
     sink: &mut impl FrameSink,
     stop: tokio::sync::watch::Receiver<bool>,
+    idr_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> std::io::Result<ReceiveStats> {
     let mut depack = VideoDepacketizer::new(keys);
     let mut gate = crate::gate::KeyframeGate::new();
@@ -431,6 +461,16 @@ pub async fn run_receiver(
                 // stream to this client. Once a session exists the host has
                 // pinned its target and ignores these entirely.
                 let _ = socket.send_to(b"PING", peer).await;
+
+                // Same tick carries the sink's repair request. Checking here
+                // rather than on the frame path keeps the hot loop free of it,
+                // and 500 ms is well inside what a viewer perceives as "it
+                // recovered" while being far too slow to spam the encoder.
+                if sink.take_keyframe_request() {
+                    if let Some(tx) = &idr_tx {
+                        let _ = tx.send(());
+                    }
+                }
             }
             datagram = media_rx.recv() => {
                 match datagram {
@@ -503,6 +543,11 @@ pub async fn demultiplex(
                                     return Ok(());
                                 }
                             }
+                            // Input only ever travels client → host, so one
+                            // arriving here is our own datagram reflected by a
+                            // middlebox or someone probing. Either way there is
+                            // no receiver for it on this side.
+                            Class::EchoInput => {}
                             // The host's STUN keepalives and punch probes, plus
                             // internet noise.
                             Class::Stun | Class::Other => {}

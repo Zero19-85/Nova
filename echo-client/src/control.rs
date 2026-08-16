@@ -140,19 +140,36 @@ impl ControlChannel {
         let id = self.next_id;
         self.next_id += 1;
 
-        let line = encode_line(&OutboundRequest {
-            id,
-            command: command.to_string(),
-            params,
-        })?;
+        let line = encode_line(&OutboundRequest::call(id, command, params))?;
         self.write.write_all(&line).await.map_err(|e| format!("send {command}: {e}"))?;
         self.write.flush().await.map_err(|e| format!("flush {command}: {e}"))?;
 
-        let text = read_line_bounded(&mut self.read, MAX_LINE_BYTES)
-            .await
-            .map_err(|e| format!("read reply to {command}: {e}"))?
-            .ok_or_else(|| format!("host closed the connection during {command}"))?;
-        let response: InboundResponse = decode_line(text.as_bytes())?;
+        // Notifications are answered only when they FAIL, and such a response
+        // carries no id. It can land here, between a numbered call and its
+        // reply, so those lines are skipped rather than mistaken for desync —
+        // treating one as a mismatch would tear down a healthy channel because
+        // a mouse packet was rejected.
+        let response = loop {
+            let text = read_line_bounded(&mut self.read, MAX_LINE_BYTES)
+                .await
+                .map_err(|e| format!("read reply to {command}: {e}"))?
+                .ok_or_else(|| format!("host closed the connection during {command}"))?;
+            let response: InboundResponse = decode_line(text.as_bytes())?;
+            if response.id.is_none() {
+                if !response.ok {
+                    // stderr rather than a logging crate: this is the only line
+                    // in the crate that would need one, and the host logs the
+                    // same rejection with more context than the client has.
+                    let why = response
+                        .error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "unspecified".into());
+                    eprintln!("⚠️  host rejected a notification: {why}");
+                }
+                continue;
+            }
+            break response;
+        };
 
         // A mismatched id means the stream desynced, which is worse than any
         // single failed command — the next reply would be read as this one's.
@@ -167,6 +184,30 @@ impl ControlChannel {
             return Err(err);
         }
         Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    /// Build a channel over an arbitrary stream, for tests.
+    #[cfg(test)]
+    fn over(stream: Stream) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        Self { write, read: BufReader::new(read), next_id: 1 }
+    }
+
+    /// Send a command without waiting for a reply.
+    ///
+    /// This is the input path's reason for existing. [`call`](Self::call) is
+    /// strictly one-in-flight, so a command per pointer event serialises the
+    /// whole input stream behind a network round trip each — which put the
+    /// host's cursor seconds behind the user's hand, still coasting after they
+    /// stopped moving (live 2026-08-15).
+    ///
+    /// Failures come back asynchronously as an id-less response, which
+    /// [`call`](Self::call) logs and skips. That is the trade: immediate input,
+    /// errors reported out of band rather than returned here.
+    pub async fn notify(&mut self, command: &str, params: Map<String, Value>) -> Result<(), String> {
+        let line = encode_line(&OutboundRequest::notification(command, params))?;
+        self.write.write_all(&line).await.map_err(|e| format!("send {command}: {e}"))?;
+        self.write.flush().await.map_err(|e| format!("flush {command}: {e}"))
     }
 }
 
@@ -184,4 +225,64 @@ pub fn field_u64(result: &Value, key: &str) -> Result<u64, String> {
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("host reply is missing \"{key}\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    /// Notifications are answered only when they fail, and such a response
+    /// carries no id. It can land between a numbered call and its reply.
+    ///
+    /// Before notifications existed, `call` treated ANY id it did not expect as
+    /// a fatal desync — so a single rejected input packet would have torn down
+    /// a perfectly healthy control channel mid-session. This is the regression
+    /// that guards against reintroducing that.
+    #[tokio::test]
+    async fn a_rejected_notification_does_not_look_like_desync() {
+        let (client, mut host) = tokio::io::duplex(4096);
+        let mut ctl = ControlChannel::over(Box::new(client));
+
+        tokio::spawn(async move {
+            // Read the request so the client's write completes.
+            let mut buf = [0u8; 512];
+            let _ = tokio::io::AsyncReadExt::read(&mut host, &mut buf).await;
+
+            // Two id-less rejections arrive first — input the host refused —
+            // then the actual reply to the numbered call.
+            host.write_all(
+                b"{\"ok\":false,\"error\":{\"code\":\"not_the_owner\",\"message\":\"no\"}}\n\
+                  {\"ok\":false,\"error\":{\"code\":\"bad_request\",\"message\":\"nope\"}}\n\
+                  {\"id\":1,\"ok\":true,\"result\":{\"session_id\":42}}\n",
+            )
+            .await
+            .unwrap();
+            host.flush().await.unwrap();
+        });
+
+        let result = ctl
+            .call("stop_session", Map::new())
+            .await
+            .expect("the call must survive rejections aimed at notifications");
+        assert_eq!(result.get("session_id").and_then(Value::as_u64), Some(42));
+    }
+
+    /// A genuinely mismatched *numbered* reply is still fatal: the next reply
+    /// would otherwise be read as this one's.
+    #[tokio::test]
+    async fn a_mismatched_numbered_reply_is_still_treated_as_desync() {
+        let (client, mut host) = tokio::io::duplex(4096);
+        let mut ctl = ControlChannel::over(Box::new(client));
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let _ = tokio::io::AsyncReadExt::read(&mut host, &mut buf).await;
+            host.write_all(b"{\"id\":99,\"ok\":true,\"result\":{}}\n").await.unwrap();
+            host.flush().await.unwrap();
+        });
+
+        let err = ctl.call("stop_session", Map::new()).await.unwrap_err();
+        assert!(err.contains("mismatch"), "expected a desync error, got: {err}");
+    }
 }

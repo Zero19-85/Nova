@@ -22,6 +22,10 @@
 //!   a legacy Moonlight stream at once without either side guessing.
 //! - [`rudp`] — acknowledged, ordered delivery for control messages. Media
 //!   tolerates loss; session state does not.
+//! - [`input_channel`] — sealed, unreliable, unordered input datagrams. Input
+//!   wants neither ordering nor retransmission, and imposing both on it made
+//!   the pointer lag seconds behind the hand; it gets redundancy and
+//!   deduplication instead.
 //! - [`punch`] — UDP hole punching (simultaneous open). Symmetric by nature:
 //!   both peers run the identical algorithm, which is the mechanism itself.
 //! - [`relay`] — the signaling-relay client. Nova and Echo are *both* clients
@@ -43,6 +47,7 @@
 pub mod demux;
 pub mod envelope;
 pub mod identity;
+pub mod input_channel;
 pub mod media_crypto;
 pub mod rudp;
 pub mod punch;

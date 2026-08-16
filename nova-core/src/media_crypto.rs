@@ -66,6 +66,13 @@ pub const CRYPTO_OVERHEAD: usize = 16;
 pub const STREAM_VIDEO: u32 = 1;
 /// Stream discriminator for audio frames.
 pub const STREAM_AUDIO: u32 = 2;
+/// Stream discriminator for client-to-host input datagrams.
+///
+/// The only stream that travels *toward* the host, which is why it needs its
+/// own value rather than sharing one: an attacker who captured a video frame
+/// must not be able to replay it into the input path, and a distinct stream id
+/// makes the nonce and AAD differ so the tag check refuses it.
+pub const STREAM_INPUT: u32 = 3;
 
 /// Per-session media key material.
 ///

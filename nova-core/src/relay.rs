@@ -163,11 +163,7 @@ impl RelayConnection {
     pub async fn call(&mut self, command: &str, params: Map<String, Value>) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let body = encode_line(&OutboundRequest {
-            id,
-            command: command.to_string(),
-            params,
-        })?;
+        let body = encode_line(&OutboundRequest::call(id, command, params))?;
 
         let req = HttpRequest::builder()
             .method(Method::POST)

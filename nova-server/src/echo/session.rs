@@ -77,6 +77,30 @@ pub enum MediaOwner {
     Echo,
 }
 
+/// Why a sealed input datagram was not injected.
+///
+/// Deliberately not an [`HandoffError`]: nothing on this path can be reported
+/// back to the sender. The datagram is unacknowledged by design, and answering
+/// an unauthenticated one would tell an attacker probing the socket whether a
+/// session exists. So these are for the host's own log and counters only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputRejection {
+    /// No Echo session is running — nothing owns the keyboard.
+    NoSession,
+    /// The datagram failed to open: forged, corrupted, or sealed for a session
+    /// that has since ended.
+    Unopenable(String),
+}
+
+impl std::fmt::Display for InputRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSession => write!(f, "no Echo session holds the pipeline"),
+            Self::Unopenable(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// Why a handoff was refused. Each variant maps to a stable RPC error code, so
 /// a client can branch on the reason rather than parse prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +327,13 @@ pub struct EchoSession {
     /// session and handed to the client with the grant.
     rikey: [u8; 16],
     rikeyid: u32,
+    /// Deduplicating opener for this session's input datagrams.
+    ///
+    /// Per-session, and that is load-bearing twice over: it holds the sequence
+    /// high-water mark that makes redundant repeats idempotent, and it is keyed
+    /// to the keys minted at `start`, so input sealed for a previous session
+    /// cannot be replayed into this one.
+    input: nova_core::input_channel::InputReceiver,
 }
 
 impl EchoSession {
@@ -362,6 +393,18 @@ pub trait MediaPlane: Send + Sync + 'static {
     ) -> Result<(), HandoffError>;
     /// Stop encoding and release the target.
     fn end(&self);
+    /// Hand a GameStream input packet to the injection stack.
+    ///
+    /// Unparsed by design — see `echo::rpc::handle_input`.
+    fn inject_input(&self, packet: Vec<u8>);
+    /// Force the next encoded frame to be a keyframe.
+    ///
+    /// Nova runs an infinite GOP, so there is no scheduled IDR to wait for. A
+    /// client whose reference chain broke — a dropped frame, a decoder reset —
+    /// can decode nothing further until one is produced on request. Without
+    /// this the picture freezes permanently on the last good frame while the
+    /// host streams on, which is exactly what happened live on 2026-08-15.
+    fn request_idr(&self);
 }
 
 /// Production plane: retargets `RtpSender` and configures the live Worker.
@@ -425,6 +468,11 @@ impl MediaPlane for WorkerMediaPlane {
             rtp.set_fps(params.fps);
             rtp.set_codec(params.codec == Codec::Hevc, params.codec == Codec::Av1);
             rtp.pin_target(peer);
+            // The pin takes effect now; the Worker's reconfiguration does not.
+            // Everything it encodes in between belongs to the previous session's
+            // format and must not reach this client. Released by the Master when
+            // `WorkerConfigured` arrives, and self-releasing if it never does.
+            rtp.hold_until_configured();
         }
 
         self.worker_link.send(ControlMsg::ConfigureStart(ipc::ConfigureStart {
@@ -447,6 +495,17 @@ impl MediaPlane for WorkerMediaPlane {
             start_frame_index: 1,
         }));
         Ok(())
+    }
+
+    fn inject_input(&self, packet: Vec<u8>) {
+        // The exact message the ENet control path sends, so Echo's input meets
+        // the Master's helper-vs-Worker routing at the identical place as
+        // Moonlight's — including the gamepad exception.
+        self.worker_link.send(ControlMsg::InjectInput(packet));
+    }
+
+    fn request_idr(&self) {
+        self.worker_link.send(ControlMsg::RequestIdr);
     }
 
     fn end(&self) {
@@ -621,6 +680,7 @@ impl SessionManager {
             peer,
             params,
             started: Instant::now(),
+            input: nova_core::input_channel::InputReceiver::new(keys.clone()),
             keys,
             rikey,
             rikeyid,
@@ -666,6 +726,85 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Inject input on behalf of the session's owner.
+    ///
+    /// Owner-checked, and the check matters more here than anywhere else on
+    /// this surface: input injection drives the host's keyboard and mouse. A
+    /// device that is merely paired — not streaming — must never reach it.
+    pub fn inject_input(&self, device: &EchoIdentity, packet: Vec<u8>) -> Result<(), HandoffError> {
+        let guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return Err(HandoffError::NotTheOwner);
+        };
+        if session.device_fingerprint != device.fingerprint {
+            return Err(HandoffError::NotTheOwner);
+        }
+        self.plane.inject_input(packet);
+        Ok(())
+    }
+
+    /// Inject input from a sealed datagram that arrived on the media socket.
+    ///
+    /// The counterpart to [`inject_input`](Self::inject_input) for the
+    /// unreliable path, and the authorization works differently on purpose.
+    /// There is no TLS connection here to have authenticated a device and no
+    /// `EchoIdentity` to compare, because this datagram arrived raw on a socket
+    /// anyone can write to. What stands in for the owner check is the session
+    /// key: it was minted at `start` and handed to exactly one device over
+    /// mutual TLS, so a datagram that opens under it came from that device.
+    /// Anything else fails the tag and is counted.
+    ///
+    /// Returns how many packets were injected — zero is normal and means every
+    /// packet in the datagram was a redundant repeat of one already applied.
+    pub fn inject_sealed_input(&self, datagram: &[u8]) -> Result<usize, InputRejection> {
+        // The lock is released before anything is injected, and that boundary
+        // is deliberate: `seal_video` takes this same mutex for **every video
+        // frame**, so any work done while holding it is work the media thread
+        // can block on. Decrypting and deduplicating genuinely need the
+        // session's state; handing packets onward does not. Keeping the
+        // injection inside would couple the frame path to whatever the Worker
+        // link happens to cost that instant, which is a hitch nobody would
+        // think to look for here.
+        let packets = {
+            let mut guard = self.active.lock().unwrap();
+            let Some(session) = guard.as_mut() else {
+                return Err(InputRejection::NoSession);
+            };
+            session
+                .input
+                .open(datagram)
+                .map_err(|e| InputRejection::Unopenable(e.to_string()))?
+        };
+
+        let count = packets.len();
+        for packet in packets {
+            self.plane.inject_input(packet);
+        }
+        Ok(count)
+    }
+
+    /// Input-datagram counters for the live session, for diagnostics.
+    pub fn input_stats(&self) -> Option<nova_core::input_channel::InputStats> {
+        Some(self.active.lock().unwrap().as_ref()?.input.stats())
+    }
+
+    /// Ask the encoder for a keyframe on behalf of the session's owner.
+    ///
+    /// Owner-checked like [`stop`](Self::stop): a keyframe request is cheap but
+    /// not free — it costs a full intra-coded frame — so an authenticated device
+    /// that holds no session must not be able to make the host produce them.
+    pub fn request_idr(&self, device: &EchoIdentity) -> Result<u64, HandoffError> {
+        let guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return Err(HandoffError::NotTheOwner);
+        };
+        if session.device_fingerprint != device.fingerprint {
+            return Err(HandoffError::NotTheOwner);
+        }
+        self.plane.request_idr();
+        Ok(session.id)
+    }
+
     /// Drop the session without an owner check — for host-side teardown
     /// (shutdown, a Worker that will never come back), never for a remote
     /// request.
@@ -697,6 +836,8 @@ mod tests {
     struct MockPlane {
         begun: Mutex<Vec<(SocketAddr, StreamParams)>>,
         ended: Mutex<usize>,
+        idrs: Mutex<usize>,
+        injected: Mutex<Vec<Vec<u8>>>,
         fail: Option<HandoffError>,
     }
 
@@ -717,6 +858,12 @@ mod tests {
         }
         fn end(&self) {
             *self.ended.lock().unwrap() += 1;
+        }
+        fn request_idr(&self) {
+            *self.idrs.lock().unwrap() += 1;
+        }
+        fn inject_input(&self, packet: Vec<u8>) {
+            self.injected.lock().unwrap().push(packet);
         }
     }
 
@@ -856,6 +1003,151 @@ mod tests {
 
         // Stopping an already-stopped session is refused, not a panic.
         assert_eq!(f.mgr.stop(&device("Xbox", 1)), Err(HandoffError::NotTheOwner));
+    }
+
+    /// A keyframe request is the client's ONLY repair path under an infinite
+    /// GOP, so it must reach the encoder — and it costs a full intra-coded
+    /// frame, so a device that holds no session must not be able to demand one.
+    #[test]
+    fn only_the_owner_can_ask_for_a_keyframe() {
+        let f = fixture(Some(peer()));
+
+        // No session at all: nobody is the owner yet.
+        assert_eq!(f.mgr.request_idr(&device("Xbox", 1)), Err(HandoffError::NotTheOwner));
+        assert_eq!(*f.plane.idrs.lock().unwrap(), 0);
+
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert_eq!(f.mgr.request_idr(&device("Pixel", 2)), Err(HandoffError::NotTheOwner));
+        assert_eq!(
+            *f.plane.idrs.lock().unwrap(),
+            0,
+            "an authenticated stranger must not be able to make the host encode keyframes"
+        );
+
+        assert!(f.mgr.request_idr(&device("Xbox", 1)).is_ok());
+        assert_eq!(*f.plane.idrs.lock().unwrap(), 1);
+
+        // Repeatable: recovery may need more than one attempt on a bad link.
+        assert!(f.mgr.request_idr(&device("Xbox", 1)).is_ok());
+        assert_eq!(*f.plane.idrs.lock().unwrap(), 2);
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        assert_eq!(
+            f.mgr.request_idr(&device("Xbox", 1)),
+            Err(HandoffError::NotTheOwner),
+            "a finished session grants no further keyframes"
+        );
+    }
+
+    /// Input injection drives the host's real keyboard and mouse, so holding
+    /// the session — not merely being paired — is the bar.
+    #[test]
+    fn only_the_owner_can_inject_input() {
+        let f = fixture(Some(peer()));
+        let packet = vec![0u8; 12];
+
+        assert_eq!(
+            f.mgr.inject_input(&device("Xbox", 1), packet.clone()),
+            Err(HandoffError::NotTheOwner),
+            "no session means no injection, even for a paired device"
+        );
+
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert_eq!(
+            f.mgr.inject_input(&device("Pixel", 2), packet.clone()),
+            Err(HandoffError::NotTheOwner)
+        );
+        assert!(
+            f.plane.injected.lock().unwrap().is_empty(),
+            "a stranger must never reach the injection stack"
+        );
+
+        assert!(f.mgr.inject_input(&device("Xbox", 1), packet.clone()).is_ok());
+        assert_eq!(
+            f.plane.injected.lock().unwrap().as_slice(),
+            &[packet.clone()],
+            "the packet must arrive byte-for-byte — the host parses it, not us"
+        );
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        assert_eq!(
+            f.mgr.inject_input(&device("Xbox", 1), packet),
+            Err(HandoffError::NotTheOwner),
+            "a finished session injects nothing"
+        );
+    }
+
+    /// The unreliable input path has no TLS connection behind it and no
+    /// `EchoIdentity` to check, so the session key carries the entire
+    /// authorization burden. These datagrams arrive on a socket anyone can
+    /// write to and end at `SendInput` on a host whose Master runs as
+    /// LocalSystem, which makes this the single most security-sensitive seam
+    /// Echo has.
+    #[test]
+    fn only_the_session_key_can_inject_over_the_unreliable_path() {
+        use nova_core::input_channel::InputSender;
+        use nova_core::media_crypto::SessionKeys;
+
+        let f = fixture(Some(peer()));
+        let packet = vec![7u8; 12];
+
+        // Nothing running: a well-formed datagram from nowhere injects nothing.
+        let mut orphan = InputSender::new(SessionKeys::generate());
+        let stray = orphan.datagrams(vec![packet.clone()]).unwrap().remove(0);
+        assert_eq!(f.mgr.inject_sealed_input(&stray), Err(InputRejection::NoSession));
+
+        let grant = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let keys = SessionKeys::from_hex(&grant.keys_hex).expect("grant keys parse");
+
+        // A different key — the shape an attacker on the punched path has.
+        assert!(
+            matches!(f.mgr.inject_sealed_input(&stray), Err(InputRejection::Unopenable(_))),
+            "a foreign key must not reach the injector"
+        );
+        assert!(f.plane.injected.lock().unwrap().is_empty());
+
+        // The granted key does.
+        let mut owner = InputSender::new(keys);
+        let datagram = owner.datagrams(vec![packet.clone()]).unwrap().remove(0);
+        assert_eq!(f.mgr.inject_sealed_input(&datagram), Ok(1));
+        assert_eq!(f.plane.injected.lock().unwrap().as_slice(), &[packet.clone()]);
+
+        // Replaying it injects nothing a second time — the property that stops
+        // an observer replaying a captured click.
+        assert_eq!(f.mgr.inject_sealed_input(&datagram), Ok(0));
+        assert_eq!(f.plane.injected.lock().unwrap().len(), 1);
+
+        // A finished session takes no more input, even from its own key: the
+        // receiver dies with the session rather than outliving it.
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        let next = owner.datagrams(vec![packet]).unwrap().remove(0);
+        assert_eq!(f.mgr.inject_sealed_input(&next), Err(InputRejection::NoSession));
+    }
+
+    /// A new session must not accept input sealed for the previous one, even
+    /// for the same device — otherwise input queued during a reconnect could
+    /// arrive against a session the user did not intend it for.
+    #[test]
+    fn input_sealed_for_a_previous_session_is_refused_by_the_next() {
+        use nova_core::input_channel::InputSender;
+        use nova_core::media_crypto::SessionKeys;
+
+        let f = fixture(Some(peer()));
+        let first = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let mut stale =
+            InputSender::new(SessionKeys::from_hex(&first.keys_hex).expect("keys parse"));
+        let queued = stale.datagrams(vec![vec![9u8; 12]]).unwrap().remove(0);
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert!(matches!(
+            f.mgr.inject_sealed_input(&queued),
+            Err(InputRejection::Unopenable(_))
+        ));
+        assert!(f.plane.injected.lock().unwrap().is_empty());
     }
 
     #[test]

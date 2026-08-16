@@ -254,6 +254,12 @@ static EMERGENCY_FIRED: std::sync::atomic::AtomicBool =
 /// callers (or the normal teardown racing it) find `None` and return
 /// immediately.
 pub fn emergency_restore_for_shutdown() {
+    // Pointer settings first, and outside the snapshot check: they are armed
+    // whenever a session starts, independently of whether a virtual display
+    // was ever involved. Claim-once, so the ordinary teardown path calling it
+    // too is a no-op rather than a conflict. Cheap enough to run before the
+    // expensive display work, which is what a shutdown deadline may cut short.
+    crate::input::restore_pointer_ballistics();
     let Some(snap) = EMERGENCY_SNAPSHOT.lock().unwrap().take() else {
         // No active virtual-display session — but a NON-VDD stream may still
         // have the sink swap engaged (audio state is armed independently of the

@@ -17,10 +17,11 @@
 /// log next to the binary regardless of how the process was started.
 
 use std::path::{Path, PathBuf};
-use windows::Win32::Foundation::HANDLE;
+use std::sync::OnceLock;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_ALWAYS,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_ALWAYS,
 };
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
@@ -67,6 +68,125 @@ pub fn log_path_wide() -> Vec<u16> {
         .collect()
 }
 
+// ── Rotation ─────────────────────────────────────────────────────────────────
+
+/// Rotate once a log passes this size. Nova logs roughly 2 lines/second while
+/// streaming (`📊 RTP/s`), so an always-on host produced ~13 MB/day and grew
+/// without bound — the log was 16 MB before this existed.
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Rotated generations kept beside the live log (`nova.log.1`, `nova.log.2`).
+/// Two is enough to still hold the *previous* session when a crash is found
+/// after the fact, and bounds each log family at 48 MB.
+const KEPT_GENERATIONS: usize = 2;
+
+/// How often the watchdog re-checks the size. A process can stream for days,
+/// so rotating only at startup would not actually bound anything.
+const ROTATE_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Called after a rotation so a subsystem holding its own handle to the log can
+/// reopen it. The C++ shim keeps a CRT handle that Win32 `SetStdHandle` does
+/// not reach, so without this it would keep writing into the rotated-away file.
+static REOPEN_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Register a reopen callback (see [`REOPEN_HOOK`]). First caller wins; the
+/// shim registers itself when it initialises its log.
+pub fn set_log_reopen_hook(hook: fn()) {
+    let _ = REOPEN_HOOK.set(hook);
+}
+
+fn generation_path(path: &Path, n: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
+}
+
+/// Shift `log.1 → log.2`, drop the oldest, and move the live file aside.
+///
+/// Every step is best-effort: a rotation that cannot happen (file locked by a
+/// viewer, permissions) must never stop the process from logging, so failures
+/// leave the current file in place and the next check simply tries again.
+fn rotate(path: &Path) {
+    let _ = std::fs::remove_file(generation_path(path, KEPT_GENERATIONS));
+    for n in (1..KEPT_GENERATIONS).rev() {
+        let _ = std::fs::rename(generation_path(path, n), generation_path(path, n + 1));
+    }
+    let _ = std::fs::rename(path, generation_path(path, 1));
+}
+
+fn oversized(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false)
+}
+
+/// Open (or reopen) the log and point the process-wide stdout/stderr at it.
+///
+/// `FILE_SHARE_DELETE` is what makes live rotation possible at all: without it
+/// the rename below fails for as long as the process holds the handle, which is
+/// its entire life.
+fn open_and_redirect(path: &Path) -> Option<HANDLE> {
+    let handle = unsafe {
+        CreateFileW(
+            &windows::core::HSTRING::from(path.as_os_str()),
+            0x0004u32, // FILE_APPEND_DATA — CreateFileW takes raw u32, not FILE_ACCESS_RIGHTS
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    match handle {
+        Ok(h) => {
+            unsafe {
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("[Nova] WARNING: cannot open log file {}: {:?}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// Watch the live log and rotate it when it outgrows [`MAX_LOG_BYTES`].
+///
+/// Rotation is rename-then-reopen rather than truncate-in-place: truncating
+/// would discard the whole history at the instant it crossed the threshold,
+/// which is reliably the moment before you needed it.
+fn spawn_rotation_watchdog(path: PathBuf, initial: HANDLE) {
+    // `HANDLE` wraps a raw pointer and so is not `Send`. The value itself is
+    // just a kernel handle-table index, valid process-wide, so it moves across
+    // the thread boundary as an integer and is rebuilt on the far side.
+    let initial = initial.0 as isize;
+    std::thread::Builder::new()
+        .name("nova-log-rotate".into())
+        .spawn(move || {
+            let mut current = HANDLE(initial as *mut core::ffi::c_void);
+            loop {
+                std::thread::sleep(ROTATE_CHECK);
+                if !oversized(&path) {
+                    continue;
+                }
+                rotate(&path);
+                // Reopen even if the rename failed — the handle still points at
+                // the old file either way, and a fresh open is harmless.
+                if let Some(fresh) = open_and_redirect(&path) {
+                    // Only now is the old handle unreferenced by stdout/stderr.
+                    unsafe { let _ = CloseHandle(current); }
+                    current = fresh;
+                    println!("🗂️  Log rotated at {} (cap {} MB, keeping {} generation(s))",
+                        timestamp(), MAX_LOG_BYTES / (1024 * 1024), KEPT_GENERATIONS);
+                    if let Some(hook) = REOPEN_HOOK.get() {
+                        hook();
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Call ONCE, as the very first line of `run()` / `service_main()`, BEFORE
@@ -96,44 +216,31 @@ fn init_logger_to(path: PathBuf) {
         let _ = std::fs::create_dir_all(dir);
     }
 
-    // Open in append mode so multiple restarts accumulate in one file.
-    // FILE_SHARE_READ | FILE_SHARE_WRITE: READ lets an external viewer
-    // (`tail -f`) follow the log live; WRITE means opening the file can never
-    // sharing-violation just because another Nova process (service ↔ host, or
-    // a lingering instance) still has it open — the open always succeeds so a
-    // process is never left silently logless.
-    let handle: windows::core::Result<HANDLE> = unsafe {
-        CreateFileW(
-            &windows::core::HSTRING::from(path.as_os_str()),
-            0x0004u32, // FILE_APPEND_DATA — CreateFileW takes raw u32, not FILE_ACCESS_RIGHTS
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    };
+    // Rotate before opening, so a restart never inherits an already-huge file
+    // and start-up cost stays bounded.
+    if oversized(&path) {
+        rotate(&path);
+    }
 
-    match handle {
-        Ok(h) => {
-            unsafe {
-                // Redirect Win32 stdout and stderr to the log file.
-                // Rust's println! calls WriteFile(GetStdHandle(STD_OUTPUT_HANDLE)),
-                // so this redirect covers ALL println!/eprintln! in the process.
-                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
-            }
+    // Open in append mode so multiple restarts accumulate in one file.
+    // FILE_SHARE_READ lets an external viewer (`tail -f`) follow the log live;
+    // WRITE means opening can never sharing-violation just because another Nova
+    // process (service ↔ host, or a lingering instance) still has it open — the
+    // open always succeeds so a process is never left silently logless.
+    match open_and_redirect(&path) {
+        Some(h) => {
             // From this point on, println! writes to the log file.
             println!();
             println!("══════════════════════════════════════════════════════════");
             println!("  Nova  started at {}", timestamp());
             println!("  Log   {}", path.display());
             println!("  PID   {}", std::process::id());
+            println!("  Cap   {} MB, {} rotated generation(s) kept",
+                MAX_LOG_BYTES / (1024 * 1024), KEPT_GENERATIONS);
             println!("══════════════════════════════════════════════════════════");
+            spawn_rotation_watchdog(path, h);
         }
-        Err(e) => {
-            // Can't redirect — fall back to stderr (visible in cargo run, lost in service).
-            eprintln!("[Nova] WARNING: cannot open log file {}: {:?}", path.display(), e);
+        None => {
             eprintln!("[Nova] Service output will not be captured.");
         }
     }

@@ -46,11 +46,19 @@
 //! control datagrams from other addresses are ignored — which also bounds what
 //! an unauthenticated peer can make this process do: at most one TLS handshake
 //! at a time, and none at all while a real client is connected.
+//!
+//! **The slot must therefore be reclaimable.** Nothing beneath TLS times out, so
+//! a peer that simply stops talking leaves `serve_connection` blocked on a read
+//! that never completes and the slot held until Nova restarts — observed live
+//! (2026-08-15) as one successful tunnel followed by five successful punches
+//! that the host silently ignored, with only `tls handshake eof` on the client.
+//! [`TUNNEL_IDLE_TIMEOUT`] bounds it, and contention is logged rather than
+//! dropped in silence.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nova_core::rudp::{drive, ControlChannel, RudpStream};
 
@@ -62,6 +70,72 @@ use crate::echo::session::SessionManager;
 /// internet and retransmits, but bounded so a half-open tunnel cannot hold the
 /// single connection slot indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a tunnel may go without a single datagram before it is treated as
+/// dead and its slot reclaimed.
+///
+/// This exists because a client that simply stops talking used to hold the one
+/// tunnel slot **forever**: nothing below the TLS layer times out, so
+/// `serve_connection` waits on a read that will never complete, `busy` stays
+/// set, and every later punch is silently ignored. A client vanishing without a
+/// close_notify is the normal case, not the exceptional one — Android kills
+/// backgrounded apps, and a refused client goes quiet by design.
+///
+/// A granted session pings every 500 ms (`echo-client/src/receiver.rs`), so this
+/// is 60× the live cadence and cannot reap a working tunnel.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the accept loop checks the live tunnel for idleness. Only needs to
+/// be fine enough that a reclaimed slot is available before a user retries.
+const IDLE_SWEEP: Duration = Duration::from_secs(5);
+
+/// How often the input arrival rate is reported while input is flowing.
+///
+/// This exists to answer one question that nothing else can: input travels
+/// client → socket → Master → pipe → Worker → `SendInput`, and a pointer that
+/// lags behind the hand looks identical from the outside no matter which of
+/// those segments is queueing. The **arrival rate measured here** splits that
+/// chain in half. If it matches the client's send cadence, everything upstream
+/// is healthy and the delay is downstream; if it is a fraction of it, the
+/// client or the path is the bottleneck and the host is blameless.
+///
+/// Silent when no input is arriving, so an idle session logs nothing.
+const INPUT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The tunnel currently being served.
+struct ActiveTunnel {
+    peer: SocketAddr,
+    sink: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Last **control** datagram seen from `peer`. Dropping [`ActiveTunnel`]
+    /// closes `sink`, which ends the driver, which unblocks the TLS read — so
+    /// eviction here cascades all the way to `serve_tunnel` returning and
+    /// clearing `busy`.
+    last_seen: Instant,
+}
+
+impl ActiveTunnel {
+    /// How long this tunnel has been silent, counting **all** traffic from the
+    /// peer, not just control datagrams.
+    ///
+    /// A granted Echo session keeps its NAT mapping alive with a raw `b"PING"`
+    /// every 500 ms on the media socket. That is not control traffic and never
+    /// reaches this module, so judging by `last_seen` alone declares a perfectly
+    /// healthy stream dead — which is exactly what happened live on 2026-08-15:
+    /// a working session went black at the 30 s mark. `rtp.rs` sees every
+    /// datagram on the port and is the only place that knows the peer is alive.
+    fn idle_for(&self, rtp: &Mutex<crate::rtp::RtpSender>) -> Duration {
+        let control_idle = self.last_seen.elapsed();
+        let media_idle = rtp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .idle_since(self.peer);
+        // Whichever channel spoke most recently is the true measure of life.
+        match media_idle {
+            Some(m) => control_idle.min(m),
+            None => control_idle,
+        }
+    }
+}
 
 /// Run the WAN control endpoint.
 ///
@@ -77,22 +151,120 @@ pub fn spawn(
         // True while a tunnel is being served. Not a mutex: the accept loop is
         // the only writer, and the served task clears it on exit.
         let busy = Arc::new(AtomicBool::new(false));
-        // Datagram sink for the tunnel currently being served.
-        let mut active: Option<(SocketAddr, tokio::sync::mpsc::UnboundedSender<Vec<u8>>)> = None;
+        // The tunnel currently being served.
+        let mut active: Option<ActiveTunnel> = None;
+        let mut sweep = tokio::time::interval(IDLE_SWEEP);
+        // Rate-limit the "slot taken" notice: a rejected client retransmits.
+        let mut last_busy_notice: Option<Instant> = None;
+        // Same, for input that could not be injected.
+        let mut last_input_notice: Option<Instant> = None;
+        // Input arrival accounting — see INPUT_REPORT_INTERVAL.
+        let mut input_window = Instant::now();
+        let (mut datagrams, mut applied, mut duplicates, mut refused) = (0u32, 0u32, 0u32, 0u32);
 
         println!("🛡️  Echo WAN control ready — mutual TLS over the punched path");
 
-        while let Some((datagram, from)) = inbound.recv().await {
+        loop {
+            let (datagram, from) = tokio::select! {
+                received = inbound.recv() => match received {
+                    Some(v) => v,
+                    None => break, // demux gone; the process is shutting down
+                },
+                _ = sweep.tick() => {
+                    // Reap a tunnel whose peer stopped talking. Without this the
+                    // slot is held until Nova restarts.
+                    if let Some(t) = &active {
+                        if t.idle_for(&rtp_sender) > TUNNEL_IDLE_TIMEOUT {
+                            println!(
+                                "⌛ Echo WAN: tunnel from {} silent for {}s — reclaiming the slot",
+                                t.peer,
+                                t.idle_for(&rtp_sender).as_secs()
+                            );
+                            active = None;
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            // Input is split off before anything else looks at this datagram.
+            //
+            // It shares the inbox with control but has nothing to do with the
+            // tunnel: it carries its own authentication, so it must not open
+            // one, must not be able to evict one, and must not count toward the
+            // busy slot. Nor does it refresh `last_seen` — the idle sweep is
+            // asking whether the *tunnel* is alive, and a peer that only ever
+            // sent input would otherwise hold the slot forever.
+            if nova_core::demux::classify(&datagram) == nova_core::demux::Class::EchoInput {
+                datagrams += 1;
+                // Timed across the whole open-and-inject, because the point of
+                // measuring here is to catch this step being expensive enough
+                // to back the queue up — an assumption nobody has tested.
+                let began = Instant::now();
+                match sessions.inject_sealed_input(&datagram) {
+                    Ok(count) => {
+                        applied += count as u32;
+                        // Every datagram repeats REDUNDANCY packets, so a
+                        // healthy lossless path shows duplicates ≈ 3× datagrams.
+                        // Far fewer means datagrams are being lost, which is the
+                        // signature of a path problem rather than a queue.
+                        duplicates += (4u32.saturating_sub(count as u32)).min(3);
+                    }
+                    Err(why) => {
+                        refused += 1;
+                        // Rate-limited: a spray of forged datagrams must not
+                        // become a log-flooding amplifier, and a real one is a
+                        // steady condition rather than an event.
+                        if last_input_notice.map_or(true, |t: Instant| {
+                            t.elapsed() > Duration::from_secs(10)
+                        }) {
+                            println!("🚫 Echo input from {from} not injected: {why}");
+                            last_input_notice = Some(Instant::now());
+                        }
+                    }
+                }
+                let cost = began.elapsed();
+
+                if input_window.elapsed() >= INPUT_REPORT_INTERVAL {
+                    println!(
+                        "⌨️  Echo input/s: {datagrams} datagrams, {applied} applied, \
+                         {duplicates} repeats, {refused} refused, last inject {}µs",
+                        cost.as_micros()
+                    );
+                    input_window = Instant::now();
+                    datagrams = 0;
+                    applied = 0;
+                    duplicates = 0;
+                    refused = 0;
+                }
+                continue;
+            }
+
             // Route to the live tunnel.
-            if let Some((peer, sink)) = &active {
-                if *peer == from {
-                    if sink.send(datagram).is_err() {
+            if let Some(t) = &mut active {
+                if t.peer == from {
+                    t.last_seen = Instant::now();
+                    if t.sink.send(datagram).is_err() {
                         active = None; // driver finished
                     }
                     continue;
                 }
                 if busy.load(Ordering::Relaxed) {
-                    continue; // another peer, while one is served — ignore
+                    // Another peer while one is served. Silence here is what
+                    // made the wedged-slot bug invisible: five successful
+                    // punches produced no host-side line at all, while the
+                    // client saw only `tls handshake eof`.
+                    if last_busy_notice.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                        println!(
+                            "🚧 Echo WAN: {from} wants a tunnel but {} holds the slot \
+                             (idle {}s of {}s)",
+                            t.peer,
+                            t.idle_for(&rtp_sender).as_secs(),
+                            TUNNEL_IDLE_TIMEOUT.as_secs()
+                        );
+                        last_busy_notice = Some(Instant::now());
+                    }
+                    continue;
                 }
                 active = None;
             }
@@ -106,7 +278,7 @@ pub fn spawn(
             // the handshake decides everything that matters.
             let (dg_tx, dg_rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = dg_tx.send(datagram);
-            active = Some((from, dg_tx));
+            active = Some(ActiveTunnel { peer: from, sink: dg_tx, last_seen: Instant::now() });
             busy.store(true, Ordering::Relaxed);
 
             tokio::spawn(serve_tunnel(
@@ -247,6 +419,8 @@ mod tests {
             Ok(())
         }
         fn end(&self) {}
+        fn request_idr(&self) {}
+        fn inject_input(&self, _packet: Vec<u8>) {}
     }
 
     /// The whole batch, end to end: NDJSON commands crossing a **lossy**

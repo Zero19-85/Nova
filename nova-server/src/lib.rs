@@ -765,11 +765,28 @@ async fn control_supervisor(
                 match incoming {
                     Some(Ok(ControlMsg::WorkerReady)) => println!("✅ Master: worker ready"),
                     Some(Ok(ControlMsg::WorkerConfigured(wc))) => {
-                        let mut rtp = rtp_sender.lock().unwrap();
-                        rtp.set_fps(wc.fps.max(1));
-                        rtp.set_codec(wc.codec == WireCodec::Hevc, wc.codec == WireCodec::Av1);
+                        let released = {
+                            let mut rtp = rtp_sender.lock().unwrap();
+                            rtp.set_fps(wc.fps.max(1));
+                            rtp.set_codec(wc.codec == WireCodec::Hevc, wc.codec == WireCodec::Av1);
+                            rtp.release_config_hold()
+                        };
                         println!("📐 Master: worker configured {}x{}@{}fps codec={:?}{}",
                             wc.width, wc.height, wc.fps, wc.codec, if wc.is_hdr { "/HDR10" } else { "" });
+                        if released {
+                            // The IDR is mandatory, not tidiness. The GOP is
+                            // infinite, so the keyframe emitted at
+                            // reconfiguration may already have been dropped by
+                            // the hold, and the next one only comes on request —
+                            // without this the client waits forever.
+                            println!("▶️  Master: configuration confirmed — resuming frames with a fresh IDR");
+                            if let Some(w) = write_half.as_mut() {
+                                if let Err(e) = ipc::send_control(w, &ControlMsg::RequestIdr).await {
+                                    println!("⚠️  Master: IDR request to worker failed ({e})");
+                                    write_half = None;
+                                }
+                            }
+                        }
                     }
                     Some(Ok(ControlMsg::WorkerError(e))) => println!("⚠️  Master: worker reported error: {e}"),
                     Some(Ok(ControlMsg::WorkerCapabilities { vdd_capable, native_width, native_height })) => {
@@ -955,9 +972,10 @@ async fn control_supervisor(
 /// Dedicated per-pipe reader — the media-pipe counterpart of
 /// `control_reader_loop`; see its doc comment for why `recv_media`'s
 /// `read_exact`-based framing must never be raced inside `tokio::select!`
-/// directly (it isn't cancellation-safe, and here the sibling branch was
-/// `learn_ticker.tick()` firing every 500 ms — easily often enough to land
-/// mid-frame on a multi-packet HEVC IDR and desync the stream permanently).
+/// directly (it isn't cancellation-safe, and here the sibling branch is
+/// `learn_ticker.tick()` — easily often enough to land mid-frame on a
+/// multi-packet HEVC IDR and desync the stream permanently, and now that the
+/// ticker runs at 2 ms rather than 500 ms, essentially guaranteed to).
 async fn media_reader_loop(
     mut pipe: NamedPipeServer,
     tx: mpsc::UnboundedSender<std::io::Result<ipc::MediaMsg>>,
@@ -1001,7 +1019,24 @@ async fn media_supervisor(
     // `SessionManager::seal_video`.
     echo_sessions: Option<Arc<echo::session::SessionManager>>,
 ) {
-    let mut learn_ticker = tokio::time::interval(Duration::from_millis(500));
+    // 2 ms, not the 500 ms this ran at for Moonlight's sake.
+    //
+    // This ticker is the ONLY thing that drains the media socket in the split
+    // architecture, and `try_learn_target` is where Echo's demux hook lives —
+    // so it is also the only thing that hands Echo's control and **input**
+    // datagrams to the rest of the host. At 500 ms every input packet waited up
+    // to half a second in the receive buffer and then arrived with thirty of
+    // its neighbours, which the injector applied in a few milliseconds. That is
+    // precisely the reported symptom: a pointer that lags behind the hand and
+    // moves in hops. It measured as a ~500 ms control round trip that did not
+    // change when the client moved from cellular to the LAN — the tell that it
+    // was never the network (live 2026-08-16).
+    //
+    // 500 ms was correct for its original job: GameStream clients ping every
+    // 500 ms and only the most recent one matters. It became wrong the moment
+    // this drain also carried real-time input. The cost of 2 ms is one
+    // non-blocking `recv_from` returning WouldBlock, ~500 times a second.
+    let mut learn_ticker = tokio::time::interval(Duration::from_millis(2));
     // Phase 4 — the actual "survive a Worker respawn" mechanism. Master's own
     // RTSP/control connection to the client never dies on a Worker respawn
     // (sign-out, crash, session change) — the gap that WAS killing the
@@ -2415,11 +2450,67 @@ pub async fn run_worker() -> Result<()> {
                         }
                     }
                 });
+                // Input-injection accounting — see the InjectInput arm below.
+                let mut inject_window = std::time::Instant::now();
+                let mut inject_count: u32 = 0;
+                let mut inject_cost = Duration::ZERO;
+                let (mut inject_rel, mut inject_abs, mut inject_other) = (0u32, 0u32, 0u32);
                 loop {
                     tokio::select! {
                         incoming = in_rx.recv() => {
                             match incoming {
-                                Some(Ok(ipc::ControlMsg::InjectInput(bytes))) => input::handle_input_packet(&bytes),
+                                Some(Ok(ipc::ControlMsg::InjectInput(bytes))) => {
+                                    // Timed because this is the last unmeasured
+                                    // segment of the input path, and the only
+                                    // one doing real Win32 work per packet on a
+                                    // single thread fed by an unbounded queue.
+                                    // If injection costs more than the interval
+                                    // between packets, the queue grows without
+                                    // bound and the host's cursor keeps moving
+                                    // after the user's hand has stopped — which
+                                    // is the reported symptom, and which no
+                                    // amount of transport work can fix.
+                                    let began = std::time::Instant::now();
+                                    input::handle_input_packet(&bytes);
+                                    inject_cost += began.elapsed();
+                                    inject_count += 1;
+                                    // Which KIND of mouse packet is arriving
+                                    // decides everything about how the pointer
+                                    // behaves, and the host is the only place
+                                    // that sees the truth. ABS is one exact
+                                    // MOUSEEVENTF_ABSOLUTE — it maps the
+                                    // client's own cursor onto the capture rect,
+                                    // so it cannot drift or lag behind. REL is
+                                    // MOUSEEVENTF_MOVE, which accumulates and
+                                    // goes through Windows' acceleration curve.
+                                    // The client only sends ABS when Android
+                                    // refused pointer capture, so this line also
+                                    // reports capture state from the far end,
+                                    // without trusting the client to say so.
+                                    match bytes.get(4..8).map(|m| {
+                                        u32::from_le_bytes(m.try_into().expect("4 bytes"))
+                                    }) {
+                                        Some(0x05) => inject_abs += 1,
+                                        Some(0x07) => inject_rel += 1,
+                                        _ => inject_other += 1,
+                                    }
+                                    if inject_window.elapsed() >= Duration::from_secs(1) {
+                                        println!(
+                                            "⌨️  Worker inject/s: {inject_count} packets \
+                                             ({inject_rel} rel, {inject_abs} abs, {inject_other} other), \
+                                             {:.1}ms total, {:.0}µs avg",
+                                            inject_cost.as_secs_f64() * 1000.0,
+                                            inject_cost.as_micros() as f64
+                                                / inject_count.max(1) as f64,
+                                        );
+                                        inject_window = std::time::Instant::now();
+                                        inject_count = 0;
+                                        inject_cost = Duration::ZERO;
+                                        inject_rel = 0;
+                                        inject_abs = 0;
+                                        inject_other = 0;
+                                    }
+                                }
                                 Some(Ok(ipc::ControlMsg::RequestIdr)) => encoder::request_idr_global(),
                                 Some(Ok(ipc::ControlMsg::CongestionReduce)) => encoder::signal_congestion_reduction(),
                                 Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last })) => {

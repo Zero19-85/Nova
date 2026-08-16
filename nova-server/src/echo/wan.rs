@@ -233,8 +233,15 @@ pub fn spawn_gatherer(
                     let mut io = RtpPunchIo { rtp: &rtp_sender, inbox: &mut inbox };
                     match nova_core::punch::punch_io(&mut io, &peers, cfg).await {
                         Ok(result) => {
-                            println!("✅ Punch succeeded: path open to {} after {} round(s) ({:?})",
-                                result.peer, result.rounds, result.proof);
+                            // The path kind is logged because it, not the
+                            // client's WiFi indicator, determines latency: a
+                            // phone whose default route is its carrier reaches
+                            // the host over the internet even while showing a
+                            // WiFi icon, and every other measurement looks
+                            // healthy while the round trip is hundreds of ms.
+                            println!("✅ Punch succeeded: path open to {} after {} round(s) ({:?}) — {}",
+                                result.peer, result.rounds, result.proof,
+                                nova_core::punch::describe_path(&result.peer));
                             *latched.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.peer);
                             // Latched as the confirmed ECHO peer, deliberately
                             // NOT installed as RtpSender's media target: that

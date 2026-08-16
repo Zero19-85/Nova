@@ -61,8 +61,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SystemParametersInfoW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETMOUSE, SPI_GETMOUSESPEED, SPI_SETMOUSE,
+    SPI_SETMOUSESPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, XBUTTON1, XBUTTON2,
 };
 
 const MULTI_CONTROLLER_MAGIC_GEN5: u32 = 0x0000_000C;
@@ -299,6 +300,9 @@ fn auto_install_vigembus() -> Result<(), String> {
 /// streaming startup path non-blocking — the download (≈3 MB) and MSI
 /// install run entirely off the capture / network threads.
 pub fn start_session() {
+    // Before any gamepad work, because it must happen even if ViGEm is absent
+    // and this function returns early below.
+    suppress_pointer_ballistics();
     {
         let mut guard = manager().lock().unwrap();
         if guard.is_some() {
@@ -357,6 +361,9 @@ pub fn start_session() {
 /// real OS keyboard state) would carry a stuck modifier into the next
 /// session.
 pub fn stop_session() {
+    // The host's own pointer settings come back first, before anything here
+    // can fail: they belong to the local user, not to the stream.
+    restore_pointer_ballistics();
     let held = HELD_MODIFIERS.swap(0, Ordering::SeqCst);
     if held & MODIFIER_SHIFT != 0 {
         send_key_event(VK_SHIFT, true);
@@ -812,6 +819,120 @@ static CAPTURE_ORIGIN_X: AtomicI32 = AtomicI32::new(0);
 static CAPTURE_ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
 static CAPTURE_WIDTH: AtomicI32 = AtomicI32::new(0);
 static CAPTURE_HEIGHT: AtomicI32 = AtomicI32::new(0);
+
+// ---------------------------------------------------------------------
+// Pointer ballistics
+// ---------------------------------------------------------------------
+
+/// The host's mouse settings as they were before a stream took them over:
+/// `([threshold1, threshold2, acceleration], speed)`.
+///
+/// Claim-once, exactly like `audio::ORIGINAL_ENDPOINT` — and for the same
+/// reason. These are the local user's settings on their own machine, so a
+/// stream that changes them and fails to change them back is a bug the user
+/// discovers hours later with no idea what caused it. `Mutex<Option<_>>::take`
+/// makes "restore" idempotent and safe to call from every teardown path,
+/// including the crash paths.
+static ORIGINAL_POINTER_BALLISTICS: Mutex<Option<([u32; 3], u32)>> = Mutex::new(None);
+
+/// Windows' neutral pointer speed. The slider's midpoint, where
+/// `MOUSEEVENTF_MOVE` deltas are applied 1:1.
+const POINTER_SPEED_UNITY: u32 = 10;
+
+/// Take relative mouse motion off Windows' acceleration curve for the duration
+/// of a stream.
+///
+/// **Why this is necessary.** Relative packets are injected as plain
+/// `MOUSEEVENTF_MOVE`, which is the right call — games read look/aim through
+/// raw input (`WM_INPUT`), and warping the cursor with `SetCursorPos` would be
+/// invisible to them. But `MOUSEEVENTF_MOVE` is not a pixel command: Windows
+/// runs it through the pointer-speed slider and, if "Enhance pointer
+/// precision" is on, a non-linear velocity curve. The client's deltas have
+/// already been coalesced over a few milliseconds, so one packet represents
+/// motion that the physical mouse delivered as many smaller reports — and a
+/// curve applied once to the sum does not produce the travel it would have
+/// produced applied to each part. The result is a pointer whose distance does
+/// not match the hand's, in a way no amount of client-side tuning can correct,
+/// because the distortion happens after the delta arrives.
+///
+/// Disabling acceleration and pinning speed to unity makes the mapping exact,
+/// which is the only setting under which the client can be held responsible
+/// for how far the pointer goes.
+///
+/// Idempotent: the first call captures the originals, later calls only
+/// re-assert. That matters because Windows restores these on some session
+/// transitions, so a stream that survives a sign-in needs to re-apply without
+/// overwriting the saved values with its own.
+pub fn suppress_pointer_ballistics() {
+    let mut saved = ORIGINAL_POINTER_BALLISTICS.lock().unwrap_or_else(|e| e.into_inner());
+
+    if saved.is_none() {
+        let mut accel = [0u32; 3];
+        let mut speed = 0u32;
+        let read_ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETMOUSE,
+                0,
+                Some(accel.as_mut_ptr().cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_ok()
+                && SystemParametersInfoW(
+                    SPI_GETMOUSESPEED,
+                    0,
+                    Some((&mut speed as *mut u32).cast()),
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                )
+                .is_ok()
+        };
+        if !read_ok {
+            // Without the originals there is nothing to restore to, so changing
+            // anything would be a one-way edit to the user's settings. Leave
+            // them alone and accept the curve.
+            println!("⚠️  Input: could not read pointer settings — leaving acceleration as-is");
+            return;
+        }
+        println!(
+            "🖱️  Input: pointer acceleration {} speed {speed} — suppressing for the stream",
+            if accel[2] != 0 { "on" } else { "off" }
+        );
+        *saved = Some((accel, speed));
+    }
+
+    apply_pointer_ballistics([0, 0, 0], POINTER_SPEED_UNITY);
+}
+
+/// Give the host its pointer settings back.
+///
+/// Claim-once, so every teardown path may call it and only the first does
+/// anything. A no-op when [`suppress_pointer_ballistics`] never ran.
+pub fn restore_pointer_ballistics() {
+    let taken = ORIGINAL_POINTER_BALLISTICS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some((accel, speed)) = taken {
+        apply_pointer_ballistics(accel, speed);
+        println!("🖱️  Input: pointer acceleration and speed restored");
+    }
+}
+
+fn apply_pointer_ballistics(mut accel: [u32; 3], speed: u32) {
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSE,
+            0,
+            Some(accel.as_mut_ptr().cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSESPEED,
+            0,
+            Some(speed as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+}
 
 /// Records the desktop-coordinate rect of the display currently being
 /// captured. See [`CAPTURE_ORIGIN_X`] and friends.

@@ -27,12 +27,36 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// A request, as **sent**. Parameters are flattened to the top level:
 /// `{"id":1,"command":"set_display","res":"4K"}`.
+///
+/// Omitting `id` makes it a **notification**: the peer acts on it and sends no
+/// reply on success. That is what keeps input off the round-trip path — a
+/// command per pointer event, each waiting for an answer, put the host's cursor
+/// seconds behind the user's hand (live 2026-08-15). Use [`Self::notification`]
+/// rather than writing `None` by hand, so the intent is legible at the call
+/// site.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutboundRequest {
-    pub id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub command: String,
     #[serde(flatten)]
     pub params: Map<String, Value>,
+}
+
+impl OutboundRequest {
+    /// A request that expects a reply.
+    pub fn call(id: u64, command: impl Into<String>, params: Map<String, Value>) -> Self {
+        Self { id: Some(id), command: command.into(), params }
+    }
+
+    /// A request that expects no reply on success.
+    ///
+    /// The peer still reports *failures* (as a response with no `id`), so a
+    /// rejected notification is not silent — but the sender must be prepared to
+    /// see that response arrive out of band, between replies to numbered calls.
+    pub fn notification(command: impl Into<String>, params: Map<String, Value>) -> Self {
+        Self { id: None, command: command.into(), params }
+    }
 }
 
 /// A request, as **received**. `id` is optional so a peer may fire and forget.
@@ -166,17 +190,38 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A notification must carry no `id` at all — not `"id":null`. The receiver
+    /// distinguishes "answer me" from "just act" by the field's presence, so a
+    /// serialised null would make every notification look like a call and put
+    /// the round trip back on the input path.
+    #[test]
+    fn a_notification_omits_the_id_field_entirely() {
+        let line = encode_line(&OutboundRequest::notification("input", Map::new())).unwrap();
+        let text = String::from_utf8(line).unwrap();
+
+        assert!(!text.contains("\"id\""), "no id key at all, got: {text}");
+        assert!(text.contains("\"command\":\"input\""));
+
+        let received: InboundRequest = decode_line(text.as_bytes()).unwrap();
+        assert_eq!(received.id, None, "the receiver must see a notification");
+        assert_eq!(received.command, "input");
+    }
+
+    /// The other half of the same contract: a call must keep its id, or its
+    /// reply can never be matched to it.
+    #[test]
+    fn a_call_round_trips_its_id() {
+        let line = encode_line(&OutboundRequest::call(7, "stop_session", Map::new())).unwrap();
+        let received: InboundRequest = decode_line(&line).unwrap();
+        assert_eq!(received.id, Some(7));
+    }
+
     #[test]
     fn requests_flatten_params_and_terminate_with_a_newline() {
         let mut params = Map::new();
         params.insert("res".into(), json!("4K"));
         params.insert("hdr".into(), json!(true));
-        let line = encode_line(&OutboundRequest {
-            id: 3,
-            command: "set_display".into(),
-            params,
-        })
-        .unwrap();
+        let line = encode_line(&OutboundRequest::call(3, "set_display", params)).unwrap();
 
         assert!(line.ends_with(b"\n"));
         let v: Value = serde_json::from_slice(&line).unwrap();

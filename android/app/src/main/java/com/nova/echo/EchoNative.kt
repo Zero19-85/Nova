@@ -59,8 +59,42 @@ object EchoNative {
      */
     external fun nativeFillBuffer(handle: Long, buf: ByteBuffer, meta: LongArray, timeoutMs: Int): Int
 
+    // ── Input ───────────────────────────────────────────────────────────────
+    // Decomposed integers rather than a byte array: these are sent at pointer
+    // rates, and a JNI array allocation per twelve-byte packet would be pure
+    // waste. Rust builds the GameStream packet, so no wire format lives in
+    // Kotlin. Fire-and-forget — `false` means "not queued" (bad handle or a
+    // no-op like a zero delta), never that the host refused it.
+
+    /** Relative pointer motion — what games read. [a]=dx, [b]=dy. */
+    const val INPUT_MOUSE_MOVE = 1
+    /** Absolute position: [a]=x, [b]=y within a [c]×[d] reference surface. */
+    const val INPUT_MOUSE_ABS = 2
+    /** [a]=button 1..5 (left, middle, right, X1, X2), [b]=1 down / 0 up. */
+    const val INPUT_MOUSE_BUTTON = 3
+    /** [a]=amount in WHEEL_DELTA units (120 per notch). */
+    const val INPUT_SCROLL = 4
+    /** [a]=Windows virtual-key code, [b]=1 down / 0 up, [c]=modifier mask. */
+    const val INPUT_KEY = 5
+    /**
+     * Release every modifier and mouse button. No arguments.
+     *
+     * Send whenever input stops mid-gesture — backgrounding, toggling input
+     * off, ending a session — or the host is left with a key held down.
+     */
+    const val INPUT_RELEASE_ALL = 6
+
+    external fun nativeSendInput(handle: Long, kind: Int, a: Int, b: Int, c: Int, d: Int): Boolean
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
+
+    /**
+     * Hand the platform layer's input telemetry to the session, which folds it
+     * into the report it sends the host. Rate and capture state exist only in
+     * the View, and the host log is where they are actually useful.
+     */
+    external fun nativeReportUiState(peakRate: Int, peakSamples: Int, captureHeld: Boolean)
 
     /** End the session and free the handle. Wakes anything blocked. Idempotent. */
     external fun nativeClose(handle: Long)

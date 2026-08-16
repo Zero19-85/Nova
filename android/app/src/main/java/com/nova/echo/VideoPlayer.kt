@@ -32,15 +32,29 @@ import kotlin.concurrent.thread
  * the stream is self-describing Annex-B and `configure` needs no `csd-0`. That
  * is also why the keyframe gate in Rust matters: the first frame the decoder
  * sees must be the IDR that carries them.
+ *
+ * ## The Surface outlives nothing
+ *
+ * A `SurfaceView`'s Surface is destroyed and recreated constantly — backgrounding
+ * the app, locking the screen, and moving the window to another display all do
+ * it. A decoder configured once against the first Surface goes on writing into a
+ * dead one, which looks exactly like a frozen picture with a perfectly healthy
+ * network underneath (observed live 2026-08-15: the host logged a fine session
+ * while the phone sat silent for two minutes). [setSurface] re-attaches, so the
+ * Surface is treated as a thing that comes and goes rather than a constructor
+ * argument.
  */
 class VideoPlayer(
     private val handle: Long,
-    private val surface: Surface,
+    surface: Surface,
     private val width: Int,
     private val height: Int,
     codec: String,
     private val onError: (String) -> Unit,
 ) {
+    /** Guards [codecInstance] against a surface swap racing start/stop. */
+    private val lock = Any()
+    private var surface: Surface? = surface
     private val mime = when (codec.lowercase()) {
         "h264", "avc" -> MediaFormat.MIMETYPE_VIDEO_AVC
         "av1" -> MediaFormat.MIMETYPE_VIDEO_AV1
@@ -61,9 +75,15 @@ class VideoPlayer(
         // ignored, so setting both is safe and covers far more hardware.
         format.setInteger("vdec-lowlatency", 1)
 
+        val target = synchronized(lock) { surface }
+        if (target == null) {
+            onError("no surface to decode onto")
+            return
+        }
+
         val c = try {
             MediaCodec.createDecoderByType(mime).also {
-                it.configure(format, surface, null, 0)
+                it.configure(format, target, null, 0)
                 it.start()
             }
         } catch (e: Exception) {
@@ -71,11 +91,42 @@ class VideoPlayer(
             return
         }
 
-        codecInstance = c
+        synchronized(lock) { codecInstance = c }
         running = true
         feeder = thread(name = "echo-feeder") { feedLoop(c) }
         renderer = thread(name = "echo-render") { renderLoop(c) }
         Log.i(TAG, "decoder started: $mime ${width}x$height")
+    }
+
+    /**
+     * Point the decoder at a new Surface, or at none while one is unavailable.
+     *
+     * `setOutputSurface` swaps the output of a *running* codec without dropping
+     * the reference chain — which matters on an infinite-GOP stream, where
+     * tearing the decoder down and rebuilding it would leave the picture frozen
+     * until the host happened to send another IDR.
+     *
+     * A null Surface is recorded but NOT pushed to the codec: MediaCodec has no
+     * way to detach an output surface, and passing null throws. Frames keep
+     * decoding into the old (dead) Surface until a live one arrives, which is
+     * wasteful for a moment and harmless — the alternative, stopping the codec,
+     * is what caused the freeze in the first place.
+     */
+    fun setSurface(next: Surface?) {
+        val c = synchronized(lock) {
+            surface = next
+            codecInstance
+        }
+        if (next == null || c == null) return
+        try {
+            c.setOutputSurface(next)
+            Log.i(TAG, "decoder re-attached to a new surface")
+        } catch (e: Exception) {
+            // Some decoders refuse a swap. Report rather than pretend: the
+            // caller can restart the session, and a silent failure here is
+            // indistinguishable from the bug this method exists to fix.
+            onError("could not re-attach the decoder to the new surface: ${e.message}")
+        }
     }
 
     private fun feedLoop(c: MediaCodec) {
@@ -154,11 +205,11 @@ class VideoPlayer(
         running = false
         feeder?.join(1_000)
         renderer?.join(1_000)
-        codecInstance?.let {
+        val c = synchronized(lock) { val current = codecInstance; codecInstance = null; current }
+        c?.let {
             runCatching { it.stop() }
             runCatching { it.release() }
         }
-        codecInstance = null
     }
 
     private companion object {

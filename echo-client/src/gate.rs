@@ -99,7 +99,12 @@ mod tests {
     use super::*;
 
     fn frame(index: u32, frame_type: u8) -> DecodedFrame {
-        DecodedFrame { index, frame_type, data: vec![0u8; 4] }
+        DecodedFrame {
+            index,
+            frame_type,
+            data: vec![0u8; 4],
+            first_shard_at: std::time::Instant::now(),
+        }
     }
 
     #[test]
