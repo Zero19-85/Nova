@@ -186,6 +186,11 @@ class GameAudioPlayer(
             val info = MediaCodec.BufferInfo()
             val silence = ByteArray(BYTES_PER_FRAME)
             var samplesWritten = 0L
+            // Frames queued to the decoder vs frames it has given back. The gap
+            // is audio in flight inside MediaCodec — consumed from the jitter
+            // buffer, not yet heard, and therefore latency like any other.
+            var queuedFrames = 0L
+            var drainedFrames = 0L
             var idleLogged = false
             // Counted here rather than only in Rust because this is the side
             // that knows what actually reached the hardware, and because a
@@ -219,7 +224,7 @@ class GameAudioPlayer(
                 // Two discontinuities per swap, which is a pop, and the audio
                 // drifts later each time. Draining first means every write
                 // leaves this loop in the order the host sent it.
-                drainDecoder(codec, info, track)
+                drainedFrames += drainDecoder(codec, info, track)
 
                 // A packet held from last iteration goes in before any new one,
                 // or the stream would play out of order.
@@ -231,6 +236,7 @@ class GameAudioPlayer(
                         val ptsUs = samplesWritten * 1_000_000L / SAMPLE_RATE
                         codec.queueInputBuffer(index, 0, size, ptsUs, 0)
                         samplesWritten += SAMPLES_PER_FRAME
+                        queuedFrames += 1
                         pending.clear().limit(0)
                     }
                     // Still no buffer: hold it another iteration rather than
@@ -276,6 +282,7 @@ class GameAudioPlayer(
                             val ptsUs = samplesWritten * 1_000_000L / SAMPLE_RATE
                             codec.queueInputBuffer(index, 0, size, ptsUs, 0)
                             samplesWritten += SAMPLES_PER_FRAME
+                            queuedFrames += 1
                         } else {
                             // No input buffer this instant. The packet is HELD,
                             // not dropped: it has already been taken from the
@@ -384,6 +391,22 @@ class GameAudioPlayer(
                             (samplesWritten - ts.framePosition) * 1000 / SAMPLE_RATE
                         } else -1L
                     }.getOrDefault(-1L)
+
+                    // Decompose that 590 ms rather than attack it blind. It
+                    // lumps together three things with three different fixes:
+                    // the track buffer we asked for, whatever the decoder is
+                    // holding, and the device's own output latency. Only the
+                    // last is out of reach, and guessing which dominates is how
+                    // the earlier rounds of this went wrong.
+                    val trackMs = runCatching {
+                        track.bufferSizeInFrames.toLong() * 1000 / SAMPLE_RATE
+                    }.getOrDefault(-1L)
+                    val fast = runCatching {
+                        track.performanceMode == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY
+                    }.getOrDefault(false)
+                    // Frames handed to the decoder that have not come back out.
+                    // Pure latency: taken from the jitter buffer, not yet heard.
+                    val decoderMs = (queuedFrames - drainedFrames) * FRAME_MS
                     var arrived = -1L
                     var drift = -1L
                     var depth = -1L
@@ -416,7 +439,8 @@ class GameAudioPlayer(
                             "$silences silence, $conceals concealed, $dropped held, " +
                             "$drift drift-dropped, $shed shed, depth $depth, " +
                             "${underruns - lastUnderruns} new track underruns | " +
-                            "latency ${totalMs}ms (output ${outputMs}ms + jitter ${jitterMs}ms)"
+                            "latency ${totalMs}ms = jitter ${jitterMs}ms + output ${outputMs}ms " +
+                            "[track ${trackMs}ms, decoder ${decoderMs}ms, fastpath $fast]"
                     )
                     lastUnderruns = underruns.toLong()
                     steps = 0; silences = 0; conceals = 0; dropped = 0
@@ -449,15 +473,21 @@ class GameAudioPlayer(
      * frame, far too small to become a second clock, and it disappears entirely
      * in the steady state where output is already waiting.
      */
-    private fun drainDecoder(codec: MediaCodec, info: MediaCodec.BufferInfo, track: AudioTrack) {
+    private fun drainDecoder(
+        codec: MediaCodec,
+        info: MediaCodec.BufferInfo,
+        track: AudioTrack,
+    ): Long {
+        var drained = 0L
         var timeout = DRAIN_TIMEOUT_US
         while (true) {
             val index = codec.dequeueOutputBuffer(info, timeout)
             timeout = 0
-            if (index < 0) return // TRY_AGAIN_LATER, or a format change we ignore
+            if (index < 0) return drained // TRY_AGAIN_LATER, or a format change
 
             try {
                 if (info.size > 0) {
+                    drained += 1
                     val output = codec.getOutputBuffer(index)
                     if (output != null) {
                         output.position(info.offset)
