@@ -174,6 +174,10 @@ class GameAudioPlayer(
             var conceals = 0L
             var dropped = 0L
             var lastReport = System.nanoTime()
+            // Previous cumulative reads, so the report can print rates.
+            var lastAccepted = 0L
+            var lastDropped = 0L
+            var lastUnderruns = 0L
 
             while (running) {
                 // Drain BEFORE taking the next step, never after.
@@ -331,20 +335,37 @@ class GameAudioPlayer(
                     // nothing said what the target was, and the two counters
                     // that corroborate it — the track's own underrun count and
                     // the buffer's depth — were not reported at all.
+                    // Deltas, not totals. The previous version printed the Rust
+                    // counters cumulatively, so a healthy stream and a stalled
+                    // one both showed a number that simply stopped changing —
+                    // and "frozen" reads as "fine" at a glance. Rates are what
+                    // this question is actually about.
                     val underruns = runCatching { track.underrunCount }.getOrDefault(-1)
-                    val buf = runCatching {
+                    var arrived = -1L
+                    var drift = -1L
+                    var depth = -1L
+                    runCatching {
                         val j = org.json.JSONObject(EchoNative.nativeStats(handle))
-                        "depth ${j.optLong("audio_depth")}" +
-                            " (worst ${j.optLong("audio_worst_depth")})" +
-                            ", ${j.optLong("audio_dropped")} drift-dropped" +
-                            ", ${j.optLong("audio_lost")} lost"
-                    }.getOrDefault("buffer stats unavailable")
+                        arrived = j.optLong("audio_accepted") - lastAccepted
+                        drift = j.optLong("audio_dropped") - lastDropped
+                        depth = j.optLong("audio_depth")
+                        lastAccepted += arrived
+                        lastDropped += drift
+                    }
 
+                    // The two rates that answer everything, side by side.
+                    // `arrived` is what the host actually sent; `steps` is what
+                    // playout consumed. Both should read 500. Which one is short
+                    // says which side of the link to look at, and the previous
+                    // report could not distinguish them at all.
                     Log.i(
                         TAG,
-                        "audio/10s: $steps/500 steps, $silences silence, $conceals concealed, " +
-                            "$dropped held for the decoder, $underruns track underruns | $buf"
+                        "audio/10s: arrived $arrived/500, played $steps/500 | " +
+                            "$silences silence, $conceals concealed, $dropped held, " +
+                            "$drift drift-dropped, depth $depth, " +
+                            "${underruns - lastUnderruns} new track underruns"
                     )
+                    lastUnderruns = underruns.toLong()
                     steps = 0; silences = 0; conceals = 0; dropped = 0
                     lastReport = now
                 }
