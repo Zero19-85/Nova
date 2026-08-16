@@ -170,28 +170,156 @@ int GetDefaultAudioDeviceId(WCHAR* out_id, int cch)
     return ret;
 }
 
-// Searches active render endpoints for a known virtual audio sink (a render
-// device with no physical output). Matches the endpoint friendly name, e.g.
-// "Speakers (Steam Streaming Speakers)". Returns 0 + id on success, 1 if no
-// virtual sink is present, <0 on error.
-static const WCHAR* kVirtualSinkNames[] = {
-    L"Steam Streaming Speakers",   // installed by Steam; Sunshine's default
-    L"CABLE Input",                // VB-Audio Virtual Cable
-    L"Virtual Audio Cable",
-};
-
-static bool is_virtual_sink_name(const WCHAR* name)
+// Case-insensitive substring search (CRT-only; shlwapi's StrStrIW would add a
+// link dependency for one call).
+static bool contains_icase(const WCHAR* hay, const WCHAR* needle)
 {
-    for (const WCHAR* match : kVirtualSinkNames) {
-        if (wcsstr(name, match)) return true;
+    if (!hay || !needle || !*needle) return false;
+    size_t nlen = wcslen(needle);
+    for (const WCHAR* p = hay; *p; ++p) {
+        if (_wcsnicmp(p, needle, nlen) == 0) return true;
     }
     return false;
 }
 
-// Enumerates active render endpoints, returning the id of the first one for
-// which `want_virtual` matches `is_virtual_sink_name(friendly_name)`.
-// Returns 0 + id on success, 1 if none matched, <0 on error.
-static int find_render_device(WCHAR* out_id, int cch, bool want_virtual)
+// Reads one string property off an endpoint. False when absent or too long.
+static bool read_string_prop(IMMDevice* dev, const PROPERTYKEY& key, WCHAR* out, int cch)
+{
+    IPropertyStore* props = nullptr;
+    if (FAILED(dev->OpenPropertyStore(STGM_READ, &props))) return false;
+
+    bool ok = false;
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    if (SUCCEEDED(props->GetValue(key, &v)) && v.vt == VT_LPWSTR && v.pwszVal &&
+        (int)wcslen(v.pwszVal) < cch) {
+        wcscpy_s(out, cch, v.pwszVal);
+        ok = true;
+    }
+    PropVariantClear(&v);
+    props->Release();
+    return ok;
+}
+
+// Matches a needle against BOTH names an endpoint answers to: its own friendly
+// name ("Speakers (Steam Streaming Speakers)") and its adapter's
+// ("NVIDIA Virtual Audio Device (Wave Extensible) (WDM)").
+//
+// The second lookup exists for NVIDIA specifically: its render endpoints are
+// named after the attached display — "LG ULTRAGEAR (NVIDIA High Definition
+// Audio)" on this box — so the adapter name is the ONLY place the string
+// "NVIDIA Virtual Audio" ever appears. Matching the endpoint name alone would
+// make that list entry permanently dead and look like a missing device.
+static bool endpoint_matches(IMMDevice* dev, const WCHAR* needle)
+{
+    WCHAR buf[256];
+    if (read_string_prop(dev, PKEY_Device_FriendlyName, buf, 256) &&
+        contains_icase(buf, needle)) {
+        return true;
+    }
+    if (read_string_prop(dev, PKEY_DeviceInterface_FriendlyName, buf, 256) &&
+        contains_icase(buf, needle)) {
+        return true;
+    }
+    return false;
+}
+
+// ── Two lists, because these are two different questions ─────────────────────
+//
+// A: kGhostSinkNames — endpoints Nova may switch the system default TO while
+// streaming, so Windows migrates application audio off the physical speakers.
+// ORDERED: `find_ghost_sink` iterates this list OUTERMOST, so preference is
+// decided here rather than by WASAPI's enumeration order.
+//
+// VB-CABLE is deliberately absent. The Echo microphone renders into "CABLE
+// Input"; a ghost sink on the same cable would feed the host's own game audio
+// into the remote user's microphone — and, with "Listen to this device" enabled
+// anywhere, into a feedback loop. `mic.rs::collides_with_ghost_sink` refuses the
+// operator-override spelling of that mistake; this list refuses the automatic
+// one. An operator who genuinely wants a cable can still name one in
+// `[audio] endpoint_override`, which is checked against the mic's endpoint first.
+static const WCHAR* kGhostSinkNames[] = {
+    L"Steam Streaming Speakers",   // installed by Steam; Sunshine's default
+    L"NVIDIA Virtual Audio",       // NVIDIA's virtual audio adapter
+};
+
+// B: kNotPlaybackNames — endpoints that are NOT a place a human is listening.
+// Used only NEGATED, by `find_playback_device`, which picks where to restore the
+// default output after an unclean exit. Restoring onto a virtual cable produces
+// silence that reports success, so this list must be a SUPERSET of list A — every
+// ghost sink is also not-a-real-speaker — plus every cable that is not a ghost
+// sink candidate but is still not an output.
+//
+// Removing VB-CABLE from list A without adding it here would move the collision
+// rather than fix it: crash recovery would be free to make the microphone's own
+// cable the system default, arriving at the same feedback path from the other
+// direction.
+static const WCHAR* kNotPlaybackNames[] = {
+    L"Steam Streaming Speakers",
+    L"NVIDIA Virtual Audio",
+    L"VB-Audio Virtual Cable",   // the suffix EVERY VB-CABLE endpoint carries:
+                                 // "CABLE Input", "CABLE In 16ch", "CABLE Output"
+    L"Virtual Audio Cable",      // VAC (Muzychenko) — a different product
+    L"Virtual Audio Driver",     // VAD by MTT
+};
+
+// Finds the ghost sink: the first entry of kGhostSinkNames present as an ACTIVE
+// render endpoint. Returns 0 + id, 1 if none is present, <0 on error.
+static int find_ghost_sink(WCHAR* out_id, int cch)
+{
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDeviceCollection* coll = nullptr;
+    int ret = 1; // not found
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(hr)) hr = en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll);
+
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = coll->GetCount(&count);
+    if (FAILED(hr)) ret = -2;
+
+    // Preference list outermost — this is the whole point of the rewrite.
+    for (const WCHAR* want : kGhostSinkNames) {
+        for (UINT i = 0; SUCCEEDED(hr) && ret == 1 && i < count; ++i) {
+            IMMDevice* dev = nullptr;
+            if (FAILED(coll->Item(i, &dev))) continue;
+
+            if (endpoint_matches(dev, want)) {
+                LPWSTR id = nullptr;
+                if (SUCCEEDED(dev->GetId(&id)) && id && (int)wcslen(id) < cch) {
+                    wcscpy_s(out_id, cch, id);
+                    WCHAR label[256];
+                    if (!read_string_prop(dev, PKEY_Device_FriendlyName, label, 256)) {
+                        wcscpy_s(label, 256, want);
+                    }
+                    printf("\xF0\x9F\x8E\xA7 Ghost sink: %ls\n", label);
+                    ret = 0;
+                }
+                if (id) CoTaskMemFree(id);
+            }
+            dev->Release();
+        }
+        if (ret == 0) break;
+    }
+
+    if (coll) coll->Release();
+    if (en)   en->Release();
+    return ret;
+}
+
+extern "C" __declspec(dllexport)
+int FindVirtualAudioSink(WCHAR* out_id, int cch)
+{
+    return find_ghost_sink(out_id, cch);
+}
+
+// Finds somewhere a human can actually hear: the first ACTIVE render endpoint
+// matching nothing in kNotPlaybackNames. Returns 0 + id, 1 if none, <0 on error.
+static int find_playback_device(WCHAR* out_id, int cch)
 {
     ComScope com;
     if (FAILED(com.hr)) return -1;
@@ -210,27 +338,25 @@ static int find_render_device(WCHAR* out_id, int cch, bool want_virtual)
 
     for (UINT i = 0; SUCCEEDED(hr) && ret == 1 && i < count; ++i) {
         IMMDevice* dev = nullptr;
-        IPropertyStore* props = nullptr;
         if (FAILED(coll->Item(i, &dev))) continue;
 
-        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props))) {
-            PROPVARIANT name;
-            PropVariantInit(&name);
-            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) &&
-                name.vt == VT_LPWSTR && name.pwszVal &&
-                is_virtual_sink_name(name.pwszVal) == want_virtual) {
-                LPWSTR id = nullptr;
-                if (SUCCEEDED(dev->GetId(&id)) && id && (int)wcslen(id) < cch) {
-                    wcscpy_s(out_id, cch, id);
-                    printf(want_virtual ? "\xF0\x9F\x8E\xA7 Virtual audio sink: %ls\n"
-                                         : "\xF0\x9F\x94\x8A Real audio device: %ls\n",
-                           name.pwszVal);
-                    ret = 0;
+        bool excluded = false;
+        for (const WCHAR* skip : kNotPlaybackNames) {
+            if (endpoint_matches(dev, skip)) { excluded = true; break; }
+        }
+
+        if (!excluded) {
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(dev->GetId(&id)) && id && (int)wcslen(id) < cch) {
+                wcscpy_s(out_id, cch, id);
+                WCHAR label[256];
+                if (!read_string_prop(dev, PKEY_Device_FriendlyName, label, 256)) {
+                    wcscpy_s(label, 256, L"(unnamed endpoint)");
                 }
-                if (id) CoTaskMemFree(id);
+                printf("\xF0\x9F\x94\x8A Real audio device: %ls\n", label);
+                ret = 0;
             }
-            PropVariantClear(&name);
-            props->Release();
+            if (id) CoTaskMemFree(id);
         }
         dev->Release();
     }
@@ -238,24 +364,6 @@ static int find_render_device(WCHAR* out_id, int cch, bool want_virtual)
     if (coll) coll->Release();
     if (en)   en->Release();
     return ret;
-}
-
-extern "C" __declspec(dllexport)
-int FindVirtualAudioSink(WCHAR* out_id, int cch)
-{
-    return find_render_device(out_id, cch, true);
-}
-
-// Case-insensitive substring search (CRT-only; shlwapi's StrStrIW would add a
-// link dependency for one call).
-static bool contains_icase(const WCHAR* hay, const WCHAR* needle)
-{
-    if (!hay || !needle || !*needle) return false;
-    size_t nlen = wcslen(needle);
-    for (const WCHAR* p = hay; *p; ++p) {
-        if (_wcsnicmp(p, needle, nlen) == 0) return true;
-    }
-    return false;
 }
 
 // Finds an ACTIVE render endpoint by the operator's nova.toml designation:
@@ -322,14 +430,14 @@ int FindAudioDeviceByName(const WCHAR* needle, WCHAR* out_id, int cch)
     return ret;
 }
 
-// Finds the first ACTIVE render endpoint that is NOT a known virtual sink —
-// used for crash recovery: if Nova exited without restoring the default
-// device (killed/closed rather than a clean shutdown), startup can detect
-// the default is still the virtual sink and switch back to a real output.
+// Crash recovery: if Nova exited without restoring the default device
+// (killed/closed rather than a clean shutdown), startup detects that the
+// default is still the ghost sink and switches back to a real output — which
+// is what this returns. See kNotPlaybackNames for what "real" excludes.
 extern "C" __declspec(dllexport)
 int FindRealAudioDevice(WCHAR* out_id, int cch)
 {
-    return find_render_device(out_id, cch, false);
+    return find_playback_device(out_id, cch);
 }
 
 // Makes device_id the default render endpoint for all roles (console,

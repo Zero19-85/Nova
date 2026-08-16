@@ -99,9 +99,15 @@ pub fn set_sink_override(name: &str) {
 
 /// Resolve the streaming sink's endpoint id: the nova.toml override first
 /// (warn-and-fall-through when it matches no ACTIVE endpoint — e.g. the VDD's
-/// audio device before the display activates), then the shim's built-in known
-/// virtual sinks (Steam Streaming Speakers, VB-CABLE). `None` = no sink
-/// available; client-only routing degrades to capturing the default device.
+/// audio device before the display activates), then the shim's ordered built-in
+/// list (`kGhostSinkNames`: Steam Streaming Speakers, then NVIDIA Virtual
+/// Audio). `None` = no sink available; client-only routing degrades to
+/// capturing the default device.
+///
+/// VB-CABLE is NOT in that list, and must not be added: the Echo microphone
+/// renders into it, so a ghost sink there would feed host audio back to the
+/// remote user as their own microphone. `mic::collides_with_ghost_sink` refuses
+/// the `endpoint_override` route to the same place.
 fn find_virtual_sink_id() -> Option<Vec<u16>> {
     let needle = SINK_OVERRIDE
         .lock()
