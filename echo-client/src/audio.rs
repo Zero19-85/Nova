@@ -42,18 +42,38 @@ use nova_core::media_crypto::SessionKeys;
 
 /// How much audio to accumulate before playing any of it.
 ///
-/// The buffer exists to absorb variation in arrival time, so it has to hold
-/// something before it starts or the first jitter causes an underrun. Two
-/// packets is 40 ms — enough to ride out ordinary Wi-Fi variance, small enough
-/// that nobody perceives it.
-pub const START_DEPTH: usize = 2;
+/// Four packets is 80 ms. This was 2 (40 ms), inherited from the host's
+/// microphone buffer, and **measurement showed the window was too narrow at both
+/// ends**:
+///
+/// ```text
+/// arrived 500/500, played 501/500 | 3 silence, 0 concealed, 3 drift-dropped, depth 5
+/// arrived 506/500, played 506/500 | 2 silence, 0 concealed, 2 drift-dropped, depth 7
+/// arrived 502/500, played 502/500 | 6 silence, 0 concealed, 6 drift-dropped, depth 6
+/// ```
+///
+/// Arrival and playout rates match exactly and nothing is lost, yet the buffer
+/// manages to run *dry* and *overflow* in the same ten seconds — and `silence`
+/// equals `drift-dropped` on every line. That pairing has one explanation:
+/// packets arrive in bursts rather than evenly, as Wi-Fi aggregation and
+/// power-save deliver them, so depth swings further than the window spans and
+/// clips at both ends. Each cycle cost one pop going empty and one going full.
+///
+/// The microphone's 40 ms was tuned for the opposite direction, where a phone's
+/// own uplink paces the packets. Nothing about it transferred.
+pub const START_DEPTH: usize = 4;
 
 /// Depth beyond which latency is clawed back by dropping the oldest packet.
 ///
-/// The drift correction and the burst absorber in one. Eight packets is 160 ms —
-/// past the point where added delay is worse than a 20 ms discontinuity, and far
-/// enough above [`START_DEPTH`] that ordinary jitter never reaches it.
-pub const MAX_DEPTH: usize = 8;
+/// Fourteen packets is 280 ms. Sized as the burst amplitude the measurement
+/// above implies, plus headroom — not as a latency target, because the buffer
+/// only reaches this depth when a burst puts it there, and sits near
+/// [`START_DEPTH`] the rest of the time.
+///
+/// It is deliberately not larger. This is the one bound on how far behind live
+/// audio can drift, and every packet above [`START_DEPTH`] is latency the
+/// listener pays for.
+pub const MAX_DEPTH: usize = 14;
 
 /// Playout step: one host packet per step in the steady state.
 pub const STEP: Duration = Duration::from_millis(20);
@@ -237,10 +257,31 @@ impl AudioBuffer {
             if self.packets.len() < START_DEPTH {
                 return self.empty_step();
             }
-            // Start from the oldest packet held, not from sequence 1: the host
-            // may have been sending before this client began playing, and
-            // waiting for a sequence already past would stall playout forever.
-            self.next_seq = *self.packets.keys().next().expect("checked non-empty");
+            // Start near the NEWEST packet held, keeping exactly START_DEPTH
+            // behind it, and discard the rest.
+            //
+            // Not from sequence 1 — the host may have been sending before this
+            // client began playing, and waiting for a sequence already past
+            // would stall playout forever. But not from the oldest held packet
+            // either, which is what this used to do and which is audible at the
+            // start of every song:
+            //
+            // The host's loopback capture goes quiet between tracks, so a track
+            // beginning delivers a burst. Starting at the oldest packet of that
+            // burst begins playout already far behind live, and the MAX_DEPTH
+            // correction then spends the next several seconds hard-dropping
+            // packets to claw the latency back — one 20 ms excision at a time,
+            // which is the "garbled until it settles" sound.
+            //
+            // Discarding the backlog here costs nothing audible, because none of
+            // it has been played yet. It is the same latency, shed in one silent
+            // step instead of dozens of loud ones.
+            let newest = *self.packets.keys().next_back().expect("checked non-empty");
+            let start = newest.saturating_sub(START_DEPTH as u32 - 1);
+            let stale = self.packets.len();
+            self.packets.retain(|&seq, _| seq >= start);
+            self.stats.dropped_late += (stale - self.packets.len()) as u64;
+            self.next_seq = start;
             self.playing = true;
         }
 
@@ -390,36 +431,54 @@ mod tests {
         (0..n).map(|i| tx.datagram(format!("packet {i}").as_bytes()).unwrap()).collect()
     }
 
+    /// Get playout running, so a test about steady-state behaviour does not have
+    /// to restate the start condition.
+    ///
+    /// Expressed in terms of [`START_DEPTH`] rather than a literal, because
+    /// these tests once hardcoded it and every one of them broke the day it was
+    /// retuned from measurement — which is noise, not signal.
+    fn primed() -> (AudioSender, AudioBuffer, u32) {
+        let (mut tx, mut buf) = rig();
+        for d in packets(&mut tx, START_DEPTH) {
+            buf.accept(&d).unwrap();
+        }
+        for _ in 0..START_DEPTH {
+            assert!(matches!(buf.next_step(), PlayoutStep::Packet(_)));
+        }
+        (tx, buf, START_DEPTH as u32)
+    }
+
     #[test]
     fn holds_until_start_depth_then_plays_in_order() {
         let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 3);
+        let ds = packets(&mut tx, START_DEPTH);
 
         buf.accept(&ds[0]).unwrap();
         assert_eq!(buf.next_step(), PlayoutStep::Idle, "one packet is not enough to start");
 
-        buf.accept(&ds[1]).unwrap();
-        buf.accept(&ds[2]).unwrap();
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 0".to_vec()));
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 1".to_vec()));
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 2".to_vec()));
-        assert_eq!(buf.stats().rendered, 3);
+        for d in ds.iter().skip(1) {
+            buf.accept(d).unwrap();
+        }
+        for i in 0..START_DEPTH {
+            assert_eq!(
+                buf.next_step(),
+                PlayoutStep::Packet(format!("packet {i}").into_bytes()),
+                "in order, from the first packet when there is no backlog"
+            );
+        }
+        assert_eq!(buf.stats().rendered as usize, START_DEPTH);
     }
 
     /// Tier 1: a hole with audio behind it is concealed, not waited for.
     #[test]
     fn a_lost_packet_is_concealed_and_playout_continues() {
-        let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 4);
+        let (mut tx, mut buf, _) = primed();
+        let _lost_in_flight = tx.datagram(b"never arrives").unwrap();
+        let after = tx.datagram(b"arrives").unwrap();
+        buf.accept(&after).unwrap();
 
-        buf.accept(&ds[0]).unwrap();
-        // ds[1] never arrives.
-        buf.accept(&ds[2]).unwrap();
-        buf.accept(&ds[3]).unwrap();
-
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 0".to_vec()));
         assert_eq!(buf.next_step(), PlayoutStep::Conceal, "the gap must not stall playout");
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 2".to_vec()));
+        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"arrives".to_vec()));
         assert_eq!(buf.stats().concealed, 1);
     }
 
@@ -427,20 +486,15 @@ mod tests {
     /// case. Counted only once audio actually comes back.
     #[test]
     fn a_dry_buffer_that_refills_counts_as_underran_not_paused() {
-        let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 4);
-
-        buf.accept(&ds[0]).unwrap();
-        buf.accept(&ds[1]).unwrap();
-        buf.next_step();
-        buf.next_step();
+        let (mut tx, mut buf, _) = primed();
 
         for _ in 0..5 {
             assert_eq!(buf.next_step(), PlayoutStep::Silence);
         }
         assert_eq!(buf.stats().underran, 0, "a run in progress cannot be classified yet");
 
-        buf.accept(&ds[2]).unwrap();
+        let back = tx.datagram(b"back again").unwrap();
+        buf.accept(&back).unwrap();
         assert!(matches!(buf.next_step(), PlayoutStep::Packet(_)));
         assert_eq!(buf.stats().underran, 5, "the run is an underrun once audio returns");
         assert_eq!(buf.stats().paused, 0);
@@ -450,12 +504,7 @@ mod tests {
     /// the split that stopped a healthy session reporting 1115 faults.
     #[test]
     fn a_dry_buffer_that_never_refills_counts_as_paused_not_underran() {
-        let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 2);
-        buf.accept(&ds[0]).unwrap();
-        buf.accept(&ds[1]).unwrap();
-        buf.next_step();
-        buf.next_step();
+        let (_tx, mut buf, _) = primed();
 
         for _ in 0..IDLE_AFTER_STEPS {
             buf.next_step();
@@ -476,10 +525,14 @@ mod tests {
         }
 
         assert_eq!(buf.stats().depth as usize, MAX_DEPTH);
-        assert_eq!(buf.stats().dropped_late, 3);
+        assert_eq!(buf.stats().dropped_late, 3, "the three OLDEST went, not the newest");
 
-        // What survives is the TAIL: playout resumes at packet 3, not packet 0.
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 3".to_vec()));
+        // And what survives is the tail — the newest packet is still there to be
+        // reached, which is the property that makes dropping the oldest correct.
+        assert_eq!(
+            buf.next_step(),
+            PlayoutStep::Packet(format!("packet {}", MAX_DEPTH + 3 - START_DEPTH).into_bytes()),
+        );
     }
 
     /// After a pause, playout must restart from whatever arrives next. Holding
@@ -487,12 +540,7 @@ mod tests {
     /// silently discard it — a session that never recovers its audio.
     #[test]
     fn playout_restarts_cleanly_after_an_idle_pause() {
-        let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 2);
-        buf.accept(&ds[0]).unwrap();
-        buf.accept(&ds[1]).unwrap();
-        buf.next_step();
-        buf.next_step();
+        let (mut tx, mut buf, _) = primed();
         for _ in 0..=IDLE_AFTER_STEPS {
             buf.next_step();
         }
@@ -501,12 +549,89 @@ mod tests {
         for _ in 0..40 {
             let _ = tx.datagram(b"skipped").unwrap();
         }
-        let a = tx.datagram(b"back again").unwrap();
-        let b = tx.datagram(b"and more").unwrap();
-        buf.accept(&a).unwrap();
-        buf.accept(&b).unwrap();
+        let resumed: Vec<Vec<u8>> = (0..START_DEPTH)
+            .map(|i| tx.datagram(format!("back {i}").as_bytes()).unwrap())
+            .collect();
+        for d in &resumed {
+            buf.accept(d).unwrap();
+        }
 
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"back again".to_vec()));
+        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"back 0".to_vec()));
+    }
+
+    /// The garbled song start, as a test.
+    ///
+    /// A track beginning delivers a burst, because the host's loopback capture
+    /// was quiet between tracks. Playout must begin near the NEWEST packet — it
+    /// used to begin at the oldest, which starts already far behind live and
+    /// leaves MAX_DEPTH to claw the latency back one audible 20 ms excision at a
+    /// time.
+    #[test]
+    fn a_burst_at_the_start_of_a_track_plays_from_the_newest_not_the_oldest() {
+        let (mut tx, mut buf) = rig();
+        // Forty packets — 800 ms — arriving at once.
+        let burst = packets(&mut tx, 40);
+        for d in &burst {
+            buf.accept(d).unwrap();
+        }
+
+        // The first thing heard is near the END of the burst, not its start.
+        let first = buf.next_step();
+        assert_eq!(
+            first,
+            PlayoutStep::Packet(format!("packet {}", 40 - START_DEPTH).into_bytes()),
+            "playout must start within START_DEPTH of live"
+        );
+
+        // And what is left is exactly the start depth, so nothing has to be
+        // clawed back afterwards — the whole point.
+        assert_eq!(buf.stats().depth as usize, START_DEPTH - 1);
+
+        // The rest of the burst plays out cleanly, with no drops after the start.
+        let dropped_at_start = buf.stats().dropped_late;
+        for _ in 0..START_DEPTH - 1 {
+            assert!(matches!(buf.next_step(), PlayoutStep::Packet(_)));
+        }
+        assert_eq!(
+            buf.stats().dropped_late,
+            dropped_at_start,
+            "the backlog is shed once, silently, not repeatedly during playout"
+        );
+    }
+
+    /// The steady-state failure the measurement caught: bursty arrival against a
+    /// window too narrow to hold it, clipping at BOTH ends. With the widened
+    /// window the same pattern must produce neither.
+    #[test]
+    fn a_bursty_arrival_pattern_neither_starves_nor_overflows() {
+        let (mut tx, mut buf) = rig();
+
+        // Prime, then run bursts of 6 against a steady 6-step drain — the shape
+        // the log showed, where arrival and playout rates match exactly but the
+        // arrivals clump.
+        for _ in 0..START_DEPTH {
+            let d = tx.datagram(b"prime").unwrap();
+            buf.accept(&d).unwrap();
+        }
+        for _ in 0..START_DEPTH {
+            buf.next_step();
+        }
+
+        for _ in 0..30 {
+            for _ in 0..6 {
+                let d = tx.datagram(b"burst").unwrap();
+                buf.accept(&d).unwrap();
+            }
+            for _ in 0..6 {
+                assert!(
+                    matches!(buf.next_step(), PlayoutStep::Packet(_)),
+                    "a burst that fits the window must never yield silence"
+                );
+            }
+        }
+
+        assert_eq!(buf.stats().dropped_late, 0, "and must never overflow it either");
+        assert_eq!(buf.stats().concealed, 0);
     }
 
     /// The reversal `audio_channel` implements, proven at the buffer: a packet
@@ -514,15 +639,21 @@ mod tests {
     #[test]
     fn a_reordered_packet_still_plays_in_its_right_place() {
         let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 3);
+        let ds = packets(&mut tx, START_DEPTH);
 
-        buf.accept(&ds[2]).unwrap();
-        buf.accept(&ds[0]).unwrap();
-        buf.accept(&ds[1]).unwrap();
+        // Newest first, then the rest — the shape a reordered path delivers.
+        buf.accept(&ds[START_DEPTH - 1]).unwrap();
+        for d in &ds[..START_DEPTH - 1] {
+            buf.accept(d).unwrap();
+        }
 
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 0".to_vec()));
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 1".to_vec()));
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 2".to_vec()));
+        for i in 0..START_DEPTH {
+            assert_eq!(
+                buf.next_step(),
+                PlayoutStep::Packet(format!("packet {i}").into_bytes()),
+                "arrival order must not become playout order"
+            );
+        }
         assert_eq!(buf.stats().concealed, 0, "reordering is not loss");
     }
 
@@ -530,16 +661,18 @@ mod tests {
     /// it would play a second time, out of turn, as a stutter.
     #[test]
     fn a_packet_arriving_after_its_slot_played_is_dropped() {
-        let (mut tx, mut buf) = rig();
-        let ds = packets(&mut tx, 4);
-        buf.accept(&ds[0]).unwrap();
-        buf.accept(&ds[2]).unwrap();
-        buf.next_step(); // plays 0
-        buf.next_step(); // conceals the missing 1
+        let (mut tx, mut buf, _) = primed();
+        let late = tx.datagram(b"late").unwrap();
+        let after = tx.datagram(b"after").unwrap();
 
-        buf.accept(&ds[1]).unwrap(); // too late now
-        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"packet 2".to_vec()));
-        assert!(buf.stats().dropped_late >= 1);
+        buf.accept(&after).unwrap();
+        assert_eq!(buf.next_step(), PlayoutStep::Conceal, "late's slot passes unfilled");
+        assert_eq!(buf.next_step(), PlayoutStep::Packet(b"after".to_vec()));
+
+        let before = buf.stats().dropped_late;
+        buf.accept(&late).unwrap(); // its slot is gone
+        assert_eq!(buf.stats().dropped_late, before + 1);
+        assert_eq!(buf.stats().depth, 0, "it must not be queued to play out of turn");
     }
 
     #[test]
