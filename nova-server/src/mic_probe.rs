@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 extern "C" {
     fn FindEndpointByName(needle: *const u16, is_capture: i32, out_id: *mut u16, cch: i32) -> i32;
+    fn SetDefaultAudioDevice(device_id: *const u16) -> i32;
     fn InitMicRender(device_id: *const u16, out_buffer_frames: *mut u32, out_hr: *mut i32) -> i32;
     fn RenderMicFrames(mono: *const i16, frames: u32, out_hr: *mut i32) -> i32;
     fn CleanupMicRender();
@@ -91,6 +92,61 @@ fn resolve(name: &str, capture: bool) -> Option<Vec<u16>> {
     let len = id.iter().position(|&c| c == 0).unwrap_or(0);
     id.truncate(len + 1);
     Some(id)
+}
+
+/// Make `name` the default RECORDING device, across all three roles.
+///
+/// ## Why this exists as an operator tool
+///
+/// Nova itself never chooses your microphone — it only ever sets the default
+/// *render* endpoint, to keep host speakers quiet while streaming (see
+/// `audio::SinkGuard`). But installing VB-CABLE for microphone passthrough adds
+/// a capture endpoint, "CABLE Output", and Windows readily makes a newly
+/// arrived capture device the system default. That device carries **nothing**
+/// unless an Echo client is actively sending microphone audio into the other end
+/// of the cable, so every application on the host that uses the default
+/// microphone goes silent — with no error anywhere, because the device is
+/// present, healthy, and dutifully delivering digital silence.
+///
+/// Measured on the dev box (2026-08-17), which is what this was written for:
+/// the real "Microphone" endpoint peaked at 0.65 while "CABLE Output" read
+/// exactly 0.0000.
+///
+/// `--mic-probe listen "<name>"` tells you which endpoint hears you; this points
+/// Windows back at it.
+pub fn set_default_capture(name: &str, log_path: &str) -> i32 {
+    let mut log = ProbeLog::open(log_path);
+    log.say(&format!("=== set default capture device to \"{name}\" ==="));
+    log.say(&format!("identity: {}", whoami()));
+
+    if name.trim().is_empty() {
+        log.say("FAIL: no device name given");
+        return 2;
+    }
+
+    let Some(id) = resolve(name, true) else {
+        log.say(&format!("FAIL: no ACTIVE capture endpoint matching \"{name}\""));
+        return 2;
+    };
+
+    // Same call the render path uses: IPolicyConfig::SetDefaultEndpoint across
+    // eConsole/eMultimedia/eCommunications, so applications that ask for any of
+    // the three roles agree about which microphone they are using.
+    // 0 is SUCCESS here — the shim returns 0 on success and a negative step code
+    // on failure, the opposite of the `!= 0` convention the probe entry points
+    // above use. Getting this backwards reported a successful switch as
+    // "refused" and vice versa; `audio.rs::recover_stuck_sink` is the reference
+    // caller.
+    let rc = unsafe { SetDefaultAudioDevice(id.as_ptr()) };
+    if rc != 0 {
+        log.say(&format!(
+            "FAIL: SetDefaultEndpoint refused (step {rc}) — -1 COM init, -2 no IPolicyConfig, \
+             -3 every role rejected"
+        ));
+        return 3;
+    }
+    log.say(&format!("OK: \"{name}\" is now the default recording device (all roles)"));
+    0
 }
 
 /// Render a tone into `device` for `seconds`.
@@ -163,13 +219,30 @@ pub fn listen(device: &str, seconds: u64, log_path: &str) -> i32 {
     log.say(&format!("=== mic probe: LISTEN on \"{device}\" for {seconds}s ==="));
     log.say(&format!("identity: {}", whoami()));
 
-    let Some(id) = resolve(device, true) else {
-        log.say(&format!("FAIL: no active capture endpoint matching \"{device}\""));
-        return 2;
+    // An empty name — or the literal word `default`, since shells drop an empty
+    // argument (PowerShell silently turns `listen "" 5 log` into `listen 5 log`,
+    // which probes an endpoint named "5") — means "whatever Windows currently
+    // calls the default microphone": a null device id makes the shim call
+    // GetDefaultAudioEndpoint(eCapture). That is the question that actually
+    // matters when applications report silence. Not whether some endpoint can
+    // hear you, but whether the one they will be handed can.
+    let id = if device.trim().is_empty() || device.eq_ignore_ascii_case("default") {
+        log.say("(no device named — probing the system DEFAULT recording device)");
+        None
+    } else {
+        match resolve(device, true) {
+            Some(id) => Some(id),
+            None => {
+                log.say(&format!("FAIL: no active capture endpoint matching \"{device}\""));
+                return 2;
+            }
+        }
     };
 
     let mut hr = 0i32;
-    let rc = unsafe { InitProbeCapture(id.as_ptr(), &mut hr) };
+    let rc = unsafe {
+        InitProbeCapture(id.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), &mut hr)
+    };
     if rc != 0 {
         log.say(&format!("FAIL: InitProbeCapture step {rc}, hr 0x{:08X}", hr as u32));
         return 3;

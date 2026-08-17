@@ -129,9 +129,17 @@ fn main() {
                 // Drives the real renderer — Opus decode, jitter buffer, and
                 // all — rather than writing PCM straight to WASAPI.
                 "pipeline" => nova_server::mic_probe::pipeline(seconds, &log),
+                // `--mic-probe default <device>` — point Windows' default
+                // RECORDING device back at a real microphone. Lives here rather
+                // than in its own subcommand because it is the other half of the
+                // same diagnostic: `listen` tells you which endpoint can hear
+                // you, and this makes that endpoint the default. See
+                // `mic_probe::set_default_capture` for why VB-CABLE makes this
+                // necessary.
+                "default" => nova_server::mic_probe::set_default_capture(&device, &log),
                 _ => {
                     nova_server::debug::init_debug_logger();
-                    println!("usage: --mic-probe <render|listen> <device> <seconds> <log path>");
+                    println!("usage: --mic-probe <render|listen|pipeline|default> <device> <seconds> <log path>");
                     1
                 }
             };

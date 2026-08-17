@@ -302,6 +302,44 @@ the **controller** walks up and down underneath it.
 - A **zero** request (no `maximumBitrateKbps` in ANNOUNCE) passes through untouched;
   inventing a bitrate would hide a negotiation failure behind a plausible number.
 
+### The microphone that "stops working" — VB-CABLE steals the default (2026-08-17)
+
+**Symptom:** the host's microphone registers no sound in any application, with no
+error anywhere and no Echo session running.
+
+**Cause, measured:** installing VB-CABLE for microphone passthrough adds a *capture*
+endpoint, "CABLE Output", and Windows readily makes a newly arrived capture device the
+system default. That endpoint carries **nothing** unless an Echo client is actively
+sending microphone audio into the other end of the cable — so every app that uses the
+default microphone gets digital silence from a device that is present, healthy and
+working exactly as designed. On the dev box: real "Microphone" peaked **0.65**, "CABLE
+Output" read **0.0000**.
+
+**Nova does not cause this and cannot restore it.** `SetDefaultAudioDevice` is only ever
+called with *render* endpoints (the ghost sink), verified by grep — Nova has never chosen
+anyone's microphone. There is nothing for it to put back.
+
+**Diagnose and fix with the shipped tool** (both halves of one question):
+```
+nova-server.exe --mic-probe listen default 5 <log>   # what does the DEFAULT mic hear?
+nova-server.exe --mic-probe listen "Microphone" 5 <log>   # what does a named one hear?
+nova-server.exe --mic-probe default "Microphone" 0 <log>  # make that one the default
+```
+`listen` with the device named `default` (or empty) probes
+`GetDefaultAudioEndpoint(eCapture)` — the endpoint applications will actually be handed,
+which is the only one whose silence matters. **Shells drop an empty argument**, so the
+word `default` exists as the sentinel: PowerShell turns `listen "" 5 log` into
+`listen 5 log` and probes an endpoint named "5".
+
+**Note the return convention:** `SetDefaultAudioDevice` returns **0 for success** and a
+negative step code for failure — the opposite of the `!= 0` convention the probe entry
+points use. `audio.rs::recover_stuck_sink` is the reference caller.
+
+**Deliberately NOT automated.** Nova auto-heals a stuck *output* at startup
+(`recover_stuck_sink`) because Nova is what moved it. Doing the same to a *microphone*
+Nova never touched would mean silently overriding a device choice the operator may have
+made on purpose.
+
 ### Echo client: the dashboard "Stop" button
 
 Reported as an RPC failure; it was not. `EchoController.stop()` frees the native handle and
