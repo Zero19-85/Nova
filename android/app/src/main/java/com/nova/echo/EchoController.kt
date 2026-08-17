@@ -101,6 +101,13 @@ class EchoController(private val context: android.content.Context) {
     private var gameAudio: GameAudioPlayer? = null
 
     /**
+     * This connection exists only to end a session the host is still holding —
+     * see [releaseHostSession]. Consumed by [onGranted], which stops the session
+     * rather than starting to play it.
+     */
+    @Volatile private var releaseOnGrant = false
+
+    /**
      * Master switch for forwarding input. Read by the Activity's key dispatch
      * as well as the surface view, so both must consult the same answer.
      */
@@ -155,19 +162,56 @@ class EchoController(private val context: android.content.Context) {
         start(config.toString(), pairing = false)
     }
 
+    /**
+     * End a session still held on the host when this app has no handle to it.
+     *
+     * The case this exists for: the app was swiped away, killed, or lost the
+     * network without sending `stop_session`. The host does not tear down on
+     * that any more — it DETACHES, holding the virtual display so a reconnect is
+     * instant — so the session outlives the app, and reopening the app produces
+     * a fresh process that knows nothing about it. [stop] is useless there,
+     * because the handle it would send through no longer exists.
+     *
+     * So this reconnects and ends it. The host recognises the returning device
+     * by its certificate and hands back the very session it was holding
+     * (`⚡ reclaiming its detached session`), which is then stopped properly —
+     * `stop_session`, full teardown, physical display restored.
+     *
+     * Yes, this briefly resumes the stream in order to end it. That is the
+     * honest shape of the operation: the only authority that may end a session
+     * is the device that owns it, and proving ownership means connecting. It
+     * takes a second or two and never shows a picture — [onGranted] returns
+     * immediately in this mode rather than starting the decoder, the audio or
+     * the microphone.
+     */
+    fun releaseHostSession(relayUrl: String, relayPin: String, hostFingerprint: String) {
+        releaseOnGrant = true
+        post { it.copy(status = "Ending the session on the host…", error = null) }
+        connect(relayUrl, relayPin, hostFingerprint)
+    }
+
     private fun start(configJson: String, pairing: Boolean) {
+        // NOTE: `stop()` deliberately does not clear `releaseOnGrant`, because
+        // `releaseHostSession` sets it and then arrives here through `connect`.
         stop()
-        post { it.copy(status = if (pairing) "Pairing…" else "Connecting…", error = null, pin = null, log = emptyList()) }
+        val opening = when {
+            pairing -> "Pairing…"
+            releaseOnGrant -> "Ending the session on the host…"
+            else -> "Connecting…"
+        }
+        post { it.copy(status = opening, error = null, pin = null, log = emptyList()) }
 
         val h = try {
             if (pairing) EchoNative.nativePair(configJson) else EchoNative.nativeConnect(configJson)
         } catch (e: Throwable) {
             // Rust throws only for a malformed config or a runtime that will not
             // start; everything reachable later arrives as an error event.
+            releaseOnGrant = false
             post { it.copy(status = "Failed", error = e.message ?: "native call failed") }
             return
         }
         if (h == 0L) {
+            releaseOnGrant = false
             post { it.copy(status = "Failed", error = "native returned a null handle") }
             return
         }
@@ -210,8 +254,16 @@ class EchoController(private val context: android.content.Context) {
                     )
                 }
                 "granted" -> onGranted(event, h)
-                "error" -> post { it.copy(status = "Failed", error = event.optString("message")) }
+                "error" -> {
+                    // A release attempt that never got a grant must not leave the
+                    // flag armed, or the next deliberate "Stream" would connect
+                    // and immediately end itself.
+                    releaseOnGrant = false
+                    post { it.copy(status = "Failed", error = event.optString("message")) }
+                }
+                "refused" -> releaseOnGrant = false
                 "closed", "ended" -> {
+                    releaseOnGrant = false
                     post { it.copy(status = "Ended", streaming = false) }
                     return
                 }
@@ -220,6 +272,24 @@ class EchoController(private val context: android.content.Context) {
     }
 
     private fun onGranted(event: JSONObject, h: Long) {
+        // This connection was only ever meant to end the session — see
+        // `releaseHostSession`. Checked FIRST, before the surface test below,
+        // because releasing must work from the dashboard where there is no
+        // surface at all; that check would otherwise turn the release into a
+        // "no surface to decode onto" failure with the session still held.
+        if (releaseOnGrant) {
+            releaseOnGrant = false
+            post { it.copy(status = "Ending the session on the host…") }
+            // On its own thread: `stop()` joins the poller, and this runs ON the
+            // poller — joining itself would stall until the timeout and delay
+            // the very teardown being asked for.
+            thread(name = "echo-release") {
+                stop()
+                post { it.copy(status = "Session ended on the host") }
+            }
+            return
+        }
+
         val target = surface
         if (target == null) {
             post { it.copy(status = "Failed", error = "no surface to decode onto") }

@@ -473,6 +473,7 @@ pub async fn start_master_network() -> MasterHandles {
         rtp_sender.clone(),
         audio_tx.clone(),
         echo_sessions.clone(),
+        client_info.clone(),
     ));
 
     // Echo's command surface. Master-side because the Worker owns no sockets
@@ -618,6 +619,28 @@ fn spawn_mic_passthrough(
             }
         }
     });
+}
+
+/// Is any client session live right now — Moonlight or Echo?
+///
+/// The Master's single answer to "is anyone actually watching?", which several
+/// keepalive-shaped behaviours need and none of them had. Both halves matter:
+/// `ClientInfo` is empty during an Echo session and `echo_holds_media` is false
+/// during a Moonlight one, so either alone reports the other's live stream as
+/// idle.
+///
+/// Deliberately reads `echo_holds_media`'s lock-free flag rather than the
+/// session mutex, and treats a DETACHED Echo session as not live — which it is:
+/// its encoder is stopped and its client is not listening.
+fn session_is_live(
+    client_info: &Arc<Mutex<Option<rtsp::ClientInfo>>>,
+    echo_sessions: Option<&Arc<echo::session::SessionManager>>,
+) -> bool {
+    let moonlight = client_info
+        .lock()
+        .map(|g| g.as_ref().is_some_and(|c| c.streaming_active))
+        .unwrap_or(false);
+    moonlight || echo_sessions.is_some_and(|s| s.echo_holds_media())
 }
 
 /// Whether a detached session has outlived its grace period.
@@ -1229,6 +1252,9 @@ async fn media_supervisor(
     // lock-free flag, so a Moonlight session pays one atomic load — see
     // `SessionManager::seal_video`.
     echo_sessions: Option<Arc<echo::session::SessionManager>>,
+    // Read once a second by the keepalive tick, to answer "is anyone still
+    // watching?" — see `session_is_live`. Not on the frame path.
+    client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
 ) {
     // 2 ms, not the 500 ms this ran at for Moonlight's sake.
     //
@@ -1437,7 +1463,31 @@ async fn media_supervisor(
                 // alive, actively-streaming Worker already has its own
                 // static-desktop IDR keepalive (run_worker's loop) well
                 // under this threshold, so this never fights with it.
-                if video_learned && last_frame_at.elapsed() >= Duration::from_secs(1) {
+                // A session must still exist. The retransmit exists to carry a
+                // LIVE client across a Worker respawn's dead air — it is not a
+                // reason to keep transmitting after the session is over.
+                //
+                // Nothing checked that, and the two facts it depends on are both
+                // sticky: `video_learned` is only ever set true, and `last_idr`
+                // holds the frame forever. So after any session ended, this went
+                // on re-sending that one cached IDR — once a second, for as long
+                // as Nova ran. It kept finding a target because the departed
+                // client's app carries on pinging the media socket, which
+                // `try_learn_target` dutifully re-learns. Observed live
+                // (2026-08-17): `📦 frame 1 … frame_type=2` at 1-2 fps,
+                // indefinitely, minutes after the operator had force-ended the
+                // session from the tray.
+                //
+                // Clearing the cache rather than merely skipping the send: the
+                // next session must not be able to inherit the previous one's
+                // last frame, whose reference timeline means nothing to it.
+                if !session_is_live(&client_info, echo_sessions.as_ref()) {
+                    if last_idr.is_some() || video_learned {
+                        video_learned = false;
+                        first_idr_forwarded = false;
+                        last_idr = None;
+                    }
+                } else if video_learned && last_frame_at.elapsed() >= Duration::from_secs(1) {
                     if let Some((idx, data)) = &last_idr {
                         // Retransmit the cached IDR under its ORIGINAL index — a
                         // genuine retransmit, not a new frame; the client keeps
@@ -3033,7 +3083,18 @@ pub async fn run_worker() -> Result<()> {
         match capturer.try_get_frame() {
             Some(texture) => {
                 timeout_streak = 0;
-                texture_to_encode = Some(texture);
+                // Only when someone is watching. The duplicate-frame path below
+                // has always been gated this way; the REAL-frame path was not,
+                // so any desktop movement with no client connected was captured,
+                // colour-converted, encoded by NVENC and then thrown away at the
+                // send gate. Measured live on an idle host (2026-08-17):
+                // ~15 Mbps of encoder output, 60 fps, with no session at all —
+                // the exact opposite of the "0% Video Encode while idle"
+                // signature Phase 11 was built for, hiding in the one branch
+                // that never got the check.
+                if client_connected {
+                    texture_to_encode = Some(texture);
+                }
             }
             None => {
                 timeout_streak += 1;
@@ -4558,7 +4619,14 @@ pub async fn run() -> Result<()> {
                 // the WGC pool frame was already flushed and released inside
                 // try_get_frame before this returns. Safe to encode from.
                 timeout_streak = 0;
-                texture_to_encode = Some(texture);
+                // Only when someone is watching — see the Worker loop's twin
+                // for the measurement. The duplicate-frame path below was
+                // always gated; this one was not, so an idle host encoded every
+                // desktop change at full bitrate and discarded it at the send
+                // gate.
+                if client_connected {
+                    texture_to_encode = Some(texture);
+                }
             }
             None => {
                 timeout_streak += 1;
@@ -4751,6 +4819,40 @@ mod tests {
         // another stall still lands one interval past that stall's `now`.
         let now2 = after_stall + Duration::from_millis(300);
         assert_eq!(advance_frame_deadline(after_stall, interval, now2), now2 + interval);
+    }
+
+    /// `session_is_live` must see BOTH kinds of client, and must not count a
+    /// detached Echo session as live.
+    ///
+    /// It gates the Master's cached-IDR keepalive. Wrong in the "always live"
+    /// direction, that keepalive re-transmits one stale frame every second
+    /// forever — which is exactly what it did, because nothing consulted a
+    /// session at all (observed live 2026-08-17: `📦 frame 1` at 1-2 fps, minutes
+    /// after the operator force-ended the session). Wrong the other way it stops
+    /// covering a Worker respawn, and a live client's watchdog trips.
+    #[test]
+    fn session_liveness_sees_both_client_kinds() {
+        let idle: Arc<Mutex<Option<rtsp::ClientInfo>>> = Arc::new(Mutex::new(None));
+        assert!(!session_is_live(&idle, None), "nothing connected");
+
+        // A ClientInfo exists from /launch onward, but only PLAY makes it live.
+        let pending = Arc::new(Mutex::new(Some(rtsp::ClientInfo {
+            streaming_active: false,
+            ..Default::default()
+        })));
+        assert!(!session_is_live(&pending, None), "pre-PLAY is not streaming");
+
+        let streaming = Arc::new(Mutex::new(Some(rtsp::ClientInfo {
+            streaming_active: true,
+            ..Default::default()
+        })));
+        assert!(session_is_live(&streaming, None), "a Moonlight PLAY is live");
+
+        // The Echo half is `echo_holds_media()`, which is covered where it can
+        // be built without a socket or a Worker:
+        // `echo::session::tests::a_silent_client_detaches_and_keeps_the_display`
+        // asserts it goes false on detach, which is what makes a detached
+        // session read as not-live here.
     }
 
     /// The detach grace clock's boundary conditions. `0` is the one that would

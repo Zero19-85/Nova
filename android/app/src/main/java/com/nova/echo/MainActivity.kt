@@ -547,14 +547,35 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Stream") }
 
-        // Only shown when there is a live session handle to act on. Ending the
-        // stream frees that handle, so this button had nothing left to send
-        // through and quietly did nothing — see UiState.connected. Hidden rather
-        // than disabled, on this screen's own principle that a disabled control
-        // which cannot say why is a dead end: with no session there is nothing
-        // to explain, because ending the stream already tore the host down.
-        if (state.connected) {
-            OutlinedButton(onClick = { controller.stop() }, Modifier.fillMaxWidth()) { Text("Stop") }
+        // Always present, and it always does something. With a live handle it
+        // stops the session directly; without one it reconnects first, because
+        // the host may still be HOLDING a session this app has no handle for —
+        // an app that was swiped away or lost the network never sent
+        // `stop_session`, so the host detached and is keeping the display up for
+        // the grace period.
+        //
+        // Two earlier versions of this button were both wrong. It used to call
+        // `stop()` unconditionally, which sent nothing at all once the handle
+        // had been freed — a button that looked live and did nothing. Hiding it
+        // in that state was honest but useless: it removed the only control that
+        // could have released the held session, leaving the tray on the PC as
+        // the sole way out. Naming what will happen is better than either.
+        OutlinedButton(
+            onClick = {
+                if (state.connected) controller.stop()
+                else controller.releaseHostSession(relayUrl, relayPin, hostFp)
+            },
+            enabled = state.connected || hostFp.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (state.connected) "Stop" else "End session on host")
+        }
+        if (!state.connected) {
+            Text(
+                "Use this if the PC still shows a stream after the app was closed.",
+                color = MaterialTheme.colorScheme.secondary,
+                fontSize = 12.sp,
+            )
         }
 
         Text(
