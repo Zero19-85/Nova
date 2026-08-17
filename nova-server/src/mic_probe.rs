@@ -306,7 +306,7 @@ pub fn pipeline(seconds: u64, log_path: &str) -> i32 {
         }
     };
 
-    let mut encoder = match audiopus::coder::Encoder::new(
+    let encoder = match audiopus::coder::Encoder::new(
         audiopus::SampleRate::Hz48000,
         audiopus::Channels::Mono,
         audiopus::Application::Voip,

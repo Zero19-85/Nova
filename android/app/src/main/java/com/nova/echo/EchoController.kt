@@ -21,17 +21,18 @@ data class UiState(
      *
      * Deliberately distinct from [streaming], which only becomes true once video
      * is flowing: a session that is connecting, pairing, or waiting for a grant
-     * has a live handle and no picture. The dashboard's Stop button keys off
-     * THIS, because "can this button do anything?" is a question about the
-     * handle, not about the picture.
+     * has a live handle and no picture.
      *
      * It exists because the answer used to be invisible to the UI. [stop] frees
      * the handle and zeroes it, so a second press found `handle == 0`, skipped
-     * `nativeClose`, and sent nothing at all — a button that looked live, did
-     * nothing, and could only be revived by force-closing the app (reported
-     * 2026-08-17). The host needs no fix for this: one press already performs a
-     * full teardown, and Nova's own grace-period reaper collects anything a
-     * previous run orphaned.
+     * `nativeClose`, and sent nothing at all — a button that looked live and did
+     * nothing (reported 2026-08-17).
+     *
+     * The dashboard button reads this to decide WHICH action it performs, not
+     * whether to appear: with a handle it stops the session directly, without
+     * one it goes through [releaseHostSession]. Hiding it instead was a worse
+     * answer — it removed the only control that could release a session the host
+     * was still holding.
      */
     val connected: Boolean = false,
     val error: String? = null,

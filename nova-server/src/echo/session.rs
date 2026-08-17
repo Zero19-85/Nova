@@ -946,6 +946,10 @@ impl SessionManager {
     /// session is refused rather than torn down: a paired-but-idle device
     /// asking to release the display must not be able to end someone else's
     /// stream through the back door.
+    ///
+    /// `echo_client::session::release` leans on the `Ok(None)` behaviour: it
+    /// sends `stop_session` without knowing whether anything is held, so a
+    /// mistimed press has to be harmless rather than an error.
     pub fn stop(&self, device: &EchoIdentity) -> Result<Option<u64>, HandoffError> {
         let mut guard = self.active.lock().unwrap();
         let Some(session) = guard.as_ref() else {
@@ -962,9 +966,11 @@ impl SessionManager {
         // Cleared before the session is dropped, so no frame is sealed with a
         // key the client has already stopped listening for.
         self.echo_active.store(false, Ordering::Relaxed);
-        // The client said it is done (or its tunnel died), so the desktop goes
-        // back to the monitor. Unchanged behaviour — only the host-initiated
-        // path below asks for anything else.
+        // The client SAID it is done, so the desktop goes back to the monitor.
+        // A tunnel merely dying no longer arrives here — that is
+        // `detach_on_disconnect`, which holds the display for the grace period
+        // instead. This path is reached only by an explicit `stop_session`, from
+        // a streaming client shutting down or from `session::release`.
         self.plane.end(EndMode::TearDown);
         *guard = None;
         println!("🛑 Echo session {id} ended by \"{}\"", device.device_name);

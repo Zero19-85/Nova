@@ -52,8 +52,9 @@
 //! that never completes and the slot held until Nova restarts — observed live
 //! (2026-08-15) as one successful tunnel followed by five successful punches
 //! that the host silently ignored, with only `tls handshake eof` on the client.
-//! [`TUNNEL_IDLE_TIMEOUT`] bounds it, and contention is logged rather than
-//! dropped in silence.
+//! [`TUNNEL_IDLE_TIMEOUT`] bounds it when nobody is waiting, and
+//! [`CONTENDED_IDLE_TIMEOUT`] bounds it much sooner when somebody is — patience
+//! is only worth having while it costs nobody anything.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -303,13 +304,12 @@ pub fn spawn(
                             t.peer,
                             idle.as_secs()
                         );
-                        active = None;
-                        // Dropping the record closes the sink, which ends the
-                        // driver, which unblocks the served task's TLS read and
-                        // lets it return and clear `busy`. That unwinding is
-                        // asynchronous, so THIS datagram still falls out at the
-                        // `busy` check below — the newcomer gets in on a
-                        // retransmit a moment later, which its RUDP layer is
+                        // Falls through to the shared `active = None` below,
+                        // which drops the record. That closes the sink, ends the
+                        // driver, unblocks the served task's TLS read and lets it
+                        // return and clear `busy` — asynchronously, so THIS
+                        // datagram still falls out at the `busy` check below. The
+                        // newcomer gets in on a retransmit its RUDP layer is
                         // already sending. The win is the wait dropping from 30 s
                         // to 5, not the elimination of a round trip.
                     } else {
@@ -557,7 +557,7 @@ mod tests {
 
         let (read, mut write) = tokio::io::split(peer_stream);
         let mut lines = BufReader::new(read).lines();
-        let mut call = |cmd: &str| -> Vec<u8> { format!("{cmd}\n").into_bytes() };
+        let call = |cmd: &str| -> Vec<u8> { format!("{cmd}\n").into_bytes() };
 
         // 1. hello — the surface answers at all, over loss.
         write.write_all(&call(r#"{"id":1,"command":"hello"}"#)).await.unwrap();

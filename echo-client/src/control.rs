@@ -230,7 +230,6 @@ pub fn field_u64(result: &Value, key: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt as _;
 
     /// Notifications are answered only when they fail, and such a response
     /// carries no id. It can land between a numbered call and its reply.

@@ -1,32 +1,53 @@
 # Nova — Handoff to Next Chat
 
-## ⚠️ NEWEST FIRST — session persistence + flow control (2026-08-17)
+## ⚠️ NEWEST FIRST — session persistence, flow control, and the fallout (2026-08-17)
 
-**Code complete, 121 lib tests, NOT live-validated.** Detached sessions with hot reconnect on
-both client kinds, plus a per-session bitrate budget. Full engineering record and every
-invariant: **CLAUDE.md → "Session persistence + flow control (2026-08-17)"**. Read that before
-touching `session_watcher`, `resume_suspended`, `echo::session::sweep`, or `qos.rs`.
+**Shipped, deployed live, and pushed. 124 lib tests + 69 in echo-client.** Detached sessions
+with hot reconnect on both client kinds, a per-session bitrate budget, and four follow-up
+fixes the first live runs exposed. Full engineering record and every invariant:
+**CLAUDE.md → "Session persistence + flow control (2026-08-17)"** and the three sections
+after it. Read those before touching `session_watcher`, `resume_suspended`,
+`echo::session::sweep`, `qos.rs`, or the tunnel slot logic.
 
-**What to look for on the first live run** (the whole batch turns on these two lines):
-- `⚡ Reclaimed the detached virtual display …` — 1B's fast path hit. If you see `🖥️ Cannot
-  reclaim the existing virtual display (…)` instead, the reason is in the parentheses; the
-  session is still correct, just not fast.
-- `⏸️ Echo session N DETACHED …` ~30 s after a phone drops off Wi-Fi, then `🕐 … not reclaimed
-  within 600s` if nobody returns.
+**Live-confirmed working:** detach on silence, `⚡ reclaiming its detached session`, the
+5 s contended slot handover, an idle host at 0% encode, and the microphone restored to a
+real device.
 
-Test sequence worth running: (1) Moonlight mid-stream, kill the network, reconnect inside 10
-min → picture returns, desktop never rearranges; (2) same but wait out the grace → physical
-monitor comes back; (3) Echo on the phone, airplane mode, return inside the window; (4) press
-"End Stream" and confirm it STILL tears down instantly (the clock must not soften an explicit
-end); (5) confirm the Echo dashboard's "Stop" button is now hidden when idle.
+**Owed live validation:** the Moonlight side of detach/resume (only Echo has been exercised),
+`resume_suspended`'s fast path (`⚡ Reclaimed the detached virtual display` — if you see
+`🖥️ Cannot reclaim …` instead, the reason is in the parentheses and the session is still
+correct, just not fast), and the grace expiry actually firing at 300 s.
 
-**Three things were found already built while scoping this** — do not rebuild them: the Android
-MediaCodec decoder (complete since 2026-08-15), QoS slow-start recovery (`QosController` is
-already AIMD-with-memory), and the Moonlight detached state (`Deactivate { cancelled: false }`).
+**⚠️ The APK must be rebuilt** — `nativeRelease` and the dashboard's "End session on host"
+button are client-side only, and the host already has everything it needs for them.
 
-**One live bug fixed as a side effect:** `[stream] idle_teardown_secs` had been dead in the
-deployed split — producer in the Worker, consumer only in the monolithic `run()` — so a vanished
-Moonlight client left the virtual display up forever.
+### What the live runs cost, in order — each one is a lesson worth keeping
+
+1. **A closed tunnel tore down instead of detaching**, un-doing every detach microseconds
+   after it happened. The sweep and the transport had only ever been tested apart.
+2. **NVENC encoded at ~15 Mbps on a completely idle host** — the duplicate-frame path was
+   gated on `client_connected`, the real-frame path never was.
+3. **The Master re-sent one cached IDR forever** after any session ended, because
+   `video_learned` and `last_idr` are sticky and a departed client keeps pinging.
+4. **A returning client was locked out of the tunnel slot for 30 s** — its own re-punch from
+   a new port erased the incumbent's liveness reading (`last_rx` remembers one sender).
+5. **"End session on host" needed four presses** — it drove a real connection and stopped it
+   at the grant, racing the session it had just created. Ending a session never needed a
+   session; it is one RPC on the control tunnel.
+
+**The recurring shape:** every one of these was found by reading `nova-service.log`, and
+none by a test. Two of them were features that worked perfectly in isolation and were
+cancelled by a neighbour. **When something new spans two modules, go and read what the other
+one does at the same moment.**
+
+**Three things were found already built while scoping this** — do not rebuild them: the
+Android MediaCodec decoder (complete since 2026-08-15), QoS slow-start recovery
+(`QosController` is already AIMD-with-memory), and the Moonlight detached state
+(`Deactivate { cancelled: false }`).
+
+**Configuration note:** the live `nova.toml` still sets `idle_teardown_secs = 300`, so this
+box's detach grace is **5 minutes, not the 600 default**. The alias is working as designed;
+add `detach_grace_secs` to change it.
 
 ---
 
@@ -58,7 +79,7 @@ full-screen 4K HDR10. Hovering clickable elements on the UAC/security screen is 
 ## Build + hot-patch (**restart the service immediately after copying**)
 ```powershell
 cd c:\Users\nova-server
-cargo build --release      # expect 31 tests via: cargo test --lib
+cargo build --release      # expect 124 tests via: cargo test --lib (2026-08-17)
 sc.exe stop NovaService; Start-Sleep 8
 Copy-Item target\release\nova-server.exe "C:\Program Files\Nova Server\" -Force
 Copy-Item target\release\nova_shim.dll   "C:\Program Files\Nova Server\" -Force  # if shim changed
