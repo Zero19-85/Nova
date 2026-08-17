@@ -22,6 +22,10 @@ pub mod mic_probe;
 /// spawn/accept logic can both reach it.
 pub mod ipc;
 mod pairing;
+/// Bitrate policy: the per-session budget (resolution cap + audio reservation)
+/// and the closed-loop congestion controller that runs underneath it. Both
+/// capture loops share the controller; both negotiators share the budget.
+mod qos;
 mod rtp;
 mod rtsp;
 mod session_negotiate;
@@ -47,6 +51,7 @@ use clap::Parser;
 // manager's business (WGC normally, DDA during secure-desktop interludes).
 use capture::DesktopCapture;
 use encoder::{Encoder, EncoderConfig};
+use qos::QosController;
 use socket2;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -445,6 +450,13 @@ pub async fn start_master_network() -> MasterHandles {
                 )),
                 client_info.clone(),
                 gather.latched_handle(),
+                echo::session::SessionPolicy {
+                    audio_reserve_kbps: cfg.network.audio_reserve_kbps,
+                    // The same grace period a Moonlight session gets — this is a
+                    // property of how long the operator wants a display held for
+                    // an absent client, not of which protocol asked for it.
+                    detach_grace: Duration::from_secs(cfg.stream.detach_grace() as u64),
+                },
             ));
             echo::signaling::spawn(&cfg.echo.signaling, wan_candidates, gather);
             Some(manager)
@@ -608,6 +620,20 @@ fn spawn_mic_passthrough(
     });
 }
 
+/// Whether a detached session has outlived its grace period.
+///
+/// Split out of `session_watcher` so the boundary is testable without waiting
+/// ten real minutes, and takes the elapsed time rather than the `Instant` for
+/// the same reason.
+///
+/// `grace_secs == 0` means "hold indefinitely" and must never expire — a
+/// configured zero is an operator saying they will end sessions themselves, not
+/// a request to tear down immediately. Getting that backwards would turn the
+/// opt-out into the most aggressive possible setting.
+fn detach_grace_expired(grace_secs: u32, elapsed: Duration) -> bool {
+    grace_secs > 0 && elapsed >= Duration::from_secs(grace_secs as u64)
+}
+
 /// Polls `ClientInfo` for the RTSP PLAY transition (the same trigger the
 /// monolithic `run()`'s main loop used to react to in-process) and sends the
 /// negotiated `ConfigureStart` to whichever Worker is currently connected.
@@ -654,7 +680,23 @@ async fn session_watcher(
     // Fix: remember the generation we suspended, and if THAT generation's
     // cancelled flag flips true afterward (before any new session starts),
     // send a second Deactivate to upgrade the suspend into a full teardown.
-    let mut suspended_generation: Option<u64> = None;
+    //
+    // The `Instant` alongside it is the DETACH GRACE CLOCK. A suspend is not a
+    // teardown: encoding and transmission stop at once, but the virtual display
+    // and everything running on it are held so a reconnect resumes instantly.
+    // Held forever, that is a ghost monitor nobody asked for, so the clock
+    // upgrades an unclaimed suspend into a full teardown after
+    // `[stream] detach_grace_secs`.
+    //
+    // It lives in the MASTER, and that placement is the whole point. The Worker
+    // has had `mark_suspended()`/`suspended_idle_secs()` since Phase 13, but
+    // only the monolithic `run()` ever polled them — `run_worker` never did, so
+    // in the deployed split the timer has been dead and a vanished client left
+    // the virtual display up indefinitely. Moving it here also makes it correct
+    // rather than merely alive: the Worker dies on every sign-out, taking any
+    // Worker-side clock with it, and a sign-out is exactly when a detached
+    // session must keep counting rather than start over.
+    let mut suspended_generation: Option<(u64, Instant)> = None;
     // The session we last logged an Echo-deferral for, so a Moonlight client
     // waiting behind an Echo session produces one line rather than twenty a
     // second.
@@ -682,9 +724,21 @@ async fn session_watcher(
                         }
                     }
                 } else {
-                    suspended_generation = Some(ended_gen);
+                    let grace = cfg.stream.detach_grace();
+                    if grace > 0 {
+                        println!(
+                            "⏸️  Master: session {ended_gen} DETACHED — encoder and transmission \
+                             stopped, display held for {grace}s in case it comes back"
+                        );
+                    } else {
+                        println!(
+                            "⏸️  Master: session {ended_gen} DETACHED — display held indefinitely \
+                             ([stream] detach_grace_secs = 0)"
+                        );
+                    }
+                    suspended_generation = Some((ended_gen, Instant::now()));
                 }
-            } else if let Some(gen) = suspended_generation {
+            } else if let Some((gen, detached_at)) = suspended_generation {
                 if client.session_generation == gen && client.cancelled {
                     println!("🛑 Master: session {gen}'s /cancel arrived after the disconnect that suspended it — upgrading to full teardown");
                     worker_link.send(ControlMsg::Deactivate { cancelled: true });
@@ -694,6 +748,19 @@ async fn session_watcher(
                             info.cancelled = false;
                         }
                     }
+                } else if detach_grace_expired(cfg.stream.detach_grace(), detached_at.elapsed()) {
+                    // Nobody came back. Upgrade the suspend into the teardown
+                    // the client never asked for, which also clears
+                    // `last_configure` in control_supervisor (only a CANCELLED
+                    // Deactivate does — Phase 16.1's invariant) so no Worker
+                    // respawn can resurrect a session that has now expired.
+                    println!(
+                        "🕐 Master: detached session {gen} was not reclaimed within {}s — \
+                         tearing down and restoring the display",
+                        cfg.stream.detach_grace()
+                    );
+                    worker_link.send(ControlMsg::Deactivate { cancelled: true });
+                    suspended_generation = None;
                 }
             }
             continue;
@@ -723,7 +790,7 @@ async fn session_watcher(
             continue;
         }
         let caps = *worker_caps.lock().unwrap();
-        let negotiated = session_negotiate::negotiate(&client, &cfg.stream, caps);
+        let negotiated = session_negotiate::negotiate(&client, &cfg.stream, &cfg.network, caps);
         println!(
             "🚀 Master: PLAY latched — negotiated {}x{}@{}fps {}{} (session {}) — sending ConfigureStart",
             negotiated.width, negotiated.height, negotiated.fps, negotiated.codec.as_str(),
@@ -1513,25 +1580,70 @@ fn apply_configure_start(
     if app_launcher::uses_virtual_display(cs.app_id, cfg.stream.headless_for_all_apps)
         && !defer_for_secure
     {
-        println!("🖥️  Activating virtual display for upcoming session ({}x{}@{}fps{})",
-            cs.width, cs.height, cs.fps, if cs.hdr_confirmed { " HDR10" } else { "" });
-        // Capture the restore target BEFORE the VDD flip — see audio.rs's
-        // arm_endpoint_restore doc comment for why this ordering matters.
-        audio::arm_endpoint_restore();
-        match vd.activate_for_stream(cs.width, cs.height, cs.fps) {
-            Ok(()) => {
-                if !cs.device_name.is_empty() {
-                    if let Err(e) = vd.rename_devnode(&cs.device_name) {
-                        println!("⚠️  Monitor rename: {e}");
-                    }
+        // HOT RESUME: a client that dropped and came back inside the detach
+        // grace window is looking at a display that is already exactly right.
+        // Rebuilding it would cost seconds of visible desktop rearrangement to
+        // arrive where we started — see `resume_suspended`, which verifies the
+        // committed mode out of CCD rather than trusting what we last asked for,
+        // and refuses (falling through to the full path) on any doubt.
+        //
+        // Only the display is skipped. The encoder is still rebound below, which
+        // it must be: the returning client may have negotiated a different
+        // codec, HDR mode or bitrate, and its decoder needs a fresh IDR either
+        // way.
+        let resumed = match vd.resume_suspended(cs.width, cs.height, cs.fps) {
+            virtual_display::Resume::Reused => true,
+            virtual_display::Resume::Mismatch(why) => {
+                if vd.active_device_name().is_some() {
+                    println!("🖥️  Cannot reclaim the existing virtual display ({why}) — full activation");
                 }
-                // The VDD is up but not yet in Advanced Color — that flip (and
-                // the FP16 rebind that follows it) happens in the HDR block below.
-                rebind_capture_and_encoder(capturer, enc, vd.active_device_name(),
-                    Some((cs.width, cs.height)), Some((cs.width, cs.height)), Some(false))?;
+                false
             }
-            Err(e) => {
-                println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display");
+        };
+
+        if resumed {
+            // Still armed even though nothing is flipping. The detach already
+            // ran the claim-once restore (via the audio manager's
+            // stop_and_release), so the current default endpoint is the real
+            // speaker again and this captures the right target — see audio.rs.
+            // Cheap and idempotent; skipping it would leave the invariant
+            // "armed before a session touches audio" true only by luck.
+            audio::arm_endpoint_restore();
+            // The label follows whoever holds the display now. A detached
+            // session can be reclaimed by a DIFFERENT paired device, and this is
+            // a registry property write rather than a topology change — the
+            // expensive part of activation is the devnode cycle and the GDI
+            // wait, neither of which happens here.
+            if !cs.device_name.is_empty() {
+                if let Err(e) = vd.rename_devnode(&cs.device_name) {
+                    println!("⚠️  Monitor rename: {e}");
+                }
+            }
+            // The display is already up and already ours, so the capture side is
+            // all that needs re-pointing. Same call the Ok arm below makes.
+            rebind_capture_and_encoder(capturer, enc, vd.active_device_name(),
+                Some((cs.width, cs.height)), Some((cs.width, cs.height)), Some(false))?;
+        } else {
+            println!("🖥️  Activating virtual display for upcoming session ({}x{}@{}fps{})",
+                cs.width, cs.height, cs.fps, if cs.hdr_confirmed { " HDR10" } else { "" });
+            // Capture the restore target BEFORE the VDD flip — see audio.rs's
+            // arm_endpoint_restore doc comment for why this ordering matters.
+            audio::arm_endpoint_restore();
+            match vd.activate_for_stream(cs.width, cs.height, cs.fps) {
+                Ok(()) => {
+                    if !cs.device_name.is_empty() {
+                        if let Err(e) = vd.rename_devnode(&cs.device_name) {
+                            println!("⚠️  Monitor rename: {e}");
+                        }
+                    }
+                    // The VDD is up but not yet in Advanced Color — that flip (and
+                    // the FP16 rebind that follows it) happens in the HDR block below.
+                    rebind_capture_and_encoder(capturer, enc, vd.active_device_name(),
+                        Some((cs.width, cs.height)), Some((cs.width, cs.height)), Some(false))?;
+                }
+                Err(e) => {
+                    println!("⚠️  Virtual display activation failed: {e} — streaming from the physical display");
+                }
             }
         }
     } else {
@@ -1779,216 +1891,6 @@ fn deactivate_worker(
     // partway leaves the menu offering to finish the job instead of claiming
     // the desktop is already back.
     stats::set_teardown_pending(vd.active_device_name().is_some());
-}
-
-/// One ramp-back step: +10% of the current bitrate, never past `target`.
-///
-/// `+ cur / 10` (not `* 11 / 10`) so the arithmetic cannot overflow at any
-/// plausible bitrate, and `max(1)` on the increment guarantees forward
-/// progress — an integer +10% of a very low bitrate would otherwise round to
-/// zero and the ramp would stall below the target forever.
-fn qos_ramp_step(cur: u32, target: u32) -> u32 {
-    cur.saturating_add((cur / 10).max(1)).min(target)
-}
-
-/// Dynamic-bitrate (QoS) controller: AIMD **with memory of the rate that
-/// failed**. Shared by the Worker and monolithic capture loops so the two can
-/// never drift apart (they already had once — that is how dynamic bitrate came
-/// to be completely dead in the split deployment).
-///
-/// ### Why memory is required (live 2026-08-07)
-///
-/// The first version ramped back to the client's full negotiated ceiling, which
-/// produced a permanent sawtooth — straight from the log:
-///
-/// ```text
-/// 📉 72320 → 📈 79552 → 📉 63641 → 📈 70005 → 77005 → 84705 → 90400
-/// 📉 72320 → 📈 79552 → 📉 63641 → 📈 70005 → 77005 → 84705 → 90400 → …
-/// ```
-///
-/// Every ~12 s it climbed back to the one bitrate already proven
-/// unsustainable, re-saturated the link and took another loss hit: four such
-/// cycles in one session, each a visible freeze. At the ceiling the wire rate
-/// also starved the ENet control channel until the client's control peer timed
-/// out and the whole session dropped, needing a `/resume`.
-///
-/// ### Control law
-///
-/// * **Remember** the bitrate that was applied when congestion fired.
-/// * **Drop fast** — apply the pending 20% cut at once ([`Self::REDUCE_COOLDOWN`]
-///   collapses a burst of reports into one step rather than a slide to the floor).
-/// * **Ramp to a safe target, not the ceiling** — climb 10% at a time toward
-///   [`Self::ramp_target`] (90% of what failed) and then HOLD. Each further
-///   failure ratchets that target down, so it converges on what the link
-///   actually sustains instead of rediscovering the cliff.
-/// * **Probe slowly** — after [`Self::PROBE_INTERVAL`] parked and clean, relax the
-///   remembered failure point 5% so a one-off blip can't cap the session's
-///   quality forever. Deliberately ~20× slower than the ramp.
-struct QosController {
-    /// Ceiling this state belongs to; a change means a new session and stale
-    /// memory (see [`Self::tick`]).
-    ceiling_seen: u32,
-    /// Bitrate live when congestion last fired. `None` = nothing has failed
-    /// this session, so the full ceiling is fair game.
-    known_bad_kbps: Option<u32>,
-    /// Reduce/ramp cooldown clock.
-    last_event: Instant,
-    /// Last upward relaxation of the target (the slow probe).
-    last_probe: Instant,
-}
-
-impl QosController {
-    /// Minimum gap between two reductions.
-    const REDUCE_COOLDOWN: Duration = Duration::from_secs(2);
-    /// Quiet period before stepping the bitrate back up.
-    const RAMP_INTERVAL: Duration = Duration::from_secs(3);
-    /// Quiet period parked at the target before probing above it. Short so a
-    /// link that has actually healed recovers in seconds, not minutes — during
-    /// genuine congestion the reduce path keeps firing and resets this clock,
-    /// so it only elapses once the link is truly quiet.
-    const PROBE_INTERVAL: Duration = Duration::from_secs(10);
-    /// The remembered target may never drive the stream below this.
-    const FLOOR_KBPS: u32 = 1_000;
-
-    fn a_past_instant() -> Instant {
-        // checked_sub: Instant is QPC-since-boot on Windows, so plain
-        // subtraction panics when the process starts <30 s after power-on (the
-        // Phase 15.3 crash-loop). Starting the clocks in the past lets the
-        // first congestion signal act at once instead of waiting out a cooldown
-        // that never applied to anything.
-        Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .unwrap_or_else(Instant::now)
-    }
-
-    fn new() -> Self {
-        let past = Self::a_past_instant();
-        Self { ceiling_seen: 0, known_bad_kbps: None, last_event: past, last_probe: past }
-    }
-
-    /// Forget everything a session learned about the link. Called at each new
-    /// session (see the Worker's Configure arm) — the failure memory is
-    /// per-link-episode, and a reconnect after a MoCA/Wi-Fi glitch deserves a
-    /// clean slate. Without this the memory leaked across reconnects whenever
-    /// two sessions negotiated the same ceiling (live 2026-08-08: an 11-session
-    /// MoCA-failure run left a fresh session capped at 3.5 Mbps by the previous
-    /// session's collapse, because the ceiling-change reset never fired).
-    fn reset(&mut self) {
-        self.known_bad_kbps = None;
-        self.last_event = Self::a_past_instant();
-        self.last_probe = Self::a_past_instant();
-    }
-
-    /// What recovery is allowed to climb to: 90% of whatever failed, clamped to
-    /// the ceiling and the floor. With no failure on record, the ceiling.
-    fn ramp_target(&self, ceiling_kbps: u32) -> u32 {
-        match self.known_bad_kbps {
-            Some(bad) => (bad / 10 * 9).clamp(Self::FLOOR_KBPS.min(ceiling_kbps), ceiling_kbps),
-            None => ceiling_kbps,
-        }
-    }
-
-    /// Record the bitrate that was live when congestion fired. Only ratchets
-    /// DOWN within a session: a failure at a lower rate means the link is worse
-    /// than we thought, while one at a higher rate is stale news.
-    fn note_congestion(&mut self, applied_kbps: u32) {
-        if applied_kbps == 0 {
-            return;
-        }
-        self.known_bad_kbps = Some(match self.known_bad_kbps {
-            Some(bad) => bad.min(applied_kbps),
-            None => applied_kbps,
-        });
-    }
-
-    /// Relax the remembered failure point toward the ceiling by a QUARTER of
-    /// the remaining gap each probe, so recovery time is BOUNDED regardless of
-    /// how deep congestion drove the stream: geometric convergence reaches the
-    /// ceiling in ~13 probes from any depth, versus the old fixed +5% which
-    /// took ~80 minutes to climb back from a 3.5 Mbps collapse (live
-    /// 2026-08-08). Big steps far from the ceiling (fast recovery through the
-    /// safe zone) taper to small steps near it (cautious where the cliff was) —
-    /// the shape you actually want. Clearing the memory once the target reaches
-    /// the ceiling lets a fully recovered link return to full quality.
-    fn relax_target(&mut self, ceiling_kbps: u32) {
-        let Some(bad) = self.known_bad_kbps else { return };
-        if bad >= ceiling_kbps {
-            self.known_bad_kbps = None;
-            return;
-        }
-        // A quarter of the remaining gap, but never a smaller step than
-        // ceiling/16 — pure geometric convergence crawls in tiny steps near
-        // the top (the gap, and thus gap/4, shrinks toward 1), which would
-        // drag the last stretch of the recovery out to dozens of probes. The
-        // floor makes the tail snap to full instead: once within ~ceiling/16
-        // of the ceiling the next step clears it and the memory is forgotten.
-        let step = ((ceiling_kbps - bad) / 4).max(ceiling_kbps / 16).max(1);
-        let relaxed = bad.saturating_add(step);
-        self.known_bad_kbps = if relaxed >= ceiling_kbps { None } else { Some(relaxed) };
-    }
-
-    /// One tick. Idle cost: one atomic swap plus two `Instant::elapsed`.
-    fn tick(&mut self, ceiling_kbps: u32, fps: u32) {
-        if ceiling_kbps == 0 {
-            return; // no session
-        }
-        // A different ceiling means a different session — the old session's
-        // failure memory says nothing about this one's link budget.
-        if ceiling_kbps != self.ceiling_seen {
-            self.ceiling_seen = ceiling_kbps;
-            self.known_bad_kbps = None;
-        }
-
-        if let Some(reduced) = encoder::take_congestion_bitrate() {
-            if self.last_event.elapsed() >= Self::REDUCE_COOLDOWN {
-                let applied = encoder::get_stream_bitrate_kbps().max(0) as u32;
-                self.note_congestion(applied);
-                encoder::reconfigure_bitrate(reduced, fps);
-                encoder::set_stream_bitrate_kbps(reduced as i32);
-                self.last_event = Instant::now();
-                self.last_probe = Instant::now();
-                println!(
-                    "📉 Congestion: bitrate → {} Kbps ({}% of {} ceiling) — \
-                     {} Kbps failed, will hold at {} Kbps",
-                    reduced,
-                    reduced * 100 / ceiling_kbps,
-                    ceiling_kbps,
-                    applied,
-                    self.ramp_target(ceiling_kbps),
-                );
-            }
-            return;
-        }
-
-        let cur = encoder::get_stream_bitrate_kbps().max(0) as u32;
-        if cur == 0 {
-            return;
-        }
-        let target = self.ramp_target(ceiling_kbps);
-        if cur < target {
-            if self.last_event.elapsed() >= Self::RAMP_INTERVAL {
-                let ramped = qos_ramp_step(cur, target);
-                encoder::reconfigure_bitrate(ramped, fps);
-                encoder::set_stream_bitrate_kbps(ramped as i32);
-                self.last_event = Instant::now();
-                self.last_probe = Instant::now();
-                let held = if ramped == target { " — holding here" } else { "" };
-                println!("📈 Congestion: ramped bitrate → {ramped} Kbps (+10%, target {target}){held}");
-            }
-        } else if target < ceiling_kbps && self.last_probe.elapsed() >= Self::PROBE_INTERVAL {
-            // Parked at the safe target and clean for a full minute: the link
-            // may have recovered, so lift the target and let the ramp above
-            // walk up to it.
-            self.relax_target(ceiling_kbps);
-            self.last_probe = Instant::now();
-            println!(
-                "🔎 Congestion: {}s clean at {} Kbps — probing up to {} Kbps",
-                Self::PROBE_INTERVAL.as_secs(),
-                cur,
-                self.ramp_target(ceiling_kbps),
-            );
-        }
-    }
 }
 
 /// Advance the frame-pacing deadline after a slot has been served, dropping
@@ -3873,13 +3775,18 @@ pub async fn run() -> Result<()> {
             // (e.g. user backed out, VDD was suspended, then clicked "Quit App"),
             // and auto-teardown of a VDD left suspended (client disconnected
             // WITHOUT /cancel — the common "just quit Moonlight" flow) past
-            // [stream] idle_teardown_secs. Neither path's normal handler runs
+            // [stream] detach_grace_secs. Neither path's normal handler runs
             // while idle, so we do the full teardown here.
+            //
+            // This is the MONOLITHIC loop's copy of the grace clock. The split
+            // deployment's clock lives in Master's `session_watcher` instead,
+            // deliberately: this one dies with the process on every sign-out,
+            // which is precisely a moment the grace period must survive.
             if vd.active_device_name().is_some() {
                 let was_cancelled = client_info.lock()
                     .map(|g| g.as_ref().is_some_and(|c| c.cancelled))
                     .unwrap_or(false);
-                let idle_timeout_secs = cfg.stream.idle_teardown_secs as u64;
+                let idle_timeout_secs = cfg.stream.detach_grace() as u64;
                 let idle_timed_out = idle_timeout_secs > 0
                     && vd.suspended_idle_secs().is_some_and(|s| s >= idle_timeout_secs);
                 if was_cancelled || idle_timed_out {
@@ -3943,14 +3850,30 @@ pub async fn run() -> Result<()> {
                     }
                     enc.config.fps = fps as i32;
                     let vdd_ok = if app_launcher::uses_virtual_display(app_id, cfg.stream.headless_for_all_apps) {
-                        println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
-                            if hdr_req { " HDR10" } else { "" });
                         // Capture the restore target BEFORE the VDD flip: once the
                         // virtual display is primary, Windows may auto-switch the
                         // default endpoint to its HDMI audio device — arming after
                         // that would restore to the wrong endpoint at session end.
                         audio::arm_endpoint_restore();
-                        match vd.activate_for_stream(width, height, fps) {
+                        // HOT RESUME, mirroring apply_configure_start's — a client
+                        // returning inside the detach grace window is looking at a
+                        // display that is already right, and rebuilding it costs
+                        // seconds of visible rearrangement to arrive where we
+                        // started. Everything after this point (rename, rebind, the
+                        // HDR flip) runs identically either way; only the
+                        // activation itself is skipped.
+                        let activation = match vd.resume_suspended(width, height, fps) {
+                            virtual_display::Resume::Reused => Ok(()),
+                            virtual_display::Resume::Mismatch(why) => {
+                                if vd.active_device_name().is_some() {
+                                    println!("🖥️  Cannot reclaim the existing virtual display ({why}) — full activation");
+                                }
+                                println!("🖥️  Pre-activating virtual display for upcoming session ({width}x{height}@{fps}fps{})",
+                                    if hdr_req { " HDR10" } else { "" });
+                                vd.activate_for_stream(width, height, fps)
+                            }
+                        };
+                        match activation {
                             Ok(()) => {
                                 // Rename the virtual monitor so Display Settings and Device
                                 // Manager show the client device name (e.g. "Xbox") instead
@@ -4830,6 +4753,27 @@ mod tests {
         assert_eq!(advance_frame_deadline(after_stall, interval, now2), now2 + interval);
     }
 
+    /// The detach grace clock's boundary conditions. `0` is the one that would
+    /// hurt if it were wrong: it means "hold the session indefinitely", and
+    /// treating it as "expire immediately" would make the opt-out the most
+    /// aggressive setting available — every disconnect instantly rearranging
+    /// the operator's monitors.
+    #[test]
+    fn detach_grace_zero_means_never_not_now() {
+        assert!(!detach_grace_expired(0, Duration::from_secs(0)));
+        assert!(!detach_grace_expired(0, Duration::from_secs(86_400)));
+
+        // The configured boundary is inclusive, and nothing before it fires.
+        assert!(!detach_grace_expired(600, Duration::from_secs(599)));
+        assert!(detach_grace_expired(600, Duration::from_secs(600)));
+        assert!(detach_grace_expired(600, Duration::from_secs(601)));
+
+        // A short grace still behaves, including at the extremes.
+        assert!(!detach_grace_expired(1, Duration::from_millis(999)));
+        assert!(detach_grace_expired(1, Duration::from_secs(1)));
+        assert!(detach_grace_expired(u32::MAX, Duration::MAX));
+    }
+
     /// The static-desktop diagnostic must stay off the hot path. The guard it
     /// replaced fired on every other frame slot (55,203 blocking writes in one
     /// live session) because `timeout_streak` resets on every delivered frame.
@@ -4851,129 +4795,5 @@ mod tests {
             log_static_desktop(capture::BackendKind::Wgc, streak, &mut last);
         }
         assert_eq!(last, Some(first), "must not re-log inside the throttle window");
-    }
-
-    /// The QoS ramp must climb, converge exactly on its target, and never
-    /// overshoot — overshooting would push the encoder above the rate the
-    /// controller decided is safe, which is the failure the loop exists to stop.
-    #[test]
-    fn qos_ramp_converges_on_target_without_overshoot() {
-        let target = 81_360u32; // 90% of a 90400 Kbps failure
-        let mut cur = 72_320; // where one 20% congestion cut lands
-        let mut steps = 0;
-        while cur < target {
-            let next = qos_ramp_step(cur, target);
-            assert!(next > cur, "ramp must make progress: {cur} -> {next}");
-            assert!(next <= target, "ramp overshot the target: {next} > {target}");
-            cur = next;
-            steps += 1;
-            assert!(steps < 1000, "ramp failed to converge");
-        }
-        assert_eq!(cur, target);
-
-        // At or above the target: clamped, never climbing further.
-        assert_eq!(qos_ramp_step(target, target), target);
-        assert_eq!(qos_ramp_step(target + 5_000, target), target);
-
-        // Very low bitrates must still make progress — an integer +10% of a
-        // small value rounds to zero and would stall the ramp forever.
-        assert!(qos_ramp_step(1, 10_000) > 1);
-        assert!(qos_ramp_step(9, 10_000) > 9);
-    }
-
-    /// The whole point of AIMD-with-memory: recovery must NOT return to the
-    /// negotiated ceiling after a failure. The previous ramp-to-ceiling policy
-    /// produced a live 12-second freeze sawtooth (see QosController's docs).
-    #[test]
-    fn qos_holds_below_the_rate_that_failed() {
-        let ceiling = 90_400u32;
-        let mut qos = QosController::new();
-
-        // Nothing has failed yet ⇒ the full ceiling is fair game.
-        assert_eq!(qos.ramp_target(ceiling), ceiling);
-
-        // The ceiling itself failed ⇒ hold at 90% of it, never back at 90400.
-        qos.note_congestion(90_400);
-        let target = qos.ramp_target(ceiling);
-        assert_eq!(target, 81_360);
-        assert!(target < ceiling, "must not ramp back to a rate known to fail");
-
-        // A LOWER failure means the link is worse than we thought — ratchet down.
-        qos.note_congestion(63_641);
-        assert!(qos.ramp_target(ceiling) < target, "target must ratchet down");
-        assert_eq!(qos.ramp_target(ceiling), 57_276);
-
-        // A HIGHER failure is stale news and must not raise the target.
-        let tightest = qos.ramp_target(ceiling);
-        qos.note_congestion(88_000);
-        assert_eq!(qos.ramp_target(ceiling), tightest);
-
-        // Repeated failures can never drive the target below the floor.
-        for _ in 0..200 {
-            let t = qos.ramp_target(ceiling);
-            qos.note_congestion(t);
-            assert!(t >= QosController::FLOOR_KBPS.min(ceiling), "target fell through the floor: {t}");
-        }
-
-        // A zero reading (no session yet) must not poison the memory.
-        let before = qos.ramp_target(ceiling);
-        qos.note_congestion(0);
-        assert_eq!(qos.ramp_target(ceiling), before);
-    }
-
-    /// The probe must let a recovered link climb back in BOUNDED time from any
-    /// depth — the live 2026-08-08 MoCA failure drove the stream to ~3.5 Mbps,
-    /// where the old fixed +5% probe needed ~80 minutes to recover. Geometric
-    /// relaxation (a quarter of the gap per probe) must reach the ceiling in a
-    /// handful of steps even from the floor.
-    #[test]
-    fn qos_probe_recovers_in_bounded_time_from_any_depth() {
-        let ceiling = 90_400u32;
-        for start in [70_000u32, 8_640, QosController::FLOOR_KBPS] {
-            let mut qos = QosController::new();
-            qos.note_congestion(start);
-
-            let mut prev = qos.ramp_target(ceiling);
-            let mut probes = 0;
-            while qos.ramp_target(ceiling) < ceiling {
-                qos.relax_target(ceiling);
-                let now = qos.ramp_target(ceiling);
-                assert!(now >= prev, "probe must not move the target backwards");
-                prev = now;
-                probes += 1;
-                assert!(probes < 40, "recovery from {start} took {probes} probes — not bounded");
-            }
-            // ~13 probes max from the floor; at PROBE_INTERVAL that is well
-            // under 3 minutes, versus ~80 min for the old policy.
-            assert!(probes <= 20, "recovery from {start} took {probes} probes");
-            assert!(qos.known_bad_kbps.is_none(), "a recovered link should forget the failure");
-        }
-
-        // Relaxing with nothing remembered is a no-op, not a panic.
-        let mut qos = QosController::new();
-        qos.relax_target(ceiling);
-        assert_eq!(qos.ramp_target(ceiling), ceiling);
-    }
-
-    /// A new session must NOT inherit the previous session's link memory — the
-    /// bug that left a fresh 4K session capped at 3.5 Mbps after a MoCA-failure
-    /// session collapsed, because every reconnect negotiated the same ceiling
-    /// so the ceiling-change reset never fired.
-    #[test]
-    fn qos_reset_clears_cross_session_memory() {
-        let ceiling = 90_400u32;
-        let mut qos = QosController::new();
-
-        // Previous session collapsed to the floor.
-        for _ in 0..50 {
-            let t = qos.ramp_target(ceiling);
-            qos.note_congestion(t);
-        }
-        assert!(qos.ramp_target(ceiling) < ceiling, "precondition: memory is capped");
-
-        // A new session begins.
-        qos.reset();
-        assert_eq!(qos.ramp_target(ceiling), ceiling, "fresh session must start at the full ceiling");
-        assert!(qos.known_bad_kbps.is_none());
     }
 }

@@ -1,4 +1,36 @@
-# Nova — Handoff to Next Chat (2026-08-11, evening)
+# Nova — Handoff to Next Chat
+
+## ⚠️ NEWEST FIRST — session persistence + flow control (2026-08-17)
+
+**Code complete, 121 lib tests, NOT live-validated.** Detached sessions with hot reconnect on
+both client kinds, plus a per-session bitrate budget. Full engineering record and every
+invariant: **CLAUDE.md → "Session persistence + flow control (2026-08-17)"**. Read that before
+touching `session_watcher`, `resume_suspended`, `echo::session::sweep`, or `qos.rs`.
+
+**What to look for on the first live run** (the whole batch turns on these two lines):
+- `⚡ Reclaimed the detached virtual display …` — 1B's fast path hit. If you see `🖥️ Cannot
+  reclaim the existing virtual display (…)` instead, the reason is in the parentheses; the
+  session is still correct, just not fast.
+- `⏸️ Echo session N DETACHED …` ~30 s after a phone drops off Wi-Fi, then `🕐 … not reclaimed
+  within 600s` if nobody returns.
+
+Test sequence worth running: (1) Moonlight mid-stream, kill the network, reconnect inside 10
+min → picture returns, desktop never rearranges; (2) same but wait out the grace → physical
+monitor comes back; (3) Echo on the phone, airplane mode, return inside the window; (4) press
+"End Stream" and confirm it STILL tears down instantly (the clock must not soften an explicit
+end); (5) confirm the Echo dashboard's "Stop" button is now hidden when idle.
+
+**Three things were found already built while scoping this** — do not rebuild them: the Android
+MediaCodec decoder (complete since 2026-08-15), QoS slow-start recovery (`QosController` is
+already AIMD-with-memory), and the Moonlight detached state (`Deactivate { cancelled: false }`).
+
+**One live bug fixed as a side effect:** `[stream] idle_teardown_secs` had been dead in the
+deployed split — producer in the Worker, consumer only in the monolithic `run()` — so a vanished
+Moonlight client left the virtual display up forever.
+
+---
+
+## Previous handoff (2026-08-11, evening)
 
 ## TL;DR
 **Session survival AND the UAC-screen flicker are both DONE and live-confirmed.** Connect at the
@@ -8,7 +40,7 @@ full-screen 4K HDR10. Hovering clickable elements on the UAC/security screen is 
 **No known open bugs.** The next session starts on polish/QoL, not firefighting.
 
 - Git HEAD `b598afd` on `main`, working tree clean, live install hash-verified (exe + dll), service
-  Running.
+  Running. *(Stale as of 2026-08-17 — see the section above.)*
 - Two items remain merely *unmeasured* (see the bottom) — neither is a known defect.
 
 ## Key locations

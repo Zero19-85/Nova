@@ -38,14 +38,52 @@ pub struct StreamConfig {
     /// When false, only App 5 (Virtual Desktop) activates headless mode.
     /// Default true — universal headless is the recommended configuration.
     pub headless_for_all_apps: bool,
-    /// Seconds a suspended-but-idle virtual monitor (client disconnected
-    /// without hitting "Quit App" — the common case) is left active before
-    /// Nova auto-tears it down, exactly as if /cancel had been sent. Keeps
-    /// /resume fast for a normal app-switch/reconnect while still reclaiming
-    /// the ghost monitor if nobody comes back. 0 disables auto-teardown
-    /// (old behaviour — VDD stays up until an explicit /cancel or restart).
-    /// Default 300 (5 minutes).
-    pub idle_teardown_secs: u32,
+    /// Seconds a **detached** session is held before Nova tears it down.
+    ///
+    /// A client that vanishes without saying goodbye (network drop, app
+    /// backgrounded, phone in a pocket) does not end its session: the encoder
+    /// stops and transmission stops, but the virtual monitor, the desktop
+    /// arrangement and whatever is running on it are all left exactly as they
+    /// were, so a reconnect inside this window resumes instantly instead of
+    /// paying a full display cycle. When it expires, Nova tears down as if
+    /// `/cancel` had been sent and the physical monitor comes back.
+    ///
+    /// 0 disables the timer — a detached session is then held until an explicit
+    /// end or a restart.
+    ///
+    /// Not a timeout on the *stream*: an explicit "End Stream" (from the tray,
+    /// the client, or `/cancel`) bypasses this entirely and tears down at once.
+    pub detach_grace_secs: Option<u32>,
+
+    /// Deprecated name for [`Self::detach_grace_secs`], still honoured so an
+    /// existing `nova.toml` keeps working. Read only through
+    /// [`Self::detach_grace`].
+    pub idle_teardown_secs: Option<u32>,
+}
+
+/// Default for [`StreamConfig::detach_grace_secs`] — 10 minutes.
+///
+/// Long enough to cover the cases that motivated it (a phone that lost signal, a
+/// laptop that slept, a client app backgrounded while its user does something
+/// else) and short enough that a genuinely abandoned session returns the
+/// operator's monitor within one coffee break.
+pub const DEFAULT_DETACH_GRACE_SECS: u32 = 600;
+
+impl StreamConfig {
+    /// How long to hold a detached session, in seconds. 0 = hold indefinitely.
+    ///
+    /// Resolves the current name against the deprecated one: whichever the
+    /// operator actually wrote wins, the new name wins if both are present, and
+    /// an absent setting means [`DEFAULT_DETACH_GRACE_SECS`]. Distinguishing
+    /// "absent" from "explicitly set to the default value" is the whole reason
+    /// both fields are `Option` — an upgraded install that had tuned
+    /// `idle_teardown_secs` must keep its tuning rather than silently adopting
+    /// the new default.
+    pub fn detach_grace(&self) -> u32 {
+        self.detach_grace_secs
+            .or(self.idle_teardown_secs)
+            .unwrap_or(DEFAULT_DETACH_GRACE_SECS)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +109,23 @@ pub struct NetworkConfig {
     /// baseline for the wired/stable networks Nova actually targets; raise it
     /// only for genuinely lossy links (congested WiFi, powerline).
     pub fec_percentage: u32,
+
+    /// Bandwidth held back from the video encoder for the audio pipelines, in
+    /// Kbps. Subtracted from the session's ceiling at negotiation, so video
+    /// never budgets bandwidth that Opus is going to use anyway.
+    ///
+    /// The measured cost is ~140 Kbps: game audio is Opus at 128 Kbps
+    /// (`audio.rs`) plus ~7% RTP/AES framing at 20 ms frames. The default is
+    /// ~3.5x that, because the consequence of under-reserving (audio and video
+    /// fighting at the moment the link saturates) is worse than the consequence
+    /// of over-reserving by a few hundred Kbps. Echo's microphone travels the
+    /// other direction and contends for the client's uplink, not the host's, so
+    /// it is deliberately not counted here.
+    ///
+    /// Never claims more than a quarter of a session's ceiling — see
+    /// `qos::MAX_RESERVE_FRACTION` — so raising this for a fat link cannot
+    /// starve a thin one.
+    pub audio_reserve_kbps: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +226,8 @@ impl Default for StreamConfig {
             codec:                "h264".to_string(),
             enable_hdr:           false,
             headless_for_all_apps: true,
-            idle_teardown_secs:   300,
+            detach_grace_secs:    None,
+            idle_teardown_secs:   None,
         }
     }
 }
@@ -184,7 +240,7 @@ impl Default for AudioConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { fec_percentage: 5 }
+        Self { fec_percentage: 5, audio_reserve_kbps: 512 }
     }
 }
 
@@ -207,9 +263,16 @@ enable_hdr           = false   # set true to allow HDR10/HEVC-Main10 even when t
                                 # capability query is slow to reflect HDRPlus=true
 headless_for_all_apps = true   # route ALL apps through the VDD (recommended);
                                 # set false to restrict headless mode to App 5 only
-idle_teardown_secs   = 300     # auto-detach the virtual monitor after this many
-                                # seconds idle-but-connected-less (0 = never;
-                                # VDD stays up until /cancel or restart)
+detach_grace_secs    = 600     # a client that vanishes without saying goodbye
+                                # (network drop, app backgrounded) leaves the
+                                # session DETACHED: encoding and transmission
+                                # stop at once, but the virtual monitor and
+                                # everything running on it are held, so a
+                                # reconnect within this window resumes instantly.
+                                # After it, Nova tears down as if /cancel had
+                                # been sent. 0 = hold indefinitely. An explicit
+                                # "End Stream" ignores this and ends immediately.
+                                # (Old name idle_teardown_secs still works.)
 
 [audio]
 endpoint_override = ""  # Windows audio endpoint friendly name or GUID;
@@ -220,6 +283,11 @@ fec_percentage = 5      # Reed-Solomon FEC parity % (0 = disabled).
                         # Pure overhead on top of the video bitrate — 5% suits
                         # wired/stable LANs. Raise for lossy links (WiFi,
                         # powerline); 20% at 4K120 added ~20 Mbps of parity.
+audio_reserve_kbps = 512 # bandwidth held back from video for the Opus audio
+                        # pipeline. Measured cost is ~140 Kbps (128 Kbps Opus +
+                        # framing), so this is ~3.5x headroom. Never takes more
+                        # than a quarter of a session's ceiling, so a thin link
+                        # degrades its audio share instead of losing its picture.
 
 [echo]
 # Echo side-channel — the control/telemetry RPC for Nova's native client.
@@ -300,5 +368,54 @@ impl NovaConfig {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join(CONFIG_FILENAME)))
             .unwrap_or_else(|| PathBuf::from(CONFIG_FILENAME))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An install that had tuned the old name must keep its tuning across the
+    /// rename — silently adopting the new default would change teardown
+    /// behaviour on an upgrade, which is exactly the kind of surprise a
+    /// deprecated alias exists to prevent.
+    #[test]
+    fn the_deprecated_grace_name_is_still_honoured() {
+        let legacy: NovaConfig = toml::from_str("[stream]\nidle_teardown_secs = 90\n").unwrap();
+        assert_eq!(legacy.stream.detach_grace(), 90);
+
+        // The current name wins when both are present.
+        let both: NovaConfig =
+            toml::from_str("[stream]\nidle_teardown_secs = 90\ndetach_grace_secs = 42\n").unwrap();
+        assert_eq!(both.stream.detach_grace(), 42);
+
+        // Absent entirely ⇒ the default, not zero. A zero here would mean
+        // "hold detached sessions forever", which is the opposite of the
+        // intended behaviour and would leak virtual monitors.
+        let empty: NovaConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.stream.detach_grace(), DEFAULT_DETACH_GRACE_SECS);
+        assert_eq!(NovaConfig::default().stream.detach_grace(), DEFAULT_DETACH_GRACE_SECS);
+
+        // Explicit zero is a real choice and must survive as one.
+        let never: NovaConfig = toml::from_str("[stream]\ndetach_grace_secs = 0\n").unwrap();
+        assert_eq!(never.stream.detach_grace(), 0);
+    }
+
+    /// The shipped template must parse, and must agree with the built-in
+    /// defaults — a template that drifts from `Default` hands new installs a
+    /// different configuration from upgraded ones.
+    #[test]
+    fn the_default_template_parses_and_matches_the_builtin_defaults() {
+        let from_template: NovaConfig =
+            toml::from_str(DEFAULT_TOML).expect("shipped nova.toml template must parse");
+        let built_in = NovaConfig::default();
+
+        assert_eq!(from_template.stream.detach_grace(), built_in.stream.detach_grace());
+        assert_eq!(
+            from_template.network.audio_reserve_kbps,
+            built_in.network.audio_reserve_kbps,
+        );
+        assert_eq!(from_template.network.fec_percentage, built_in.network.fec_percentage);
+        assert_eq!(from_template.stream.fps, built_in.stream.fps);
     }
 }

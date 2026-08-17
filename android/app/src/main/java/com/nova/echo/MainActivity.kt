@@ -547,7 +547,15 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Stream") }
 
-        OutlinedButton(onClick = { controller.stop() }, Modifier.fillMaxWidth()) { Text("Stop") }
+        // Only shown when there is a live session handle to act on. Ending the
+        // stream frees that handle, so this button had nothing left to send
+        // through and quietly did nothing — see UiState.connected. Hidden rather
+        // than disabled, on this screen's own principle that a disabled control
+        // which cannot say why is a dead end: with no session there is nothing
+        // to explain, because ending the stream already tore the host down.
+        if (state.connected) {
+            OutlinedButton(onClick = { controller.stop() }, Modifier.fillMaxWidth()) { Text("Stop") }
+        }
 
         Text(
             "This device: ${state.myFingerprint}",

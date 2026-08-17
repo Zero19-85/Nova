@@ -160,6 +160,148 @@ from "nothing happened".
 
 ---
 
+## Session persistence + flow control (2026-08-17) — code complete, **live validation owed**
+
+Detached sessions with hot reconnect, on both client kinds, plus a per-session bitrate
+budget. 121 lib tests. Nothing here has been exercised against a real client yet.
+
+### The state model: DETACHED is not ENDED
+
+A client that vanishes without saying goodbye (network drop, backgrounded app, phone in a
+pocket) no longer ends its session. **Encoding and transmission stop immediately** — the
+GPU and the uplink are not spent on someone who is gone — while the virtual display, the
+desktop arrangement and whatever is running on it are **held**, so a reconnect resumes
+into them. After `[stream] detach_grace_secs` (default 600) with nobody back, Nova tears
+down as if `/cancel` had arrived.
+
+`Deactivate { cancelled: false }` was already exactly this state; what was missing was a
+bounded clock, a fast resume, and any equivalent at all on the Echo side.
+
+**Invariants — do not break these:**
+
+1. **The grace clock lives in the MASTER** (`session_watcher`'s `suspended_generation:
+   Option<(gen, Instant)>`), never the Worker. The Worker dies on every sign-out, taking
+   any Worker-side clock with it, and a sign-out is precisely when a detached session must
+   keep counting rather than restart. This also fixed a live bug: `[stream]
+   idle_teardown_secs` had been **dead in the deployed split** — `deactivate_worker` calls
+   `mark_suspended()`, but only the monolithic `run()` ever polled `suspended_idle_secs()`,
+   so a vanished Moonlight client left the virtual display up forever. General lesson,
+   third time now (cf. dynamic bitrate): **when a feature moves into the split, check the
+   Worker loop has a CONSUMER, not just a producer.**
+2. **`grace == 0` means hold indefinitely, NOT expire immediately** — on both paths. A
+   configured zero is an operator saying they will end sessions themselves; inverting it
+   would make the opt-out the most aggressive setting available.
+3. **An explicit end always bypasses the clock.** `EndMode::TearDown` / `cancelled: true`
+   tears down at once — that is yesterday's "one press goes all the way down".
+4. `detach_grace_secs` supersedes `idle_teardown_secs`, which still works. **Both are
+   `Option<u32>`** so "absent" is distinguishable from "explicitly set to the default";
+   read only through `StreamConfig::detach_grace()`. An upgraded install that had tuned
+   the old name must keep its tuning.
+
+### Display-plane caching + CCD read-back (`VirtualDisplay::resume_suspended`)
+
+`activate_for_stream` rewrites `vdd_settings.xml`, may cycle the devnode, waits for GDI
+enumeration, snapshots the CCD database and commits a topology change — seconds of visibly
+rearranging desktop. Paying that to arrive at the arrangement already on screen is pure
+latency at the exact moment a returning user is watching. `resume_suspended(w,h,fps) ->
+Resume::{Reused, Mismatch(why)}` skips it.
+
+- **The committed mode is READ BACK out of CCD (`QDC_ONLY_ACTIVE_PATHS`), never assumed.**
+  `active_resolution` is only what this process last *asked* for. Windows re-derives modes
+  on its own schedule, `SDC_ALLOW_CHANGES` lets `SetDisplayConfig` substitute one, and PnP
+  settles asynchronously after the call returns — the same family of failures that had a
+  2560x1440 monitor come back at 1024x768 while the log said success.
+- **Anything unknown is a mismatch.** Falling through to full activation is always safe
+  (it is what every session did before); guessing wrong streams a display that is not the
+  shape the client was promised. Size matches exactly; refresh gets the ±1 Hz tolerance
+  `PhysicalMode::matches` uses, because Windows reports 59.951 Hz for a "60 Hz" mode.
+- **Never reclaims a display that is not detached** — that would be two sessions sharing
+  one display with neither told.
+- Only ever succeeds **within one Worker's lifetime**: a respawned Worker's
+  `VirtualDisplay` has `active == false`, so a resume across a sign-out correctly takes the
+  full path. Wired into both `apply_configure_start` and the monolithic pre-activation.
+- The encoder is still rebound and the monitor still renamed on the fast path — only the
+  display *construction* is skipped. The returning client may have negotiated a different
+  codec/HDR/bitrate, and a detached session can be reclaimed by a **different** device.
+
+### Echo detach + idle reaper (`SessionManager::sweep`)
+
+Echo had **no session reaper at all**: `stop` needs a client well enough to ask and
+`force_end` needs an operator at the tray, so a phone that lost signal left the host
+encoding and transmitting to an address nobody was listening at, indefinitely. The tunnel
+sweep in `transport.rs` reclaimed its *slot* but never told the session. It now also calls
+`sessions.sweep(media_idle, TUNNEL_IDLE_TIMEOUT)` every 5 s.
+
+**Invariants — each of these is a real hazard, not a style preference:**
+
+1. **The reap must NOT end the plane if Moonlight has taken the pipeline.** `echo_active`
+   goes false at detach precisely so a Moonlight client can claim an idle pipeline — but
+   the detached session's grace clock keeps running, and its expiry would send a cancelling
+   `Deactivate` that tears down *that* session. It would present as a Moonlight stream
+   dying at random, ten minutes after an unrelated phone lost signal. The reap forgets the
+   record and touches nothing. Mutation-tested.
+2. **Lock order is ALWAYS session → RTP.** Every existing path does this (`start` →
+   `plane.begin`, `force_end` → `plane.end`, and `media_supervisor` releases the session
+   lock in `seal_video` before taking the RTP lock). The sweep therefore reads
+   `rtp.idle_since` FIRST, unlocked, and passes the result in — `live_peer()` exists for
+   exactly that. A sweep that queried RTP while holding the session lock would be the sole
+   inversion in the system and the sole deadlock opportunity.
+3. **`rtp.idle_since` returning `None` means "no news", never "dead".** It tracks only the
+   single most recent sender (deliberately — a per-address table on an internet-reachable
+   port is a memory footgun), so one stray datagram from a scanner erases the reading.
+   Detaching on `None` would let a port scan kill a healthy stream.
+4. **Liveness is authenticated or it is a ping, never control traffic alone.** Input and
+   mic datagrams that open under the session key are *proof* only the holder sent them; the
+   other source is the 500 ms media-socket ping. Judging by control idle alone declared a
+   perfectly healthy stream dead 30 s in, live on 2026-08-15.
+5. **Detached takeover semantics: another device MAY take over a DETACHED session; a LIVE
+   one is still refused** with `HeldByAnotherDevice`. Holding the seat for the whole grace
+   period would lock every other paired device out of the host for ten minutes to protect a
+   stream nobody is watching. The newcomer inherits the same display; keys are freshly
+   minted either way.
+6. **Reclaiming calls no `plane.end` at all** — nothing is running, and `end(TearDown)`
+   would destroy the very display being reused. **Keys are always minted fresh**, never
+   cached across a detach, so a datagram sealed for the old session cannot be replayed into
+   the new one.
+
+### Bitrate budget (`src/qos.rs`)
+
+`QosController` moved here from lib.rs unchanged, joined by `video_budget()`. Two layers:
+the **budget** is decided once at negotiation from facts that cannot change mid-session;
+the **controller** walks up and down underneath it.
+
+- **Cap first, then reserve** — reserving from the raw request would let a client dodge the
+  reservation by asking for more.
+- `resolution_ceiling()` interpolates a tier table (720p 20 / 1080p 40 / 1440p 70 /
+  4K 120 Mbps at 60 fps, ~2x Moonlight's recommendation) on pixel count, scaled by
+  `(fps/60)^0.75` — sub-linear because inter-frame prediction improves as cadence rises.
+  Tune the table, not the call sites.
+- Applied at **both** negotiators (`session_negotiate::negotiate` and
+  `SessionRequest::validate`) and computed against the **negotiated** fps, not the
+  requested one — an H264 session capped to 24 fps by Level 5.2 must not be budgeted for
+  120.
+- `[network] audio_reserve_kbps = 512` against a measured ~140 Kbps cost (128 Kbps Opus +
+  framing). **Never takes more than ¼ of a session's ceiling**, so raising it for a fat
+  link cannot starve a thin one. Echo's mic is upstream and deliberately not counted.
+- **The budgeted number IS the QoS ramp ceiling** — `NegotiatedParams::bitrate_kbps`
+  becomes both NVENC's CBR target and `QosController`'s `ramp_target`, so recovery
+  converges on the cap and never on the raw request. That was free, and it is the reason
+  the cap belongs at negotiation rather than in the encoder.
+- A **zero** request (no `maximumBitrateKbps` in ANNOUNCE) passes through untouched;
+  inventing a bitrate would hide a negotiation failure behind a plausible number.
+
+### Echo client: the dashboard "Stop" button
+
+Reported as an RPC failure; it was not. `EchoController.stop()` frees the native handle and
+zeroes it, so a second press found `handle == 0`, skipped `nativeClose`, and **sent nothing
+at all** — no stale channel to re-latch, the whole native session object was gone. The
+first press already performs a full teardown host-side (`stop_session` → `EndMode::
+TearDown`), so the button was redundant rather than broken. New `UiState.connected` mirrors
+the handle and the button is hidden without one; anything a previous run orphaned is now
+collected by the reaper above.
+
+---
+
 ## Phase 16 — **ALPHA 2.0** — Session-Survival Architecture: Master/Worker split, lock-screen streaming + remote PIN entry (2026-08-06)
 
 Alpha 2.0's headline: **reboot → connect from Moonlight → see the Windows login screen → type the PIN with the remote mouse/keyboard.** All items below are live-confirmed on the dev box unless marked otherwise.

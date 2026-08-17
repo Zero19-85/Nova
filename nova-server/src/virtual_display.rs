@@ -301,6 +301,21 @@ impl PhysicalMode {
     }
 }
 
+/// Whether a detached session's display could be re-used as-is.
+///
+/// Deliberately carries the reason for a refusal rather than being a bare bool:
+/// the caller logs it, and "why did this reconnect pay a full display cycle?"
+/// is otherwise unanswerable from the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resume {
+    /// The live virtual display already IS what the session needs. Nothing was
+    /// touched; the session may start encoding immediately.
+    Reused,
+    /// Not usable as-is. The caller must run the full
+    /// [`VirtualDisplay::activate_for_stream`].
+    Mismatch(String),
+}
+
 /// File holding the baseline between processes. Plain `device=WxH@Hz` lines:
 /// the structure is fixed, a human can read and correct it, and it needs no
 /// JSON dependency (repo rule #2).
@@ -2292,6 +2307,91 @@ impl VirtualDisplay {
         }
     }
 
+    /// Try to re-use the display a detached session left behind, instead of
+    /// building it again.
+    ///
+    /// `activate_for_stream` is not a cheap call and was never meant to be: it
+    /// rewrites `vdd_settings.xml`, checks and possibly cycles the devnode,
+    /// waits for the monitor to appear in GDI enumeration, snapshots the CCD
+    /// database, and commits a topology change — seconds of work, during which
+    /// the physical desktop visibly rearranges. Paying that to arrive at the
+    /// arrangement already on screen is pure latency at exactly the moment a
+    /// returning user is watching for the picture.
+    ///
+    /// ## What is verified, and why it is READ rather than assumed
+    ///
+    /// `self.active_resolution` records what this process last *asked* for. That
+    /// is not evidence of what the display is *doing*: Windows re-derives modes
+    /// on its own schedule, `SDC_ALLOW_CHANGES` lets `SetDisplayConfig`
+    /// substitute a mode it prefers, and PnP settles asynchronously after the
+    /// call that triggered it returns — the exact family of failures that had a
+    /// 2560x1440 monitor coming back at 1024x768 while the log reported success
+    /// (see the PhysicalMode section). So the committed mode is queried back out
+    /// of CCD (`QDC_ONLY_ACTIVE_PATHS`, the live topology, never the database)
+    /// and compared to what the session needs.
+    ///
+    /// Anything unknown counts as a mismatch. Falling through to the full
+    /// activation is always safe — it is what every session did before this
+    /// existed — whereas guessing wrong hands the client a stream of a display
+    /// that is not the shape it was promised.
+    ///
+    /// Size must match exactly. Refresh is compared with the same ±1 Hz
+    /// tolerance [`PhysicalMode::matches`] uses, because Windows reports the
+    /// rational timing it actually programmed (59.951 Hz for a "60 Hz" mode) and
+    /// an exact test would reject every single resume.
+    ///
+    /// ## Scope
+    ///
+    /// Only ever succeeds within one Worker's lifetime: a respawned Worker's
+    /// `VirtualDisplay` is a fresh object with `active == false`, so a session
+    /// resumed across a sign-out correctly takes the full path. That is the
+    /// right split — after a session change the display state genuinely does
+    /// need rebuilding, and this is the case where it genuinely does not.
+    pub fn resume_suspended(&mut self, width: u32, height: u32, refresh_hz: u32) -> Resume {
+        if !self.active {
+            return Resume::Mismatch("no virtual display is up".to_string());
+        }
+        // A display that is not suspended belongs to a session that is still
+        // running. Re-using it would mean two sessions sharing one display
+        // without either being told, so the full path — which knows how to
+        // re-point it — handles that case.
+        if self.suspended_since.is_none() {
+            return Resume::Mismatch("virtual display is in use, not detached".to_string());
+        }
+        let Some(device) = self.active_device_name.clone() else {
+            return Resume::Mismatch("virtual display has no GDI name".to_string());
+        };
+
+        let Some((live_w, live_h)) = Self::query_ccd_source_size(&device) else {
+            return Resume::Mismatch(format!("{device} is not in the active topology"));
+        };
+        if (live_w, live_h) != (width, height) {
+            return Resume::Mismatch(format!(
+                "{device} is committed at {live_w}x{live_h}, session needs {width}x{height}"
+            ));
+        }
+
+        let Some(live_hz) = Self::query_ccd_target_refresh(&device) else {
+            return Resume::Mismatch(format!("{device}'s committed refresh rate is unreadable"));
+        };
+        if (live_hz - refresh_hz as f64).abs() > 1.0 {
+            return Resume::Mismatch(format!(
+                "{device} is committed at {live_hz:.3} Hz, session needs {refresh_hz} Hz"
+            ));
+        }
+
+        // Verified. Clearing the suspension is the only mutation this makes —
+        // it stops the grace clock's local counterpart and marks the display as
+        // belonging to a live session again.
+        self.suspended_since = None;
+        self.active_resolution = Some((width, height));
+        println!(
+            "⚡ Reclaimed the detached virtual display {device} at {width}x{height}@{refresh_hz}Hz \
+             (verified committed {live_w}x{live_h}@{live_hz:.3}Hz) — skipping activation"
+        );
+        Resume::Reused
+    }
+
     /// GDI device name (`\\.\DISPLAYn`) of the virtual monitor, once
     /// [`activate_for_stream`] has run. Used by the capture re-hook
     /// (`rebind_capture_and_encoder` in lib.rs) to pick the right
@@ -3832,6 +3932,52 @@ impl Drop for VirtualDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hot-resume path must refuse in every state where re-using the
+    /// display would be a guess.
+    ///
+    /// These are the guards that run BEFORE any CCD query, plus the read-back
+    /// itself — which is exercised here for real, because a device name that
+    /// does not exist can never appear in the live topology, so "unknown ⇒
+    /// mismatch" is checked against the actual Windows call rather than a mock.
+    ///
+    /// The consequence of getting these wrong is not a failed resume (harmless
+    /// — the caller falls through to full activation) but a session streaming a
+    /// display that is not the shape it promised the client.
+    #[test]
+    fn a_hot_resume_refuses_anything_it_cannot_verify() {
+        // Nothing is up at all.
+        let mut vd = VirtualDisplay::new();
+        assert!(matches!(vd.resume_suspended(1920, 1080, 60), Resume::Mismatch(_)));
+
+        // Active, but streaming — someone else is using it.
+        vd.active = true;
+        vd.active_device_name = Some("\\\\.\\DISPLAY_NOPE".to_string());
+        vd.suspended_since = None;
+        match vd.resume_suspended(1920, 1080, 60) {
+            Resume::Mismatch(why) => assert!(why.contains("in use"), "{why}"),
+            Resume::Reused => panic!("must not reclaim a display that is still streaming"),
+        }
+
+        // Detached, but the display is not in the live topology, so its
+        // committed mode is unknowable. Must NOT be assumed from
+        // `active_resolution`, which is only what we last asked for.
+        vd.suspended_since = Some(Instant::now());
+        vd.active_resolution = Some((1920, 1080));
+        match vd.resume_suspended(1920, 1080, 60) {
+            Resume::Mismatch(why) => assert!(
+                why.contains("not in the active topology"),
+                "expected the read-back to refuse, got: {why}"
+            ),
+            Resume::Reused => panic!("must not trust active_resolution over the committed mode"),
+        }
+
+        // A refusal must leave the display state untouched: the caller is about
+        // to run the full activation and a half-cleared suspension would make
+        // the grace clock's local view disagree with the Master's.
+        assert!(vd.suspended_since.is_some(), "a refusal must not clear the suspension");
+        assert!(vd.active, "a refusal must not deactivate anything");
+    }
 
     /// The baseline outlives the process that captured it (a Worker respawn is
     /// routine under the split), so the on-disk form has to survive a

@@ -51,7 +51,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nova_core::media_crypto::{SessionKeys, STREAM_VIDEO};
 
@@ -256,7 +256,12 @@ pub const WAN_MTU_BUDGET: usize = 1400;
 pub const ECHO_DATAGRAM_SIZE: usize = WAN_PACKET_SIZE as usize + 16;
 
 impl SessionRequest {
-    fn validate(&self) -> Result<StreamParams, HandoffError> {
+    /// `audio_reserve_kbps` comes from `[network]` in `nova.toml`, carried by the
+    /// [`SessionManager`] — see [`crate::qos::video_budget`]. Echo goes through
+    /// the same budget as a Moonlight session deliberately: the cap exists
+    /// because of what a *resolution* can consume and what the audio pipeline
+    /// needs, neither of which cares which protocol asked.
+    fn validate(&self, audio_reserve_kbps: u32) -> Result<StreamParams, HandoffError> {
         let bad = |why: String| HandoffError::BadRequest(why);
 
         // NVENC requires even dimensions; round down rather than reject, for
@@ -289,13 +294,25 @@ impl SessionRequest {
             fps = 60;
         }
 
+        // Bound what was asked for. Unlike the Moonlight path this is not
+        // defending against a slider — an Echo client picks its own number — but
+        // against the same two realities: a 1080p stream cannot consume 100 Mbps,
+        // and audio needs its slice of whatever we do send. A WAN session has
+        // more reason to care than a LAN one, not less.
+        let budget = crate::qos::video_budget(
+            self.bitrate_kbps, width, height, fps, audio_reserve_kbps,
+        );
+        if let Some(line) = budget.describe(width, height, fps) {
+            println!("{line}");
+        }
+
         Ok(StreamParams {
             width,
             height,
             fps,
             hdr: self.hdr,
             codec: self.codec,
-            bitrate_kbps: self.bitrate_kbps,
+            bitrate_kbps: budget.video_kbps,
             app_id: self.app_id,
             host_audio: self.host_audio,
             packet_size: WAN_PACKET_SIZE,
@@ -319,6 +336,27 @@ pub struct EchoSession {
     pub peer: SocketAddr,
     pub params: StreamParams,
     pub started: Instant,
+    /// Last evidence that the device holding this session is still there.
+    ///
+    /// Updated from two sources, and neither is a heartbeat invented for the
+    /// purpose. Authenticated input and microphone datagrams are *proof* — they
+    /// opened under this session's key, so only the holder could have sent them.
+    /// The liveness sweep supplies the other source: a granted session pings the
+    /// media socket every 500 ms to hold its NAT pinhole open, which `rtp.rs`
+    /// sees and nothing else does.
+    ///
+    /// Deliberately NOT judged from control traffic alone. A working session's
+    /// steady state is media pings and nothing on the control channel, so a
+    /// control-only measure calls a perfectly healthy stream dead — which is
+    /// exactly what happened live on 2026-08-15, 30 s into a working session.
+    last_seen: Instant,
+    /// When this session was detached, if it has been.
+    ///
+    /// Detached means the holder stopped answering: encoding and transmission
+    /// have already been stopped, but the virtual display and everything running
+    /// on it are held so the holder can pick up where it left off. `None` = the
+    /// session is live.
+    detached_since: Option<Instant>,
     /// Media key material. Private: a session hands its keys out exactly once,
     /// at start, over TLS.
     keys: SessionKeys,
@@ -599,6 +637,35 @@ impl MediaPlane for WorkerMediaPlane {
 /// this reads it.
 pub type LatchedPeer = Arc<Mutex<Option<SocketAddr>>>;
 
+/// Operator settings from `nova.toml` that this manager needs.
+///
+/// A struct rather than two `u32` parameters because they would otherwise sit
+/// adjacent and positional at every construction site, where swapping them
+/// compiles cleanly and produces a 512-second grace period and a 600 Kbps audio
+/// reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPolicy {
+    /// `[network] audio_reserve_kbps` — see [`crate::qos::video_budget`].
+    pub audio_reserve_kbps: u32,
+    /// `[stream] detach_grace_secs` — how long a detached session is held before
+    /// its display is released. `Duration::ZERO` = hold indefinitely, matching
+    /// the Moonlight path's reading of a configured 0.
+    pub detach_grace: Duration,
+}
+
+/// What one [`SessionManager::sweep`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Nothing to do: no session, a healthy one, or a detached one still inside
+    /// its grace period.
+    Nothing,
+    /// A live session stopped answering. Encoding and transmission have been
+    /// stopped; the display is held.
+    Detached,
+    /// A detached session outlived its grace period and has been torn down.
+    Reaped,
+}
+
 /// Owns the one Echo session Nova can run, and the gate protecting it.
 pub struct SessionManager {
     plane: Arc<dyn MediaPlane>,
@@ -616,6 +683,9 @@ pub struct SessionManager {
     /// `active`'s mutex is held, so it can never disagree with it for longer
     /// than one instruction.
     echo_active: std::sync::atomic::AtomicBool,
+    /// Operator settings. Held here rather than read from config at the call
+    /// sites so the gate stays testable without a `nova.toml`.
+    policy: SessionPolicy,
 }
 
 impl SessionManager {
@@ -623,6 +693,7 @@ impl SessionManager {
         plane: Arc<dyn MediaPlane>,
         client_info: Arc<Mutex<Option<ClientInfo>>>,
         latched: LatchedPeer,
+        policy: SessionPolicy,
     ) -> Self {
         Self {
             plane,
@@ -631,6 +702,7 @@ impl SessionManager {
             active: Mutex::new(None),
             next_id: AtomicU64::new(1),
             echo_active: std::sync::atomic::AtomicBool::new(false),
+            policy,
         }
     }
 
@@ -742,7 +814,7 @@ impl SessionManager {
     ) -> Result<SessionGrant, HandoffError> {
         // 1. Validate before consulting any state — a malformed request should
         //    not be able to report on whether someone else is streaming.
-        let params = request.validate()?;
+        let params = request.validate(self.policy.audio_reserve_kbps)?;
 
         // 2. Anti-hijack: a live Moonlight client owns the pipeline outright.
         if self.moonlight_is_live() {
@@ -758,19 +830,49 @@ impl SessionManager {
         //    materially different situation from a second device barging in.
         let mut guard = self.active.lock().unwrap();
         if let Some(existing) = guard.as_ref() {
-            if existing.device_fingerprint != device.fingerprint {
+            let detached = existing.detached_since.is_some();
+            let same_device = existing.device_fingerprint == device.fingerprint;
+
+            if !same_device && !detached {
                 return Err(HandoffError::HeldByAnotherDevice {
                     device: existing.device_name.clone(),
                 });
             }
-            println!(
-                "🔁 Echo: \"{}\" restarting its session {} — ending the old one first",
-                device.device_name, existing.id
-            );
-            // KeepDisplay: the same device is reconnecting and a new `begin`
-            // follows immediately, so tearing the VDD down here would make a
-            // restart pay a full display cycle it is about to undo.
-            self.plane.end(EndMode::KeepDisplay);
+
+            if detached {
+                // Nothing is running: the sweep already stopped the encoder and
+                // the transmission, and left the display up for exactly this.
+                // Calling `end` again would be pointless work at the moment
+                // latency matters most, and `end(TearDown)` would destroy the
+                // very thing being reclaimed.
+                //
+                // A DIFFERENT device is allowed to take a detached session over.
+                // The alternative — holding the seat for the whole grace period
+                // — means one phone losing signal locks every other paired
+                // device out of the host for ten minutes, to protect a stream
+                // nobody is watching. The display it inherits is the same
+                // display, and the keys minted below are new either way.
+                if same_device {
+                    println!(
+                        "⚡ Echo: \"{}\" reclaiming its detached session {} — display still up, resuming",
+                        device.device_name, existing.id
+                    );
+                } else {
+                    println!(
+                        "🔄 Echo: \"{}\" taking over session {}, detached by \"{}\" — display still up",
+                        device.device_name, existing.id, existing.device_name
+                    );
+                }
+            } else {
+                println!(
+                    "🔁 Echo: \"{}\" restarting its session {} — ending the old one first",
+                    device.device_name, existing.id
+                );
+                // KeepDisplay: the same device is reconnecting and a new `begin`
+                // follows immediately, so tearing the VDD down here would make a
+                // restart pay a full display cycle it is about to undo.
+                self.plane.end(EndMode::KeepDisplay);
+            }
             *guard = None;
             self.echo_active.store(false, Ordering::Relaxed);
         }
@@ -795,6 +897,11 @@ impl SessionManager {
             peer,
             params,
             started: Instant::now(),
+            // A brand-new session counts as alive now. Without this the very
+            // first sweep would measure against a zero mark and detach a session
+            // whose client has not had time to send its first ping.
+            last_seen: Instant::now(),
+            detached_since: None,
             input: nova_core::input_channel::InputReceiver::new(keys.clone()),
             mic: nova_core::mic_channel::MicReceiver::new(keys.clone()),
             audio: nova_core::audio_channel::AudioSender::new(keys.clone()),
@@ -908,10 +1015,16 @@ impl SessionManager {
             let Some(session) = guard.as_mut() else {
                 return Err(InputRejection::NoSession);
             };
-            session
+            let packets = session
                 .input
                 .open(datagram)
-                .map_err(|e| InputRejection::Unopenable(e.to_string()))?
+                .map_err(|e| InputRejection::Unopenable(e.to_string()))?;
+            // Proof of life, and the best kind available: this datagram opened
+            // under the session's own key, so only the device holding it could
+            // have sent it. Recorded even for a repeat — a duplicate still had
+            // to be transmitted by someone who is there.
+            session.last_seen = Instant::now();
+            packets
         };
 
         let count = packets.len();
@@ -944,10 +1057,150 @@ impl SessionManager {
         let Some(session) = guard.as_mut() else {
             return Err(InputRejection::NoSession);
         };
-        session
+        let opened = session
             .mic
             .open(datagram)
-            .map_err(|e| InputRejection::Unopenable(e.to_string()))
+            .map_err(|e| InputRejection::Unopenable(e.to_string()))?;
+        // Proof of life for the same reason as `inject_sealed_input`: it opened
+        // under this session's key.
+        session.last_seen = Instant::now();
+        Ok(opened)
+    }
+
+    /// Address of the session's peer, if one is live and not already detached.
+    ///
+    /// The caller uses it to ask `rtp.rs` how long that peer has been silent.
+    /// Returned rather than having this type query `rtp` itself, so the two
+    /// locks are taken one after another instead of nested: every existing path
+    /// takes the session lock and then the RTP lock (`start` → `plane.begin`,
+    /// `force_end` → `plane.end`), and a sweep that read RTP while holding the
+    /// session lock would be the one place doing it the other way round.
+    pub fn live_peer(&self) -> Option<SocketAddr> {
+        let guard = self.active.lock().unwrap();
+        let session = guard.as_ref()?;
+        session.detached_since.is_none().then_some(session.peer)
+    }
+
+    /// One liveness sweep: detach a session whose holder has gone quiet, and
+    /// tear down a detached one that was never reclaimed.
+    ///
+    /// `media_idle` is how long the media socket has been silent from the peer
+    /// [`live_peer`](Self::live_peer) reported, or `None` when that is unknown —
+    /// `rtp.rs` tracks only the single most recent sender, so a stray datagram
+    /// from anywhere else erases the reading. `None` therefore means "no news",
+    /// never "dead": treating it as evidence of death would let one packet from
+    /// a port scanner detach a healthy session.
+    ///
+    /// ## Why both halves live here
+    ///
+    /// Nothing else ends an Echo session. `stop` requires a client that is well
+    /// enough to ask, and `force_end` requires an operator at the tray — so a
+    /// phone that lost signal left the host encoding and transmitting to an
+    /// address nobody was listening at, indefinitely. The tunnel sweep reclaimed
+    /// its *slot* (transport.rs) but never told the session, which is why this
+    /// is called from there.
+    pub fn sweep(&self, media_idle: Option<Duration>, idle_timeout: Duration) -> Sweep {
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return Sweep::Nothing;
+        };
+
+        // ── Already detached: is the grace period up? ────────────────────────
+        if let Some(detached_at) = session.detached_since {
+            let grace = self.policy.detach_grace;
+            if grace.is_zero() || detached_at.elapsed() < grace {
+                return Sweep::Nothing;
+            }
+            let id = session.id;
+            let name = session.device_name.clone();
+            *guard = None;
+
+            // A Moonlight client may have claimed the pipeline while this
+            // session sat detached — `echo_active` went false at detach
+            // precisely so it could. Ending the plane now would send a
+            // cancelling Deactivate and tear down THAT session instead, which
+            // would look exactly like a stream dying at random ten minutes after
+            // an unrelated phone lost signal. Drop the record and touch nothing.
+            if self.moonlight_is_live() {
+                println!(
+                    "🧹 Echo: detached session {id} (\"{name}\") expired, but Moonlight now holds \
+                     the pipeline — forgetting the session without touching the display"
+                );
+                return Sweep::Reaped;
+            }
+
+            println!(
+                "🕐 Echo: detached session {id} (\"{name}\") was not reclaimed within {}s — \
+                 tearing down and restoring the display",
+                grace.as_secs()
+            );
+            self.plane.end(EndMode::TearDown);
+            return Sweep::Reaped;
+        }
+
+        // ── Live: has the holder stopped answering? ──────────────────────────
+        //
+        // A fresh reading is proof of life and moves the mark forward; a stale
+        // or absent one leaves whatever authenticated input and microphone
+        // datagrams have already recorded.
+        if let Some(idle) = media_idle {
+            if idle < idle_timeout {
+                // `now - idle` rather than `now`: the reading says the peer was
+                // there THEN, and stamping it as now would push detection out by
+                // up to a full timeout. checked_sub because Instant is
+                // QPC-since-boot on Windows and plain subtraction panics near
+                // boot (the Phase 15.3 crash-loop); the guard also keeps the
+                // mark monotonic, since an authenticated input datagram may have
+                // already recorded something fresher.
+                if let Some(seen_at) = Instant::now().checked_sub(idle) {
+                    if seen_at > session.last_seen {
+                        session.last_seen = seen_at;
+                    }
+                }
+            }
+        }
+        if session.last_seen.elapsed() < idle_timeout {
+            return Sweep::Nothing;
+        }
+
+        let id = session.id;
+        let name = session.device_name.clone();
+        let silent_for = session.last_seen.elapsed().as_secs();
+        session.detached_since = Some(Instant::now());
+
+        // Cleared before the plane is touched, for the same reason `stop` does
+        // it: no frame may be sealed with a key for a session that is no longer
+        // receiving. It also un-blocks the Moonlight path, which defers to Echo
+        // while this flag is set — a detached session must not hold the whole
+        // pipeline hostage against a client that is actually present.
+        self.echo_active.store(false, Ordering::Relaxed);
+
+        let grace = self.policy.detach_grace;
+        if self.moonlight_is_live() {
+            // Defensive: the gate should make this unreachable. Detaching still
+            // has to happen, but touching the plane would suspend someone else's
+            // live stream.
+            println!("⏸️  Echo session {id} (\"{name}\") DETACHED — Moonlight holds the pipeline, leaving it alone");
+        } else {
+            // KeepDisplay, not TearDown: the encoder stops and the frames stop,
+            // which is the whole point of noticing — but the desktop stays
+            // exactly as the user left it so a reconnect resumes into it. The
+            // Worker's `resume_suspended` is what makes that reconnect instant.
+            self.plane.end(EndMode::KeepDisplay);
+            if grace.is_zero() {
+                println!(
+                    "⏸️  Echo session {id} (\"{name}\") DETACHED after {silent_for}s of silence — \
+                     encoder and transmission stopped, display held indefinitely"
+                );
+            } else {
+                println!(
+                    "⏸️  Echo session {id} (\"{name}\") DETACHED after {silent_for}s of silence — \
+                     encoder and transmission stopped, display held for {}s",
+                    grace.as_secs()
+                );
+            }
+        }
+        Sweep::Detached
     }
 
     /// Microphone-datagram counters for the live session, for diagnostics.
@@ -1074,14 +1327,26 @@ mod tests {
     }
 
     fn fixture(latched: Option<SocketAddr>) -> Fixture {
-        let plane = Arc::new(MockPlane::default());
-        let client_info = Arc::new(Mutex::new(None));
-        let mgr = SessionManager::new(
-            Arc::new(plane.clone()),
-            client_info.clone(),
-            Arc::new(Mutex::new(latched)),
-        );
-        Fixture { mgr, plane, client_info }
+        // No audio reservation and a long grace: these tests are about the gate,
+        // and the ones that care about detachment set their own policy.
+        Fixture::with_policy(
+            latched,
+            SessionPolicy { audio_reserve_kbps: 0, detach_grace: Duration::from_secs(600) },
+        )
+    }
+
+    impl Fixture {
+        fn with_policy(latched: Option<SocketAddr>, policy: SessionPolicy) -> Fixture {
+            let plane = Arc::new(MockPlane::default());
+            let client_info = Arc::new(Mutex::new(None));
+            let mgr = SessionManager::new(
+                Arc::new(plane.clone()),
+                client_info.clone(),
+                Arc::new(Mutex::new(latched)),
+                policy,
+            );
+            Fixture { mgr, plane, client_info }
+        }
     }
 
     #[test]
@@ -1397,6 +1662,184 @@ mod tests {
         assert_eq!(*f.plane.ended.lock().unwrap(), 1, "the plane is not ended twice");
     }
 
+    // ── 1C: detach, reap, reclaim ────────────────────────────────────────────
+
+    /// Force a session into the detached state without waiting out a real
+    /// timeout: rewind its liveness mark past the timeout and sweep.
+    fn detach_now(f: &Fixture, idle_timeout: Duration) -> Sweep {
+        {
+            let mut guard = f.mgr.active.lock().unwrap();
+            let session = guard.as_mut().expect("a session to detach");
+            session.last_seen = session.last_seen.checked_sub(idle_timeout * 2).unwrap();
+        }
+        f.mgr.sweep(None, idle_timeout)
+    }
+
+    /// The core of 1C. A client that stops answering must stop costing the host
+    /// an encoder and an uplink — but must NOT cost the user their desktop
+    /// arrangement, which is the whole point of detaching rather than ending.
+    #[test]
+    fn a_silent_client_detaches_and_keeps_the_display() {
+        let timeout = Duration::from_secs(30);
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert!(f.mgr.echo_holds_media());
+
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+
+        // Encoding and transmission stopped, display held.
+        assert_eq!(f.plane.end_modes.lock().unwrap().as_slice(), &[EndMode::KeepDisplay]);
+        // The frame path must stop sealing at once: a detached session's client
+        // is not listening, and the keys are about to be replaced.
+        assert!(!f.mgr.echo_holds_media(), "a detached session must release the frame path");
+        // ...which also unblocks Moonlight. A detached Echo session holding the
+        // whole pipeline hostage against a client that IS present would be a
+        // worse bug than the one this fixes.
+        assert!(!f.mgr.echo_holds_media());
+
+        // Sweeping again inside the grace window changes nothing — no repeated
+        // `end` calls, no repeated log lines.
+        assert_eq!(f.mgr.sweep(None, timeout), Sweep::Nothing);
+        assert_eq!(*f.plane.ended.lock().unwrap(), 1, "the plane must not be ended twice");
+    }
+
+    /// Evidence of life keeps a session alive, and `None` is not evidence of
+    /// death. `rtp.rs` reports only its most recent sender, so a single stray
+    /// datagram from anywhere else erases the reading — treating that as a dead
+    /// client would let a port scanner detach a healthy stream.
+    #[test]
+    fn an_unknown_idle_reading_never_detaches_a_healthy_session() {
+        let timeout = Duration::from_secs(30);
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+
+        // Unknown, repeatedly, on a session that has just been seen.
+        for _ in 0..100 {
+            assert_eq!(f.mgr.sweep(None, timeout), Sweep::Nothing);
+        }
+        // A fresh media reading is proof of life.
+        assert_eq!(f.mgr.sweep(Some(Duration::from_millis(500)), timeout), Sweep::Nothing);
+        // A stale one is not, and detaches.
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+    }
+
+    /// The grace period ends with the display coming back — and `0` means hold
+    /// forever, exactly as it does on the Moonlight path. Getting that backwards
+    /// would turn the opt-out into an instant teardown.
+    #[test]
+    fn a_detached_session_is_reaped_when_its_grace_expires() {
+        let timeout = Duration::from_secs(30);
+
+        // Grace 0: detached forever, never reaped.
+        let f = Fixture::with_policy(
+            Some(peer()),
+            SessionPolicy { audio_reserve_kbps: 0, detach_grace: Duration::ZERO },
+        );
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+        for _ in 0..100 {
+            assert_eq!(f.mgr.sweep(None, timeout), Sweep::Nothing, "grace 0 must never reap");
+        }
+        assert_eq!(f.plane.end_modes.lock().unwrap().as_slice(), &[EndMode::KeepDisplay]);
+
+        // A real grace period, already elapsed: the display comes back.
+        let f = Fixture::with_policy(
+            Some(peer()),
+            SessionPolicy { audio_reserve_kbps: 0, detach_grace: Duration::from_millis(1) },
+        );
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(f.mgr.sweep(None, timeout), Sweep::Reaped);
+        assert_eq!(
+            f.plane.end_modes.lock().unwrap().as_slice(),
+            &[EndMode::KeepDisplay, EndMode::TearDown],
+            "detach holds the display; the reap releases it"
+        );
+        // Reaped means gone: nothing further to sweep, and no second teardown.
+        assert_eq!(f.mgr.sweep(None, timeout), Sweep::Nothing);
+        assert_eq!(*f.plane.ended.lock().unwrap(), 2);
+    }
+
+    /// The cross-protocol hazard. `echo_active` goes false at detach precisely
+    /// so a Moonlight client can claim the idle pipeline — but the detached
+    /// session's grace clock is still running, and its expiry would otherwise
+    /// send a cancelling Deactivate that tears down THAT session. From the
+    /// operator's chair it would look like a Moonlight stream dying at random,
+    /// ten minutes after an unrelated phone lost signal.
+    #[test]
+    fn reaping_a_detached_session_never_ends_a_moonlight_stream() {
+        let timeout = Duration::from_secs(30);
+        let f = Fixture::with_policy(
+            Some(peer()),
+            SessionPolicy { audio_reserve_kbps: 0, detach_grace: Duration::from_millis(1) },
+        );
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+
+        // Moonlight takes the pipeline while the phone is away.
+        *f.client_info.lock().unwrap() =
+            Some(ClientInfo { streaming_active: true, ..Default::default() });
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(f.mgr.sweep(None, timeout), Sweep::Reaped, "the record is still forgotten");
+        assert_eq!(
+            f.plane.end_modes.lock().unwrap().as_slice(),
+            &[EndMode::KeepDisplay],
+            "the reap must NOT end the plane while Moonlight is streaming"
+        );
+    }
+
+    /// Reclaiming is the fast path: nothing is ended, because nothing is
+    /// running and the display being reused is the one an `end` would destroy.
+    /// Fresh keys are minted regardless — a session's keys are never reused,
+    /// which is what stops a datagram sealed for the old session from being
+    /// replayed into the new one.
+    #[test]
+    fn the_owner_reclaims_a_detached_session_without_touching_the_display() {
+        let timeout = Duration::from_secs(30);
+        let f = fixture(Some(peer()));
+        let pixel = device("Pixel", 1);
+        let first = f.mgr.start(&pixel, SessionRequest::default()).unwrap();
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+        let ends_after_detach = *f.plane.ended.lock().unwrap();
+
+        let second = f.mgr.start(&pixel, SessionRequest::default()).expect("owner may reclaim");
+
+        assert_eq!(
+            *f.plane.ended.lock().unwrap(), ends_after_detach,
+            "reclaiming must not end the plane — that would tear down the display it is reusing"
+        );
+        assert_ne!(second.keys_hex, first.keys_hex, "every session mints fresh keys");
+        assert_ne!(second.session_id, first.session_id);
+        assert!(f.mgr.echo_holds_media(), "the frame path is live again");
+        assert_eq!(f.plane.begun.lock().unwrap().len(), 2);
+    }
+
+    /// A detached session must not lock every other paired device out of the
+    /// host for the whole grace period. It is holding a display nobody is
+    /// watching, on behalf of a device that is not answering — while a LIVE
+    /// session is still defended, which is the distinction that matters.
+    #[test]
+    fn another_device_may_take_over_a_detached_session_but_not_a_live_one() {
+        let timeout = Duration::from_secs(30);
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+
+        // Live: defended.
+        let err = f
+            .mgr
+            .start(&device("Tablet", 2), SessionRequest::default())
+            .expect_err("a live session belongs to its owner");
+        assert!(matches!(err, HandoffError::HeldByAnotherDevice { .. }));
+
+        // Detached: available.
+        assert_eq!(detach_now(&f, timeout), Sweep::Detached);
+        let taken = f.mgr.start(&device("Tablet", 2), SessionRequest::default());
+        assert!(taken.is_ok(), "a detached session may be taken over: {taken:?}");
+        assert!(f.mgr.echo_holds_media());
+    }
+
     /// A client that disconnects is done with the desktop; only the host's
     /// first press is the "stop the stream, keep the display" case. Asserted
     /// because the two callers sit three lines apart and the wrong mode here
@@ -1603,6 +2046,7 @@ mod tests {
             Arc::new(plane.clone()),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(Some(peer()))),
+            SessionPolicy { audio_reserve_kbps: 0, detach_grace: Duration::from_secs(600) },
         );
 
         assert!(mgr.start(&device("Xbox", 1), SessionRequest::default()).is_err());

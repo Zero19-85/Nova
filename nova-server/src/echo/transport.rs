@@ -183,6 +183,25 @@ pub fn spawn(
                             active = None;
                         }
                     }
+
+                    // Reaping the tunnel reclaims a SLOT. It says nothing to the
+                    // session, which until this existed was the whole problem:
+                    // a phone that lost signal left the host encoding and
+                    // transmitting to an address nobody was listening at, with
+                    // no path to ever stop — `stop` needs a client well enough
+                    // to ask, and `force_end` needs an operator at the tray.
+                    //
+                    // The two steps are read in two separate lock acquisitions
+                    // rather than one nested pair. Every other path in this
+                    // system takes the session lock and then the RTP lock
+                    // (`start` → `plane.begin`, `force_end` → `plane.end`);
+                    // holding the session lock while asking RTP a question would
+                    // be the sole inversion, and the sole opportunity for a
+                    // deadlock.
+                    let media_idle = sessions
+                        .live_peer()
+                        .and_then(|peer| rtp_sender.lock().unwrap_or_else(|e| e.into_inner()).idle_since(peer));
+                    sessions.sweep(media_idle, TUNNEL_IDLE_TIMEOUT);
                     continue;
                 }
             };
@@ -443,6 +462,11 @@ mod tests {
             Arc::new(RecordingPlane),
             client_info.clone(),
             Arc::new(Mutex::new(Some("203.0.113.7:47998".parse().unwrap()))),
+            // This test is about the tunnel, not the budget or the reaper.
+            crate::echo::session::SessionPolicy {
+                audio_reserve_kbps: 0,
+                detach_grace: Duration::from_secs(600),
+            },
         ));
         let handler = rpc::build_handler(
             Arc::new(OneVirtualSeat),

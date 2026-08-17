@@ -15,6 +15,25 @@ data class UiState(
     val hostFingerprint: String? = null,
     val myFingerprint: String = "",
     val streaming: Boolean = false,
+    /**
+     * Whether a native session handle exists — i.e. whether there is anything to
+     * send a command through.
+     *
+     * Deliberately distinct from [streaming], which only becomes true once video
+     * is flowing: a session that is connecting, pairing, or waiting for a grant
+     * has a live handle and no picture. The dashboard's Stop button keys off
+     * THIS, because "can this button do anything?" is a question about the
+     * handle, not about the picture.
+     *
+     * It exists because the answer used to be invisible to the UI. [stop] frees
+     * the handle and zeroes it, so a second press found `handle == 0`, skipped
+     * `nativeClose`, and sent nothing at all — a button that looked live, did
+     * nothing, and could only be revived by force-closing the app (reported
+     * 2026-08-17). The host needs no fix for this: one press already performs a
+     * full teardown, and Nova's own grace-period reaper collects anything a
+     * previous run orphaned.
+     */
+    val connected: Boolean = false,
     val error: String? = null,
     val log: List<String> = emptyList(),
     /** The user's intent for the microphone; persists across sessions. */
@@ -154,6 +173,7 @@ class EchoController(private val context: android.content.Context) {
         }
 
         synchronized(lock) { handle = h }
+        post { it.copy(connected = true) }
         // From here on the keepalive threads must survive backgrounding, and
         // that includes pairing: waiting for someone to walk to the PC and type
         // a PIN is exactly when the user switches away from the app.
@@ -421,7 +441,7 @@ class EchoController(private val context: android.content.Context) {
         poller?.join(1_500)
         poller = null
         EchoService.stop(context)
-        post { it.copy(streaming = false) }
+        post { it.copy(streaming = false, connected = false) }
     }
 
     private fun describe(event: JSONObject): String = when (event.optString("type")) {
