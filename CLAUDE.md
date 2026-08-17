@@ -302,6 +302,42 @@ the **controller** walks up and down underneath it.
 - A **zero** request (no `maximumBitrateKbps` in ANNOUNCE) passes through untouched;
   inventing a bitrate would hide a negotiation failure behind a plausible number.
 
+### "End Stream did nothing — I had to close the app" — the tunnel slot lockout (2026-08-17)
+
+**Symptom:** ending an Echo stream works the first time; a later attempt does nothing, and
+only closing and reopening the app makes it register.
+
+**What the log showed:** the session was never ended by an RPC at all — it aged out
+(`⌛ tunnel … silent for 30s`) and detached. Just before that:
+`🚧 {new port} wants a tunnel but {old port} holds the slot`. The client had moved to a new
+source port and was locked out for the remainder of the 30 s timeout, so its
+`stop_session` had nowhere to go. Closing the app cannot help — closing it is what starts
+the wait.
+
+**Two compounding causes, both fixed:**
+
+1. **`RtpSender::last_rx` remembers exactly ONE sender**, so any other datagram on the media
+   port erased the liveness reading for the live tunnel — and in practice that "other"
+   address is the client's own re-punch from a new port. The incumbent then looked silent
+   on media, `idle_for` fell back to control idle, and a healthy tunnel read as dead.
+   Fix: `last_rx_pinned`, one `Instant` for the pinned peer specifically, cleared by
+   `reset`/`pin_target`. Not a map — the footgun `last_rx` warns about is a table keyed by
+   whatever a stranger sends; this is keyed by the peer Nova itself pinned.
+2. **Contention did not shorten the wait.** `TUNNEL_IDLE_TIMEOUT` (30 s) is the right
+   patience when nobody is waiting, and the wrong patience when a user is staring at a
+   phone that will not connect. New `CONTENDED_IDLE_TIMEOUT` (5 s): when another peer is
+   actively asking, an incumbent silent that long hands the slot over.
+
+**Why 5 s is safe only because of fix 1:** a granted session pings every 500 ms, and those
+pings are now recorded against the pinned peer no matter who else sends to the port. Before
+fix 1, a contender's own packets erased the incumbent's liveness — this shortcut would have
+handed away healthy tunnels. **Do not lower `CONTENDED_IDLE_TIMEOUT` further, and do not
+reintroduce a control-idle-only test** (that is the 2026-08-15 black-screen-at-30 s bug).
+
+The handover releases the slot but `busy` clears asynchronously, when the served task
+unwinds — so the triggering datagram is still dropped and the newcomer arrives on a
+retransmit. The win is 30 s → 5 s, not a saved round trip.
+
 ### The microphone that "stops working" — VB-CABLE steals the default (2026-08-17)
 
 **Symptom:** the host's microphone registers no sound in any application, with no

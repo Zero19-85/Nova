@@ -85,6 +85,27 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// is 60× the live cadence and cannot reap a working tunnel.
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long an incumbent tunnel may be silent before a peer that is *actively
+/// asking* for the slot takes it.
+///
+/// [`TUNNEL_IDLE_TIMEOUT`] is the right patience when nobody is waiting: it must
+/// clear well past any plausible hiccup, because reaping a live tunnel drops a
+/// working stream. But when another peer is knocking, that patience is paid by a
+/// user standing in front of the machine wondering why the app will not connect.
+///
+/// Live 2026-08-17: a client closed and reopened, arrived on a new source port,
+/// and was refused for the remainder of the 30 s while the host held a tunnel
+/// its owner had already abandoned. The operator's workaround — close the app
+/// and try again — could not work, because closing it is what started the wait.
+///
+/// Safe at five seconds because the measurement underneath it is now accurate: a
+/// granted session pings every 500 ms and those pings are recorded against the
+/// pinned peer specifically (see `RtpSender::last_rx_pinned`), so a live session
+/// reads as ~0.5 s idle no matter who else is sending to the port. Before that
+/// fix a contender's own packets erased the incumbent's liveness, and this
+/// shortcut would have handed away healthy tunnels.
+const CONTENDED_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How often the accept loop checks the live tunnel for idleness. Only needs to
 /// be fine enough that a reclaimed slot is available before a user retries.
 const IDLE_SWEEP: Duration = Duration::from_secs(5);
@@ -269,22 +290,48 @@ pub fn spawn(
                     continue;
                 }
                 if busy.load(Ordering::Relaxed) {
-                    // Another peer while one is served. Silence here is what
-                    // made the wedged-slot bug invisible: five successful
-                    // punches produced no host-side line at all, while the
-                    // client saw only `tls handshake eof`.
-                    if last_busy_notice.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                    // Someone is asking for a slot the incumbent may no longer
+                    // be using. Contention is not itself proof the incumbent is
+                    // dead — but it IS the moment to stop being patient about
+                    // finding out, so the incumbent gets a much shorter leash
+                    // than the unattended timeout.
+                    let idle = t.idle_for(&rtp_sender);
+                    if idle > CONTENDED_IDLE_TIMEOUT {
                         println!(
-                            "🚧 Echo WAN: {from} wants a tunnel but {} holds the slot \
-                             (idle {}s of {}s)",
+                            "🔀 Echo WAN: {from} wants a tunnel and {} has been silent {}s — \
+                             handing the slot over",
                             t.peer,
-                            t.idle_for(&rtp_sender).as_secs(),
-                            TUNNEL_IDLE_TIMEOUT.as_secs()
+                            idle.as_secs()
                         );
-                        last_busy_notice = Some(Instant::now());
+                        active = None;
+                        // Dropping the record closes the sink, which ends the
+                        // driver, which unblocks the served task's TLS read and
+                        // lets it return and clear `busy`. That unwinding is
+                        // asynchronous, so THIS datagram still falls out at the
+                        // `busy` check below — the newcomer gets in on a
+                        // retransmit a moment later, which its RUDP layer is
+                        // already sending. The win is the wait dropping from 30 s
+                        // to 5, not the elimination of a round trip.
+                    } else {
+                        // A live incumbent. Silence here is what made the
+                        // wedged-slot bug invisible: five successful punches
+                        // produced no host-side line at all, while the client
+                        // saw only `tls handshake eof`.
+                        if last_busy_notice.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                            println!(
+                                "🚧 Echo WAN: {from} wants a tunnel but {} holds the slot \
+                                 (idle {}s, handover at {}s)",
+                                t.peer,
+                                idle.as_secs(),
+                                CONTENDED_IDLE_TIMEOUT.as_secs()
+                            );
+                            last_busy_notice = Some(Instant::now());
+                        }
+                        continue;
                     }
-                    continue;
                 }
+                // Either the slot was never really busy, or the handover above
+                // released it. Drop the stale record and open a fresh tunnel.
                 active = None;
             }
             if busy.load(Ordering::Relaxed) {

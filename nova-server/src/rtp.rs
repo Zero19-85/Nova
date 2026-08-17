@@ -175,6 +175,22 @@ pub struct RtpSender {
     /// sessions that are streaming perfectly — observed live 2026-08-15 as a
     /// black screen exactly 30 s in. See `echo::transport`'s idle sweep.
     last_rx: Option<(SocketAddr, Instant)>,
+    /// Last datagram from the PINNED peer specifically, kept alongside
+    /// [`Self::last_rx`] rather than derived from it.
+    ///
+    /// `last_rx` remembers one sender, so any other datagram on the port erases
+    /// the reading for the peer being asked about — and the media port is
+    /// internet-reachable, so "any other datagram" includes a port scan. Worse,
+    /// it includes the client's OWN reconnection attempt from a new source
+    /// port: a phone that re-punches while its old tunnel is still held makes
+    /// that tunnel look silent, which is precisely when an accurate answer
+    /// matters most (live 2026-08-17 — a healthy tunnel read as idle, and the
+    /// returning client was refused the slot for the full 30 s timeout).
+    ///
+    /// One `Instant` for one address, not a map: the footgun `last_rx`'s design
+    /// note warns about is a table keyed by whatever a stranger sends, and this
+    /// is keyed by the peer Nova itself pinned.
+    last_rx_pinned: Option<Instant>,
     /// Highest wire frame index queued this client session (0 = none yet).
     /// Master reads it to stamp `ConfigureStart::start_frame_index` so a
     /// replacement Worker adopted mid-session continues the client's frame
@@ -248,6 +264,7 @@ impl RtpSender {
             bufs_in_flight: 0,
             config_hold: None,
             last_rx: None,
+            last_rx_pinned: None,
             last_sent_index: 0,
             stun_inbox: None,
             echo_inbox: None,
@@ -336,6 +353,11 @@ impl RtpSender {
     pub fn pin_target(&mut self, addr: SocketAddr) {
         self.target = Some(addr);
         self.pinned = true;
+        // A newly pinned peer has not been heard from under THIS pin yet. Left
+        // stale from a previous session it would report a fresh liveness the
+        // new peer never earned; cleared, `idle_since` falls back to `last_rx`
+        // until the first datagram arrives, which is the honest answer.
+        self.last_rx_pinned = None;
         // A pinned target IS an Echo session — the two are the same fact, so
         // the demux tag is set here rather than through a separate call a
         // future caller could forget to make.
@@ -396,6 +418,10 @@ impl RtpSender {
             // raw `b"PING"` that classifies as `Other`, and Echo's control
             // tunnel judges its peer alive from exactly this.
             self.last_rx = Some((addr, Instant::now()));
+            // Separately, and for the pinned peer only — see last_rx_pinned.
+            if self.pinned && self.target == Some(addr) {
+                self.last_rx_pinned = Some(Instant::now());
+            }
             // STUN and RTP/ping traffic share this port. They are bitwise
             // unambiguous — STUN's leading two bits are always 00, RTP carries
             // version 2 (0x80) — and `is_stun_message` also checks the magic
@@ -527,6 +553,15 @@ impl RtpSender {
     /// somebody else's" is both rare and safe — it only falls back to the
     /// stricter control-traffic test.
     pub fn idle_since(&self, peer: SocketAddr) -> Option<Duration> {
+        // The pinned peer has its own mark, which nothing else can overwrite —
+        // this is the reading Echo's tunnel sweep depends on, and the one that
+        // used to be erased by any stray datagram. Checked first so a pinned
+        // session always gets the accurate answer.
+        if self.pinned && self.target == Some(peer) {
+            if let Some(at) = self.last_rx_pinned {
+                return Some(at.elapsed());
+            }
+        }
         match self.last_rx {
             Some((addr, at)) if addr == peer => Some(at.elapsed()),
             _ => None,
@@ -567,6 +602,10 @@ impl RtpSender {
         // Moonlight client's pings — reset is the one call every session
         // teardown path already makes.
         self.pinned = false;
+        // The pinned peer's liveness mark belongs to the session that pinned
+        // it. Left behind, the next session's first `idle_since` would answer
+        // with the previous client's last ping.
+        self.last_rx_pinned = None;
         self.last_sent_index = 0; // next session's client expects frame 1 again
         // Back to Moonlight's wire format: the next session may well be a
         // GameStream client, which would discard datagrams carrying an Echo
@@ -1203,6 +1242,50 @@ mod tests {
         assert!(
             sender.idle_since(stranger).is_none(),
             "liveness must be attributed to the sender we actually heard from"
+        );
+    }
+
+    /// A pinned peer's liveness must survive traffic from anyone else.
+    ///
+    /// The media port is internet-reachable and `last_rx` remembers exactly one
+    /// sender, so before `last_rx_pinned` existed a single datagram from any
+    /// other address erased the reading for the live session — and the address
+    /// that does this in practice is the CLIENT'S OWN, re-punching from a new
+    /// source port while its previous tunnel is still held. Echo's tunnel sweep
+    /// then read a healthy session as silent and refused the returning client
+    /// the slot for the full timeout (live 2026-08-17).
+    #[test]
+    fn a_pinned_peers_liveness_survives_a_stranger_on_the_port() {
+        let mut sender = RtpSender::new(0).expect("bind ephemeral");
+        let dst = loopback_addr(&sender);
+        let echo_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = echo_peer.local_addr().unwrap();
+        // Stands in for the same phone re-punching from a new source port.
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        sender.pin_target(peer_addr);
+        ping(&echo_peer, dst, 3);
+        sender.try_learn_target(); // drains the socket, recording liveness
+        assert!(sender.idle_since(peer_addr).is_some(), "precondition: peer was heard");
+
+        // Someone else sends, and is now the most recent sender on the port.
+        ping(&other, dst, 3);
+        sender.try_learn_target();
+
+        let idle = sender
+            .idle_since(peer_addr)
+            .expect("the pinned peer's liveness must NOT be erased by a stranger");
+        assert!(idle < Duration::from_secs(5), "should still read as fresh, got {idle:?}");
+
+        // The stranger is still not the pinned peer, and gets its own answer.
+        let stranger_idle = sender.idle_since(other.local_addr().unwrap());
+        assert!(stranger_idle.is_some(), "the most recent sender is still tracked");
+
+        // A new session must not inherit the previous peer's liveness mark.
+        sender.reset();
+        assert!(
+            sender.idle_since(peer_addr).is_none(),
+            "reset must clear the pinned liveness — a new session starts unheard"
         );
     }
 
