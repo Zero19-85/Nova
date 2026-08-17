@@ -234,6 +234,126 @@ struct EmergencySnapshot {
 static EMERGENCY_SNAPSHOT: std::sync::Mutex<Option<EmergencySnapshot>> =
     std::sync::Mutex::new(None);
 
+// ── Physical-display mode baseline ────────────────────────────────────────
+//
+// The topology restore below puts the physical monitor's *path* back, and it
+// reports success when it does — but it does not guarantee the monitor comes
+// back at the MODE it had. Measured live (2026-08-16, 4K120 session torn down
+// by a service stop): `restore_topology` returned 0 and logged "Restored the
+// original display topology", and the committed source mode on `\\.\DISPLAY1`
+// — a 2560x1440 panel — was **1024x768**. The service log shows the same
+// number reported by the Worker on nine of the eleven session boundaries in
+// that log: the operator's monitor had been coming back at a fallback mode all
+// day.
+//
+// Why the existing restore cannot fix that on its own: every path that
+// re-lights a physical output hands the mode decision to Windows.
+// `SDC_TOPOLOGY_EXTEND` (the boot isolate, and `restore_topology`'s stale-
+// coordinate fallback) derives modes itself; `SDC_ALLOW_CHANGES` lets
+// SetDisplayConfig re-resolve a supplied mode it dislikes; and the snapshot
+// `restore_topology` replays is `QDC_DATABASE_CURRENT`, which is the CCD
+// *database's* idea of the topology and therefore inherits whatever the last
+// activation persisted with `SDC_SAVE_TO_DATABASE`. Once Windows has guessed
+// wrong once, the guess is what gets faithfully restored forever after.
+//
+// So the mode is cached explicitly, before the stream touches anything, and
+// pushed back explicitly afterwards — this module stops relying on Windows to
+// remember and instead verifies what was committed (the same "never trust the
+// success code, read back the commit" rule `force_resolution` already follows
+// for refresh rate).
+//
+// The cache is persisted next to the exe rather than kept in memory only,
+// because under the Master/Worker split the process that captures the baseline
+// is frequently NOT the process that restores it: a Worker is respawned on
+// sign-out, session swap, lock-screen upgrade, crash, and after the service's
+// 6 s grace expires. The replacement Worker heals the orphaned topology in
+// `ensure_enabled_at_boot` — and without a persisted baseline it would heal the
+// topology and leave the mode wrong, which is the bug.
+
+/// One physical display's committed mode, as observed while no virtual display
+/// was in the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalMode {
+    /// GDI device name (`\\.\DISPLAY1`) — the same key `force_resolution` and
+    /// `path_is_device` target by.
+    pub device: String,
+    pub width: u32,
+    pub height: u32,
+    /// Whole Hz, rounded from the committed rational. Windows reports a
+    /// nominal 60 Hz mode as 59.951 Hz, so this is compared with a tolerance
+    /// (see [`PhysicalMode::matches`]) rather than for equality.
+    pub refresh_hz: u32,
+}
+
+impl PhysicalMode {
+    /// True when a committed mode is close enough to this baseline that
+    /// re-asserting it would be a no-op.
+    ///
+    /// Size must match exactly; refresh is compared with the same ±1.5 Hz
+    /// tolerance `force_resolution` uses to verify its own commits, because
+    /// the OS reports the rational timing it actually programmed (59.951 Hz
+    /// for a "60 Hz" mode) and an exact test would re-assert on every single
+    /// teardown forever.
+    fn matches(&self, width: u32, height: u32, refresh_hz: u32) -> bool {
+        self.width == width
+            && self.height == height
+            && (self.refresh_hz as i64 - refresh_hz as i64).abs() <= 1
+    }
+}
+
+/// File holding the baseline between processes. Plain `device=WxH@Hz` lines:
+/// the structure is fixed, a human can read and correct it, and it needs no
+/// JSON dependency (repo rule #2).
+const DISPLAY_BASELINE_PATH: &str = "nova_display_baseline.txt";
+
+/// Process-local copy of the baseline, so the common path (capture and restore
+/// in the same Worker) never touches the disk.
+static PHYSICAL_BASELINE: std::sync::Mutex<Vec<PhysicalMode>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Next to the exe, never CWD-relative — the SCM sets CWD to System32, exactly
+/// as [`crate::pairing`]'s store explains.
+fn display_baseline_file() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DISPLAY_BASELINE_PATH)))
+        .unwrap_or_else(|| PathBuf::from(DISPLAY_BASELINE_PATH))
+}
+
+fn serialize_baseline(modes: &[PhysicalMode]) -> String {
+    let mut out = String::new();
+    for m in modes {
+        out.push_str(&format!("{}={}x{}@{}\n", m.device, m.width, m.height, m.refresh_hz));
+    }
+    out
+}
+
+/// Tolerant by design: a line that doesn't parse is skipped, not fatal. A
+/// corrupt baseline must never stop Nova from starting — the worst case is the
+/// pre-fix behaviour (Windows picks the mode).
+fn parse_baseline(text: &str) -> Vec<PhysicalMode> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((device, mode)) = line.split_once('=') else { continue };
+        let Some((size, hz)) = mode.split_once('@') else { continue };
+        let Some((w, h)) = size.split_once(['x', 'X']) else { continue };
+        let (Ok(width), Ok(height), Ok(refresh_hz)) =
+            (w.trim().parse::<u32>(), h.trim().parse::<u32>(), hz.trim().parse::<u32>())
+        else {
+            continue;
+        };
+        if width == 0 || height == 0 {
+            continue;
+        }
+        out.push(PhysicalMode { device: device.trim().to_string(), width, height, refresh_hz });
+    }
+    out
+}
+
 /// Set once [`emergency_restore_for_shutdown`] has actually restored the
 /// topology, so a subsequently-running `deactivate_after_stream` (the tokio
 /// signal path also fires on shutdown) skips the display/audio mutations
@@ -1354,6 +1474,35 @@ impl VirtualDisplay {
     /// capturer's "first output" fallback can't bind to the virtual display.
     pub fn ensure_enabled_at_boot(&mut self, width: u32, height: u32, refresh_hz: u32) -> Result<Option<String>, String> {
         self.ensure_installed()?;
+
+        // A Worker start HEALS the mode; it does not learn from it.
+        //
+        // Learning here was wrong and it cost the operator their resolution: a
+        // Worker that exits before Windows finishes re-picking the physical
+        // mode (see `reassert_physical_baseline`, and TerminateProcess after
+        // the service's stop grace does it too) leaves the desktop at a
+        // fallback mode, and the replacement Worker adopting that reading turned
+        // one lost race into a permanent baseline — 1024x768 restored
+        // faithfully, forever (live, 2026-08-17).
+        //
+        // A start is exactly the moment the reading cannot be trusted, and also
+        // the moment a previous Worker's damage most needs undoing. So: if a
+        // baseline is already recorded, put the desktop back to it; only a
+        // machine that has never recorded one captures here.
+        //
+        // The trade, stated plainly: a resolution the operator changes by hand
+        // while Nova is running is not adopted until the next stream starts
+        // (`activate_for_stream`'s capture, which runs while the desktop is in
+        // exactly the state they want preserved). If a Worker respawns before
+        // that, their change is reverted once — visible in the log, undone by
+        // starting a stream. Losing a deliberate change once beats inheriting a
+        // fallback mode permanently.
+        if Self::physical_baseline().is_empty() {
+            self.capture_physical_baseline("worker startup (no baseline recorded yet)");
+        } else {
+            self.reassert_physical_baseline("worker startup");
+        }
+
         self.configure_mode(width, height, refresh_hz)?;
 
         // Pre-seed every resolution/refresh-rate pair from SupportedDisplayModeList
@@ -1432,6 +1581,12 @@ impl VirtualDisplay {
                     Ok(n) => println!("🧹 Removed {n} phantom virtual-monitor devnode(s)"),
                     Err(e) => println!("⚠️  Phantom-monitor sweep: {e}"),
                 }
+                // The heal above re-lights the physical output with
+                // SDC_TOPOLOGY_EXTEND, which picks its own mode — the same
+                // "Windows guesses" path as the teardown. The dead Worker never
+                // got to restore the mode, so this Worker does it, from the
+                // baseline that Worker persisted.
+                self.reassert_physical_baseline("orphaned-VDD heal");
             }
             return Ok(None);
         }
@@ -1477,6 +1632,14 @@ impl VirtualDisplay {
             Ok(n) => println!("🧹 Boot sweep: removed {n} phantom virtual-monitor devnode(s)"),
             Err(e) => println!("⚠️  Boot phantom-monitor sweep: {e}"),
         }
+
+        // The devnode cycle above briefly took the VDD onto the desktop and
+        // `isolate_virtual_display_at_boot` re-lit the physical output to get
+        // rid of it again — another SDC_TOPOLOGY_EXTEND, another mode Windows
+        // chose. Assert the baseline captured at the top of this function, so
+        // a Worker start can never be what leaves the monitor at a fallback
+        // mode.
+        self.reassert_physical_baseline("boot devnode cycle");
 
         // Return None: VDD is disabled and absent from GDI enumeration.
         // lib.rs passes this to WgcCapturer::new_excluding(None) so the WGC
@@ -1814,6 +1977,14 @@ impl VirtualDisplay {
     ///   6. [`wait_for_display_resolution`], then `self.saved_topology` /
     ///      `self.active_device_name` / `self.active = true`.
     pub fn activate_for_stream(&mut self, width: u32, height: u32, refresh_hz: u32) -> Result<(), String> {
+        // Before ANY topology mutation: record what mode the physical
+        // monitor(s) are in, so teardown can put them back explicitly instead
+        // of hoping Windows remembers. The topology snapshot below restores
+        // *which paths were lit*; this restores *what they were lit at*. They
+        // are separate failures and this one was live-measured — see the
+        // PhysicalMode section header.
+        self.capture_physical_baseline("pre-stream");
+
         let saved_topology = Self::query_database_topology()?;
         println!("📸 Saved current display topology from the CCD database ({} path(s))", saved_topology.0.len());
 
@@ -2098,6 +2269,13 @@ impl VirtualDisplay {
             Err(e) => println!("⚠️  Phantom virtual-monitor cleanup: {e}"),
         }
 
+        // LAST word on the display: the topology restore above puts the
+        // physical path back but lets Windows choose the mode, and the devnode
+        // disable + phantom sweep can disturb it again afterwards. Measured
+        // outcome without this: a 2560x1440 monitor returning at 1024x768 while
+        // the log said the restore succeeded.
+        self.reassert_physical_baseline("stream teardown");
+
         // Audio endpoint restore: owned by crate::audio (Phase 15.1). lib.rs
         // stops the audio session (which performs the claim-once restore)
         // before deactivating the display, so by this point the default
@@ -2210,6 +2388,255 @@ impl VirtualDisplay {
             });
         }
         out
+    }
+
+    // ── Physical-mode baseline: capture, then push back ───────────────────
+
+    /// Record every physical display's committed mode as the state to return
+    /// the desktop to. Call before touching the topology — see the
+    /// `PhysicalMode` section header for the measurement that motivates this.
+    ///
+    /// Reads the COMMITTED topology (`QDC_ONLY_ACTIVE_PATHS` via
+    /// [`Self::enumerate_displays`]), not the CCD database: the database is
+    /// what the buggy restore was already trusting, and it is the thing that
+    /// carries a previous session's guess forward.
+    ///
+    /// Refuses to record an empty set. That is the load-bearing guard: an
+    /// empty set means no physical display is currently active — the desktop
+    /// is already headless (an orphaned VDD from a killed Worker, or a second
+    /// `activate_for_stream` over a live session) — and overwriting a good
+    /// baseline with "nothing" would leave the next teardown with nothing to
+    /// assert, which is precisely the pre-fix behaviour. Same reasoning as
+    /// `activate_for_stream`'s `keep_existing_snapshot` guard.
+    ///
+    /// What it deliberately does NOT do is second-guess the operator. Whatever
+    /// the physical monitor was set to before the stream is what gets restored,
+    /// including a deliberately non-native mode. The consequence worth knowing:
+    /// if a display is already sitting at a wrong mode when the baseline is
+    /// taken, that wrong mode becomes the baseline — so the logged line below
+    /// prints exactly what was captured.
+    pub fn capture_physical_baseline(&self, reason: &str) {
+        let physical: Vec<PhysicalMode> = self
+            .enumerate_displays()
+            .into_iter()
+            .filter(|d| !d.is_virtual && d.width > 0 && d.height > 0)
+            .map(|d| PhysicalMode {
+                device: d.device_name,
+                width: d.width,
+                height: d.height,
+                refresh_hz: d.refresh_hz,
+            })
+            .collect();
+
+        if physical.is_empty() {
+            println!(
+                "📸 Physical-mode baseline ({reason}): no active physical display right now \
+                 (already headless) — keeping the previously captured baseline"
+            );
+            return;
+        }
+
+        let summary = physical
+            .iter()
+            .map(|m| format!("{} {}x{}@{}Hz", m.device, m.width, m.height, m.refresh_hz))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("📸 Physical-mode baseline ({reason}): {summary}");
+
+        // A CHANGED baseline is worth a second line, because there are two very
+        // different reasons for it and only the log can tell them apart later:
+        // the operator chose a new resolution (adopt it, correct), or a
+        // previous Nova exited without restoring the mode and this capture is
+        // adopting its damage (wrong, and it would then be restored forever).
+        // The guard above catches the common shape of the second case — an
+        // orphaned headless desktop has no physical path to capture at all —
+        // but a host that died AFTER re-lighting the monitor at the wrong mode
+        // leaves nothing to distinguish it from a deliberate change. Print
+        // both, so "when did my desktop become 1024x768" is answerable.
+        let previous = Self::physical_baseline();
+        if !previous.is_empty() && previous != physical {
+            let before = previous
+                .iter()
+                .map(|m| format!("{} {}x{}@{}Hz", m.device, m.width, m.height, m.refresh_hz))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "📸 Baseline changed from [{before}] — if that is not a resolution YOU chose, \
+                 a previous session left the desktop this way; set it back in Display Settings \
+                 and the next capture will record the right one"
+            );
+        }
+
+        if let Ok(mut guard) = PHYSICAL_BASELINE.lock() {
+            *guard = physical.clone();
+        }
+        // Persisted because the process that restores is often not the process
+        // that captured — see the section header.
+        if let Err(e) = std::fs::write(display_baseline_file(), serialize_baseline(&physical)) {
+            println!("⚠️  Could not persist the physical-mode baseline ({e}) — an in-place \
+                teardown still restores it, a Worker respawn will not");
+        }
+    }
+
+    /// The baseline to restore to: this process's copy, else the persisted one
+    /// (which is then adopted, so a respawned Worker reads the file once).
+    fn physical_baseline() -> Vec<PhysicalMode> {
+        if let Ok(guard) = PHYSICAL_BASELINE.lock() {
+            if !guard.is_empty() {
+                return guard.clone();
+            }
+        }
+        let Ok(text) = std::fs::read_to_string(display_baseline_file()) else {
+            return Vec::new();
+        };
+        let parsed = parse_baseline(&text);
+        if !parsed.is_empty() {
+            if let Ok(mut guard) = PHYSICAL_BASELINE.lock() {
+                *guard = parsed.clone();
+            }
+        }
+        parsed
+    }
+
+    /// Push the cached physical mode(s) back after the topology has been
+    /// restored — the second half of the fix.
+    ///
+    /// Runs AFTER the devnode disable and phantom sweep rather than straight
+    /// after `restore_topology`, because both of those also mutate the display
+    /// tree and either can be what knocks the mode loose; asserting last means
+    /// the last word on the mode is Nova's.
+    ///
+    /// ## Why this watches instead of checking once
+    ///
+    /// The first version checked, found the mode correct, and returned — and
+    /// the monitor was at 1024x768 seconds later (live, 2026-08-17: the
+    /// teardown logged no restore at all because nothing was wrong yet, the
+    /// Worker exited, and the replacement Worker's startup capture found
+    /// 1024x768). Disabling the VDD devnode and removing its phantom monitor
+    /// are PnP operations: Windows re-evaluates the display tree
+    /// asynchronously, and it can re-pick the physical mode after both calls
+    /// have returned. A single read races that, and losing the race silently
+    /// poisons the next capture.
+    ///
+    /// So this holds the desktop to the baseline for a bounded window, and only
+    /// leaves once the mode has read correct twice in a row — i.e. once Windows
+    /// has stopped moving it. Cheap in the common case (one extra query and one
+    /// 250 ms sleep) and bounded well inside the service's 6 s stop grace.
+    ///
+    /// Per display, per pass: skip unless it is active AND its committed mode
+    /// differs from the baseline, then re-apply via [`Self::force_resolution`]
+    /// — which already invalidates the target-mode index, the Phase 14.4 lesson
+    /// without which a refresh-rate change is silently ignored while returning
+    /// success — and re-read to say plainly whether it took.
+    pub fn reassert_physical_baseline(&self, context: &str) {
+        /// Longest this will hold the desktop to the baseline. Long enough for
+        /// a devnode disable plus a phantom removal to settle, short enough to
+        /// leave room inside `HOST_GRACEFUL_EXIT_MS` for the rest of teardown.
+        const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+        const STEP: std::time::Duration = std::time::Duration::from_millis(250);
+        /// Consecutive clean reads that count as "Windows has stopped moving
+        /// it". Two, because one is exactly what the first version trusted.
+        const STABLE_PASSES: u32 = 2;
+
+        let baseline = Self::physical_baseline();
+        if baseline.is_empty() {
+            println!(
+                "🖥️  No physical-mode baseline recorded yet ({context}) — leaving the mode to \
+                 Windows this once; the next stream captures one"
+            );
+            return;
+        }
+
+        let deadline = std::time::Instant::now() + SETTLE_WINDOW;
+        let mut clean_passes = 0u32;
+        let mut corrections = 0u32;
+        let mut announced_absent = false;
+        let mut last_seen: Vec<(String, u32, u32, u32)> = Vec::new();
+
+        loop {
+            let live = self.enumerate_displays();
+            let mut all_matched = true;
+            last_seen.clear();
+
+            for want in &baseline {
+                let Some(now) = live
+                    .iter()
+                    .find(|d| d.device_name.eq_ignore_ascii_case(&want.device))
+                else {
+                    // Absent counts as NOT settled, and that distinction was
+                    // also measured: a teardown logged "not in the active
+                    // topology — skipped" because `restore_topology` had only
+                    // just run and the physical path had not come back yet
+                    // (live, 2026-08-17). Treating that as "all clear" is how
+                    // the check misses the mode entirely. Keep watching until
+                    // it reappears — or until the deadline, if the monitor is
+                    // genuinely gone (off, unplugged, renumbered), which costs
+                    // one bounded wait and asserts nothing.
+                    if !announced_absent {
+                        println!(
+                            "🖥️  Physical-mode restore ({context}): {} is not in the active \
+                             topology yet — waiting for it",
+                            want.device
+                        );
+                    }
+                    all_matched = false;
+                    continue;
+                };
+                last_seen.push((want.device.clone(), now.width, now.height, now.refresh_hz));
+
+                if want.matches(now.width, now.height, now.refresh_hz) {
+                    continue;
+                }
+                all_matched = false;
+                corrections += 1;
+                println!(
+                    "🖥️  Physical-mode restore ({context}): {} is at {}x{}@{}Hz, restoring \
+                     {}x{}@{}Hz",
+                    want.device, now.width, now.height, now.refresh_hz,
+                    want.width, want.height, want.refresh_hz,
+                );
+                Self::force_resolution(&want.device, want.width, want.height, want.refresh_hz);
+            }
+            announced_absent = true;
+
+            if all_matched {
+                clean_passes += 1;
+                if clean_passes >= STABLE_PASSES {
+                    break;
+                }
+            } else {
+                clean_passes = 0;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(STEP);
+        }
+
+        // No false success: this whole bug was a restore that reported success
+        // with the wrong mode on the glass, so the verdict quotes what the OS
+        // last reported rather than what was asked for. Silent when nothing
+        // needed correcting — the quiet path stays quiet.
+        if corrections == 0 {
+            // Nothing needed correcting. If the display never showed up at all
+            // the wait above already said so once; either way there is nothing
+            // to report.
+            return;
+        }
+        let settled = clean_passes >= STABLE_PASSES;
+        for (device, w, h, hz) in &last_seen {
+            if settled {
+                println!("✅ {device} holding at {w}x{h}@{hz}Hz after {corrections} correction(s)");
+            } else {
+                println!(
+                    "⚠️  {device} is at {w}x{h}@{hz}Hz and still moving after {}ms — Windows kept \
+                     re-picking the mode, or the baseline mode is no longer supported (monitor or \
+                     cable changed?). Set it once in Display Settings and the next stream captures \
+                     the new baseline.",
+                    SETTLE_WINDOW.as_millis()
+                );
+            }
+        }
     }
 
     /// The monitor's human-readable device string (`EnumDisplayDevicesW`'s
@@ -3405,6 +3832,135 @@ impl Drop for VirtualDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The baseline outlives the process that captured it (a Worker respawn is
+    /// routine under the split), so the on-disk form has to survive a
+    /// round-trip exactly — a mangled refresh rate would be re-asserted onto
+    /// the operator's monitor.
+    #[test]
+    fn physical_baseline_survives_the_disk_round_trip() {
+        let modes = vec![
+            PhysicalMode { device: "\\\\.\\DISPLAY1".into(), width: 2560, height: 1440, refresh_hz: 60 },
+            PhysicalMode { device: "\\\\.\\DISPLAY2".into(), width: 3840, height: 2160, refresh_hz: 120 },
+        ];
+        assert_eq!(parse_baseline(&serialize_baseline(&modes)), modes);
+    }
+
+    /// A corrupt or hand-edited baseline must degrade to "no baseline", never
+    /// to a bogus mode: the worst acceptable outcome is the pre-fix behaviour
+    /// (Windows picks), and the unacceptable one is Nova confidently forcing a
+    /// display into garbage.
+    #[test]
+    fn a_damaged_baseline_line_is_skipped_not_guessed() {
+        let text = "\
+# a comment
+\\\\.\\DISPLAY1=2560x1440@60
+this line is nonsense
+\\\\.\\DISPLAY2=x1080@60
+\\\\.\\DISPLAY3=1920x1080@
+\\\\.\\DISPLAY4=0x0@60
+
+\\\\.\\DISPLAY5=1920x1080@144
+";
+        let parsed = parse_baseline(text);
+        assert_eq!(parsed.len(), 2, "only the two well-formed lines survive: {parsed:?}");
+        assert_eq!(parsed[0].device, "\\\\.\\DISPLAY1");
+        assert_eq!((parsed[1].width, parsed[1].height, parsed[1].refresh_hz), (1920, 1080, 144));
+    }
+
+    /// Windows programs a nominal 60 Hz mode as 59.951 Hz and reports it back
+    /// rounded to 60, but a 59 can also come back off a different timing. An
+    /// exact refresh comparison would therefore re-assert the mode on every
+    /// single teardown — a visible mode flicker forever — so the comparison
+    /// carries the same tolerance `force_resolution` verifies its own commits
+    /// with. Size, by contrast, must be exact: 1024x768 vs 2560x1440 is the
+    /// bug this exists to catch.
+    #[test]
+    fn baseline_comparison_tolerates_rounded_refresh_but_not_size() {
+        let want = PhysicalMode {
+            device: "\\\\.\\DISPLAY1".into(), width: 2560, height: 1440, refresh_hz: 60,
+        };
+        assert!(want.matches(2560, 1440, 60), "the identical mode is a no-op");
+        assert!(want.matches(2560, 1440, 59), "59.951Hz rounds to 59 or 60 — both are this mode");
+        assert!(!want.matches(2560, 1440, 120), "a real refresh change must be re-asserted");
+        assert!(!want.matches(1024, 768, 60), "the measured failure mode must never look like a match");
+        assert!(!want.matches(2560, 1440, 0), "an unknown refresh is not a match");
+    }
+
+    /// Proves the repair half of the physical-mode fix against the real
+    /// display, which no unit test can: capture the baseline, knock the
+    /// monitor into a different mode the way a topology re-light does, then
+    /// assert that `reassert_physical_baseline` puts it back and says so.
+    ///
+    /// `#[ignore]`d because it visibly changes the desktop resolution for a
+    /// second — same convention as the live devnode tests below. Run it
+    /// explicitly:
+    ///   `cargo test -p nova-server --lib physical_mode_restore_live -- --ignored --nocapture`
+    ///
+    /// Leaves the desktop where it found it on success AND on the assertion
+    /// failure path, because a test that fails by stranding the operator at
+    /// 1024x768 is worse than no test.
+    #[test]
+    #[ignore = "changes the real display mode for ~2s — run explicitly"]
+    fn physical_mode_restore_live() {
+        let vd = VirtualDisplay::new();
+        vd.capture_physical_baseline("live test");
+
+        let baseline = VirtualDisplay::physical_baseline();
+        let Some(want) = baseline.first().cloned() else {
+            println!("no physical display to test against — skipping");
+            return;
+        };
+        // Skip rather than fail when the baseline's display is not currently
+        // lit: mid-stream the desktop is headless on the virtual display, and a
+        // diagnostic that panics because it was run at the wrong moment teaches
+        // nothing.
+        if !vd
+            .enumerate_displays()
+            .iter()
+            .any(|d| d.device_name.eq_ignore_ascii_case(&want.device))
+        {
+            println!("{} is not in the active topology (streaming?) — skipping", want.device);
+            return;
+        }
+        // Pick a mode that is definitely different and definitely supported:
+        // half-size, which every scaler accepts, at the same refresh.
+        let (probe_w, probe_h) = (want.width / 2, want.height / 2);
+        println!(
+            "baseline {} {}x{}@{}Hz — knocking it to {probe_w}x{probe_h} then restoring",
+            want.device, want.width, want.height, want.refresh_hz
+        );
+
+        VirtualDisplay::force_resolution(&want.device, probe_w, probe_h, want.refresh_hz);
+        let knocked = vd
+            .enumerate_displays()
+            .into_iter()
+            .find(|d| d.device_name.eq_ignore_ascii_case(&want.device))
+            .expect("display still enumerates after the probe mode set");
+        if knocked.width == want.width {
+            println!("the probe mode was refused ({probe_w}x{probe_h} unsupported?) — nothing to restore, skipping");
+            return;
+        }
+        assert_eq!((knocked.width, knocked.height), (probe_w, probe_h), "probe mode did not take");
+
+        vd.reassert_physical_baseline("live test");
+
+        let after = vd
+            .enumerate_displays()
+            .into_iter()
+            .find(|d| d.device_name.eq_ignore_ascii_case(&want.device))
+            .expect("display still enumerates after the restore");
+        if !want.matches(after.width, after.height, after.refresh_hz) {
+            // Put it back by hand before failing — see the doc comment.
+            VirtualDisplay::force_resolution(&want.device, want.width, want.height, want.refresh_hz);
+            panic!(
+                "reassert_physical_baseline left {} at {}x{}@{}Hz, expected {}x{}@{}Hz",
+                want.device, after.width, after.height, after.refresh_hz,
+                want.width, want.height, want.refresh_hz,
+            );
+        }
+        println!("restored to {}x{}@{}Hz ✅", after.width, after.height, after.refresh_hz);
+    }
 
     /// Read-only sanity check against the real device tree — run with
     /// `cargo test virtual_display -- --nocapture` to confirm SetupAPI

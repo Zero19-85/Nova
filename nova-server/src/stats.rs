@@ -62,6 +62,11 @@ fn codec_label(code: u32, hdr: bool) -> &'static str {
 /// read by the tray thread.
 struct StreamStats {
     streaming: AtomicBool,
+    /// No session, but the virtual display is still up — see
+    /// [`teardown_pending`]. Separate from `streaming` because the tray needs
+    /// to distinguish three states, not two: streaming, display-still-held,
+    /// and idle.
+    teardown_pending: AtomicBool,
     width: AtomicU32,
     height: AtomicU32,
     /// The session's negotiated frame rate (the pacing target).
@@ -85,6 +90,7 @@ struct StreamStats {
 
 static STATS: StreamStats = StreamStats {
     streaming: AtomicBool::new(false),
+    teardown_pending: AtomicBool::new(false),
     width: AtomicU32::new(0),
     height: AtomicU32::new(0),
     target_fps: AtomicU32::new(0),
@@ -190,6 +196,10 @@ pub fn session_started(
     STATS.target_kbps.store(ceiling_kbps, Ordering::Relaxed);
     STATS.measured_fps_x10.store(0, Ordering::Relaxed);
     STATS.measured_kbps.store(0, Ordering::Relaxed);
+    // A live session owns the display, so there is nothing pending to release
+    // — cleared here rather than at each call site so no future session-start
+    // path can leave the tray offering to tear down a display in use.
+    STATS.teardown_pending.store(false, Ordering::Release);
     // Released last: the tray treats this flag as the gate for the whole
     // struct, so publishing it after the payload means a reader that sees
     // "streaming" always sees the geometry that goes with it.
@@ -238,6 +248,24 @@ pub fn is_streaming() -> bool {
     STATS.streaming.load(Ordering::Acquire)
 }
 
+/// No session is running, but the virtual display is still up (suspended for a
+/// fast reconnect) — so there is still something for the tray to release.
+///
+/// This is the state the tray's second "End Stream" press acts on. Without it
+/// the menu item greyed out the moment the stream stopped, which left the
+/// suspended virtual display reachable only by waiting out
+/// `[stream] idle_teardown_secs` or connecting another client.
+pub fn teardown_pending() -> bool {
+    STATS.teardown_pending.load(Ordering::Acquire)
+}
+
+/// Published by the Worker (and the monolithic loop) whenever the virtual
+/// display's occupancy changes: true once a session has ended with the display
+/// left up, false as soon as it is released or a new session claims it.
+pub fn set_teardown_pending(pending: bool) {
+    STATS.teardown_pending.store(pending, Ordering::Release);
+}
+
 pub fn snapshot() -> Snapshot {
     let streaming = STATS.streaming.load(Ordering::Acquire);
     let hdr = STATS.hdr.load(Ordering::Relaxed);
@@ -255,14 +283,19 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// Serializes every test that touches [`STATS`], wherever it lives.
+///
+/// Module-level rather than inside `mod tests` because `tray`'s tests drive
+/// the same process-global (the menu item's three states are defined by these
+/// flags), and cargo runs tests from different modules on different threads. A
+/// mutex rather than separate globals keeps the tested type identical to the
+/// shipped one.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // These share one process-global, so they must not run concurrently.
-    // A mutex rather than separate globals keeps the tested type identical to
-    // the shipped one.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn session_lifecycle_publishes_then_clears() {

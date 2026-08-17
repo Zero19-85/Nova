@@ -371,8 +371,11 @@ async fn serve_tunnel(
 /// End the Echo session held by `identity`, if it holds one.
 fn release_session_of(sessions: &SessionManager, identity: &EchoIdentity, why: &str) {
     // `stop` is owner-checked, which is exactly right here: if some other
-    // device holds the session, this disconnect must not end it.
-    if sessions.stop(identity).is_ok() {
+    // device holds the session, this disconnect must not end it. `Ok(None)` —
+    // this device held nothing — is not worth a line: a control tunnel closing
+    // with no session behind it is the ordinary end of a client that already
+    // said goodbye.
+    if matches!(sessions.stop(identity), Ok(Some(_))) {
         println!("🛑 Echo: session released — {why}");
     }
 }
@@ -418,7 +421,7 @@ mod tests {
         ) -> Result<(), crate::echo::session::HandoffError> {
             Ok(())
         }
-        fn end(&self) {}
+        fn end(&self, _mode: crate::echo::session::EndMode) {}
         fn request_idr(&self) {}
         fn inject_input(&self, _packet: Vec<u8>) {}
     }

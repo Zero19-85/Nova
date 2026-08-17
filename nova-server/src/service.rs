@@ -75,7 +75,8 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, ControlService,
-    ENUM_SERVICE_TYPE, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SHUTDOWN,
+    ENUM_SERVICE_TYPE, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
+    SERVICE_QUERY_STATUS, SERVICE_STOP, SERVICE_ACCEPT_SHUTDOWN,
     SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
     SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_ERROR, SERVICE_ERROR_NORMAL,
     SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_TABLE_ENTRYW,
@@ -761,19 +762,89 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
 /// display/audio teardown) after a stop, before force-terminating it.
 const HOST_GRACEFUL_EXIT_MS: u32 = 6000;
 
-/// Ask the SCM to stop `NovaService` (best-effort). The host's tray "Quit"
-/// calls this so the service does not immediately respawn the exiting host —
-/// without it, "Quit" just triggers a relaunch. A no-op in effect when the host
-/// was not launched by the service (task/manual launch): `sc` returns an error
-/// which we ignore. Uses `.status()` so the stop request is delivered to the
-/// SCM before the host proceeds to tear down and exit.
-pub fn request_service_stop() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = std::process::Command::new("sc")
-        .args(["stop", SERVICE_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+/// What happened when the host asked the SCM to stop `NovaService`.
+///
+/// The distinction matters to the caller and used to be thrown away. Under the
+/// split, the service respawns a Worker the moment one exits — that is the
+/// whole Session-Survival design — so a "Quit" whose service stop did NOT take
+/// does not quit anything: the Worker dies, a new one is spawned within a
+/// reconcile tick, the Master keeps the client's session alive and replays
+/// `ConfigureStart` into the new Worker, and the operator sees the tray icon
+/// blink and come back. Which is indistinguishable from Quit doing nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceStopRequest {
+    /// The SCM accepted a stop for a running service, or it was already
+    /// stopping. Exiting is safe: nothing will respawn this host.
+    Accepted,
+    /// This host is not service-managed (task launch, manual launch, or the
+    /// service is not installed / not running). Exiting is safe for the same
+    /// reason — there is no supervisor to respawn it.
+    NotServiceManaged,
+    /// The service exists and is running but refused the stop, with why.
+    /// Exiting here would be a respawn, not a quit.
+    Refused(String),
+}
+
+/// Ask the SCM to stop `NovaService`. The host's tray "Quit" calls this first
+/// so the service does not immediately respawn the exiting host.
+///
+/// Native SCM calls rather than shelling out to `sc.exe`, for two reasons that
+/// both showed up in the logs. `sc.exe` inherits the host's stdout — which this
+/// process has redirected into `nova.log` — so every Quit printed sc's status
+/// table into the middle of the teardown log (visible verbatim in nova.log,
+/// 2026-08-16). And `.status()`'s exit code was discarded, so a stop that never
+/// took looked exactly like one that did; the failure mode above is silent by
+/// construction. This returns a verdict the caller can act on and log.
+pub fn request_service_stop() -> ServiceStopRequest {
+    unsafe {
+        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) {
+            Ok(h) => h,
+            // No SCM access at all: an unelevated or heavily restricted
+            // context. Nothing here is service-managed in that case.
+            Err(e) => {
+                println!("ℹ️  Service stop: no SCM access ({e:?}) — treating this host as \
+                    not service-managed");
+                return ServiceStopRequest::NotServiceManaged;
+            }
+        };
+        let _scm_guard = ScHandleGuard(scm);
+
+        let name_w = wide(SERVICE_NAME);
+        let svc = match OpenServiceW(
+            scm,
+            PCWSTR(name_w.as_ptr()),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        ) {
+            Ok(h) => h,
+            Err(_) => return ServiceStopRequest::NotServiceManaged,
+        };
+        let _svc_guard = ScHandleGuard(svc);
+
+        let mut status = SERVICE_STATUS::default();
+        match ControlService(svc, SERVICE_CONTROL_STOP, &mut status) {
+            Ok(()) => ServiceStopRequest::Accepted,
+            Err(e) => {
+                // Already stopping (the stop originated service-side) or
+                // already stopped — both mean nothing will respawn us.
+                let code = e.code().0 as u32 & 0xFFFF;
+                const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+                const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
+                if code == ERROR_SERVICE_NOT_ACTIVE || code == ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                    ServiceStopRequest::Accepted
+                } else {
+                    ServiceStopRequest::Refused(format!("{e:?}"))
+                }
+            }
+        }
+    }
+}
+
+impl ServiceStopRequest {
+    /// True when the caller may proceed to tear down and exit without the
+    /// service simply starting it again.
+    pub fn safe_to_exit(&self) -> bool {
+        !matches!(self, ServiceStopRequest::Refused(_))
+    }
 }
 
 // ── Cross-process graceful stop (service → host) ─────────────────────────────

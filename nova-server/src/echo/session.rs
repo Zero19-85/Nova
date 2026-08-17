@@ -403,6 +403,24 @@ pub struct SessionGrant {
     pub rikeyid: u32,
 }
 
+/// What ending a session should do to the virtual display.
+///
+/// Nova has always had both behaviours — `Deactivate { cancelled }` is exactly
+/// this distinction on the wire — but until the tray needed to end an Echo
+/// session, every caller here wanted the same one, so it was hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndMode {
+    /// Full teardown: the virtual display goes away and the physical monitor
+    /// comes back. What a client disconnecting or quitting means — it is done
+    /// with the desktop.
+    TearDown,
+    /// Stop the stream, leave the virtual display up and suspended, so a
+    /// reconnect is instant. What the tray's first "End Stream" press means:
+    /// the operator asked for the stream to stop, not for the desktop to be
+    /// rearranged. A second press releases the display.
+    KeepDisplay,
+}
+
 /// The seam between "the session manager decided" and "the pipeline actually
 /// moved". A trait for the same two reasons `DisplayOrchestrator` is one: the
 /// gate is testable without a Worker or a socket, and multi-seat replaces an
@@ -422,7 +440,13 @@ pub trait MediaPlane: Send + Sync + 'static {
         rikeyid: u32,
     ) -> Result<(), HandoffError>;
     /// Stop encoding and release the target.
-    fn end(&self);
+    ///
+    /// `mode` decides what happens to the virtual display, which is a separate
+    /// question from whether the session is over: a client that disconnected is
+    /// done with the desktop, but a host operator who pressed "End Stream" has
+    /// asked only for the stream to stop and may press again to release the
+    /// display. See [`EndMode`].
+    fn end(&self, mode: EndMode);
     /// Hand a GameStream input packet to the injection stack.
     ///
     /// Unparsed by design — see `echo::rpc::handle_input`.
@@ -554,11 +578,18 @@ impl MediaPlane for WorkerMediaPlane {
         self.worker_link.send(ControlMsg::RequestIdr);
     }
 
-    fn end(&self) {
+    fn end(&self, mode: EndMode) {
         // Deactivate first, then reset: the Worker stops producing frames
         // before the sender forgets where they were going, so no frame is
         // encoded into a sender with no target.
-        self.worker_link.send(ControlMsg::Deactivate { cancelled: true });
+        //
+        // `cancelled` IS the display decision on this wire: true tears the VDD
+        // down and restores the monitor, false suspends it for a fast
+        // reconnect (see `deactivate_worker`). Either way the session is over
+        // and the RTP pin is dropped below.
+        self.worker_link.send(ControlMsg::Deactivate {
+            cancelled: matches!(mode, EndMode::TearDown),
+        });
         let mut rtp = self.rtp_sender.lock().unwrap();
         rtp.reset(); // clears the pin — learning resumes for the next Moonlight client
     }
@@ -736,7 +767,10 @@ impl SessionManager {
                 "🔁 Echo: \"{}\" restarting its session {} — ending the old one first",
                 device.device_name, existing.id
             );
-            self.plane.end();
+            // KeepDisplay: the same device is reconnecting and a new `begin`
+            // follows immediately, so tearing the VDD down here would make a
+            // restart pay a full display cycle it is about to undo.
+            self.plane.end(EndMode::KeepDisplay);
             *guard = None;
             self.echo_active.store(false, Ordering::Relaxed);
         }
@@ -791,10 +825,28 @@ impl SessionManager {
     /// End the session held by `device`. Only its owner may — otherwise any
     /// paired device could end anyone's stream, which is a denial-of-service
     /// dressed up as a feature.
-    pub fn stop(&self, device: &EchoIdentity) -> Result<u64, HandoffError> {
+    ///
+    /// `Ok(None)` means there was nothing running and the display was released
+    /// anyway. That case used to return `NotTheOwner`, which was both wrong (no
+    /// owner exists to not be) and user-visible: pressing "End Stream" a second
+    /// time in the Echo app got an error, so the button looked dead and the
+    /// only way to make it respond again was to close and reopen the app
+    /// (reported 2026-08-16). Ending something already ended is a request that
+    /// has been satisfied, so it answers yes — and, since the whole point of
+    /// the press is "put my desktop back", it makes sure of that too.
+    ///
+    /// The owner check still stands where an owner exists, and a live Moonlight
+    /// session is refused rather than torn down: a paired-but-idle device
+    /// asking to release the display must not be able to end someone else's
+    /// stream through the back door.
+    pub fn stop(&self, device: &EchoIdentity) -> Result<Option<u64>, HandoffError> {
         let mut guard = self.active.lock().unwrap();
         let Some(session) = guard.as_ref() else {
-            return Err(HandoffError::NotTheOwner);
+            if self.moonlight_is_live() {
+                return Err(HandoffError::MoonlightActive);
+            }
+            self.plane.end(EndMode::TearDown);
+            return Ok(None);
         };
         if session.device_fingerprint != device.fingerprint {
             return Err(HandoffError::NotTheOwner);
@@ -803,10 +855,13 @@ impl SessionManager {
         // Cleared before the session is dropped, so no frame is sealed with a
         // key the client has already stopped listening for.
         self.echo_active.store(false, Ordering::Relaxed);
-        self.plane.end();
+        // The client said it is done (or its tunnel died), so the desktop goes
+        // back to the monitor. Unchanged behaviour — only the host-initiated
+        // path below asks for anything else.
+        self.plane.end(EndMode::TearDown);
         *guard = None;
         println!("🛑 Echo session {id} ended by \"{}\"", device.device_name);
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Inject input on behalf of the session's owner.
@@ -925,14 +980,25 @@ impl SessionManager {
     }
 
     /// Drop the session without an owner check — for host-side teardown
-    /// (shutdown, a Worker that will never come back), never for a remote
-    /// request.
-    pub fn force_end(&self, why: &str) {
+    /// (shutdown, a Worker that will never come back, the tray's "End
+    /// Stream"), never for a remote request.
+    ///
+    /// Returns whether there was a session to end, which is what lets the tray
+    /// distinguish "I stopped your stream" from "there was nothing running" —
+    /// and the absence of that answer is why "End Stream" reported *"no active
+    /// session"* while an Echo client was streaming: the Master only ever
+    /// consulted `ClientInfo`, which describes the GameStream session and knows
+    /// nothing about this one.
+    pub fn force_end(&self, why: &str, mode: EndMode) -> bool {
         let mut guard = self.active.lock().unwrap();
         self.echo_active.store(false, Ordering::Relaxed);
-        if let Some(session) = guard.take() {
-            println!("🛑 Echo session {} force-ended: {why}", session.id);
-            self.plane.end();
+        match guard.take() {
+            Some(session) => {
+                println!("🛑 Echo session {} force-ended: {why}", session.id);
+                self.plane.end(mode);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -955,6 +1021,9 @@ mod tests {
     struct MockPlane {
         begun: Mutex<Vec<(SocketAddr, StreamParams)>>,
         ended: Mutex<usize>,
+        /// Every end's mode, in order — the tray's two-stage "End Stream"
+        /// turns on which one each caller asks for.
+        end_modes: Mutex<Vec<EndMode>>,
         idrs: Mutex<usize>,
         injected: Mutex<Vec<Vec<u8>>>,
         fail: Option<HandoffError>,
@@ -975,8 +1044,9 @@ mod tests {
             self.begun.lock().unwrap().push((peer, params.clone()));
             Ok(())
         }
-        fn end(&self) {
+        fn end(&self, mode: EndMode) {
             *self.ended.lock().unwrap() += 1;
+            self.end_modes.lock().unwrap().push(mode);
         }
         fn request_idr(&self) {
             *self.idrs.lock().unwrap() += 1;
@@ -1116,12 +1186,36 @@ mod tests {
         assert_eq!(f.mgr.stop(&device("Pixel", 2)), Err(HandoffError::NotTheOwner));
         assert_eq!(*f.plane.ended.lock().unwrap(), 0, "a stranger's stop is a no-op");
 
-        assert!(f.mgr.stop(&device("Xbox", 1)).is_ok());
+        assert_eq!(f.mgr.stop(&device("Xbox", 1)), Ok(Some(1)));
         assert_eq!(f.mgr.owner(), MediaOwner::Idle);
         assert_eq!(*f.plane.ended.lock().unwrap(), 1);
 
-        // Stopping an already-stopped session is refused, not a panic.
-        assert_eq!(f.mgr.stop(&device("Xbox", 1)), Err(HandoffError::NotTheOwner));
+        // Stopping an ALREADY-stopped session succeeds and releases the
+        // display, rather than erroring. The old `NotTheOwner` here was
+        // user-visible: the Echo app's "End Stream" button did nothing on a
+        // second press and only recovered after closing and reopening the app.
+        assert_eq!(f.mgr.stop(&device("Xbox", 1)), Ok(None));
+        assert_eq!(
+            f.plane.end_modes.lock().unwrap().as_slice(),
+            &[EndMode::TearDown, EndMode::TearDown],
+            "both the real stop and the repeat put the desktop back"
+        );
+    }
+
+    /// The one thing the idempotent stop must never become: a way for a paired
+    /// device that holds nothing to reach across and end somebody else's
+    /// stream. An Echo device asking to stop while MOONLIGHT is streaming is
+    /// refused — the display it would release is in use.
+    #[test]
+    fn an_idle_device_cannot_release_a_display_moonlight_is_using() {
+        let f = fixture(Some(peer()));
+        *f.client_info.lock().unwrap() = Some(ClientInfo {
+            streaming_active: true,
+            ..Default::default()
+        });
+
+        assert_eq!(f.mgr.stop(&device("Pixel", 2)), Err(HandoffError::MoonlightActive));
+        assert_eq!(*f.plane.ended.lock().unwrap(), 0, "the Moonlight session is untouched");
     }
 
     /// A keyframe request is the client's ONLY repair path under an infinite
@@ -1267,6 +1361,53 @@ mod tests {
             Err(InputRejection::Unopenable(_))
         ));
         assert!(f.plane.injected.lock().unwrap().is_empty());
+    }
+
+    /// The tray's "End Stream" must reach an Echo session, and it must be able
+    /// to say whether it ended anything.
+    ///
+    /// This is the bug the two-stage End Stream exists to fix: the Master
+    /// judged "is anything streaming?" from `ClientInfo` alone, which describes
+    /// the GameStream session and is empty during an Echo one — so with a phone
+    /// mid-stream the tray reported "no active session — nothing to end" and
+    /// the stream carried on (live log, 2026-08-16).
+    #[test]
+    fn the_host_can_end_an_echo_session_and_is_told_whether_it_did() {
+        let f = fixture(Some(peer()));
+
+        // Nothing running: the host must learn that, not silently succeed —
+        // it is what lets the tray fall through to releasing the display.
+        assert!(!f.mgr.force_end("tray", EndMode::KeepDisplay), "no session to end");
+        assert_eq!(*f.plane.ended.lock().unwrap(), 0, "nothing to end means nothing ended");
+
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert!(f.mgr.echo_holds_media());
+
+        assert!(f.mgr.force_end("tray", EndMode::KeepDisplay), "a live session was ended");
+        assert!(!f.mgr.echo_holds_media(), "the pipeline must be released for the next client");
+        assert_eq!(
+            f.plane.end_modes.lock().unwrap().as_slice(),
+            &[EndMode::KeepDisplay],
+            "the first press stops the stream but leaves the display up"
+        );
+
+        // And it stays ended — a second press has nothing left to stop, which
+        // is precisely the signal the tray turns into "release the display".
+        assert!(!f.mgr.force_end("tray", EndMode::TearDown));
+        assert_eq!(*f.plane.ended.lock().unwrap(), 1, "the plane is not ended twice");
+    }
+
+    /// A client that disconnects is done with the desktop; only the host's
+    /// first press is the "stop the stream, keep the display" case. Asserted
+    /// because the two callers sit three lines apart and the wrong mode here
+    /// would either strand the VDD after every client quit or make the tray's
+    /// two-stage press collapse into one.
+    #[test]
+    fn a_client_ending_its_own_session_tears_the_display_down() {
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        f.mgr.stop(&device("Pixel", 1)).expect("owner may stop");
+        assert_eq!(f.plane.end_modes.lock().unwrap().as_slice(), &[EndMode::TearDown]);
     }
 
     #[test]

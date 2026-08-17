@@ -81,6 +81,85 @@ buys sync with input latency.
 
 ---
 
+## Teardown QoL (2026-08-17) — physical-mode baseline + End Stream across both client kinds
+
+Two operator-reported teardown bugs, both live-measured and fixed. Read this before
+touching `deactivate_after_stream`, the tray, or `ControlMsg::EndSession`.
+
+### Restoring the topology is NOT restoring the mode
+**Symptom:** after every stream the physical monitor came back at **1024x768** (a
+2560x1440 panel) while `restore_topology` logged success. The service log had the
+Worker reporting it on 9 of 11 session boundaries in one day.
+
+**Root cause:** every path that re-lights a physical output hands the mode decision
+to Windows — `SDC_TOPOLOGY_EXTEND` derives its own, `SDC_ALLOW_CHANGES` lets
+`SetDisplayConfig` re-resolve a supplied mode, and the snapshot `restore_topology`
+replays comes from `QDC_DATABASE_CURRENT`, i.e. the CCD *database*, which inherits
+whatever the last activation persisted with `SDC_SAVE_TO_DATABASE`. One bad guess
+became the thing Nova faithfully restored forever after.
+
+**Fix (`virtual_display.rs`, `PhysicalMode` section):** capture each physical
+display's committed mode (`QDC_ONLY_ACTIVE_PATHS`, never the database) before the
+stream, persist it to `nova_display_baseline.txt` beside the exe, and push it back
+via `force_resolution` + read-back verification at teardown, the boot devnode cycle,
+and the orphaned-VDD heal. Deployment note: `nova_display_baseline.txt` is new state
+next to `nova.toml`/`nova_paired.json`; deleting it is safe (the next stream
+recaptures).
+
+**Two non-obvious rules that are load-bearing:**
+1. **The mode change lands AFTER the calls return.** The devnode disable and phantom-
+   monitor removal are PnP operations; Windows re-evaluates the display tree
+   asynchronously and can re-pick the mode after both return. The first version read
+   once, saw the right mode, exited, and the monitor changed seconds later. The
+   re-assert now watches for a bounded 2 s and leaves only after **two consecutive**
+   clean reads, treating "not in the topology yet" as not-settled rather than
+   all-clear.
+2. **A Worker start HEALS, it does not learn.** Adopting the observed mode at startup
+   turned one lost race into a permanent baseline (1024x768 restored forever). Startup
+   re-asserts the persisted baseline; only a machine with no baseline captures there.
+   Trade: a hand-changed resolution is adopted at the next stream start, and a Worker
+   respawn before that reverts it once.
+
+Live diagnostic: `cargo test -p nova-server --lib physical_mode_restore_live --
+--ignored --nocapture` knocks the real display to half size and asserts the restore.
+
+### "End Stream" only knew about Moonlight
+`ControlMsg::EndSession` judged "is anything streaming?" from `ClientInfo` alone,
+which describes the GameStream session and is empty during an Echo one — so with a
+phone mid-stream the tray logged *"no active session — nothing to end"* and the
+stream carried on. It now ends both: `SessionManager::force_end(why, EndMode)` for
+Echo (returning whether anything was ended) plus the `ClientInfo` path, and clears
+`last_configure` explicitly for both so no respawned Worker resurrects an
+operator-ended session (Phase 16.1's invariant, no longer riding on `cancelled`).
+
+**One press goes all the way down** — stream stopped AND physical display restored
+(`EndMode::TearDown` / `cancelled: true`). A two-stage version was built and rejected
+after use: "End Stream" reads as one intention. The tray item still relabels itself to
+**"Release Display"** for the state that genuinely produces it — a client that
+vanishes without a `/cancel` leaves the display suspended for a fast reconnect — driven
+by `stats::teardown_pending`, published from the display itself rather than from intent.
+
+**Echo's `stop_session` is now idempotent:** with no session it used to return
+`NotTheOwner` (wrong — no owner exists to not be), which made the app's "End Stream"
+button look dead on a second press. It now succeeds and releases the display, while
+still refusing when *another* device holds the session or Moonlight is streaming.
+**Client-side note:** `EchoController.stop()` zeroes its handle and only calls
+`nativeClose` when non-zero, so a second press sends nothing at all — the app's button
+is inert when idle by construction. Unnecessary now that press one tears down fully;
+making it live again needs a reconnect-and-release path in `echo-android`.
+
+### Tray "Quit Nova" — reported broken, did NOT reproduce
+Measured clean twice (1.5 s, both processes gone, full graceful teardown). The Phase 9
+threads suspected of hanging exit live in `echo-client`/`echo-android` — on the phone —
+and both host entry points end in `process::exit`. What was real: the path was entirely
+silent, `request_service_stop()` shelled out to `sc.exe` (whose stdout landed in
+nova.log) and discarded the exit code. It now uses native SCM `ControlService`, returns
+a `ServiceStopRequest` verdict, logs each step, and **refuses to exit on a refused
+stop** — exiting there is a service respawn, not a quit, which is indistinguishable
+from "nothing happened".
+
+---
+
 ## Phase 16 — **ALPHA 2.0** — Session-Survival Architecture: Master/Worker split, lock-screen streaming + remote PIN entry (2026-08-06)
 
 Alpha 2.0's headline: **reboot → connect from Moonlight → see the Windows login screen → type the PIN with the remote mouse/keyboard.** All items below are live-confirmed on the dev box unless marked otherwise.

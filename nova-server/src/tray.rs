@@ -78,10 +78,21 @@ pub enum TrayCmd {
 /// out — see this module's header for why the tray never performs these itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
-    /// "End Stream": tear the live session down (physical monitor restored, DXGI
-    /// and audio hooks released) while leaving the server listening for the next
-    /// client. Already confirmed with the user by the time this is sent.
+    /// "End Stream": end the live session — whichever kind it is — and put the
+    /// desktop back on the physical monitor. One press, the whole way down.
+    /// Already confirmed with the user by the time this is sent.
     EndStream,
+    /// "Release Display" — the same menu item, relabelled for the state where
+    /// there is no session left but the virtual display is still held.
+    ///
+    /// That state is not reached by ending a stream deliberately (which now
+    /// tears down in one press); it is what a client that vanishes leaves
+    /// behind. A client that disconnects without a `/cancel` — the ordinary
+    /// "just close the app" flow — suspends the display rather than releasing
+    /// it, so a fast reconnect stays fast. Without this entry the only ways
+    /// back were to wait out `[stream] idle_teardown_secs` or connect another
+    /// client.
+    ReleaseDisplay,
     /// "Clear Paired Devices": drop every entry from the trust store, on disk
     /// and in memory. Already confirmed with the user by the time this is sent.
     ClearPairedDevices,
@@ -146,9 +157,12 @@ fn tray_main(
         // Order puts the session actions first (what a user reaches for mid-
         // stream) and the destructive ones behind separators.
         let stats_item = MenuItem::new("Server Stats…", true, None);
-        // Starts disabled: with no session there is nothing to end, and a
-        // greyed item explains that better than an error dialog would.
-        let end_item = MenuItem::new("End Stream", crate::stats::is_streaming(), None);
+        // Two-stage, and the label says which stage it is on: "End Stream"
+        // while a client is streaming, "Release Display" once the stream has
+        // stopped but the virtual display is still held. Disabled only when
+        // there is genuinely nothing to do — a greyed item explains that
+        // better than an error dialog would.
+        let end_item = MenuItem::new(end_item_label(), end_item_enabled(), None);
         let pair_item = MenuItem::new("Pair Device", true, None);
         let clear_item = MenuItem::new("Clear Paired Devices…", true, None);
         let quit_item = MenuItem::new("Quit Nova", true, None);
@@ -202,6 +216,10 @@ fn tray_main(
     // Icon/tooltip state, so neither is pushed to the shell unless it changed —
     // Shell_NotifyIconW is an IPC to Explorer, not a local write.
     let mut shown_streaming: Option<bool> = None;
+    // Last text/enabled state pushed to the two-stage End Stream item, so the
+    // menu is only rewritten when the stage actually changes.
+    let mut shown_end_label: Option<String> = None;
+    let mut shown_end_enabled: Option<bool> = None;
     let mut shown_tooltip = String::new();
     // A pairing status message temporarily owns the tooltip; see STATUS_TOOLTIP_HOLD.
     let mut status_until: Option<Instant> = None;
@@ -226,20 +244,40 @@ fn tray_main(
             if event.id == ids.stats {
                 open_or_focus_stats_window();
             } else if event.id == ids.end {
+                // Which stage this press is depends on what is live RIGHT NOW,
+                // re-read here rather than trusted from the last refresh tick:
+                // a session can end (or start) in the half-second between the
+                // menu being drawn and the item being clicked, and acting on a
+                // stale reading would either kill a stream the user thought
+                // was already stopped or release a display in use.
+                let (action, prompt, title) = if crate::stats::is_streaming() {
+                    (
+                        TrayAction::EndStream,
+                        "End the active streaming session?\n\n\
+                         The client is disconnected, the virtual display is torn \
+                         down, and the desktop returns to your physical monitor at \
+                         the resolution it had before streaming.\n\n\
+                         Nova keeps running and stays ready for the next connection.",
+                        "Nova — End Stream",
+                    )
+                } else {
+                    (
+                        TrayAction::ReleaseDisplay,
+                        "Release the virtual display?\n\n\
+                         The desktop returns to your physical monitor at the \
+                         resolution it had before streaming, and the virtual display \
+                         goes dormant until the next client connects.\n\n\
+                         Nova keeps running.",
+                        "Nova — Release Display",
+                    )
+                };
                 // Confirmed rather than immediate: the click lands on a menu the
-                // user opened for some other reason often enough, and this drops
-                // a live session.
-                if confirm(
-                    "End the active streaming session?\n\n\
-                     The virtual display is torn down, your physical monitor is \
-                     restored, and the client is disconnected.\n\n\
-                     Nova keeps running and stays ready for the next connection.",
-                    "Nova — End Stream",
-                    MB_ICONQUESTION,
-                ) {
-                    println!("🛑 Tray: \"End Stream\" — requesting session teardown");
-                    if action_tx.try_send(TrayAction::EndStream).is_err() {
-                        println!("⚠️  Tray: End Stream could not be delivered (queue full or receiver gone)");
+                // user opened for some other reason often enough, and either
+                // stage is disruptive to whoever is watching.
+                if confirm(prompt, title, MB_ICONQUESTION) {
+                    println!("🛑 Tray: {title} — {action:?} requested");
+                    if action_tx.try_send(action).is_err() {
+                        println!("⚠️  Tray: {action:?} could not be delivered (queue full or receiver gone)");
                     }
                 }
             } else if event.id == ids.pair {
@@ -271,7 +309,20 @@ fn tray_main(
             } else if event.id == ids.quit {
                 // Signal the main capture loop to shut down cleanly.
                 close_stats_window();
-                let _ = shutdown_tx.send(true);
+                // Logged because the rest of this path used to be invisible:
+                // if the shutdown never lands, this line is what says the click
+                // was received and the fault is downstream of the tray.
+                // `send` fails only if every receiver is gone, which would mean
+                // the capture loop has already exited — worth saying out loud
+                // rather than discarding, since the icon would then be all
+                // that is left of Nova.
+                match shutdown_tx.send(true) {
+                    Ok(()) => println!("🛑 Tray: \"Quit Nova\" — shutdown signalled"),
+                    Err(_) => println!(
+                        "⚠️  Tray: \"Quit Nova\" clicked but nothing is listening for the \
+                         shutdown signal — the main loop has already exited"
+                    ),
+                }
                 return; // exit the tray thread; TrayIcon drops and removes the icon
             }
         }
@@ -333,7 +384,22 @@ fn tray_main(
                     idle_icon.clone()
                 };
                 let _ = tray.set_icon(Some(icon));
-                end_item.set_enabled(snap.streaming);
+            }
+
+            // Tracked separately from the icon: the item has three states to
+            // the icon's two, and the transition that matters most here —
+            // stream stops, display still held — does not change `streaming`
+            // and `teardown_pending` at the same instant. Guarded on a change
+            // so the menu is not rewritten twice a second forever.
+            let label = end_item_label();
+            if shown_end_label.as_deref() != Some(label) {
+                shown_end_label = Some(label.to_string());
+                end_item.set_text(label);
+            }
+            let enabled = end_item_enabled();
+            if shown_end_enabled != Some(enabled) {
+                shown_end_enabled = Some(enabled);
+                end_item.set_enabled(enabled);
             }
 
             let status_active = status_until.is_some_and(|t| Instant::now() < t);
@@ -353,6 +419,26 @@ fn tray_main(
 
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
+}
+
+/// Text for the two-stage session item, from the live state.
+///
+/// One item rather than two because they are the two halves of one intention
+/// and only ever one of them is meaningful: with a stream running, releasing
+/// the display would yank it out from under the client; with no stream, there
+/// is nothing to end. A second permanently-greyed entry would say less than a
+/// label that changes.
+fn end_item_label() -> &'static str {
+    if crate::stats::is_streaming() {
+        "End Stream"
+    } else {
+        "Release Display"
+    }
+}
+
+/// Clickable while there is either a stream to stop or a display to release.
+fn end_item_enabled() -> bool {
+    crate::stats::is_streaming() || crate::stats::teardown_pending()
 }
 
 /// Menu item IDs captured at build time (the items themselves are borrowed into
@@ -978,6 +1064,50 @@ pub fn prompt_for_pin_and_name() -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three states the one menu item has to express, and the transition
+    /// that used to strand the display: a stream stopping does not release the
+    /// virtual display, and the item must stay clickable to offer that.
+    ///
+    /// Shares `crate::stats`' process-global with the stats tests, so it takes
+    /// their lock: cargo runs the two modules' tests on different threads, and
+    /// without it this and `session_lifecycle_publishes_then_clears` would
+    /// flip the same flags underneath each other.
+    #[test]
+    fn the_session_item_offers_end_then_release_then_nothing() {
+        let _g = crate::stats::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::stats::session_ended();
+        crate::stats::set_teardown_pending(false);
+        assert_eq!(end_item_label(), "Release Display");
+        assert!(!end_item_enabled(), "idle with nothing held: nothing to offer");
+
+        crate::stats::session_started(1920, 1080, 60, crate::encoder::Codec::Hevc, false, 15_000);
+        assert_eq!(end_item_label(), "End Stream");
+        assert!(end_item_enabled(), "a live stream can be stopped");
+
+        // Press one lands: the session is over, the display is not.
+        crate::stats::session_ended();
+        crate::stats::set_teardown_pending(true);
+        assert_eq!(end_item_label(), "Release Display");
+        assert!(end_item_enabled(), "the second press must remain reachable");
+
+        // Press two lands.
+        crate::stats::set_teardown_pending(false);
+        assert!(!end_item_enabled(), "nothing held, nothing streaming");
+    }
+
+    /// A session claiming the display must clear any pending-release state, or
+    /// the item would offer to tear down a display a client is watching.
+    #[test]
+    fn starting_a_session_clears_the_pending_release() {
+        let _g = crate::stats::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::stats::set_teardown_pending(true);
+        crate::stats::session_started(1280, 720, 60, crate::encoder::Codec::H264, false, 8_000);
+        assert!(!crate::stats::teardown_pending());
+        assert!(crate::stats::is_streaming());
+        crate::stats::session_ended();
+        crate::stats::set_teardown_pending(false);
+    }
 
     #[test]
     fn badge_marks_the_lower_right_and_leaves_the_upper_left_alone() {

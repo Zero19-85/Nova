@@ -882,7 +882,20 @@ impl Handler {
             return RpcResponse::err(id, E_NO_SESSION_LAYER, "no session layer on this host");
         };
         match mgr.stop(identity) {
-            Ok(session_id) => RpcResponse::ok(id, json!({ "session_id": session_id, "stopped": true })),
+            Ok(Some(session_id)) => {
+                RpcResponse::ok(id, json!({ "session_id": session_id, "stopped": true }))
+            }
+            // Nothing was running — answered as success, not as an error, and
+            // the display was released regardless. See `SessionManager::stop`
+            // for why: a repeat press is a satisfied request, and returning an
+            // error for it is what made the app's button look broken.
+            Ok(None) => {
+                println!(
+                    "🛑 Echo: \"{}\" asked to stop with no session running — display released",
+                    identity.device_name
+                );
+                RpcResponse::ok(id, json!({ "stopped": false, "display_released": true }))
+            }
             Err(e) => RpcResponse::err(id, handoff_code(&e), e.to_string()),
         }
     }

@@ -409,18 +409,12 @@ pub async fn start_master_network() -> MasterHandles {
     // — see that message's doc comment.
     let display_seats: echo::rpc::SeatCache = Arc::new(Mutex::new(Vec::new()));
 
+    // Channel now, supervisor below: it needs `echo_sessions` (for the tray's
+    // "End Stream", which must be able to end an Echo session too), and that
+    // is built by the WAN block further down. Nothing is lost by waiting —
+    // both of its inputs are channels, so a Worker pipe or an outbound message
+    // that arrives first simply queues until the task starts.
     let (control_pipe_tx, control_pipe_rx) = mpsc::unbounded_channel();
-    tokio::spawn(control_supervisor(
-        control_pipe_rx,
-        control_outbound_rx,
-        rtp_sender.clone(),
-        global_pin,
-        helper_tx,
-        helper_ready,
-        worker_caps.clone(),
-        client_info.clone(),
-        display_seats.clone(),
-    ));
 
     // WAN: zero-config internet connections. Both halves start only when a
     // relay is configured — with no relay there is no WAN path, and a LAN-only
@@ -482,12 +476,25 @@ pub async fn start_master_network() -> MasterHandles {
         Arc::new(echo::rpc::WorkerOrchestrator::new(
             worker_link.clone(),
             worker_caps.clone(),
-            display_seats,
+            display_seats.clone(),
         )),
         client_info.clone(),
         echo_sessions.clone(),
     );
     echo::rpc::spawn(&cfg.echo, echo_handler.clone());
+
+    tokio::spawn(control_supervisor(
+        control_pipe_rx,
+        control_outbound_rx,
+        rtp_sender.clone(),
+        global_pin,
+        helper_tx,
+        helper_ready,
+        worker_caps.clone(),
+        client_info.clone(),
+        display_seats,
+        echo_sessions.clone(),
+    ));
 
     // WAN control: mutual TLS over reliable UDP, on the socket the punch
     // opened. Only when there is a session layer at all — with no relay
@@ -808,6 +815,10 @@ async fn control_supervisor(
     client_info: Arc<Mutex<Option<rtsp::ClientInfo>>>,
     // Cache of the Worker's ControlMsg::DisplayInventory, read by echo_rpc.
     display_seats: echo::rpc::SeatCache,
+    // Also needed for EndSession: an Echo client's session lives here and NOT
+    // in `client_info`, so a tray "End Stream" that consulted only the latter
+    // ended nothing while a phone was streaming.
+    echo_sessions: Option<Arc<echo::session::SessionManager>>,
 ) {
     // Mirrors the Worker's view of the input desktop (ControlMsg::
     // SecureDesktopChanged). While true AND a helper is live, input routes to
@@ -930,20 +941,41 @@ async fn control_supervisor(
                         }
                     }
                     Some(Ok(ControlMsg::EndSession)) => {
-                        // Tray "End Stream". Deliberately does NOT tear anything
-                        // down directly: marking the session cancelled hands it
-                        // to session_watcher's existing active→inactive edge,
-                        // which resets the RTP timeline and sends
-                        // Deactivate{cancelled:true} — the identical path a
-                        // client's own "Quit App" takes, restoring the physical
-                        // monitor and releasing the DXGI/audio hooks. Reusing it
-                        // is the point: a second teardown path here would be a
-                        // second place for the VDD to get stranded.
+                        // Tray "End Stream": stop the stream AND put the
+                        // desktop back on the physical monitor, in one press.
                         //
-                        // cancelled=true also clears `last_configure` (see the
-                        // outbound arm below), so no future Worker inherits a
-                        // session the user deliberately ended.
-                        let ended = {
+                        // This was briefly two presses (stop, then release).
+                        // Rejected after using it: "End Stream" reads as one
+                        // intention, and stopping a stream while leaving the
+                        // monitor dark is a state nobody asked to be in. The
+                        // two-stage machinery still exists for the case that
+                        // genuinely produces it — a client that disconnects
+                        // without saying goodbye leaves the display suspended,
+                        // and the tray item relabels itself to "Release
+                        // Display" so that state is reachable — but the
+                        // deliberate press does the whole job.
+                        //
+                        // Both kinds of session are ended here, and that is the
+                        // original fix: an Echo client's session lives in
+                        // `SessionManager`, not in `ClientInfo`, so consulting
+                        // only the latter meant "End Stream" during an Echo
+                        // stream logged "nothing to end" and the stream kept
+                        // running (live log, 2026-08-16).
+                        let echo_ended = echo_sessions
+                            .as_ref()
+                            .is_some_and(|s| {
+                                s.force_end(
+                                    "tray \"End Stream\"",
+                                    echo::session::EndMode::TearDown,
+                                )
+                            });
+
+                        // Moonlight: hand the session to session_watcher's
+                        // active→inactive edge, which resets the RTP timeline
+                        // and sends the Deactivate. `cancelled` is that
+                        // message's display decision — true tears the VDD down
+                        // and restores the monitor.
+                        let moonlight_ended = {
                             let mut guard = client_info.lock().unwrap();
                             match guard.as_mut() {
                                 Some(info) if info.streaming_active => {
@@ -954,16 +986,26 @@ async fn control_supervisor(
                                 _ => None,
                             }
                         };
-                        match ended {
-                            Some(gen) => {
-                                println!("🛑 Master: tray \"End Stream\" — ending session {gen} \
-                                    (server stays up and listening)");
-                                // Ordered AFTER the flags above: the Disconnect
-                                // event this produces must never be able to read
-                                // as a client leaving a session still marked live.
-                                control::request_peer_kick();
-                            }
-                            None => println!("ℹ️  Master: tray \"End Stream\" with no active session — nothing to end"),
+                        if let Some(gen) = moonlight_ended {
+                            println!("🛑 Master: tray \"End Stream\" — ending Moonlight session \
+                                {gen} and restoring the physical display");
+                            // Ordered AFTER the flags above: the Disconnect
+                            // event this produces must never be able to read
+                            // as a client leaving a session still marked live.
+                            control::request_peer_kick();
+                        }
+
+                        // The session is over by the operator's decision, so no
+                        // future Worker may inherit it. The Moonlight path's
+                        // `cancelled = true` also clears this via the outbound
+                        // arm, but an Echo-only session never travels that way,
+                        // so the clear is explicit here for both. Phase 16.1's
+                        // invariant, kept.
+                        if echo_ended || moonlight_ended.is_some() {
+                            last_configure = None;
+                        } else {
+                            println!("ℹ️  Master: tray \"End Stream\" with no active session — \
+                                nothing to end");
                         }
                     }
                     Some(Ok(ControlMsg::ClearPaired)) => {
@@ -1731,6 +1773,12 @@ fn deactivate_worker(
     }
     let (ox, oy) = capturer.origin();
     input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+
+    // Tell the tray whether anything is still held. Read from the virtual
+    // display itself rather than from `cancelled`, so a teardown that failed
+    // partway leaves the menu offering to finish the job instead of claiming
+    // the desktop is already back.
+    stats::set_teardown_pending(vd.active_device_name().is_some());
 }
 
 /// One ramp-back step: +10% of the current bitrate, never past `target`.
@@ -2492,10 +2540,17 @@ pub async fn run_worker() -> Result<()> {
         }
     });
 
-    // Tray actions → Master. "End Stream" and "Clear Paired Devices" both act
-    // on state this process does not own (the client session; pairing's trust
-    // store) — see ControlMsg::EndSession / ControlMsg::ClearPaired for why
-    // doing either locally would be wrong rather than merely inconvenient.
+    // Tray actions. "End Stream" and "Clear Paired Devices" act on state this
+    // process does not own (the client session; pairing's trust store) — see
+    // ControlMsg::EndSession / ControlMsg::ClearPaired for why doing either
+    // locally would be wrong rather than merely inconvenient.
+    //
+    // "Release Display" is the opposite: the virtual display belongs to THIS
+    // process, and by the time it can be pressed there is no session left for
+    // the Master to have an opinion about. It goes straight onto the Worker's
+    // own command channel as the same Deactivate the Master would have sent,
+    // so the teardown runs through one code path (`deactivate_worker`) rather
+    // than a second one written for the tray.
     //
     // A dedicated OS thread, not a tokio task: the tray hands work over a
     // blocking `std::sync::mpsc` receiver, and blocking a runtime worker on it
@@ -2505,13 +2560,23 @@ pub async fn run_worker() -> Result<()> {
         .name("nova-tray-action-fwd".into())
         .spawn({
             let reply_tx = reply_tx.clone();
+            let cmd_tx = cmd_tx.clone();
             move || {
                 // recv() only errors once the tray thread is gone (Quit /
                 // process teardown), so exiting then is correct.
                 while let Ok(action) = tray_action_rx.recv() {
+                    if matches!(action, tray::TrayAction::ReleaseDisplay) {
+                        println!("🖥️  Worker: tray \"Release Display\" — tearing down the \
+                            virtual display and restoring the physical monitor");
+                        if cmd_tx.send(WorkerCommand::Deactivate { cancelled: true }).is_err() {
+                            return; // main loop gone — process is shutting down
+                        }
+                        continue;
+                    }
                     let msg = match action {
                         tray::TrayAction::EndStream => ipc::ControlMsg::EndSession,
                         tray::TrayAction::ClearPairedDevices => ipc::ControlMsg::ClearPaired,
+                        tray::TrayAction::ReleaseDisplay => unreachable!("handled above"),
                     };
                     println!("📨 Worker: relaying tray action {action:?} to Master");
                     if reply_tx.send(msg).is_err() {
@@ -2536,13 +2601,38 @@ pub async fn run_worker() -> Result<()> {
     // not launched by the service; harmless if the shutdown ORIGINATED from
     // a service stop (service is already STOP_PENDING, the extra `sc stop`
     // errors and is ignored).
+    //
+    // Every step here logs. This path used to be completely silent — a Quit
+    // that failed anywhere between the tray click and the Worker's teardown
+    // left no trace at all in nova.log, so "I clicked Quit and nothing
+    // happened" was unanswerable from the logs. Three lines, once per process
+    // lifetime, on a path that ends the process.
     tokio::spawn({
         let mut shutdown_rx = shutdown_rx.clone();
         let cmd_tx = cmd_tx.clone();
         async move {
             if shutdown_rx.changed().await.is_ok() && *shutdown_rx.borrow() {
-                service::request_service_stop();
-                let _ = cmd_tx.send(WorkerCommand::Stop);
+                println!("🛑 Quit requested — asking the service to stop before tearing down");
+                let verdict = service::request_service_stop();
+                match &verdict {
+                    service::ServiceStopRequest::Accepted =>
+                        println!("🛑 Service stop accepted — proceeding with Worker teardown"),
+                    service::ServiceStopRequest::NotServiceManaged =>
+                        println!("🛑 Not service-managed — proceeding with Worker teardown"),
+                    // The one case where exiting is WRONG: the service is alive
+                    // and keeping a Worker in the console session is its job, so
+                    // quitting here just hands it a vacancy to fill. Staying up
+                    // and saying so beats a Quit that silently reincarnates.
+                    service::ServiceStopRequest::Refused(why) => println!(
+                        "❌ Quit ignored: NovaService refused to stop ({why}). This Worker is \
+                         NOT exiting — the service would respawn it within seconds and Quit \
+                         would look like it did nothing. Stop the service directly \
+                         (`sc stop NovaService` from an elevated prompt) to shut Nova down."
+                    ),
+                }
+                if verdict.safe_to_exit() {
+                    let _ = cmd_tx.send(WorkerCommand::Stop);
+                }
             }
         }
     });
@@ -3508,6 +3598,11 @@ pub async fn run() -> Result<()> {
             move || {
                 while let Ok(action) = tray_action_rx.recv() {
                     match action {
+                        // Stop the stream AND restore the physical display, in
+                        // one press — `cancelled = true` is what makes the
+                        // capture loop's disconnect handling tear the VDD down
+                        // rather than suspend it. Mirrors control_supervisor's
+                        // EndSession arm; see it for why this is one press.
                         tray::TrayAction::EndStream => {
                             let ended = {
                                 let mut guard = info.lock().unwrap_or_else(|e| e.into_inner());
@@ -3522,12 +3617,33 @@ pub async fn run() -> Result<()> {
                             };
                             match ended {
                                 Some(gen) => {
-                                    println!("🛑 Tray: ending session {gen} (server stays up and listening)");
+                                    println!("🛑 Tray: ending session {gen} and restoring the \
+                                        physical display");
                                     // After the flags, never before — see
                                     // control::request_peer_kick.
                                     control::request_peer_kick();
                                 }
                                 None => println!("ℹ️  Tray: \"End Stream\" with no active session — nothing to end"),
+                            }
+                        }
+                        // Press two: release the display. Marking the (already
+                        // ended) session cancelled is what the monolithic
+                        // capture loop's idle block watches for — it runs the
+                        // same `deactivate_after_stream` + rebind the /cancel
+                        // path does, so this adds no second teardown path.
+                        tray::TrayAction::ReleaseDisplay => {
+                            println!("🖥️  Tray: \"Release Display\" — tearing down the virtual \
+                                display and restoring the physical monitor");
+                            let mut guard = info.lock().unwrap_or_else(|e| e.into_inner());
+                            match guard.as_mut() {
+                                Some(c) => {
+                                    c.streaming_active = false;
+                                    c.cancelled = true;
+                                }
+                                // No ClientInfo at all (nothing has ever
+                                // connected) means no VDD was ever activated
+                                // for a session, so there is nothing held.
+                                None => println!("ℹ️  Tray: no session state — nothing to release"),
                             }
                         }
                         tray::TrayAction::ClearPairedDevices => {
@@ -3706,10 +3822,32 @@ pub async fn run() -> Result<()> {
                     // so the service's worker won't respawn us; the service then
                     // grace-waits for this graceful teardown to finish. No-op when
                     // not launched by the service, and harmless when the shutdown
-                    // ORIGINATED from a service stop (service is already
-                    // STOP_PENDING; the extra `sc stop` errors and is ignored).
-                    crate::service::request_service_stop();
-                    break;
+                    // ORIGINATED from a service stop (already STOP_PENDING, which
+                    // the verdict reports as accepted).
+                    //
+                    // A REFUSED stop is the one case where breaking out is
+                    // wrong: the service is alive and its job is to keep a host
+                    // running, so exiting is a relaunch rather than a shutdown.
+                    // Say so and keep streaming — same reasoning as the Worker
+                    // path in run_worker.
+                    match crate::service::request_service_stop() {
+                        crate::service::ServiceStopRequest::Refused(why) => {
+                            println!(
+                                "❌ Quit ignored: NovaService refused to stop ({why}). Not \
+                                 exiting — the service would respawn this host within seconds. \
+                                 Stop the service directly (`sc stop NovaService` from an \
+                                 elevated prompt) to shut Nova down."
+                            );
+                            // Fall through into the normal frame path — the
+                            // session keeps running. `changed()` has consumed
+                            // this edge, so the arm stays quiet until the next
+                            // Quit rather than re-firing every iteration.
+                        }
+                        verdict => {
+                            println!("🛑 Service stop: {verdict:?} — proceeding with teardown");
+                            break;
+                        }
+                    }
                 }
             }
             // Precise dispatch: spin out the sub-millisecond remainder.
@@ -3772,6 +3910,9 @@ pub async fn run() -> Result<()> {
                     // the server stays alive and the capturer recovers via WGC's
                     // internal ACCESS_LOST handling or the next
                     // activate_for_stream rebind when a new client connects.
+                    // The display is released (or failed to release) — either
+                    // way the tray's item now reflects what is actually held.
+                    stats::set_teardown_pending(vd.active_device_name().is_some());
                     if let Err(e) = rebind_capture_and_encoder(&mut capturer, &mut enc, None, None, None, None) {
                         eprintln!("⚠️  Capture rebind after deferred cancel failed ({e}) — staying in idle loop");
                     }
@@ -4383,6 +4524,10 @@ pub async fn run() -> Result<()> {
                 }
                 let (ox, oy) = capturer.origin();
                 input::set_active_capture_rect(ox, oy, capturer.width(), capturer.height());
+                // Whether the tray's second press has anything to release —
+                // same rule as the Worker path's `deactivate_worker`: read the
+                // display, not the intent.
+                stats::set_teardown_pending(vd.active_device_name().is_some());
             }
         }
 
