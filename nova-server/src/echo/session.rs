@@ -1163,9 +1163,20 @@ impl SessionManager {
             return Sweep::Nothing;
         }
 
+        let silent_for = session.last_seen.elapsed().as_secs();
+        self.detach_locked(session, &format!("{silent_for}s of silence"));
+        Sweep::Detached
+    }
+
+    /// Move a live session into the detached state. Caller holds the lock.
+    ///
+    /// Shared by the liveness sweep and the control-tunnel-closed path so the
+    /// two can never disagree about what detaching means — they did once, and it
+    /// silently un-did the entire feature: the sweep detached, and the tunnel
+    /// teardown that followed it by microseconds tore the display down anyway.
+    fn detach_locked(&self, session: &mut EchoSession, why: &str) {
         let id = session.id;
         let name = session.device_name.clone();
-        let silent_for = session.last_seen.elapsed().as_secs();
         session.detached_since = Some(Instant::now());
 
         // Cleared before the plane is touched, for the same reason `stop` does
@@ -1180,27 +1191,63 @@ impl SessionManager {
             // Defensive: the gate should make this unreachable. Detaching still
             // has to happen, but touching the plane would suspend someone else's
             // live stream.
-            println!("⏸️  Echo session {id} (\"{name}\") DETACHED — Moonlight holds the pipeline, leaving it alone");
-        } else {
-            // KeepDisplay, not TearDown: the encoder stops and the frames stop,
-            // which is the whole point of noticing — but the desktop stays
-            // exactly as the user left it so a reconnect resumes into it. The
-            // Worker's `resume_suspended` is what makes that reconnect instant.
-            self.plane.end(EndMode::KeepDisplay);
-            if grace.is_zero() {
-                println!(
-                    "⏸️  Echo session {id} (\"{name}\") DETACHED after {silent_for}s of silence — \
-                     encoder and transmission stopped, display held indefinitely"
-                );
-            } else {
-                println!(
-                    "⏸️  Echo session {id} (\"{name}\") DETACHED after {silent_for}s of silence — \
-                     encoder and transmission stopped, display held for {}s",
-                    grace.as_secs()
-                );
-            }
+            println!("⏸️  Echo session {id} (\"{name}\") DETACHED ({why}) — Moonlight holds the pipeline, leaving it alone");
+            return;
         }
-        Sweep::Detached
+        // KeepDisplay, not TearDown: the encoder stops and the frames stop,
+        // which is the whole point of noticing — but the desktop stays exactly
+        // as the user left it so a reconnect resumes into it. The Worker's
+        // `resume_suspended` is what makes that reconnect instant.
+        self.plane.end(EndMode::KeepDisplay);
+        if grace.is_zero() {
+            println!(
+                "⏸️  Echo session {id} (\"{name}\") DETACHED ({why}) — encoder and transmission \
+                 stopped, display held indefinitely"
+            );
+        } else {
+            println!(
+                "⏸️  Echo session {id} (\"{name}\") DETACHED ({why}) — encoder and transmission \
+                 stopped, display held for {}s",
+                grace.as_secs()
+            );
+        }
+    }
+
+    /// The owner's control tunnel closed. Detach — do **not** end.
+    ///
+    /// Returns true if a session was detached by this call.
+    ///
+    /// ## This is the case the grace period exists for
+    ///
+    /// A WAN client vanishing is the expected end of a session, not the
+    /// exceptional one: phones lose signal, Android kills backgrounded apps, and
+    /// a laptop lid closes. Until the detach state existed this path called
+    /// [`stop`](Self::stop), which tore the virtual display down and rearranged
+    /// the operator's monitors the instant a phone lost its connection — the
+    /// exact behaviour the grace period replaces.
+    ///
+    /// A client that deliberately finishes still gets a full teardown: it sends
+    /// `stop_session` over the tunnel BEFORE closing it, and that path is
+    /// unchanged. So the distinction on the wire is "said goodbye" versus "went
+    /// quiet", which is exactly the distinction that should decide whether the
+    /// desktop is put back.
+    ///
+    /// Owner-checked, like `stop`: another device's session must not be detached
+    /// by this one's disconnect. Already-detached is a no-op, so the tunnel
+    /// closing in the same sweep tick that detached the session cannot double up.
+    pub fn detach_on_disconnect(&self, device: &EchoIdentity, why: &str) -> bool {
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        if session.device_fingerprint != device.fingerprint {
+            return false;
+        }
+        if session.detached_since.is_some() {
+            return false; // the sweep already did it
+        }
+        self.detach_locked(session, why);
+        true
     }
 
     /// Microphone-datagram counters for the live session, for diagnostics.
@@ -1701,6 +1748,52 @@ mod tests {
         // `end` calls, no repeated log lines.
         assert_eq!(f.mgr.sweep(None, timeout), Sweep::Nothing);
         assert_eq!(*f.plane.ended.lock().unwrap(), 1, "the plane must not be ended twice");
+    }
+
+    /// The control tunnel closing must DETACH, not end.
+    ///
+    /// This is the regression test for a defect that shipped in the first cut of
+    /// the detach work and would have made the entire feature a no-op in
+    /// production: `transport.rs` ends the tunnel-serving task by releasing the
+    /// session, which called `stop` — a full teardown. The sweep detaches at the
+    /// idle timeout and drops the tunnel in the same tick, so that teardown
+    /// landed microseconds later and put the display back anyway. Nothing caught
+    /// it, because the sweep and the transport were only ever tested apart.
+    ///
+    /// The distinction on the wire: a client that MEANT to stop sends
+    /// `stop_session` before closing (still a teardown, asserted below); one
+    /// that simply vanished only closes.
+    #[test]
+    fn a_closed_tunnel_detaches_the_session_rather_than_ending_it() {
+        let f = fixture(Some(peer()));
+        let pixel = device("Pixel", 1);
+        f.mgr.start(&pixel, SessionRequest::default()).unwrap();
+
+        assert!(f.mgr.detach_on_disconnect(&pixel, "control tunnel closed"));
+        assert_eq!(
+            f.plane.end_modes.lock().unwrap().as_slice(),
+            &[EndMode::KeepDisplay],
+            "a vanished client must not cost the operator their display"
+        );
+        assert!(!f.mgr.echo_holds_media());
+
+        // Idempotent: the sweep dropping the tunnel in the same tick that
+        // detached the session must not double up.
+        assert!(!f.mgr.detach_on_disconnect(&pixel, "again"));
+        assert_eq!(*f.plane.ended.lock().unwrap(), 1);
+
+        // Another device's disconnect must never touch this session.
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Pixel", 1), SessionRequest::default()).unwrap();
+        assert!(!f.mgr.detach_on_disconnect(&device("Tablet", 2), "not yours"));
+        assert!(f.mgr.echo_holds_media(), "someone else's disconnect must not detach this session");
+
+        // And a client that deliberately stops still gets the full teardown.
+        let f = fixture(Some(peer()));
+        let pixel = device("Pixel", 1);
+        f.mgr.start(&pixel, SessionRequest::default()).unwrap();
+        f.mgr.stop(&pixel).expect("owner may stop");
+        assert_eq!(f.plane.end_modes.lock().unwrap().as_slice(), &[EndMode::TearDown]);
     }
 
     /// Evidence of life keeps a session alive, and `None` is not evidence of

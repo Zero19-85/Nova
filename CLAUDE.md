@@ -226,11 +226,23 @@ Resume::{Reused, Mismatch(why)}` skips it.
 
 ### Echo detach + idle reaper (`SessionManager::sweep`)
 
-Echo had **no session reaper at all**: `stop` needs a client well enough to ask and
-`force_end` needs an operator at the tray, so a phone that lost signal left the host
-encoding and transmitting to an address nobody was listening at, indefinitely. The tunnel
-sweep in `transport.rs` reclaimed its *slot* but never told the session. It now also calls
-`sessions.sweep(media_idle, TUNNEL_IDLE_TIMEOUT)` every 5 s.
+What Echo had before this: the tunnel sweep in `transport.rs` reclaimed the tunnel *slot*
+at `TUNNEL_IDLE_TIMEOUT` (30 s), which dropped the sink, ended the driver, unblocked the
+TLS read and returned from `serve_tunnel` — whose cleanup called `release_session_of` →
+`stop` → **full teardown**. So a phone that lost signal cost the operator their monitor
+arrangement 30 seconds later. That is the behaviour being replaced, and it is *why* both
+halves had to change together:
+
+- The sweep now calls `sessions.sweep(media_idle, TUNNEL_IDLE_TIMEOUT)` every 5 s, which
+  **detaches** (`KeepDisplay`) and starts the grace clock.
+- `release_session_of` now calls `detach_on_disconnect` rather than `stop`. **This is
+  load-bearing**: the sweep drops the tunnel in the same tick it detaches, so the
+  tunnel-closed path lands microseconds later. Left as a teardown it silently un-did every
+  detach the instant it happened — the feature would have been a no-op in production, and
+  no unit test saw it because the sweep and the transport were only ever tested apart.
+- The distinction on the wire is **"said goodbye" versus "went quiet"**: a client that
+  deliberately stops sends `stop_session` over the tunnel BEFORE closing it, and that path
+  still tears down in full. Only a silent vanish detaches.
 
 **Invariants — each of these is a real hazard, not a style preference:**
 

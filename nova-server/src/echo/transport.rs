@@ -374,11 +374,17 @@ async fn serve_tunnel(
             Err(e) => println!("🔌 Echo WAN: {peer} closed: {e}"),
         }
 
-        // The control channel dying IS the session ending. Without this, a
-        // client that loses its connection mid-stream leaves the pipeline
-        // marked as held — blocking the next client, including a Moonlight
-        // one, until Nova restarts. A WAN client vanishing is the expected
-        // case, not the exceptional one.
+        // The control channel dying means the client is GONE — not that it is
+        // finished. Those are different, and the difference is the whole of the
+        // detach feature: a client that deliberately stops sends `stop_session`
+        // over this tunnel first (a full teardown, unchanged), while one that
+        // simply vanishes gets its display held for the grace period instead.
+        //
+        // This used to call `stop`, i.e. a full teardown, which rearranged the
+        // operator's monitors the instant a phone lost signal. It must not do so
+        // again: the sweep detaches at the idle timeout and then drops the
+        // tunnel, which lands HERE microseconds later — a teardown here would
+        // silently un-do every detach the moment it happened.
         release_session_of(&sessions, &identity, "control tunnel closed");
     };
 
@@ -387,15 +393,15 @@ async fn serve_tunnel(
     busy.store(false, Ordering::Relaxed);
 }
 
-/// End the Echo session held by `identity`, if it holds one.
+/// Detach the Echo session held by `identity`, if it holds a live one.
 fn release_session_of(sessions: &SessionManager, identity: &EchoIdentity, why: &str) {
-    // `stop` is owner-checked, which is exactly right here: if some other
-    // device holds the session, this disconnect must not end it. `Ok(None)` —
-    // this device held nothing — is not worth a line: a control tunnel closing
-    // with no session behind it is the ordinary end of a client that already
-    // said goodbye.
-    if matches!(sessions.stop(identity), Ok(Some(_))) {
-        println!("🛑 Echo: session released — {why}");
+    // Owner-checked inside, which is exactly right here: if some other device
+    // holds the session, this disconnect must not touch it. A false return —
+    // no session, someone else's, or one the sweep already detached — is not
+    // worth a line: a control tunnel closing with nothing live behind it is the
+    // ordinary end of a client that already said goodbye.
+    if sessions.detach_on_disconnect(identity, why) {
+        println!("⏸️  Echo: session detached — {why}");
     }
 }
 
