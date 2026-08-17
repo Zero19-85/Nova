@@ -1150,3 +1150,88 @@ mod pairing_bridge_tests {
         assert!(start_session("nonsense").unwrap_err().contains("not valid JSON"));
     }
 }
+
+/// Ask the host to end whatever session it is holding for this device.
+///
+/// **Blocking**, unlike every other entry point here, and deliberately: it is a
+/// single request-response with no ongoing state, so a handle and a poll loop
+/// would be machinery around nothing. Kotlin calls it from a worker thread and
+/// shows the returned string.
+///
+/// Returns a short human-readable outcome. Errors are thrown as exceptions, so
+/// a returned string always means the host answered.
+///
+/// This exists because a session outlives the app that started it: an app that
+/// was swiped away or lost the network never sent `stop_session`, so the host
+/// detached and is holding the display. See `session::release` for why this is a
+/// separate path rather than "start a session and immediately stop it" — the
+/// short version is that the latter raced itself and needed several presses.
+///
+/// Config JSON is the same shape `nativeConnect` takes; the stream fields are
+/// simply unused.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRelease<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config: JString<'local>,
+) -> jni::sys::jstring {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let config: String = env
+            .get_string(&config)
+            .map_err(|e| format!("read config argument: {e}"))?
+            .into();
+        release_blocking(&config)
+    }));
+
+    match flatten(result) {
+        Ok(message) => match env.new_string(message) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(msg) => {
+            throw(&mut env, &msg);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn release_blocking(config_json: &str) -> Result<String, String> {
+    let cfg: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
+
+    let identity_dir = str_field(&cfg, "identity_dir")?;
+    let host_fingerprint = str_field(&cfg, "host_fingerprint")?;
+    let connect = ConnectOptions {
+        relay_url: str_field(&cfg, "relay_url")?,
+        relay_pin: str_field(&cfg, "relay_pin")?,
+        host_fingerprint: host_fingerprint.clone(),
+        punch_timeout: Duration::from_secs(
+            cfg.get("punch_secs").and_then(|v| v.as_u64()).unwrap_or(8),
+        ),
+    };
+
+    let identity =
+        Identity::load_or_create_rsa2048(std::path::Path::new(&identity_dir), "echo", "echo-android")?;
+
+    // Single-threaded: this does one punch and one round trip, then ends. The
+    // streaming path's two worker threads exist for the receive loop and the
+    // keepalives, neither of which happens here.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("start runtime: {e}"))?;
+
+    // Progress goes nowhere: there is no poll loop on a blocking call, and the
+    // outcome is the return value. Events are still generated so the shared
+    // path stays identical to the streaming one.
+    struct Discard;
+    impl Progress for Discard {
+        fn event(&mut self, _event: Event) {}
+    }
+
+    runtime.block_on(async move {
+        let path = session::open_path(&identity, &connect, &mut Discard).await?;
+        session::release(&identity, &host_fingerprint, path, &mut Discard).await?;
+        Ok::<String, String>("the host released its session".to_string())
+    })
+}

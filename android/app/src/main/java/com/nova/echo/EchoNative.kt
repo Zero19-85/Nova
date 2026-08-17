@@ -168,4 +168,18 @@ object EchoNative {
 
     /** End the session and free the handle. Wakes anything blocked. Idempotent. */
     external fun nativeClose(handle: Long)
+
+    /**
+     * Ask the host to end whatever session it is holding for this device, with
+     * no handle and no session of our own.
+     *
+     * **Blocking** — one punch and one RPC — so call it off the main thread.
+     * Returns the host's answer; throws if the host could not be reached.
+     *
+     * For a session that outlived the app: swiped away or network lost, so
+     * `stop_session` was never sent and the host is holding the display for the
+     * grace period. Deliberately NOT "connect and then stop": that raced the
+     * session it had just started and needed several presses to land.
+     */
+    external fun nativeRelease(configJson: String): String
 }

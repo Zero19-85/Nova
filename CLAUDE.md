@@ -376,15 +376,32 @@ points use. `audio.rs::recover_stuck_sink` is the reference caller.
 Nova never touched would mean silently overriding a device choice the operator may have
 made on purpose.
 
-### Echo client: the dashboard "Stop" button
+### Echo client: ending a session the app no longer has a handle for
 
 Reported as an RPC failure; it was not. `EchoController.stop()` frees the native handle and
 zeroes it, so a second press found `handle == 0`, skipped `nativeClose`, and **sent nothing
-at all** — no stale channel to re-latch, the whole native session object was gone. The
-first press already performs a full teardown host-side (`stop_session` → `EndMode::
-TearDown`), so the button was redundant rather than broken. New `UiState.connected` mirrors
-the handle and the button is hidden without one; anything a previous run orphaned is now
-collected by the reaper above.
+at all** — no stale channel to re-latch, the whole native session object was gone.
+
+That matters more now than it did, because a session **outlives the app**: swiped away or
+network lost means no `stop_session`, so the host detaches and holds the display for the
+grace period with no client left to ask for it back.
+
+**The wrong fix, and what it cost.** First attempt drove a real connection and stopped it
+the instant the grant arrived. It landed roughly one press in three, and the log says why:
+`⚡ reclaiming its detached session N` → `🎬 session N+1 started` → silence. The teardown
+raced the session it had just created, and when it lost, the host learned nothing and the
+fresh session detached again — so each press walked the session id up by one. Live
+2026-08-17: **four presses for two teardowns.**
+
+**The right one:** `stop_session` is an RPC on the control tunnel. It needs an
+authenticated channel and nothing else — no media socket, no keys, no grant. `session::
+release` (echo-client) stops after `hello` and asks; `nativeRelease` (echo-android) is the
+blocking JNI entry point, the only one here without a handle or a poll loop, because one
+request-response has no ongoing state to manage. One press, one round trip, no session
+churn, nothing to race.
+
+**Ending a session never needed a session.** If a future change is tempted to reuse the
+streaming path for a control-plane action, that is the lesson.
 
 ---
 

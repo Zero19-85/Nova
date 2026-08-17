@@ -880,3 +880,91 @@ mod tests {
         assert_eq!(Event::Ended { stats }.to_json()["frames_dropped_before_keyframe"], json!(3));
     }
 }
+
+/// End whatever session the host is holding for this device, **without starting
+/// one**.
+///
+/// ## Why this exists as its own path
+///
+/// A session outlives the app that started it. If the app is swiped away, killed
+/// or loses the network, it never sends `stop_session`, so the host detaches and
+/// holds the virtual display for the grace period — which is the point of
+/// detaching, but leaves the operator's monitors rearranged with no client left
+/// to ask for them back.
+///
+/// The first attempt at fixing that drove [`stream`] and stopped it the instant
+/// the grant arrived. It worked roughly one press in three, and the log says
+/// exactly why: reclaim, start session N+1, then silence — the teardown raced
+/// the session it had just created, and when it lost, the host learned nothing
+/// and the newly started session simply detached again. Pressing the button
+/// repeatedly walked the session id up one at a time (live 2026-08-17, four
+/// presses for two successes).
+///
+/// `stop_session` is an RPC on the control tunnel. It needs an authenticated
+/// channel and nothing else: no media socket, no keys, no grant. So this stops
+/// after `hello` and asks. One press, one round trip, no session churn, nothing
+/// to race.
+pub async fn release(
+    identity: &Identity,
+    host_fingerprint: &str,
+    path: OpenPath,
+    progress: &mut impl Progress,
+) -> Result<(), String> {
+    let pin = parse_fingerprint(host_fingerprint).map_err(|e| format!("host fingerprint: {e}"))?;
+    let OpenPath { socket, peer } = path;
+    let socket = Arc::new(socket);
+
+    // Same rule as `stream`: the socket must have exactly one reader, and the
+    // TLS handshake below needs its datagrams delivered. Media and audio are
+    // demultiplexed into channels nothing drains — correct here, because a
+    // release never asks for a session and the host therefore never sends any.
+    let (media_tx, _media_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (audio_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let demux_task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            let _ = receiver::demultiplex(&socket, peer, media_tx, control_tx, audio_tx, stop_rx)
+                .await;
+        }
+    });
+
+    let outcome = release_inner(identity, pin, &socket, peer, control_rx, progress).await;
+    demux_task.abort();
+    outcome
+}
+
+async fn release_inner(
+    identity: &Identity,
+    pin: [u8; 32],
+    socket: &Arc<tokio::net::UdpSocket>,
+    peer: SocketAddr,
+    control_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    progress: &mut impl Progress,
+) -> Result<(), String> {
+    progress.event(Event::ControlOpening { peer, lan: None });
+    let mut ctl = ControlChannel::connect_wan(socket.clone(), peer, control_rx, identity, pin)
+        .await
+        .map_err(|e| format!("control tunnel: {e}"))?;
+    progress.event(Event::ControlAuthenticated);
+
+    // `hello` first, for the same reason `stream` does it: it is what proves the
+    // host speaks a protocol this client understands, and its answer names the
+    // device the host thinks we are — worth having in the log when a release is
+    // refused as "not the owner".
+    let hello = ctl.call("hello", serde_json::Map::new()).await?;
+    progress.event(Event::Hello {
+        server: control::field_str(&hello, "server").unwrap_or("nova").to_string(),
+        protocol_version: control::field_u64(&hello, "protocol_version").unwrap_or(0),
+        device_name: control::field_str(&hello, "device_name").unwrap_or("?").to_string(),
+    });
+
+    // The host answers this even when it holds nothing — "ended something that
+    // was already ended" is a satisfied request, not an error — so a release
+    // sent at the wrong moment is harmless rather than confusing.
+    ctl.call("stop_session", serde_json::Map::new())
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("stop_session: {e}"))
+}
