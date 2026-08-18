@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- minSdk is 26, so every device Echo runs on resolves the icon here and the
+     legacy density-bucket PNGs are never consulted. That is why there are no
+     mipmap-*dpi folders: nothing would ever load them.
+
+     The monochrome layer is the same vector as the foreground, not a separate
+     silhouette. The system discards its colours and tints the alpha with the
+     user's wallpaper palette, so the cyan is irrelevant here — only the shape
+     is read, and this shape is already a clean two-arc-and-node silhouette.
+     Omitting the layer would opt Echo out of themed icons on API 33+, which
+     shows up as the only un-themed icon on an otherwise themed home screen. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

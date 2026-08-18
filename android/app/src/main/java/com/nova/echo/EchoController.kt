@@ -223,18 +223,32 @@ class EchoController(private val context: android.content.Context) {
         poller = thread(name = "echo-events") { pollLoop(h) }
     }
 
+    /** Whether [handle] is still the session this thread is polling for. */
+    private fun stillOurs(h: Long): Boolean = synchronized(lock) { handle } == h
+
     private fun pollLoop(h: Long) {
         while (true) {
+            // Checked before EVERY native call, not only after a timeout.
+            // `stop()` clears the handle before it frees the pointer, so this is
+            // what keeps the poller out of a session that is being torn down.
+            // The old version only tested on the timeout path, which left the
+            // whole "handled an event, looped round" edge unguarded — and that
+            // is the edge a manual disconnect lands on, because stopping while
+            // events are flowing is the normal case rather than a rare one.
+            if (!stillOurs(h)) return
+
             val json = try {
                 EchoNative.nativePollEvent(h, 500)
             } catch (e: Throwable) {
-                post { it.copy(status = "Failed", error = e.message) }
+                // A throw while the handle is already gone is the session
+                // ending underneath us, not a failure worth showing anyone.
+                // Belt and braces: the Rust side answers `null` for an
+                // unrecognised handle now, so this should no longer fire for a
+                // disconnect — but the guard costs nothing and the alternative
+                // is a teardown race presenting as `Failed`.
+                if (stillOurs(h)) post { it.copy(status = "Failed", error = e.message) }
                 return
-            } ?: run {
-                // Timeout. Stop if the handle was closed underneath us.
-                if (synchronized(lock) { handle } != h) return
-                continue
-            }
+            } ?: continue
 
             val event = runCatching { JSONObject(json) }.getOrNull() ?: continue
             Log.i(TAG, json)
@@ -483,7 +497,14 @@ class EchoController(private val context: android.content.Context) {
         poller?.join(1_500)
         poller = null
         EchoService.stop(context)
-        post { it.copy(streaming = false, connected = false) }
+        // A deliberate stop is a clean landing, so it says so and clears
+        // whatever the session left behind. `error` in particular: without this
+        // an error from earlier in the session — or from a teardown race —
+        // survives the disconnect and greets the user on the setup screen as
+        // though the stop itself had failed. `pin` goes too, since a pairing
+        // that was abandoned mid-flight would otherwise leave a stale code on
+        // screen for a handshake nobody is running any more.
+        post { it.copy(status = "Idle", error = null, pin = null, streaming = false, connected = false) }
     }
 
     private fun describe(event: JSONObject): String = when (event.optString("type")) {

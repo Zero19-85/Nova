@@ -378,6 +378,11 @@ pub async fn start_master_network() -> MasterHandles {
     let _ = mdns.register(svc);
     println!("📡 mDNS broadcaster started for Nova (Master)");
 
+    // The Echo record — a second service type on the same daemon, for Echo
+    // clients rather than Moonlight ones. Registered on a task because it must
+    // wait for the pairing certificate; see `echo::discovery`.
+    echo::discovery::spawn(&mdns, &cfg.echo, &local_ip);
+
     let rtp_sender = Arc::new(Mutex::new(
         rtp::RtpSender::new(47998).expect("Failed to bind RTP socket on 47998"),
     ));
@@ -3657,6 +3662,11 @@ pub async fn run() -> Result<()> {
     .unwrap();
     let _ = mdns.register(svc);
     println!("📡 mDNS broadcaster started for Nova");
+
+    // The Echo record — a second service type on the same daemon, for Echo
+    // clients rather than Moonlight ones. Registered on a task because it must
+    // wait for the pairing certificate; see `echo::discovery`.
+    echo::discovery::spawn(&mdns, &cfg.echo, &local_ip);
 
     // Bind to the GameStream video port (47998) so RTP packets arrive from the
     // port advertised in the RTSP SETUP response — Moonlight validates the source port.

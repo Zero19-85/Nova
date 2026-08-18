@@ -321,6 +321,25 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeConnect<'local>(
 ///
 /// Blocks up to `timeout_ms`, so it belongs on a worker thread. Kotlin should
 /// treat `null` as "nothing happened" and keep polling.
+///
+/// **A handle this no longer recognises also answers `null`, never an
+/// exception.** Closing a session is what makes a handle stop resolving, and
+/// `nativeClose` clears the magic word before it has finished tearing the
+/// runtime down — so for the whole of an ordinary disconnect there is a window
+/// where the polling thread's next call arrives at a handle that is already on
+/// its way out. Throwing there reported a routine teardown to the user as
+/// `Failed: invalid session handle` (2026-08-18).
+///
+/// It is also what every other data-path entry point here already does:
+/// `nativeSendInput` returns `false`, `nativeFillBuffer` returns
+/// `FILL_BAD_HANDLE`, `nativePollAudio` returns `AUDIO_BAD_HANDLE`. A bad
+/// handle is a return value on this bridge, not an exception; this function was
+/// the one exception to that, and the exception was the bug.
+///
+/// Note this does not make a stale handle *safe* to pass — see the comment on
+/// [`EchoHandle::from_raw`]. Kotlin is still responsible for not calling here
+/// after `nativeClose`; this only ensures that losing that race reads as the
+/// end of the session rather than as a failure.
 #[no_mangle]
 pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollEvent<'local>(
     mut env: JNIEnv<'local>,
@@ -329,7 +348,9 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollEvent<'local>(
     timeout_ms: jint,
 ) -> jni::sys::jstring {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let session = unsafe { EchoHandle::from_raw(handle) }.ok_or("invalid session handle")?;
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return Ok::<Option<String>, String>(None);
+        };
         let events = session.events.lock().unwrap_or_else(|e| e.into_inner());
         match events.recv_timeout(Duration::from_millis(timeout_ms.max(0) as u64)) {
             Ok(json) => Ok::<Option<String>, String>(Some(json)),

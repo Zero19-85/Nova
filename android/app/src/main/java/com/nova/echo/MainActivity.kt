@@ -448,6 +448,17 @@ private fun rememberPref(key: String, default: String): MutableState<String> {
     return state
 }
 
+/**
+ * How long "Searching…" may claim to be making progress before the UI admits it
+ * has found nothing.
+ *
+ * Long enough for a first mDNS round trip on a busy network with a retry in it,
+ * short enough that nobody sits watching it. Expiry changes only the message —
+ * the browse keeps running, so a host that boots a minute from now still
+ * appears on its own without anyone pressing anything.
+ */
+private const val SEARCH_SETTLE_MS = 8_000L
+
 @Composable
 private fun ControlPanel(controller: EchoController, state: UiState) {
     var host by rememberPref("host", "10.0.0.205")
@@ -461,6 +472,33 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
     LaunchedEffect(state.hostFingerprint) {
         state.hostFingerprint?.let { if (it.isNotBlank()) hostFp = it }
     }
+
+    // Browse the LAN only while this screen is up. During a session there is
+    // nothing to choose, and a browse that outlives its UI is just multicast
+    // traffic and a wakelock nobody asked for.
+    val context = LocalContext.current
+    val discovery = remember { HostDiscovery(context) }
+    DisposableEffect(discovery) {
+        discovery.start()
+        onDispose { discovery.stop() }
+    }
+    val found by discovery.hosts.collectAsState()
+    val browsing by discovery.browsing.collectAsState()
+
+    // "Searching…" is a promise that something is about to happen, and after a
+    // few seconds on a quiet network it stops being true. This bounds it: the
+    // browse itself keeps running — a host that boots in a minute still appears
+    // — but the UI stops claiming progress it is not making and says what to
+    // check instead. Without this the spinner sat there indefinitely with no
+    // way to tell "still looking" from "nothing here" (2026-08-18).
+    var searchStartedAt by remember { mutableStateOf(System.currentTimeMillis()) }
+    var settled by remember { mutableStateOf(false) }
+    LaunchedEffect(searchStartedAt) {
+        settled = false
+        kotlinx.coroutines.delay(SEARCH_SETTLE_MS)
+        settled = true
+    }
+    val searching = browsing && !settled
 
     Column(
         Modifier
@@ -487,6 +525,75 @@ private fun ControlPanel(controller: EchoController, state: UiState) {
         state.error?.let {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
+
+        // ── Found on this network ───────────────────────────────────────────
+        // Tapping a host fills the address and, when it advertises one, the
+        // relay pair. It deliberately does NOT fill Nova's fingerprint: that
+        // field is the trust decision, and mDNS is unauthenticated. Anything on
+        // this Wi-Fi can advertise `_echo._tcp` and claim any fingerprint, so
+        // the advertised one is used only to recognise a host already paired
+        // with — never to establish that trust. Pairing writes that field.
+        //
+        // The header is part of the state rather than a fixed label. As a
+        // constant it read as a result — "Found on this network" sitting above
+        // "Searching…" looks like a success message, and it was taken for one
+        // (2026-08-18) while the list underneath was in fact empty.
+        Text(
+            when {
+                found.isNotEmpty() -> "Found on this network"
+                searching -> "Looking for Nova on this network"
+                else -> "No hosts found"
+            },
+            style = MaterialTheme.typography.titleSmall,
+        )
+        when {
+            found.isNotEmpty() -> found.forEach { h ->
+                val isPaired = hostFp.isNotBlank() && h.fingerprint.equals(hostFp, ignoreCase = true)
+                OutlinedButton(
+                    onClick = {
+                        host = h.address
+                        if (h.hasRelay) {
+                            relayUrl = h.relayUrl!!
+                            relayPin = h.relayPin!!
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text("${h.name} — ${h.address}")
+                        Text(
+                            listOf(
+                                if (isPaired) "paired" else "not paired yet",
+                                if (h.hasRelay) "relay advertised" else "LAN only",
+                            ).joinToString(" · "),
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
+                    }
+                }
+            }
+            searching -> Text(
+                "Searching…",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            else -> {
+                Text(
+                    "Nothing answered on this network. Check the phone and the PC are on " +
+                        "the same Wi-Fi, and that Nova is running a build that advertises " +
+                        "itself — nova-service.log logs \"Echo mDNS: advertising\" at startup " +
+                        "when it does. You can still enter the address by hand below.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.secondary,
+                )
+                TextButton(onClick = {
+                    discovery.restart()
+                    searchStartedAt = System.currentTimeMillis()
+                }) { Text("Search again") }
+            }
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 6.dp))
 
         // Named arguments throughout: OutlinedTextField has a TextFieldValue
         // overload, and positional args let the compiler pick it, at which point

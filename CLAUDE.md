@@ -81,6 +81,120 @@ buys sync with input latency.
 
 ---
 
+## Zero-config LAN discovery + Echo client polish (2026-08-18) — LIVE-CONFIRMED
+
+The phone finds the PC by itself. Host advertises `_echo._tcp`; the Android app
+browses, and tapping a result fills the address and the relay pair. Live on the
+dev box: discovered as **APEX / 10.0.0.205**, relay auto-filled, paired, streamed.
+
+### `nova-server/src/echo/discovery.rs` — the `_echo._tcp` record
+
+- **A SECOND service type, never extra keys on `_nvstream`.** That record
+  advertises port 47989 and describes a GameStream host to every Moonlight
+  client on the LAN; Echo is a different protocol on a different port. One
+  daemon, two registrations.
+- TXT: `txtvers`, `fp` (host cert fingerprint), `name` (COMPUTERNAME), and
+  `relay`/`relaypin` — **the relay pair is emitted only when BOTH are set.** A
+  URL without its pin is not a usable relay (the pin is what authenticates it),
+  so publishing one alone would fill one field and send the user hunting for the
+  other. Absent keys let the app say "LAN only" honestly.
+- **Registration is spawned, not inline.** The fingerprint comes from
+  `pairing::server_identity()`, which a fresh install has not generated yet;
+  registering immediately would advertise a blank `fp` and the app would
+  helpfully fill its field with the blank. Waits ≤60 s, same as
+  `echo::signaling`'s `await_identity`.
+- **Both registration sites** — Master (`start_master_network`) and monolithic
+  `run()`. Miss the second and a manually-launched host is undiscoverable.
+- `ServiceDaemon` has no `Drop` impl and its loop uses `try_recv`, so the daemon
+  thread outlives every handle. The pre-existing `_nvstream` record relies on
+  this too; it is a fact, not an accident.
+
+**THE SECURITY BOUNDARY — do not erode it.** mDNS is unauthenticated: anything on
+the LAN can advertise `_echo._tcp` and claim any fingerprint. `fp` is a *hint
+that pre-fills a field*, and the app deliberately **does not** fill Nova's
+fingerprint from it — that field is written only by a completed PIN handshake
+(phase-3 signature check). The advertised `fp` is used only to label a host
+"paired"/"not paired yet" by comparing against what pairing already stored. A
+value published here must never let a client skip a check it would otherwise
+perform.
+
+### The loopback relay rewrite — `relay_reachable_from`
+
+`[echo.signaling] url` is written from the PC's point of view, so
+`https://127.0.0.1:8443/...` is correct *there*. Broadcast to a phone it resolves
+to the phone's own loopback: `Connection refused (os error 111)`, live 2026-08-18.
+The advertised copy is now rewritten to the host's LAN IP. **Only the
+advertisement** — Nova's own signalling client still uses the configured URL
+verbatim and keeps its loopback path.
+
+Two measured facts make this sound rather than a guess, and both must stay true:
+the relay listens on **`0.0.0.0`** (so the LAN address really answers), and relay
+TLS is pinned by **certificate fingerprint** via a custom verifier
+(`identity::client_config_pinned`), **never by hostname** — so moving the
+authority cannot break the handshake. Echo carries the same rewrite client-side
+for hosts that predate this.
+
+### `android/.../HostDiscovery.kt` — why Kotlin, not Rust
+
+`NsdManager`, deliberately, against the instinct to mirror the host's `mdns-sd`.
+Receiving multicast on Android needs a `WifiManager.MulticastLock` held across
+the browse, so a Rust listener would need a Kotlin dependency anyway and would
+still owe Doze and network-change handling. Discovery is not on the latency
+path — it runs once, before a session, driven by a human reading a list.
+
+- **Serialized resolve queue below API 34.** The platform resolver handles one
+  request at a time; a second `resolveService` fails `FAILURE_ALREADY_ACTIVE` and
+  on several releases wedges the resolver outright. Two hosts, or one host on
+  Wi-Fi and Ethernet, is the normal case.
+- **API 34+ uses `registerServiceInfoCallback`,** guarded on
+  `SDK_INT >= 34` **AND** T-extension 7 — the platform annotates it as needing
+  the extension, so an API-level test alone is not the documented guard.
+- Callbacks run on a **direct executor**, not `Context.mainExecutor`: that is an
+  API-28 call this class does not need, and it is the one arrangement that lets
+  publishing a `StateFlow` resume a Compose collector inline while a lock is held.
+
+### Adaptive icon — zero PNGs
+
+`mipmap-anydpi-v26/ic_launcher.xml` + two vector drawables + a `<monochrome>`
+layer reusing the foreground. **minSdk is 26, so nothing ever consults density
+buckets** — the absence of `mipmap-*dpi` PNGs is correct, and lint's
+`ObsoleteSdkInt` warning about the `-v26` qualifier is the same fact stated as a
+complaint. Content sits inside a 36-unit radius of centre, so no mask clips it.
+
+### Two client bugs, and the lesson from each
+
+- **"Failed: invalid session handle" on manual disconnect.** `nativeClose` zeroes
+  the magic word *before* it finishes tearing down (seconds), and `pollLoop` only
+  re-checked the handle on the **timeout** path — leaving the "handled an event,
+  looped round" edge unguarded, which is exactly the edge a manual stop lands on.
+  Fix: `nativePollEvent` answers `null` for an unrecognised handle, the loop
+  checks before every call, and `stop()` posts a clean idle state clearing the
+  stale `error`. **A bad handle is a RETURN VALUE on this bridge** —
+  `nativeSendInput`→`false`, `nativeFillBuffer`→`FILL_BAD_HANDLE`,
+  `nativePollAudio`→`AUDIO_BAD_HANDLE`; `nativePollEvent` was the sole outlier and
+  the outlier was the bug. `nativeRelease` was never involved — it takes no handle.
+- **"Stuck Searching…"** was a static `Found on this network` header above an
+  empty list, read as a result. The header is state now, with an 8 s settle and a
+  "Search again" button; the browse keeps running past the settle so a host that
+  boots later still appears.
+
+### Still open (deliberately)
+
+- **LAN-direct is NOT built.** `session::open_path` is unconditionally
+  relay-mediated: STUN gather → relay `lookup` → `offer` → punch. Discovery fills
+  in fields; it does not remove the relay. `--control <ip>:48011` moves only the
+  control tunnel. Removing the relay for same-LAN peers is a separate, larger task.
+- **`network_security_config.xml` lists exact IP literals** (`10.0.0.0`, …), which
+  match no real host and do not cover discovered addresses. Currently inert — the
+  Rust pairing client is a raw socket that never consults the policy — but the
+  declared intent is now misleading.
+- The Kotlin handle model is still a raw `Box` pointer + magic word. The poller
+  can in principle touch it between the staleness check and the call. Closing that
+  for good needs an id-keyed `Arc` registry so an in-flight caller keeps the
+  allocation alive.
+
+---
+
 ## Teardown QoL (2026-08-17) — physical-mode baseline + End Stream across both client kinds
 
 Two operator-reported teardown bugs, both live-measured and fixed. Read this before
