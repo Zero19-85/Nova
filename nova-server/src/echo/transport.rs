@@ -416,7 +416,11 @@ async fn serve_tunnel(
         };
         println!("🔓 Echo WAN: {peer} authenticated as \"{}\"", identity.device_name);
 
-        match rpc::serve_connection(tls, handler, &identity).await {
+        // `Origin::Tunnel`: a WAN client already has a punched path, so the LAN
+        // rendezvous is not merely unnecessary here, it is unanswerable — the
+        // peer address on this connection is the punched one, and validating an
+        // offer against it would be circular.
+        match rpc::serve_connection(tls, handler, &identity, rpc::Origin::Tunnel).await {
             Ok(()) => println!("🔌 Echo WAN: {peer} disconnected"),
             Err(e) => println!("🔌 Echo WAN: {peer} closed: {e}"),
         }
@@ -525,6 +529,10 @@ mod tests {
             Arc::new(OneVirtualSeat),
             client_info.clone(),
             Some(sessions.clone()),
+            // This test drives the tunnel, which can never reach the LAN
+            // rendezvous — nothing here punches.
+            rpc::inert_prober(),
+            crate::ECHO_MEDIA_PORT,
         );
 
         let (host_stream, host_plumbing) = RudpStream::new();
@@ -552,7 +560,8 @@ mod tests {
             device_name: "Xbox".into(),
         };
         tokio::spawn(async move {
-            let _ = rpc::serve_connection(host_stream, handler, &identity).await;
+            let _ = rpc::serve_connection(host_stream, handler, &identity, rpc::Origin::Tunnel)
+                .await;
         });
 
         let (read, mut write) = tokio::io::split(peer_stream);

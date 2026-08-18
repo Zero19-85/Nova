@@ -243,6 +243,10 @@ const E_WORKER_UNAVAILABLE: &str = "worker_unavailable";
 /// WAN layer is off because no relay is configured). Distinct from
 /// `unknown_command`: the command is real, the capability is not present.
 const E_NO_SESSION_LAYER: &str = "session_layer_unavailable";
+/// A command that only the LAN control port may serve, reached over the WAN
+/// tunnel. Distinct from `unknown_command` for the same reason as above: the
+/// command exists, this door is the wrong one for it.
+const E_LAN_ONLY: &str = "lan_only";
 
 // ── Display orchestration model ─────────────────────────────────────────────
 
@@ -644,6 +648,105 @@ fn session_is_live(client_info: &Arc<Mutex<Option<ClientInfo>>>) -> bool {
 
 // ── Command handling ────────────────────────────────────────────────────────
 
+/// Where a command arrived from.
+///
+/// One [`Handler`] serves both doors deliberately: a command must not behave
+/// differently depending on the transport, and neither must the anti-hijack
+/// gate in front of it. `Origin` is the single explicit exception, and it exists
+/// for exactly one reason — [`Handler::handle_lan_rendezvous`] validates a
+/// client's offered candidates against the source address of the connection
+/// carrying them, and only the transport knows that address.
+///
+/// An argument rather than a task-local: a handler that silently changes
+/// behaviour according to ambient state is the bug this enum prevents, not a
+/// style it should adopt. Because each transport names itself at its own call
+/// sites, the WAN tunnel's inability to reach the LAN path is a consequence of
+/// the type rather than a runtime check somebody can forget to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Accepted on the LAN TCP listener. Both addresses come from the kernel's
+    /// view of an established connection, so neither is client-supplied.
+    ///
+    /// `local` is the host's address *on the interface facing this client*,
+    /// which is exactly the candidate to hand back: correct on a multi-homed
+    /// host, and obtained without asking the routing table anything.
+    Lan { peer: SocketAddr, local: SocketAddr },
+    /// The punched WAN tunnel (`echo::transport`).
+    Tunnel,
+}
+
+/// The half of the WAN gatherer this module needs: "start blasting at these".
+///
+/// A narrow trait rather than a concrete `GatherHandle`, for the same reason
+/// [`DisplayOrchestrator`] is one — the command surface is unit-tested without
+/// a media socket, a STUN inbox, or a running Master.
+pub(crate) trait PathProber: Send + Sync {
+    /// Blast at these candidates and latch whatever answers.
+    ///
+    /// The LAN timeout is chosen by the implementation rather than passed in,
+    /// because it is a property of the path this trait is used for: a client
+    /// that reached the LAN port has a fallback waiting and needs a fast
+    /// failure. See `wan::LAN_PUNCH_TIMEOUT`.
+    fn punch_toward(&self, candidates: Vec<SocketAddr>);
+}
+
+impl PathProber for crate::echo::wan::GatherHandle {
+    fn punch_toward(&self, candidates: Vec<SocketAddr>) {
+        crate::echo::wan::GatherHandle::punch_toward(
+            self,
+            candidates,
+            crate::echo::wan::lan_punch_config(),
+        )
+    }
+}
+
+/// How many candidates one rendezvous may offer.
+///
+/// A client has one media socket, so one address is the normal case; a few more
+/// covers a client with several interfaces on the same LAN. The cap is here
+/// because every accepted candidate becomes a probe target re-sent every
+/// `PROBE_INTERVAL` for the punch's duration — an unbounded list is an
+/// unbounded send loop.
+const MAX_LAN_CANDIDATES: usize = 4;
+
+/// Decide whether one offered candidate may be punched toward.
+///
+/// **This function is the security boundary of the LAN path.** `punch_toward`
+/// aims the host's media socket, and the address a punch latches is where a
+/// granted session's video gets pinned. An offer that could name a third party
+/// would turn an authenticated client into a redirector — mutual TLS proves
+/// *who is asking*, never *who should receive*.
+///
+/// So the only thing a client may offer is a port on the machine already at the
+/// other end of this connection:
+///
+/// - **Same IP as the connection source.** A client's media socket lives on the
+///   same host as its TCP socket, so this costs a legitimate client nothing,
+///   and it makes redirection unrepresentable rather than merely unlikely. It
+///   is also what bounds amplification: probes go back to whoever asked.
+/// - **Private address space**, re-checked here rather than inherited from the
+///   accept loop's [`is_lan_peer`]. Two fences that can drift apart are worth
+///   less than two that are each complete, and this one is three lines.
+/// - **Non-zero port.** `:0` means "the kernel will choose" — a client offering
+///   it read its socket's address before binding, and the probe cycle would be
+///   dead on arrival.
+fn accept_lan_candidate(offered: SocketAddr, source: SocketAddr) -> Result<SocketAddr, String> {
+    if offered.ip() != source.ip() {
+        return Err(format!(
+            "candidate {offered} is not on {} — a client may only offer a port on its own \
+             address",
+            source.ip()
+        ));
+    }
+    if !is_lan_peer(&offered) {
+        return Err(format!("candidate {offered} is not a private address"));
+    }
+    if offered.port() == 0 {
+        return Err(format!("candidate {offered} names no port"));
+    }
+    Ok(offered)
+}
+
 /// The command surface, independent of how a client reached it.
 ///
 /// One instance serves both transports — the LAN TCP listener below and the
@@ -659,13 +762,19 @@ pub(crate) struct Handler {
     /// The streaming commands then answer [`E_NO_SESSION_LAYER`] rather than
     /// pretending the command does not exist.
     sessions: Option<Arc<SessionManager>>,
+    /// Aims the media socket for a LAN rendezvous. See [`PathProber`].
+    prober: Arc<dyn PathProber>,
+    /// The port the media socket is bound to, reported to a LAN client so it
+    /// knows where to punch. Supplied by the caller rather than spelled here:
+    /// `lib.rs` owns that number.
+    media_port: u16,
 }
 
 impl Handler {
     /// `identity` is established by the TLS handshake before this is ever
     /// called — an unauthorized peer never reaches a command at all, so there
     /// is no in-band auth state to track here.
-    fn dispatch(&self, req: RpcRequest, identity: &EchoIdentity) -> RpcResponse {
+    fn dispatch(&self, req: RpcRequest, identity: &EchoIdentity, origin: Origin) -> RpcResponse {
         let id = req.id;
         if req.command == "hello" {
             return self.handle_hello(id, identity);
@@ -743,12 +852,120 @@ impl Handler {
                 }
             }
             "set_display" => self.handle_set_display(id, &req.params),
+            "lan_rendezvous" => {
+                self.handle_lan_rendezvous(id, &req.params, identity, origin)
+            }
             other => RpcResponse::err(
                 id,
                 E_UNKNOWN_COMMAND,
                 format!("unknown command \"{other}\""),
             ),
         }
+    }
+
+    /// `lan_rendezvous` — the LAN's replacement for the relay's `lookup` +
+    /// `offer`.
+    ///
+    /// The client hands over the address its media socket will punch from; the
+    /// host starts blasting toward it and answers with its own. Both sides then
+    /// run the ordinary punch, and everything downstream — the RUDP control
+    /// tunnel, `start_session`, sealed media, the detach sweep — is the WAN
+    /// path's code, unchanged.
+    ///
+    /// **A rendezvous, not a transport.** The TCP connection carrying this
+    /// command exchanges candidates and is then finished: it carries no control
+    /// traffic, and no session's liveness depends on it. That is deliberate and
+    /// load-bearing. The detach/sweep model is bound to the punched tunnel —
+    /// `transport.rs`'s `release_session_of` fires when that tunnel closes, and
+    /// this port has no equivalent — so a second long-lived control transport
+    /// would need every one of those invariants re-derived for it. Nothing here
+    /// should grow in that direction.
+    fn handle_lan_rendezvous(
+        &self,
+        id: Option<u64>,
+        params: &Map<String, Value>,
+        identity: &EchoIdentity,
+        origin: Origin,
+    ) -> RpcResponse {
+        // The WAN tunnel cannot serve this: its peer address IS a punched UDP
+        // address, so validating an offer against it would be circular — the
+        // punch is the thing being set up.
+        let Origin::Lan { peer, local } = origin else {
+            return RpcResponse::err(
+                id,
+                E_LAN_ONLY,
+                "lan_rendezvous is available only on the LAN control port; a WAN client \
+                 reached this host over a path it has already punched",
+            );
+        };
+
+        let Some(offered) = params.get("candidates").and_then(Value::as_array) else {
+            return RpcResponse::err(
+                id,
+                E_BAD_REQUEST,
+                "lan_rendezvous needs a \"candidates\" array",
+            );
+        };
+        if offered.len() > MAX_LAN_CANDIDATES {
+            return RpcResponse::err(
+                id,
+                E_BAD_REQUEST,
+                format!(
+                    "{} candidates offered; at most {MAX_LAN_CANDIDATES} are accepted",
+                    offered.len()
+                ),
+            );
+        }
+
+        let mut accepted: Vec<SocketAddr> = Vec::with_capacity(offered.len());
+        let mut refused: Vec<String> = Vec::new();
+        for value in offered {
+            let Some(text) = value.as_str() else {
+                refused.push("a candidate was not a string".to_string());
+                continue;
+            };
+            match text.parse::<SocketAddr>() {
+                // Deduplicated here as well as in `punch_toward`, so that the
+                // log line below reports what is actually blasted.
+                Ok(addr) => match accept_lan_candidate(addr, peer) {
+                    Ok(ok) if accepted.contains(&ok) => {}
+                    Ok(ok) => accepted.push(ok),
+                    Err(why) => refused.push(why),
+                },
+                Err(_) => refused.push(format!("\"{text}\" is not an address:port")),
+            }
+        }
+
+        // Refusals are logged even when something was accepted. A client whose
+        // candidate this host will not punch at is a client whose next session
+        // may quietly take the WAN path instead — and "why is this slow when
+        // both machines are in the same room" is a question that has already
+        // cost this project several rounds of diagnosis.
+        for why in &refused {
+            println!("⛔ Echo LAN rendezvous with \"{}\": {why}", identity.device_name);
+        }
+        if accepted.is_empty() {
+            return RpcResponse::err(
+                id,
+                E_BAD_REQUEST,
+                format!("no usable candidate — {}", refused.join("; ")),
+            );
+        }
+
+        println!(
+            "🤝 Echo LAN rendezvous: \"{}\" at {} — punching toward {}",
+            identity.device_name,
+            peer.ip(),
+            accepted.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        );
+        self.prober.punch_toward(accepted);
+
+        RpcResponse::ok(
+            id,
+            json!({
+                "candidates": [SocketAddr::new(local.ip(), self.media_port).to_string()],
+            }),
+        )
     }
 
     /// `hello` is a version/identity handshake, NOT an authentication step —
@@ -1089,8 +1306,10 @@ pub(crate) fn build_handler(
     orchestrator: Arc<dyn DisplayOrchestrator>,
     client_info: Arc<Mutex<Option<ClientInfo>>>,
     sessions: Option<Arc<SessionManager>>,
+    prober: Arc<dyn PathProber>,
+    media_port: u16,
 ) -> Arc<Handler> {
-    Arc::new(Handler { orchestrator, client_info, sessions })
+    Arc::new(Handler { orchestrator, client_info, sessions, prober, media_port })
 }
 
 /// Peers allowed to reach the TCP listener.
@@ -1117,6 +1336,18 @@ fn is_lan_peer(addr: &SocketAddr) -> bool {
                 || (ip.segments()[0] & 0xfe00) == 0xfc00
         }
     }
+}
+
+/// A prober that discards every request, for tests that build a [`Handler`] to
+/// exercise something else. Shared rather than redefined per test module so
+/// "this test does not care about punching" reads the same everywhere.
+#[cfg(test)]
+pub(crate) fn inert_prober() -> Arc<dyn PathProber> {
+    struct Inert;
+    impl PathProber for Inert {
+        fn punch_toward(&self, _candidates: Vec<SocketAddr>) {}
+    }
+    Arc::new(Inert)
 }
 
 #[cfg(test)]
@@ -1168,6 +1399,12 @@ pub fn spawn(cfg: &EchoConfig, handler: Arc<Handler>) {
                     continue;
                 }
             };
+            // Captured before the TLS handshake consumes the stream. `local` is
+            // the host's address on the interface this client actually reached,
+            // which is what the rendezvous hands back — a routing-table guess
+            // would be wrong on a multi-homed host, which is the normal shape
+            // for a machine with a virtual display adapter and a NIC.
+            let local_addr = stream.local_addr().unwrap_or(addr);
             if !is_lan_peer(&peer) {
                 // Dropped before the TLS handshake, so a remote scanner cannot
                 // even make this process do certificate work.
@@ -1206,7 +1443,8 @@ pub fn spawn(cfg: &EchoConfig, handler: Arc<Handler>) {
                                     identity.device_name,
                                     identity.short_fingerprint()
                                 );
-                                match serve_connection(tls, handler, &identity).await {
+                                let origin = Origin::Lan { peer, local: local_addr };
+                                match serve_connection(tls, handler, &identity, origin).await {
                                     Ok(()) => println!("🔌 Echo RPC {peer} disconnected"),
                                     Err(e) => println!("🔌 Echo RPC {peer} closed: {e}"),
                                 }
@@ -1305,6 +1543,7 @@ pub(crate) async fn serve_connection<S>(
     stream: S,
     handler: Arc<Handler>,
     identity: &EchoIdentity,
+    origin: Origin,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1338,7 +1577,7 @@ where
         let (expects_reply, response) = match serde_json::from_str::<RpcRequest>(trimmed) {
             Ok(req) => {
                 let expects_reply = req.id.is_some();
-                (expects_reply, handler.dispatch(req, identity))
+                (expects_reply, handler.dispatch(req, identity, origin))
             }
             Err(e) => (true, RpcResponse::err(None, E_BAD_REQUEST, format!("malformed request: {e}"))),
         };
@@ -1422,12 +1661,52 @@ mod tests {
         }
     }
 
+    /// Records what it was told to blast at, and nothing else.
+    ///
+    /// The assertion that matters for the LAN path is not "did the RPC answer"
+    /// but "what did the host end up aiming its media socket at" — so the
+    /// double is the thing under test, not scaffolding around it.
+    #[derive(Default)]
+    struct MockProber {
+        punched: Mutex<Vec<Vec<SocketAddr>>>,
+    }
+
+    impl PathProber for MockProber {
+        fn punch_toward(&self, candidates: Vec<SocketAddr>) {
+            self.punched.lock().unwrap().push(candidates);
+        }
+    }
+
+    const TEST_MEDIA_PORT: u16 = 47998;
+
     fn handler_with(orch: Arc<MockOrchestrator>, info: Option<ClientInfo>) -> Handler {
+        handler_probing(orch, info, Arc::new(MockProber::default()))
+    }
+
+    fn handler_probing(
+        orch: Arc<MockOrchestrator>,
+        info: Option<ClientInfo>,
+        prober: Arc<MockProber>,
+    ) -> Handler {
         Handler {
             orchestrator: Arc::new(orch),
             client_info: Arc::new(Mutex::new(info)),
             sessions: None,
+            prober,
+            media_port: TEST_MEDIA_PORT,
         }
+    }
+
+    /// A LAN connection from `client_ip:client_port`, answered on `host_ip`.
+    fn lan(client: &str, host: &str) -> Origin {
+        Origin::Lan {
+            peer: client.parse().expect("peer address"),
+            local: host.parse().expect("local address"),
+        }
+    }
+
+    fn rendezvous(candidates: &str) -> RpcRequest {
+        request(&format!(r#"{{"command":"lan_rendezvous","candidates":{candidates}}}"#))
     }
 
     fn test_identity() -> EchoIdentity {
@@ -1540,7 +1819,7 @@ mod tests {
     fn hello_reports_the_authenticated_identity() {
         let orch = MockOrchestrator::with_primary();
         let h = handler_with(orch, None);
-        let resp = h.dispatch(request(r#"{"id":2,"command":"hello"}"#), &test_identity());
+        let resp = h.dispatch(request(r#"{"id":2,"command":"hello"}"#), &test_identity(), Origin::Tunnel);
         assert!(resp.ok);
         assert_eq!(resp.id, Some(2));
         let result = resp.result.expect("hello result");
@@ -1557,8 +1836,7 @@ mod tests {
 
         let resp = h.dispatch(
             request(r#"{"id":7,"command":"set_display","res":"1440p","hdr":true,"fps":120}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(resp.ok, "expected success, got {:?}", resp.error);
         assert_eq!(resp.id, Some(7));
 
@@ -1584,8 +1862,7 @@ mod tests {
 
         let resp = h.dispatch(
             request(r#"{"command":"set_display","device_id":"seat_2","res":"1080p"}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, E_UNKNOWN_DISPLAY);
         assert!(orch.applied.lock().unwrap().is_empty());
@@ -1604,15 +1881,13 @@ mod tests {
 
         let resp = h.dispatch(
             request(r#"{"command":"set_display","display_id":"\\\\.\\DISPLAY9","res":"4K"}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(resp.ok, "virtual seat should accept a mode change: {:?}", resp.error);
         assert_eq!(orch.applied.lock().unwrap()[0].display_id, r"\\.\DISPLAY9");
 
         let resp = h.dispatch(
             request(r#"{"command":"set_display","display_id":"\\\\.\\DISPLAY1","res":"4K"}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(!resp.ok, "physical monitor must not be re-moded by a remote client");
         assert_eq!(resp.error.unwrap().code, E_WORKER_UNAVAILABLE);
         assert_eq!(orch.applied.lock().unwrap().len(), 1, "no second apply");
@@ -1651,16 +1926,14 @@ mod tests {
 
         let resp = h.dispatch(
             request(r#"{"command":"set_display","res":"4K"}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, E_SESSION_LOCKED);
         assert!(orch.applied.lock().unwrap().is_empty());
 
         let resp = h.dispatch(
             request(r#"{"command":"set_display","res":"4K","force":true}"#),
-            &test_identity(),
-        );
+            &test_identity(), Origin::Tunnel);
         assert!(resp.ok, "force should override the guard");
         assert_eq!(orch.applied.lock().unwrap().len(), 1);
     }
@@ -1703,13 +1976,13 @@ mod tests {
         let h = handler_with(MockOrchestrator::with_primary(), None);
 
         for command in [r#"{"command":"start_session"}"#, r#"{"command":"stop_session"}"#] {
-            let resp = h.dispatch(request(command), &test_identity());
+            let resp = h.dispatch(request(command), &test_identity(), Origin::Tunnel);
             assert!(!resp.ok);
             assert_eq!(resp.error.unwrap().code, E_NO_SESSION_LAYER);
         }
 
         // …and `hello` says so up front, so a client never offers the button.
-        let resp = h.dispatch(request(r#"{"command":"hello"}"#), &test_identity());
+        let resp = h.dispatch(request(r#"{"command":"hello"}"#), &test_identity(), Origin::Tunnel);
         assert_eq!(resp.result.unwrap()["capabilities"]["sessions"], false);
     }
 
@@ -1717,8 +1990,169 @@ mod tests {
     fn unknown_commands_and_malformed_ids_do_not_panic() {
         let orch = MockOrchestrator::with_primary();
         let h = handler_with(orch, None);
-        let resp = h.dispatch(request(r#"{"id":3,"command":"reboot_host"}"#), &test_identity());
+        let resp = h.dispatch(request(r#"{"id":3,"command":"reboot_host"}"#), &test_identity(), Origin::Tunnel);
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, E_UNKNOWN_COMMAND);
+    }
+    // ── LAN rendezvous ──────────────────────────────────────────────────────
+    //
+    // `accept_lan_candidate` is the security boundary of the LAN path: it
+    // decides where the host aims its media socket, and a granted session pins
+    // video at whatever the resulting punch latches. These tests are about that
+    // decision, not about the JSON around it.
+
+    #[test]
+    fn a_candidate_on_another_address_is_refused() {
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        // The classic redirect: an authenticated client asking the host to blast
+        // at somebody else. mTLS proves who is asking, never who should receive.
+        let resp = h.dispatch(
+            rendezvous(r#"["192.168.1.50:47998"]"#),
+            &test_identity(),
+            lan("192.168.1.20:51000", "192.168.1.10:48011"),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, E_BAD_REQUEST);
+        assert!(
+            prober.punched.lock().unwrap().is_empty(),
+            "a refused candidate must never reach the media socket"
+        );
+    }
+
+    #[test]
+    fn a_public_candidate_is_refused_even_when_it_matches_the_source() {
+        // Defence in depth: the accept loop's `is_lan_peer` should already have
+        // dropped this connection, so this asserts the second fence holds on its
+        // own rather than trusting the first one to have run.
+        assert!(accept_lan_candidate(
+            "203.0.113.5:47998".parse().unwrap(),
+            "203.0.113.5:51000".parse().unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn port_zero_is_refused() {
+        assert!(accept_lan_candidate(
+            "192.168.1.20:0".parse().unwrap(),
+            "192.168.1.20:51000".parse().unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_port_on_the_source_address_is_accepted() {
+        // The legitimate case: same machine, different socket. The media socket
+        // and the TCP socket share a host, so the IP matches and only the port
+        // differs.
+        let ok = accept_lan_candidate(
+            "192.168.1.20:47998".parse().unwrap(),
+            "192.168.1.20:51000".parse().unwrap(),
+        );
+        assert_eq!(ok.unwrap(), "192.168.1.20:47998".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn the_wan_tunnel_cannot_use_lan_rendezvous() {
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        let resp = h.dispatch(
+            rendezvous(r#"["192.168.1.20:47998"]"#),
+            &test_identity(),
+            Origin::Tunnel,
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, E_LAN_ONLY);
+        assert!(prober.punched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_host_offers_back_the_address_the_client_reached_it_on() {
+        // Not a routing-table guess: on a host with a NIC and a virtual display
+        // adapter, "the default route's address" and "the address this client
+        // connected to" are routinely different, and only the second one is
+        // reachable from the client.
+        let h = handler_with(MockOrchestrator::with_primary(), None);
+        let resp = h.dispatch(
+            rendezvous(r#"["10.0.0.7:47998"]"#),
+            &test_identity(),
+            lan("10.0.0.7:51000", "10.0.0.205:48011"),
+        );
+        assert!(resp.ok, "{:?}", resp.error);
+        let result = resp.result.unwrap();
+        let offered = result["candidates"].as_array().unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0], format!("10.0.0.205:{TEST_MEDIA_PORT}"));
+    }
+
+    #[test]
+    fn duplicate_candidates_are_punched_once() {
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        let resp = h.dispatch(
+            rendezvous(r#"["10.0.0.7:47998","10.0.0.7:47998","10.0.0.7:50000"]"#),
+            &test_identity(),
+            lan("10.0.0.7:51000", "10.0.0.205:48011"),
+        );
+        assert!(resp.ok, "{:?}", resp.error);
+        let punched = prober.punched.lock().unwrap();
+        assert_eq!(punched.len(), 1, "exactly one blast");
+        assert_eq!(punched[0].len(), 2, "the duplicate is collapsed");
+    }
+
+    #[test]
+    fn an_over_long_candidate_list_is_refused_whole() {
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        let many = (1..=MAX_LAN_CANDIDATES + 1)
+            .map(|i| format!(r#""10.0.0.7:{}""#, 47000 + i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let resp = h.dispatch(
+            rendezvous(&format!("[{many}]")),
+            &test_identity(),
+            lan("10.0.0.7:51000", "10.0.0.205:48011"),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, E_BAD_REQUEST);
+        assert!(prober.punched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_good_candidate_survives_alongside_bad_ones() {
+        // A mixed offer is not a hostile one: a client with a stale interface
+        // list is the ordinary cause. Punch what is usable rather than refusing
+        // the whole rendezvous and sending the client to the relay.
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        let resp = h.dispatch(
+            rendezvous(r#"["10.0.0.7:47998","10.0.0.99:47998","not-an-address"]"#),
+            &test_identity(),
+            lan("10.0.0.7:51000", "10.0.0.205:48011"),
+        );
+        assert!(resp.ok, "{:?}", resp.error);
+        let punched = prober.punched.lock().unwrap();
+        assert_eq!(punched[0], vec!["10.0.0.7:47998".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn a_rendezvous_without_candidates_is_a_bad_request_not_a_silent_punch() {
+        let prober = Arc::new(MockProber::default());
+        let h = handler_probing(MockOrchestrator::with_primary(), None, prober.clone());
+
+        let resp = h.dispatch(
+            request(r#"{"command":"lan_rendezvous"}"#),
+            &test_identity(),
+            lan("10.0.0.7:51000", "10.0.0.205:48011"),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, E_BAD_REQUEST);
+        assert!(prober.punched.lock().unwrap().is_empty());
     }
 }

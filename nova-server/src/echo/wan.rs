@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nova_core::punch::PunchConfig;
 use nova_core::stun::{
     parse_binding_response, MappingBehavior, StunError,
     RETRY_DELAYS,
@@ -45,6 +46,27 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 /// How long to wait for the first candidate before giving up on a probe cycle.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// How long the host blasts at a peer that arrived over the LAN rendezvous.
+///
+/// Far shorter than [`PunchConfig::default`]'s eight seconds, and the gap is
+/// load-bearing rather than an optimisation. The gatherer serves one punch at a
+/// time: its `punch_rx` arm awaits `punch_io` to completion, so a second offer
+/// waits for the first to finish. A LAN attempt that fails is followed within
+/// ~1 s by the client's relay fallback — and with the WAN timeout that
+/// fallback's offer would queue behind a blast at a peer which has already given
+/// up and moved on, making the staged design SLOWER than no LAN attempt at all.
+///
+/// 1.5 s is generous for the case it serves: on a LAN there is no NAT to open,
+/// so the exchange is one round trip at [`nova_core::punch::PROBE_INTERVAL`]
+/// (25 ms) and converges in one or two rounds. Anything still unconfirmed at
+/// 1.5 s is not slow, it is blocked.
+pub const LAN_PUNCH_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// The blast configuration for a LAN rendezvous.
+pub fn lan_punch_config() -> PunchConfig {
+    PunchConfig { timeout: LAN_PUNCH_TIMEOUT, ..Default::default() }
+}
+
 /// Punch transport over Nova's media socket.
 ///
 /// The host cannot use [`nova_core::punch::UdpPunchIo`]: `rtp.rs` owns the
@@ -71,14 +93,21 @@ impl nova_core::punch::PunchIo for RtpPunchIo<'_> {
     }
 }
 
-/// Controls for the gathering loop, held by the signaling client.
+/// Controls for the gathering loop.
+///
+/// `Clone` because there are now two holders with different jobs: the signaling
+/// client, which republishes on address changes, and the LAN rendezvous RPC,
+/// which only ever calls `punch_toward`. Every field is a handle to shared
+/// state — notably `latched`, which is an `Arc` precisely so that all holders
+/// observe one latch rather than each keeping a private idea of the path.
+#[derive(Clone)]
 pub struct GatherHandle {
     /// Peer candidates to blast at, delivered from the signaling client when
     /// the relay hands over an offer. Routed through the gatherer rather than
     /// punched from the signaling task because the gatherer is the sole owner
     /// of the STUN inbox — two consumers of that channel would race for each
     /// other's responses.
-    punch_tx: tokio::sync::mpsc::UnboundedSender<Vec<SocketAddr>>,
+    punch_tx: tokio::sync::mpsc::UnboundedSender<(Vec<SocketAddr>, PunchConfig)>,
     /// The peer address a punch confirmed, if any.
     latched: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     /// Poke to force an immediate probe — the signaling client fires this the
@@ -105,11 +134,19 @@ impl GatherHandle {
 
     /// Start blasting at a peer's candidates.
     ///
-    /// Called when the relay delivers an offer. Passive answering alone is not
-    /// enough against a restrictive NAT: if only one side ever *initiates*,
-    /// the other side's NAT may still have no outbound mapping toward us when
-    /// our packets arrive, and drops them. Both sides must initiate.
-    pub fn punch_toward(&self, candidates: Vec<SocketAddr>) {
+    /// Called when the relay delivers an offer, and by the LAN rendezvous RPC.
+    /// Passive answering alone is not enough against a restrictive NAT: if only
+    /// one side ever *initiates*, the other side's NAT may still have no
+    /// outbound mapping toward us when our packets arrive, and drops them. Both
+    /// sides must initiate.
+    ///
+    /// `cfg` travels with the candidates rather than being a property of this
+    /// handle because the two callers want opposite patience: a WAN offer has a
+    /// NAT to open and deserves [`PunchConfig::default`], while a LAN offer has
+    /// a client waiting to fall back and must fail fast — see
+    /// [`LAN_PUNCH_TIMEOUT`]. One blast at a time means the slow one would
+    /// otherwise delay the fast one's replacement.
+    pub fn punch_toward(&self, candidates: Vec<SocketAddr>, cfg: PunchConfig) {
         // Deduplicate here rather than relying on `punch_io`'s own guard, so
         // the log line reports what is actually blasted. A peer behind an
         // endpoint-independent NAT offers the same address once per STUN
@@ -125,7 +162,7 @@ impl GatherHandle {
         if unique.is_empty() {
             return;
         }
-        let _ = self.punch_tx.send(unique);
+        let _ = self.punch_tx.send((unique, cfg));
     }
 
     /// The peer address a punch confirmed, if one has.
@@ -144,7 +181,24 @@ impl GatherHandle {
     }
 }
 
-/// Start the STUN gathering + NAT-keepalive loop on Nova's **media socket**.
+/// The STUN half of the gatherer: what it probes and where it publishes.
+///
+/// Bundled into one optional argument rather than passed as two nullable ones
+/// so that "this install does no STUN" is a single, unmistakable value at the
+/// call site. The distinction is not cosmetic — a LAN-only install must never
+/// emit traffic to third-party STUN servers every 25 s, and that promise is
+/// easier to keep when breaking it requires constructing something.
+pub struct StunGathering {
+    /// Where the discovered reflexive candidates are published for the
+    /// signaling client to read.
+    pub candidates: Arc<std::sync::Mutex<Vec<WanCandidate>>>,
+    /// STUN server hostnames (`host:port`), resolved lazily and re-resolved
+    /// after a failure so a DNS change or a dead server cannot wedge the loop.
+    pub servers: Vec<String>,
+}
+
+/// Start the punch/latch loop on Nova's **media socket**, optionally with STUN
+/// gathering and NAT keepalive on top.
 ///
 /// Wiring, and why each piece is where it is:
 ///
@@ -156,16 +210,18 @@ impl GatherHandle {
 ///   whether or not a client or Worker exists — so the keepalive keeps working
 ///   while Nova sits idle, which is precisely when the pinhole would otherwise
 ///   lapse.
-/// - The caller decides whether this runs at all. It is started only when a
-///   signaling relay is configured: with no relay there is no WAN path, and a
-///   LAN-only install must not emit traffic to third-party STUN servers every
-///   25 seconds.
-/// `servers` are hostnames (`host:port`), resolved lazily and re-resolved
-/// after a failure so a DNS change or a dead server cannot wedge the loop.
+/// - **`gathering` gates the STUN half only.** This loop ALWAYS runs, because
+///   two of its three jobs have nothing to do with the WAN: answering a peer's
+///   binding requests, and blasting-then-latching on demand. Those are what a
+///   LAN rendezvous needs, and gating them behind a configured relay is what
+///   used to make a relay-less install unable to grant an Echo session at all
+///   — `start_session` refuses with `NoPathLatched` when nothing owns the
+///   latch cell. `None` therefore means "punch and answer, but never speak to a
+///   STUN server": no probes, no keepalives, no publication, no third-party
+///   traffic on an install that configured no relay.
 pub fn spawn_gatherer(
     rtp_sender: Arc<std::sync::Mutex<crate::rtp::RtpSender>>,
-    candidates: Arc<std::sync::Mutex<Vec<WanCandidate>>>,
-    servers: Vec<String>,
+    gathering: Option<StunGathering>,
 ) -> GatherHandle {
     let (inbox_tx, mut inbox) = tokio::sync::mpsc::unbounded_channel();
     rtp_sender
@@ -175,7 +231,8 @@ pub fn spawn_gatherer(
 
     let probe_now = Arc::new(tokio::sync::Notify::new());
     let (change_tx, change_rx) = tokio::sync::watch::channel(0u64);
-    let (punch_tx, mut punch_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<SocketAddr>>();
+    let (punch_tx, mut punch_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Vec<SocketAddr>, PunchConfig)>();
     let latched: Arc<std::sync::Mutex<Option<SocketAddr>>> = Arc::new(std::sync::Mutex::new(None));
     let handle = GatherHandle {
         probe_now: probe_now.clone(),
@@ -185,7 +242,21 @@ pub fn spawn_gatherer(
     };
 
     tokio::spawn(async move {
-        let names = servers;
+        let gather_stun = gathering.is_some();
+        // Destructured to owned values so the loop below reads identically in
+        // both modes; with `None` the published list is a private empty cell
+        // nothing ever reads, which is cheaper than threading an `Option`
+        // through a hot-ish loop for a branch that is decided at startup.
+        let (candidates, names) = match gathering {
+            Some(g) => (g.candidates, g.servers),
+            None => (Arc::new(std::sync::Mutex::new(Vec::new())), Vec::new()),
+        };
+        if !gather_stun {
+            println!(
+                "🌐 STUN gathering off (no relay configured) — the media socket \
+                 still answers punch probes and latches a LAN peer"
+            );
+        }
         let mut servers: Vec<SocketAddr> = Vec::new();
         let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
         // A missed tick (host suspended, or a probe that overran) must not
@@ -225,11 +296,10 @@ pub fn spawn_gatherer(
                 // packets until IT has sent outbound to us, and it only does
                 // that once its own blast is running against a host that is
                 // also blasting back.
-                Some(peers) = punch_rx.recv() => {
-                    println!("🥊 Offer received — blasting at {} candidate(s): {}",
-                        peers.len(),
+                Some((peers, cfg)) = punch_rx.recv() => {
+                    println!("🥊 Offer received — blasting at {} candidate(s) for {:?}: {}",
+                        peers.len(), cfg.timeout,
                         peers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-                    let cfg = nova_core::punch::PunchConfig::default();
                     let mut io = RtpPunchIo { rtp: &rtp_sender, inbox: &mut inbox };
                     match nova_core::punch::punch_io(&mut io, &peers, cfg).await {
                         Ok(result) => {
@@ -256,6 +326,13 @@ pub fn spawn_gatherer(
                     }
                     continue;
                 }
+            }
+
+            // Past this point is the STUN cycle proper. A LAN-only install
+            // reaches here on the keepalive tick and must go no further: the
+            // probe/answer arms above are its whole job.
+            if !gather_stun {
+                continue;
             }
 
             if servers.is_empty() {
@@ -454,8 +531,10 @@ mod tests {
         let candidates = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gather = spawn_gatherer(
             rtp.clone(),
-            candidates.clone(),
-            vec![server_addr.to_string()],
+            Some(StunGathering {
+                candidates: candidates.clone(),
+                servers: vec![server_addr.to_string()],
+            }),
         );
         let mut changes = gather.changes();
 

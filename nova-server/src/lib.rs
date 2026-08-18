@@ -63,6 +63,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::signal;
 
+/// The UDP port Nova's media socket binds.
+///
+/// GameStream's video port, and Echo's too — one socket carries RTP, the
+/// punch's STUN probes, and Echo's sealed media, which is what lets a NAT
+/// mapping discovered by a probe be the mapping the stream actually uses.
+///
+/// Named rather than spelled at each site because the LAN rendezvous now has to
+/// tell a client which port to punch toward, and a third literal is how the
+/// three would drift apart.
+pub(crate) const ECHO_MEDIA_PORT: u16 = 47998;
+
 /// CLI overrides — all optional; omitted fields fall back to nova.toml values.
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Nova Server")]
@@ -384,7 +395,8 @@ pub async fn start_master_network() -> MasterHandles {
     echo::discovery::spawn(&mdns, &cfg.echo, &local_ip);
 
     let rtp_sender = Arc::new(Mutex::new(
-        rtp::RtpSender::new(47998).expect("Failed to bind RTP socket on 47998"),
+        rtp::RtpSender::new(ECHO_MEDIA_PORT)
+            .expect("Failed to bind RTP socket on 47998"),
     ));
 
     // Audio's network-send (RTP header + AES-CBC + UDP) — relocated here from
@@ -426,49 +438,64 @@ pub async fn start_master_network() -> MasterHandles {
     // that arrives first simply queues until the task starts.
     let (control_pipe_tx, control_pipe_rx) = mpsc::unbounded_channel();
 
-    // WAN: zero-config internet connections. Both halves start only when a
-    // relay is configured — with no relay there is no WAN path, and a LAN-only
-    // install must not emit STUN traffic to third-party servers every 25 s.
+    // Echo's path layer. Read the split here carefully — it is not the shape it
+    // used to be, and the reason is a bug.
     //
     // The gatherer probes through `rtp_sender`'s media socket (so the NAT
-    // mapping it discovers is the one the stream will use) and keeps that
-    // pinhole open; the signaling client publishes the result, and only when
-    // it changes.
+    // mapping it discovers is the one the stream will use), keeps that pinhole
+    // open, answers a peer's punch probes, and latches the path a punch proves.
+    // Only the FIRST of those is about the WAN. The last two are what any Echo
+    // session needs, LAN or not: `start_session` refuses with `NoPathLatched`
+    // unless something owns the latch cell.
+    //
+    // This whole block used to sit inside `if relay_configured`, which meant a
+    // relay-less install had no latch, no punch inbox, and no session manager —
+    // so it could not grant an Echo session at all. That is precisely the
+    // install LAN-direct exists to serve. The gatherer and the session manager
+    // are therefore unconditional now; only STUN gathering, the keepalive and
+    // relay publication stay gated, which is what keeps the original promise
+    // that a LAN-only install emits nothing to third-party servers.
     //
     // Started BEFORE the Echo RPC because the session manager needs the
     // gatherer's latched-peer cell: a session may only be granted over a path
     // a punch has actually proven.
+    let relay_configured = !cfg.echo.signaling.url.trim().is_empty();
+    let wan_candidates: Arc<Mutex<Vec<echo::wan::WanCandidate>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gather = echo::wan::spawn_gatherer(
+        rtp_sender.clone(),
+        relay_configured.then(|| echo::wan::StunGathering {
+            candidates: wan_candidates.clone(),
+            servers: echo::wan::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+        }),
+    );
     let echo_sessions: Option<Arc<echo::session::SessionManager>> =
-        if !cfg.echo.signaling.url.trim().is_empty() {
-            let wan_candidates: Arc<Mutex<Vec<echo::wan::WanCandidate>>> =
-                Arc::new(Mutex::new(Vec::new()));
-            let gather = echo::wan::spawn_gatherer(
+        Some(Arc::new(echo::session::SessionManager::new(
+            Arc::new(echo::session::WorkerMediaPlane::new(
                 rtp_sender.clone(),
-                wan_candidates.clone(),
-                echo::wan::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
-            );
-            let manager = Arc::new(echo::session::SessionManager::new(
-                Arc::new(echo::session::WorkerMediaPlane::new(
-                    rtp_sender.clone(),
-                    worker_link.clone(),
-                    worker_caps.clone(),
-                )),
-                client_info.clone(),
-                gather.latched_handle(),
-                echo::session::SessionPolicy {
-                    audio_reserve_kbps: cfg.network.audio_reserve_kbps,
-                    // The same grace period a Moonlight session gets — this is a
-                    // property of how long the operator wants a display held for
-                    // an absent client, not of which protocol asked for it.
-                    detach_grace: Duration::from_secs(cfg.stream.detach_grace() as u64),
-                },
-            ));
-            echo::signaling::spawn(&cfg.echo.signaling, wan_candidates, gather);
-            Some(manager)
-        } else {
-            println!("📡 Signaling: no relay configured — Echo WAN connections are disabled (LAN only)");
-            None
-        };
+                worker_link.clone(),
+                worker_caps.clone(),
+            )),
+            client_info.clone(),
+            gather.latched_handle(),
+            echo::session::SessionPolicy {
+                audio_reserve_kbps: cfg.network.audio_reserve_kbps,
+                // The same grace period a Moonlight session gets — this is a
+                // property of how long the operator wants a display held for
+                // an absent client, not of which protocol asked for it.
+                detach_grace: Duration::from_secs(cfg.stream.detach_grace() as u64),
+            },
+        )));
+    if relay_configured {
+        echo::signaling::spawn(&cfg.echo.signaling, wan_candidates, gather.clone());
+    } else {
+        println!(
+            "📡 Signaling: no relay configured — Echo WAN connections are disabled; \
+             LAN-direct sessions still work"
+        );
+    }
+    // The RPC's view of the gatherer is one method wide: "blast at these".
+    let echo_prober: Arc<dyn echo::rpc::PathProber> = Arc::new(gather);
 
     // Spawned after the WAN block because the frame path needs the session
     // manager to seal Echo frames — see `media_supervisor`'s seal call.
@@ -498,6 +525,8 @@ pub async fn start_master_network() -> MasterHandles {
         )),
         client_info.clone(),
         echo_sessions.clone(),
+        echo_prober,
+        ECHO_MEDIA_PORT,
     );
     echo::rpc::spawn(&cfg.echo, echo_handler.clone());
 
@@ -1253,9 +1282,10 @@ async fn media_supervisor(
     mut pipe_rx: mpsc::UnboundedReceiver<NamedPipeServer>,
     rtp_sender: Arc<Mutex<rtp::RtpSender>>,
     audio_tx: Arc<Mutex<audio::AudioTxState>>,
-    // Present only when a relay is configured. Consulted per frame via a
-    // lock-free flag, so a Moonlight session pays one atomic load — see
-    // `SessionManager::seal_video`.
+    // Always present now that a relay-less install can still hold an Echo
+    // session (see `start_master_network`). Consulted per frame via a
+    // lock-free flag, so a Moonlight session pays one atomic load whether or
+    // not an Echo client exists — see `SessionManager::seal_video`.
     echo_sessions: Option<Arc<echo::session::SessionManager>>,
     // Read once a second by the keepalive tick, to answer "is anyone still
     // watching?" — see `session_is_live`. Not on the frame path.
@@ -3670,7 +3700,7 @@ pub async fn run() -> Result<()> {
 
     // Bind to the GameStream video port (47998) so RTP packets arrive from the
     // port advertised in the RTSP SETUP response — Moonlight validates the source port.
-    let mut rtp_sender = crate::rtp::RtpSender::new(47998)
+    let mut rtp_sender = crate::rtp::RtpSender::new(ECHO_MEDIA_PORT)
         .expect("Failed to bind RTP socket on 47998");
 
     // Audio port (48000) — the audio session's send thread learns the client's

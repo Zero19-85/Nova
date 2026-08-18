@@ -715,7 +715,9 @@ fn handle_event(event: &Value, gather: &super::wan::GatherHandle) {
                 &peer[..16.min(peer.len())],
                 candidates.len()
             );
-            gather.punch_toward(candidates);
+            // The WAN patience: this peer has a NAT to open, and nothing is
+            // waiting to fall back if it takes a while.
+            gather.punch_toward(candidates, nova_core::punch::PunchConfig::default());
         }
         other => println!("📡 Signaling: unhandled relay event \"{other}\""),
     }
