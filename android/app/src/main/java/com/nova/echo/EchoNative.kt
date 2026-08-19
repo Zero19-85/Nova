@@ -156,6 +156,25 @@ object EchoNative {
      */
     external fun nativeSetVideoDelay(handle: Long, delayMs: Int): Int
 
+    /**
+     * Ask the host for a keyframe.
+     *
+     * Needed because Nova runs an **infinite GOP**: no IDR is ever produced on
+     * a schedule, so a decoder that has lost its reference chain recovers only
+     * by asking. The only other thing that asks is the frame queue's overflow
+     * path, which requires packet loss to happen to occur — a Surface swap is
+     * a different kind of event and needs its own trigger.
+     *
+     * Records a flag the receive loop reads on its next turn rather than
+     * calling into the control channel, so it never blocks and is safe from
+     * the main thread.
+     *
+     * Returns `false` for a handle that is no longer live — which is ordinary
+     * during teardown, when Surface callbacks fire while the handle is being
+     * zeroed.
+     */
+    external fun nativeRequestIdr(handle: Long): Boolean
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
 

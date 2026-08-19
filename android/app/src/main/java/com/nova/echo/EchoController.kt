@@ -120,6 +120,12 @@ class EchoController(private val context: android.content.Context) {
     @Volatile var surface: Surface? = null
         set(value) {
             field = value
+            // `player?` is the whole subtlety: between a session being granted
+            // and the decoder existing, a Surface can arrive and be recorded
+            // with nothing to push it to. That is why the player's creation
+            // reads this field back rather than trusting whatever was current
+            // when the grant landed — the two orderings have to converge on
+            // the same Surface, and the field is the one always up to date.
             player?.setSurface(value)
         }
 
@@ -291,6 +297,11 @@ class EchoController(private val context: android.content.Context) {
         player = VideoPlayer(h, target, width, height, codec) { message ->
             post { it.copy(status = "Failed", error = message) }
         }.also { it.start() }
+        // Re-read the field: a surfaceCreated that landed while the decoder was
+        // being built would have found `player == null` and gone nowhere,
+        // leaving the decoder attached to a Surface that no longer exists.
+        // Cheap, and skipped entirely when nothing changed.
+        surface?.let { current -> if (current !== target) player?.setSurface(current) }
 
         post { it.copy(status = "Streaming ${width}x$height $codec", streaming = true) }
 

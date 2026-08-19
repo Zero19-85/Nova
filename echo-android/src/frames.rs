@@ -186,6 +186,32 @@ impl FrameQueue {
         std::mem::replace(&mut inner.keyframe_wanted, false)
     }
 
+    /// Ask the host for a keyframe on the next receive-loop turn.
+    ///
+    /// Exists for the Android Surface lifecycle. Backgrounding destroys the
+    /// SurfaceView's Surface and returning creates a new one; the decoder is
+    /// re-attached with `setOutputSurface`, which preserves its reference
+    /// chain — but "preserves" is a decoder-implementation promise, not a
+    /// guarantee, and under Nova's infinite GOP a chain that did break is
+    /// unrecoverable without asking. One IDR is cheap; a permanently frozen
+    /// picture is not.
+    ///
+    /// **Deliberately does NOT close the gate.** Overflow does, because there
+    /// the chain is known to be broken and admitting P-frames would feed the
+    /// decoder garbage. Here it is merely *suspect*: `setOutputSurface` keeps
+    /// the decoder able to use the frames already in flight, so closing the
+    /// gate would discard good frames — and, worse, would introduce a new
+    /// freeze mode, since a lost IDR leaves nothing to re-arm the request and
+    /// the gate would stay shut forever. Flagging only is strictly safer: if
+    /// the IDR never comes, the stream is no worse off than before the ask.
+    pub fn request_keyframe(&self) {
+        let mut inner = self.lock();
+        if inner.closed {
+            return;
+        }
+        inner.keyframe_wanted = true;
+    }
+
     /// Offer a frame. Never blocks — the receive loop must not be stalled by a
     /// slow decoder, because the socket keeps filling either way.
     pub fn push(&self, frame: DecodedFrame) {

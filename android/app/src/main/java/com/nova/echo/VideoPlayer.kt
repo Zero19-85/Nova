@@ -43,6 +43,32 @@ import kotlin.concurrent.thread
  * while the phone sat silent for two minutes). [setSurface] re-attaches, so the
  * Surface is treated as a thing that comes and goes rather than a constructor
  * argument.
+ *
+ * ## Why every codec call is wrapped
+ *
+ * Re-attaching was not enough, and the reason is worth keeping. Only
+ * `dequeueOutputBuffer` used to be guarded; `releaseOutputBuffer` was not. When
+ * the Surface is destroyed, the output buffers already in flight get rendered
+ * into an abandoned surface, `releaseOutputBuffer` throws
+ * `IllegalStateException`, and that exception propagated straight out of the
+ * render loop — killing the thread with no [onError], no log the app could see,
+ * and nothing to restart it. On resume `setOutputSurface` then succeeded and
+ * cheerfully reported success while nothing was dequeuing output any more.
+ *
+ * The visible result was a black screen with a completely healthy network, and
+ * the host log agreed: 60 fps going out, client sending pings, no errors on
+ * either side (live 2026-08-19). The second-order effect completed the picture —
+ * with nobody releasing output buffers the input buffers stopped recycling, so
+ * the feeder span on `dequeueInputBuffer` returning −1 forever.
+ *
+ * Two rules came out of it, and both are load-bearing:
+ *
+ * 1. **Never render into a Surface that is gone.** [renderLoop] discards
+ *    (`render = false`) whenever there is no live Surface, which removes the
+ *    throw at its source instead of catching it afterwards.
+ * 2. **A decode thread must never die quietly.** Every codec call runs inside
+ *    [guarded]; anything that escapes it stops the player and reports, so a
+ *    failure becomes a visible error and a rebuild rather than a black screen.
  */
 class VideoPlayer(
     private val handle: Long,
@@ -65,8 +91,29 @@ class VideoPlayer(
     private var feeder: Thread? = null
     private var renderer: Thread? = null
     @Volatile private var running = false
+    /**
+     * Set once a loop has failed, so the two threads do not each report the same
+     * underlying fault and so [stop] knows the codec is already unusable.
+     */
+    @Volatile private var failed = false
 
     fun start() {
+        val target = synchronized(lock) { surface }
+        if (target == null) {
+            onError("no surface to decode onto")
+            return
+        }
+        val c = createCodec(target) ?: return
+
+        synchronized(lock) { codecInstance = c }
+        running = true
+        failed = false
+        feeder = thread(name = "echo-feeder") { feedLoop(c) }
+        renderer = thread(name = "echo-render") { renderLoop(c) }
+        Log.i(TAG, "decoder started: $mime ${width}x$height")
+    }
+
+    private fun createCodec(target: Surface): MediaCodec? {
         val format = MediaFormat.createVideoFormat(mime, width, height)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -75,27 +122,15 @@ class VideoPlayer(
         // ignored, so setting both is safe and covers far more hardware.
         format.setInteger("vdec-lowlatency", 1)
 
-        val target = synchronized(lock) { surface }
-        if (target == null) {
-            onError("no surface to decode onto")
-            return
-        }
-
-        val c = try {
+        return try {
             MediaCodec.createDecoderByType(mime).also {
                 it.configure(format, target, null, 0)
                 it.start()
             }
         } catch (e: Exception) {
             onError("decoder for $mime at ${width}x$height: ${e.message}")
-            return
+            null
         }
-
-        synchronized(lock) { codecInstance = c }
-        running = true
-        feeder = thread(name = "echo-feeder") { feedLoop(c) }
-        renderer = thread(name = "echo-render") { renderLoop(c) }
-        Log.i(TAG, "decoder started: $mime ${width}x$height")
     }
 
     /**
@@ -107,10 +142,15 @@ class VideoPlayer(
      * until the host happened to send another IDR.
      *
      * A null Surface is recorded but NOT pushed to the codec: MediaCodec has no
-     * way to detach an output surface, and passing null throws. Frames keep
-     * decoding into the old (dead) Surface until a live one arrives, which is
-     * wasteful for a moment and harmless — the alternative, stopping the codec,
-     * is what caused the freeze in the first place.
+     * way to detach an output surface, and passing null throws. [renderLoop]
+     * consults the recorded value and discards output while it is null, so
+     * nothing is ever rendered into a dead Surface.
+     *
+     * **A new Surface always asks the host for a keyframe.** The chain that
+     * `setOutputSurface` preserves is a decoder-implementation promise rather
+     * than a guarantee, and Nova's GOP is infinite — so if it did break, nothing
+     * would ever repair it on its own. One IDR costs a frame; the alternative is
+     * a picture that never comes back.
      */
     fun setSurface(next: Surface?) {
         val c = synchronized(lock) {
@@ -122,56 +162,147 @@ class VideoPlayer(
             c.setOutputSurface(next)
             Log.i(TAG, "decoder re-attached to a new surface")
         } catch (e: Exception) {
-            // Some decoders refuse a swap. Report rather than pretend: the
-            // caller can restart the session, and a silent failure here is
-            // indistinguishable from the bug this method exists to fix.
-            onError("could not re-attach the decoder to the new surface: ${e.message}")
+            // Some decoders refuse a swap. Rebuild rather than report and stop:
+            // a refused swap with a live Surface in hand is recoverable, and the
+            // user-visible alternative is the black screen this class exists to
+            // prevent.
+            Log.w(TAG, "surface swap refused (${e.message}) — rebuilding the decoder")
+            rebuild("the decoder refused a surface swap: ${e.message}")
+            return
         }
+        requestKeyframe()
+    }
+
+    /**
+     * Ask the host for an IDR. Cheap, non-blocking, and safe to call from the UI
+     * thread — the Rust side records a flag the receive loop reads on its next
+     * turn (`FrameQueue::request_keyframe`).
+     */
+    private fun requestKeyframe() {
+        if (!EchoNative.nativeRequestIdr(handle)) {
+            // Only interesting during teardown, when the handle is being zeroed
+            // underneath the Surface callbacks. Not an error.
+            Log.d(TAG, "keyframe request skipped — no live session")
+        }
+    }
+
+    /**
+     * Run one codec call, converting any failure into a reported, deliberate
+     * stop instead of an uncaught exception on a decode thread.
+     *
+     * Returns `null` when the call failed, which every caller treats as "leave
+     * the loop". `IllegalStateException` is the expected one (a codec in the
+     * error state, or a Surface that went away mid-call); the broader catch is
+     * because a dead decode thread is a black screen either way, and the one
+     * thing that must not happen is silence.
+     */
+    private inline fun <T> guarded(what: String, body: () -> T): T? =
+        try {
+            body()
+        } catch (e: Exception) {
+            fail("$what: ${e.message}")
+            null
+        }
+
+    /** First failure wins; the second thread to notice stays quiet. */
+    private fun fail(message: String) {
+        if (failed) return
+        failed = true
+        running = false
+        Log.e(TAG, "decoder failed — $message")
+        onError(message)
+    }
+
+    /**
+     * Tear the decoder down and build a new one against the current Surface.
+     *
+     * Used where the codec is known to be unusable but the session is not: a
+     * refused surface swap is the case that matters. Rebuilding costs the
+     * reference chain, which is exactly why [setSurface] tries the swap first
+     * and why the rebuild ends with a keyframe request.
+     */
+    private fun rebuild(why: String) {
+        val target = synchronized(lock) { surface }
+        if (target == null) {
+            // Nothing to rebuild onto. The next surfaceCreated will start us.
+            stopThreadsAndCodec()
+            return
+        }
+        stopThreadsAndCodec()
+        val c = createCodec(target) ?: run {
+            onError("$why, and rebuilding it failed")
+            return
+        }
+        synchronized(lock) { codecInstance = c }
+        running = true
+        failed = false
+        feeder = thread(name = "echo-feeder") { feedLoop(c) }
+        renderer = thread(name = "echo-render") { renderLoop(c) }
+        Log.i(TAG, "decoder rebuilt after: $why")
+        // A fresh decoder holds no reference frames at all, so this is not
+        // belt-and-braces here — nothing it receives is decodable until an IDR.
+        requestKeyframe()
     }
 
     private fun feedLoop(c: MediaCodec) {
         val meta = LongArray(3)
         while (running) {
-            val index = try {
+            val index = guarded("decoder input failed") {
                 c.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
-            } catch (e: IllegalStateException) {
-                if (running) onError("decoder input failed: ${e.message}")
-                return
-            }
+            } ?: return
             if (index < 0) continue
 
-            val buffer = c.getInputBuffer(index)
+            // Not routed through `guarded`: this call legitimately returns null,
+            // which `guarded` would make indistinguishable from a throw.
+            val buffer = try {
+                c.getInputBuffer(index)
+            } catch (e: Exception) {
+                fail("decoder input buffer unavailable: ${e.message}")
+                return
+            }
             if (buffer == null) {
-                c.queueInputBuffer(index, 0, 0, 0, 0)
+                guarded("releasing an unusable input buffer") {
+                    c.queueInputBuffer(index, 0, 0, 0, 0)
+                } ?: return
                 continue
             }
             buffer.clear()
 
             when (val written = EchoNative.nativeFillBuffer(handle, buffer, meta, FILL_TIMEOUT_MS)) {
                 EchoNative.FILL_ENDED -> {
-                    c.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    guarded("signalling end of stream") {
+                        c.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    }
                     return
                 }
                 EchoNative.FILL_TIMEOUT -> {
                     // MediaCodec has no way to hand an input buffer back
                     // unused, so an empty queue is the only way to release it.
                     // Harmless, and only reached when the stream has stalled.
-                    c.queueInputBuffer(index, 0, 0, 0, 0)
+                    guarded("releasing an idle input buffer") {
+                        c.queueInputBuffer(index, 0, 0, 0, 0)
+                    } ?: return
                 }
                 EchoNative.FILL_TOO_SMALL -> {
-                    c.queueInputBuffer(index, 0, 0, 0, 0)
-                    onError("frame of ${meta[0]} bytes exceeds the decoder's input buffer — " +
+                    guarded("releasing an oversized input buffer") {
+                        c.queueInputBuffer(index, 0, 0, 0, 0)
+                    }
+                    fail("frame of ${meta[0]} bytes exceeds the decoder's input buffer — " +
                             "the stream's geometry disagrees with how the codec was configured")
                     return
                 }
                 EchoNative.FILL_BAD_HANDLE -> {
-                    c.queueInputBuffer(index, 0, 0, 0, 0)
+                    guarded("releasing an input buffer after the session ended") {
+                        c.queueInputBuffer(index, 0, 0, 0, 0)
+                    }
                     return
                 }
                 else -> {
                     val flags =
                         if (meta[1] and 1L != 0L) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                    c.queueInputBuffer(index, 0, written, meta[2], flags)
+                    guarded("queueing a frame") {
+                        c.queueInputBuffer(index, 0, written, meta[2], flags)
+                    } ?: return
                 }
             }
         }
@@ -180,18 +311,21 @@ class VideoPlayer(
     private fun renderLoop(c: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         while (running) {
-            val index = try {
+            val index = guarded("decoder output failed") {
                 c.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
-            } catch (e: IllegalStateException) {
-                if (running) onError("decoder output failed: ${e.message}")
-                return
-            }
+            } ?: return
             when {
                 index >= 0 -> {
-                    // `true` renders to the Surface. Timing is deliberately not
-                    // managed here: the stream is live, so the correct moment to
-                    // show a frame is as soon as it exists.
-                    c.releaseOutputBuffer(index, true)
+                    // THE rule this loop exists to keep: never render into a
+                    // Surface that is gone. `releaseOutputBuffer(_, true)` on an
+                    // abandoned Surface throws, and that throw used to kill this
+                    // thread outright. Discarding costs one frame; the frames
+                    // are 16 ms apart and nobody is looking at the screen while
+                    // the app is backgrounded.
+                    val live = synchronized(lock) { surface }?.isValid == true
+                    guarded("releasing an output buffer") {
+                        c.releaseOutputBuffer(index, live)
+                    } ?: return
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
                 }
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -201,15 +335,24 @@ class VideoPlayer(
         }
     }
 
-    fun stop() {
+    /** Stop the threads and release the codec, leaving [surface] untouched. */
+    private fun stopThreadsAndCodec() {
         running = false
-        feeder?.join(1_000)
-        renderer?.join(1_000)
+        // Not joined from the decode threads themselves — `rebuild` is only ever
+        // reached from `setSurface`, which runs on the main thread.
+        feeder?.takeIf { it != Thread.currentThread() }?.join(1_000)
+        renderer?.takeIf { it != Thread.currentThread() }?.join(1_000)
+        feeder = null
+        renderer = null
         val c = synchronized(lock) { val current = codecInstance; codecInstance = null; current }
         c?.let {
             runCatching { it.stop() }
             runCatching { it.release() }
         }
+    }
+
+    fun stop() {
+        stopThreadsAndCodec()
     }
 
     private companion object {

@@ -795,6 +795,39 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSetVideoDelay(
     result.unwrap_or(-1)
 }
 
+/// Ask the host for a keyframe.
+///
+/// Kotlin calls this when the decoder is re-attached to a freshly created
+/// Surface. Nova runs an infinite GOP, so nothing produces an IDR on its own —
+/// the only other thing that ever asks is the queue's own overflow path, which
+/// requires packet loss to happen to occur. A surface swap is a different kind
+/// of event and needs its own trigger.
+///
+/// The request is a flag the receive loop picks up on its next turn (see
+/// `FrameQueue::request_keyframe`), not a call into the control channel, so
+/// this never blocks and can safely be called from the UI thread.
+///
+/// Returns `false` for an unrecognised handle. **A bad handle is a RETURN
+/// VALUE on this bridge**, never a throw and never a crash — the Surface
+/// callbacks fire during teardown, which is exactly when the handle is being
+/// zeroed underneath them.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRequestIdr(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jboolean {
+    let asked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return false;
+        };
+        session.frames.request_keyframe();
+        true
+    }))
+    .unwrap_or(false);
+    u8::from(asked)
+}
+
 /// End the session and free the handle.
 ///
 /// Wakes anything blocked in `nativeFillBuffer`/`nativePollEvent` first, so a

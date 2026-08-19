@@ -163,7 +163,17 @@ private fun EchoScreen(controller: EchoController) {
                         override fun surfaceCreated(h: SurfaceHolder) {
                             controller.surface = h.surface
                         }
-                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
+                            // Not a no-op: Android can hand over a DIFFERENT
+                            // Surface here without a destroy/create pair
+                            // (format and size changes both do it), and a
+                            // decoder still pointed at the previous one
+                            // renders where nobody is looking. Re-pushing an
+                            // unchanged Surface is harmless — the swap is
+                            // idempotent — so this always assigns rather than
+                            // trying to detect the interesting case.
+                            controller.surface = h.surface
+                        }
                         override fun surfaceDestroyed(h: SurfaceHolder) {
                             controller.surface = null
                         }
