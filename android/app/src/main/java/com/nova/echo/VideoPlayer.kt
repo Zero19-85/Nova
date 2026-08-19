@@ -96,6 +96,11 @@ class VideoPlayer(
      * underlying fault and so [stop] knows the codec is already unusable.
      */
     @Volatile private var failed = false
+    /**
+     * Rebuilds spent on this player, so a decoder that fails immediately on
+     * every attempt reports instead of thrashing. Reset by a clean [start].
+     */
+    private var restarts = 0
 
     fun start() {
         val target = synchronized(lock) { surface }
@@ -108,6 +113,7 @@ class VideoPlayer(
         synchronized(lock) { codecInstance = c }
         running = true
         failed = false
+        restarts = 0
         feeder = thread(name = "echo-feeder") { feedLoop(c) }
         renderer = thread(name = "echo-render") { renderLoop(c) }
         Log.i(TAG, "decoder started: $mime ${width}x$height")
@@ -204,13 +210,47 @@ class VideoPlayer(
             null
         }
 
-    /** First failure wins; the second thread to notice stays quiet. */
+    /**
+     * First failure wins; the second thread to notice stays quiet.
+     *
+     * **Reporting is not enough, and that was a real gap.** Making the decode
+     * threads fail loudly instead of dying silently was the first half of the
+     * job; this is the second. A player whose loops have both exited is a
+     * player that never consumes another frame — and on the client that shows
+     * up as the frame queue overflowing forever, which under Nova's infinite
+     * GOP means asking the host for a keyframe roughly every few seconds, for
+     * as long as the session lasts. Live 2026-08-19: 60 keyframe requests over
+     * 226 s with the stream flowing at a perfect 60 fps and the round trip
+     * under 10 ms, while the screen stayed black.
+     *
+     * So a failure now rebuilds, on a budget. The budget matters: a decoder
+     * that throws immediately on every attempt would otherwise thrash forever,
+     * and the honest answer in that case is to tell the user.
+     *
+     * The rebuild runs on its own thread because this is called FROM a decode
+     * thread, and rebuilding joins those threads.
+     */
     private fun fail(message: String) {
         if (failed) return
         failed = true
         running = false
         Log.e(TAG, "decoder failed — $message")
-        onError(message)
+
+        val live = synchronized(lock) { surface }?.isValid == true
+        if (!live || restarts >= MAX_RESTARTS) {
+            // Nothing to rebuild onto, or the budget is gone. Either way the
+            // user needs to know rather than watch a black screen.
+            onError(message)
+            return
+        }
+        restarts++
+        thread(name = "echo-recover") {
+            // A moment's pause: the usual cause is a Surface that has just
+            // gone away, and rebuilding into the same instant tends to hit the
+            // same fault. Cheap insurance on a path that only runs on failure.
+            Thread.sleep(RESTART_DELAY_MS)
+            rebuild("decoder failed ($restarts/$MAX_RESTARTS): $message")
+        }
     }
 
     /**
@@ -361,5 +401,14 @@ class VideoPlayer(
         // Long enough that a healthy 60 fps stream never times out, short enough
         // that a dead stream is noticed promptly.
         const val FILL_TIMEOUT_MS = 250
+        /**
+         * Rebuild attempts before giving up and reporting.
+         *
+         * Three covers the transient causes (a Surface swapped mid-call, a
+         * codec upset by one bad buffer) without letting a decoder that is
+         * genuinely unusable on this device spin forever.
+         */
+        const val MAX_RESTARTS = 3
+        const val RESTART_DELAY_MS = 250L
     }
 }
