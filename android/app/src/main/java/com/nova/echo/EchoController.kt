@@ -87,7 +87,8 @@ data class UiState(
  * concurrency would be racy, so the handle is only ever read and cleared under
  * [lock].
  */
-class EchoController(private val context: android.content.Context) {
+class EchoController private constructor(private val context: android.content.Context) {
+
 
     private val filesDir: String = context.filesDir.absolutePath
 
@@ -536,8 +537,39 @@ class EchoController(private val context: android.content.Context) {
         state = update(state)
     }
 
-    private companion object {
+    // Not private: [of] and [existing] are how MainActivity and EchoService
+    // reach the one controller this process owns.
+    companion object {
         const val TAG = "EchoController"
+
+        private var instance: EchoController? = null
+
+        /**
+         * The one controller for this process.
+         *
+         * **Deliberately outlives the Activity.** A session survives
+         * backgrounding because [EchoService] keeps the process alive, so the
+         * thing that owns the session must outlive the thing that draws it.
+         * It used to be constructed in `MainActivity.onCreate` and stopped in
+         * `onDestroy`, which meant an Activity teardown that the process
+         * survived (memory pressure, a configuration change, "don't keep
+         * activities") ended the session — and the replacement Activity built
+         * a fresh controller with `handle == 0` and `player == null`, so every
+         * later `surfaceCreated` landed on `player?.` and went nowhere. A live
+         * stream, a black screen, and nothing logged.
+         *
+         * Takes the APPLICATION context. An Activity context here would leak
+         * the destroyed Activity for the life of the process, which is the
+         * standard cost of getting a singleton's context wrong.
+         */
+        @Synchronized
+        fun of(context: android.content.Context): EchoController =
+            instance ?: EchoController(context.applicationContext)
+                .also { it.init(); instance = it }
+
+        /** The controller, if one has been created. For [EchoService]. */
+        @Synchronized
+        fun existing(): EchoController? = instance
 
         /**
          * What the video path costs after the delay line: decode, composite,

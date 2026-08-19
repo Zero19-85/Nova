@@ -38,6 +38,23 @@ class EchoService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * The user swiped Echo out of Recents.
+     *
+     * Now that the controller outlives the Activity, this is the only
+     * remaining signal that a person actually meant to finish — an Activity
+     * teardown no longer implies it. Without this a swipe-away would leave the
+     * session running with no UI attached, and the host holding the display for
+     * its full detach grace period with nobody coming back for it.
+     *
+     * `stop()` is idempotent and safe with no session, so this costs nothing
+     * when the app was not streaming.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        EchoController.existing()?.stop()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

@@ -50,7 +50,10 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         }
 
-        controller = EchoController(applicationContext).also { it.init() }
+        // Process-scoped, and `of` runs `init()` exactly once. Re-entering the
+        // app after an Activity teardown therefore finds the SAME controller,
+        // still holding its handle and its decoder.
+        controller = EchoController.of(applicationContext)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -69,7 +72,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        controller.stop()
+        // The session is NOT ended here, and that is the point of the hoist.
+        // This Activity is destroyed for reasons that have nothing to do with
+        // the user wanting to stop streaming — a rotation, a memory-pressure
+        // teardown while backgrounded, "don't keep activities". The session
+        // belongs to the process and [EchoService] is what keeps that alive.
+        //
+        // The deliberate ends are: the Stop button, and swiping the task away
+        // (EchoService.onTaskRemoved). Both are the user saying so.
+        //
+        // Input is released because a key held at teardown would otherwise
+        // stay held on the host — the same reason `onPause` does it.
+        controller.releaseAllInput()
     }
 
     /**
