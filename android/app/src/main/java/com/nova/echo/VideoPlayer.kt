@@ -65,7 +65,10 @@ import kotlin.concurrent.thread
  *
  * 1. **Never render into a Surface that is gone.** [renderLoop] discards
  *    (`render = false`) whenever there is no live Surface, which removes the
- *    throw at its source instead of catching it afterwards.
+ *    throw at its source instead of catching it afterwards. That turned out to
+ *    be necessary and not sufficient — a codec whose Surface is destroyed stops
+ *    cycling altogether, silently, so [detach] releases it rather than trying to
+ *    keep it alive without anywhere to draw.
  * 2. **A decode thread must never die quietly.** Every codec call runs inside
  *    [guarded]; anything that escapes it stops the player and reports, so a
  *    failure becomes a visible error and a rebuild rather than a black screen.
@@ -91,6 +94,9 @@ class VideoPlayer(
     private var feeder: Thread? = null
     private var renderer: Thread? = null
     @Volatile private var running = false
+    /** Reads and discards frames while there is no decoder. See [startDrain]. */
+    private var drain: Thread? = null
+    @Volatile private var draining = false
     /**
      * Set once a loop has failed, so the two threads do not each report the same
      * underlying fault and so [stop] knows the codec is already unusable.
@@ -147,10 +153,9 @@ class VideoPlayer(
      * tearing the decoder down and rebuilding it would leave the picture frozen
      * until the host happened to send another IDR.
      *
-     * A null Surface is recorded but NOT pushed to the codec: MediaCodec has no
-     * way to detach an output surface, and passing null throws. [renderLoop]
-     * consults the recorded value and discards output while it is null, so
-     * nothing is ever rendered into a dead Surface.
+     * A null Surface means the SurfaceView's Surface has been destroyed, and it
+     * releases the decoder outright — see [detach] for why discarding output was
+     * not enough.
      *
      * **A new Surface always asks the host for a keyframe.** The chain that
      * `setOutputSurface` preserves is a decoder-implementation promise rather
@@ -159,11 +164,21 @@ class VideoPlayer(
      * a picture that never comes back.
      */
     fun setSurface(next: Surface?) {
+        if (next == null) {
+            detach()
+            return
+        }
         val c = synchronized(lock) {
             surface = next
             codecInstance
         }
-        if (next == null || c == null) return
+        // Nothing to swap: either the decoder was released when the Surface went
+        // away, or one has never been built. Either way the Surface that just
+        // arrived is the one to build against.
+        if (c == null) {
+            rebuild("a surface arrived with no decoder attached")
+            return
+        }
         try {
             c.setOutputSurface(next)
             Log.i(TAG, "decoder re-attached to a new surface")
@@ -177,6 +192,96 @@ class VideoPlayer(
             return
         }
         requestKeyframe()
+    }
+
+    /**
+     * The Surface is gone. Release the decoder and keep draining the queue.
+     *
+     * ## Discarding output was not enough, and this is the evidence
+     *
+     * [renderLoop] already declines to render into a dead Surface, which was
+     * supposed to be sufficient: keep the codec cycling, throw the pictures
+     * away, swap a new Surface in on resume. It is not sufficient, because a
+     * MediaCodec configured for a Surface allocates its OUTPUT buffers from that
+     * Surface's BufferQueue. When the SurfaceView tears the Surface down the
+     * queue is abandoned underneath the codec (`About to force-disconnect
+     * API_MEDIA` in the platform log), and the codec simply stops: it cannot get
+     * an output buffer, so it holds the ones it has, so it never recycles an
+     * input buffer either. `dequeueOutputBuffer` returns TRY_AGAIN forever and
+     * `dequeueInputBuffer` returns −1 forever. **Nothing throws.** Both loops
+     * spin, perfectly alive, consuming nothing.
+     *
+     * That is why none of the failure reporting fired. Live 2026-08-19: the app
+     * was backgrounded 28 s into session 20 and the host then logged **198
+     * keyframe requests over the next 59 seconds** with the tunnel healthy, RTT
+     * in single-digit milliseconds and 60 fps going out the whole time — the
+     * client's frame queue overflowing on every push, which under Nova's
+     * infinite GOP is the only repair it knows how to ask for. On resume
+     * `setOutputSurface` reported success onto a codec that was already wedged,
+     * so the picture never came back.
+     *
+     * A released codec cannot wedge. The rebuild costs the reference chain,
+     * which is exactly what [setSurface]'s swap exists to preserve — but a swap
+     * is only worth preserving when there is still a working codec to swap.
+     *
+     * ## Why the queue is still drained
+     *
+     * The session stays up while the app is backgrounded, so frames keep
+     * arriving with nothing to consume them. Left alone the queue overflows
+     * every 16 ms and asks the host for a keyframe each time, which is both the
+     * flood above and the most expensive thing the host can be asked to encode.
+     * A discarding reader costs one memcpy-free pop per frame and turns that
+     * back into ordinary traffic.
+     *
+     * Suppressing the traffic entirely is the host's job, not this class's — the
+     * `PauseEncode` plumbing exists for it and is currently switched off.
+     *
+     * ## Runs synchronously on the main thread, deliberately
+     *
+     * `surfaceDestroyed` promises the framework that nothing will touch the
+     * Surface once it returns, so the codec has to be released before then. The
+     * loops exit within one dequeue timeout and the feeder within one fill
+     * timeout, so the wait is bounded at a few hundred milliseconds.
+     */
+    private fun detach() {
+        val had = synchronized(lock) {
+            surface = null
+            codecInstance
+        }
+        if (had == null) return
+        Log.i(TAG, "surface destroyed — releasing the decoder until one returns")
+        stopThreadsAndCodec()
+        startDrain()
+    }
+
+    /**
+     * Keep popping frames while there is no decoder, and throw them away.
+     *
+     * The scratch buffer is deliberately far too small for a frame: Rust pops
+     * the frame off the queue BEFORE it checks whether it fits, so `TOO_SMALL`
+     * discards it exactly as intended. Popping is the entire point, and a buffer
+     * sized for real frames would only make the discard cost a copy.
+     */
+    private fun startDrain() {
+        if (draining) return
+        draining = true
+        drain = thread(name = "echo-drain") {
+            val scratch = java.nio.ByteBuffer.allocateDirect(DRAIN_SCRATCH_BYTES)
+            val meta = LongArray(3)
+            while (draining) {
+                scratch.clear()
+                when (EchoNative.nativeFillBuffer(handle, scratch, meta, FILL_TIMEOUT_MS)) {
+                    EchoNative.FILL_ENDED, EchoNative.FILL_BAD_HANDLE -> break
+                }
+            }
+            Log.i(TAG, "drain stopped")
+        }
+    }
+
+    private fun stopDrain() {
+        draining = false
+        drain?.takeIf { it != Thread.currentThread() }?.join(1_000)
+        drain = null
     }
 
     /**
@@ -264,11 +369,14 @@ class VideoPlayer(
     private fun rebuild(why: String) {
         val target = synchronized(lock) { surface }
         if (target == null) {
-            // Nothing to rebuild onto. The next surfaceCreated will start us.
+            // Nothing to rebuild onto. The next surfaceCreated will start us,
+            // and until then the queue still needs a reader.
             stopThreadsAndCodec()
+            startDrain()
             return
         }
         stopThreadsAndCodec()
+        stopDrain()
         val c = createCodec(target) ?: run {
             onError("$why, and rebuilding it failed")
             return
@@ -393,6 +501,7 @@ class VideoPlayer(
 
     fun stop() {
         stopThreadsAndCodec()
+        stopDrain()
     }
 
     private companion object {
@@ -401,6 +510,8 @@ class VideoPlayer(
         // Long enough that a healthy 60 fps stream never times out, short enough
         // that a dead stream is noticed promptly.
         const val FILL_TIMEOUT_MS = 250
+        /** Too small for any frame on purpose — see [startDrain]. */
+        const val DRAIN_SCRATCH_BYTES = 64
         /**
          * Rebuild attempts before giving up and reporting.
          *
