@@ -66,7 +66,17 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase: Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
+## Current Phase (2026-08-19): LAN-direct — **host half done, client selector is
+the next task**
+
+The `lan_rendezvous` RPC exists on the host and has no caller; writing the
+client-side staged selector (gather candidates → attempt LAN → abandon → fall
+through to `open_path`) is where this picks up. See the 2026-08-19 section below
+for what landed and what is still inert. The one open client question is whether
+the MediaCodec teardown/rebuild fix (`e87f702`) actually restores the picture on
+resume — code complete, never run on a phone.
+
+## Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
 
 Nova's own client now carries game audio downstream and the phone's microphone
 upstream, synchronised. Host-side impact is summarised at the top of this file;
@@ -78,6 +88,133 @@ Final measured audio latency on the reference device: **190 ms** — 60 jitter,
 floor, so **video is delayed to meet it** rather than audio hurried; the sync
 engine tracks the measurement automatically and is off by default because it
 buys sync with input latency.
+
+---
+
+## LAN rendezvous (host half) + the backgrounding batch (2026-08-19)
+
+Five commits. The mDNS fix and the client's lock-screen connect are live-confirmed;
+the LAN rendezvous RPC has no caller yet, and the MediaCodec fix has not been run
+on a phone.
+
+### `echo/rpc.rs` — the `lan_rendezvous` command (`8837dfa`), **no caller yet**
+
+TCP 48011 exchanges candidates; media still punches UDP. **This is a rendezvous,
+not a transport** — `transport.rs`, `session.rs` and `rtp.rs` are untouched, and
+nothing about the media path changes. `session::open_path` remains unconditionally
+relay-mediated until the client-side staged selector is written, so the host half
+is inert in production today. Three pieces of surface came with it:
+
+- **`Origin::{Lan { peer, local }, Tunnel}`** threaded through `dispatch` and
+  `serve_connection`. The handler validates an offered candidate against the TCP
+  connection's own source IP and against private address space — a candidate that
+  does not match where the request actually came from is refused (`lan_only`), so
+  a peer cannot name an address it is not speaking from. Capped at
+  `MAX_LAN_CANDIDATES = 4`.
+- **`PathProber`** so the handler can start a punch without owning the WAN
+  machinery; `inert_prober()` is the test double.
+- **`punch_toward` takes a `PunchConfig`.** The WAN default blasts for 8 seconds,
+  which is the right patience across the internet and absurd on a LAN where the
+  answer arrives in one round trip. `lan_punch_config()` fails fast at 1.5 s
+  (`LAN_PUNCH_TIMEOUT`) so a failed LAN attempt can abandon and fall through to
+  the relay well inside a user's patience.
+
+**Split init, and why it is load-bearing:** the latch cell and the STUN punch
+inbox now initialise **unconditionally**, and only STUN gathering, keepalives and
+relay publication stay gated behind a configured `[echo.signaling] url`. They used
+to share one branch, so a LAN-only install — no relay configured at all — got no
+punch inbox and could never have completed a rendezvous.
+
+**Known gap, deliberately deferred:** a relay `offer` is not fingerprint-checked
+before punching. Logged for a security hardening pass, not fixed here.
+
+### mDNS advertised `0.0.0.0` on a cold start (`ae0f6ad`) — FIXED, live
+
+**Symptom:** discovery worked one session and not the next, with no pattern.
+
+**Cause:** `get_local_ip()` swallowed a failed `connect` on its probe socket and
+returned the string `"0.0.0.0"`. Registration is spawned early (it waits ≤60 s for
+the host identity), and on a cold boot it frequently ran before the interface had
+an address — so Nova advertised a service at `0.0.0.0`, which the phone dutifully
+tried to reach.
+
+**Fix:** `usable_local_ip()` returns `Option<String>` and rejects unspecified and
+loopback addresses; `wait_for_local_ip()` polls it for up to `LOCAL_IP_WAIT` (60 s)
+before either mDNS record registers. **Both registration sites** — the Master's
+`start_master_network` and the monolithic `run()` — and `echo::discovery::spawn`
+now resolves the address inside its own task rather than taking one as a parameter,
+so there is no way to pass in a stale value. Live: `📡 mDNS broadcaster started for
+Nova (Master) on 10.0.0.205`, instant discovery.
+
+**The general rule this is the third instance of:** a network fact read at process
+start is a guess. Read it when it is needed, or wait for it.
+
+### Honest NAL logging (`a66a2ae`)
+
+The `📦 frame N` line listed NAL types parsed out of the buffer at the point it is
+handed to `RtpSender` — which for an Echo session is **after whole-frame AES-GCM
+sealing**, so it was describing ciphertext and printing plausible nonsense. It now
+says `NALs=<sealed or not Annex-B>` when the bytes are not Annex-B, and a separate
+`🎞️ frame N plaintext NALs:` line logs the real types at the seal site, before
+encryption. That is what proved the host's IDRs were always complete
+(`["VPS", "SPS", "PPS", "IDR_W_RADL", "OTHER"]`) while the client showed a garbled
+or black picture — which moved the search to the client and kept it there.
+
+### Encode suppression — **built, wired, and switched OFF** (`a66a2ae`)
+
+`ENCODE_SUPPRESSION_ENABLED` (lib.rs) is `false`. When true, a client silent for
+`ENCODE_SUPPRESS_AFTER` (3 s) causes the Master's `session_watcher` to send
+`ControlMsg::PauseEncode { paused: true }` (IPC tag 22) and the Worker to stop
+encoding until traffic resumes. **The decision lives in the Master**, like the
+detach grace clock and for the same reason: the Worker dies on sign-out and a
+Worker-side clock dies with it.
+
+It is off deliberately — it changes what a client sees during exactly the failure
+windows currently under investigation, and a diagnostic environment that
+second-guesses itself is worthless. Flipping it is a one-const change once the
+client resume path is confirmed. It is also the right home for "stop encoding
+while the app is backgrounded", which the client currently handles by discarding.
+
+### Echo client: the black screen after backgrounding
+
+Four commits (`26a5240`, `dc5778a`, `5ba0968`, `e87f702`). Lock-screen connect is
+**live-confirmed fixed**; the backgrounding fix is **not yet run on a phone**.
+
+**The failure that mattered, and it is a good lesson.** A `MediaCodec` configured
+for a Surface allocates its **output** buffers from that Surface's BufferQueue.
+When a `SurfaceView` destroys the Surface the queue is abandoned underneath the
+codec: it cannot obtain an output buffer, so it holds the ones it has, so it never
+recycles an input buffer either. `dequeueOutputBuffer` returns TRY_AGAIN forever,
+`dequeueInputBuffer` returns −1 forever, and **nothing throws**. Both decode loops
+spin, alive and consuming nothing.
+
+Two rounds of instrumentation found nothing because there was nothing to catch —
+declining to render into a dead Surface removes the *throw* but not the *wedge*,
+and `setOutputSurface` on resume reports success onto a codec that is already
+stuck. `setSurface(null)` now releases the codec outright, and a Surface arriving
+with no codec rebuilds and asks for an IDR. A released codec cannot wedge.
+
+**The host log is what identified it**, and the signature is worth recognising:
+198 `🔑 requested a keyframe` in 59 seconds with the tunnel healthy, RTT in single
+digits and 60 fps still going out. **That pattern means the client's frame queue is
+overflowing on every push** — under an infinite GOP an IDR is the only repair it
+knows how to ask for — which means something on the client has stopped consuming.
+It is never a network fault, however much it looks like one. A discarding reader
+now drains the queue whenever there is no decoder, so a backgrounded app stops
+asking.
+
+Also in the batch: `EchoController` is a process-scoped singleton
+(`EchoController.of(applicationContext)`) rather than an Activity field, so an
+Activity teardown the process survives no longer ends the session — the deliberate
+ends are the Stop button and `EchoService.onTaskRemoved`. `nativeRequestIdr` is a
+new JNI entry point; like every other call on that bridge, a bad handle is a
+**return value** (`false`), never a thrown error.
+
+**Diagnostic honesty note.** Three theories were disproved by measurement in this
+batch — a missing Surface callback, the app being frozen (`isFrozen=false`,
+`cur=FGS`, standby bucket 5 = EXEMPTED), and the process being killed (same PID
+17466 across a 60 s background). None needed `am_kill` logs. The host log answered
+what three rounds of client-side speculation could not.
 
 ---
 
@@ -180,10 +317,10 @@ complaint. Content sits inside a 36-unit radius of centre, so no mask clips it.
 
 ### Still open (deliberately)
 
-- **LAN-direct is NOT built.** `session::open_path` is unconditionally
-  relay-mediated: STUN gather → relay `lookup` → `offer` → punch. Discovery fills
-  in fields; it does not remove the relay. `--control <ip>:48011` moves only the
-  control tunnel. Removing the relay for same-LAN peers is a separate, larger task.
+- **LAN-direct: the HOST half landed 2026-08-19 (`8837dfa`), the CLIENT selector
+  has not.** See the LAN rendezvous section below. `session::open_path` is still
+  unconditionally relay-mediated — nothing calls `lan_rendezvous` yet — so the
+  observable behaviour is unchanged until the client-side staged selector exists.
 - **`network_security_config.xml` lists exact IP literals** (`10.0.0.0`, …), which
   match no real host and do not cover discovered addresses. Currently inert — the
   Rust pairing client is a raw socket that never consults the policy — but the

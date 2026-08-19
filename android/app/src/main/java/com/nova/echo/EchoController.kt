@@ -1,5 +1,6 @@
 package com.nova.echo
 
+import android.annotation.SuppressLint
 import android.util.Log
 import android.view.Surface
 import androidx.compose.runtime.getValue
@@ -542,6 +543,12 @@ class EchoController private constructor(private val context: android.content.Co
     companion object {
         const val TAG = "EchoController"
 
+        // Lint sees a static field holding a Context and calls it a leak, which
+        // is the right default: the usual version of this holds an Activity and
+        // keeps it alive forever. `of` takes the APPLICATION context precisely
+        // so there is nothing here to outlive — the application context IS
+        // process-scoped, and so is the session this object owns.
+        @SuppressLint("StaticFieldLeak")
         private var instance: EchoController? = null
 
         /**
