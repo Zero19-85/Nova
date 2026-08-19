@@ -191,6 +191,8 @@ pub struct RtpSender {
     /// note warns about is a table keyed by whatever a stranger sends, and this
     /// is keyed by the peer Nova itself pinned.
     last_rx_pinned: Option<Instant>,
+    /// Handle-side mirror of the send thread's codec flag — see [`is_hevc`].
+    is_hevc: bool,
     /// Highest wire frame index queued this client session (0 = none yet).
     /// Master reads it to stamp `ConfigureStart::start_frame_index` so a
     /// replacement Worker adopted mid-session continues the client's frame
@@ -265,6 +267,7 @@ impl RtpSender {
             config_hold: None,
             last_rx: None,
             last_rx_pinned: None,
+            is_hevc: false,
             last_sent_index: 0,
             stun_inbox: None,
             echo_inbox: None,
@@ -576,7 +579,17 @@ impl RtpSender {
     /// Frame-type classification itself is done by the CALLER (which already
     /// runs `detect_frame_type` for the first-IDR gate) and passed per frame —
     /// avoiding a second full scan of every payload.
+    /// Whether the live session's bitstream is HEVC, as this handle last set
+    /// it. Mirrors the flag sent to the send thread purely so a caller holding
+    /// only the handle can parse a PLAINTEXT frame — the send thread's copy is
+    /// unreachable from here, and by the time a frame arrives there it may be
+    /// sealed and unparseable anyway.
+    pub fn is_hevc(&self) -> bool {
+        self.is_hevc
+    }
+
     pub fn set_codec(&mut self, is_hevc: bool, is_av1: bool) {
+        self.is_hevc = is_hevc;
         let _ = self.tx.send(TxCmd::SetCodec { is_hevc, is_av1 });
     }
 
@@ -873,9 +886,24 @@ impl TxEngine {
                 println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={} (AV1)",
                     self.frame_index, data.len(), data_shards, parity_shards, frame_type);
             } else {
-                let nal_names: Vec<&str> = list_nal_types(data, self.is_hevc).iter().map(|t| nal_type_name(*t, self.is_hevc)).collect();
-                println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs={:?}",
-                    self.frame_index, data.len(), data_shards, parity_shards, frame_type, nal_names);
+                // An Echo frame is SEALED before it reaches this thread, so this
+                // scan runs over ciphertext plus a 16-byte GCM tag and finds no
+                // start codes at all. Printing `NALs=[]` for a perfectly good IDR
+                // reads as "the encoder emitted no NAL units" — alarming, and
+                // false; it cost real time during the 2026-08-19 log review. The
+                // types are not recoverable from ciphertext, so an empty result
+                // says so instead of implying an empty frame. Real NAL types for
+                // an Echo session are logged from the PLAINTEXT at the seal site
+                // in `lib.rs`, which is the only place they still exist.
+                let nal_types = list_nal_types(data, self.is_hevc);
+                let nal_names: Vec<&str> = nal_types.iter().map(|t| nal_type_name(*t, self.is_hevc)).collect();
+                if nal_names.is_empty() {
+                    println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs=<sealed or not Annex-B>",
+                        self.frame_index, data.len(), data_shards, parity_shards, frame_type);
+                } else {
+                    println!("📦 frame {} : {} bytes, {} data + {} parity pkt(s), frame_type={}, NALs={:?}",
+                        self.frame_index, data.len(), data_shards, parity_shards, frame_type, nal_names);
+                }
             }
         }
 
@@ -1040,7 +1068,7 @@ impl TxEngine {
 }
 
 /// Human-readable NAL unit type name. `is_hevc` selects the HEVC or H.264 table.
-fn nal_type_name(t: u8, is_hevc: bool) -> &'static str {
+pub(crate) fn nal_type_name(t: u8, is_hevc: bool) -> &'static str {
     if is_hevc {
         // HEVC nal_unit_type (ITU-T H.265 Table 7-1)
         match t {
@@ -1074,7 +1102,7 @@ fn nal_type_name(t: u8, is_hevc: bool) -> &'static str {
 /// For H.264: `data[i+3] & 0x1F` (low 5 bits of the 1-byte NAL header).
 /// For HEVC: `(data[i+3] >> 1) & 0x3F` (bits [6:1] of the first byte of the
 /// 2-byte NAL header — `forbidden_zero_bit | nal_unit_type[5:0]`).
-fn list_nal_types(data: &[u8], is_hevc: bool) -> Vec<u8> {
+pub(crate) fn list_nal_types(data: &[u8], is_hevc: bool) -> Vec<u8> {
     let mut types = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {

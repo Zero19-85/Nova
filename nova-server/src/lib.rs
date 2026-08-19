@@ -74,6 +74,33 @@ use tokio::signal;
 /// three would drift apart.
 pub(crate) const ECHO_MEDIA_PORT: u16 = 47998;
 
+/// Stop encoding for a client that has gone quiet, without ending its session.
+///
+/// **OFF, deliberately.** Live on 2026-08-19 Nova spent 27 seconds encoding and
+/// transmitting 2.1 MB/s to a phone that had stopped listening, because the
+/// media-idle detach only fires at 30 s. Suppressing that is worth doing and
+/// the machinery below is complete — but the symptom of getting it wrong is a
+/// black screen on resume, which is indistinguishable from the open
+/// client-side bug where the Android app does not re-attach its Surface after
+/// backgrounding. Enabling this before that is diagnosed would make the two
+/// impossible to tell apart from a log.
+///
+/// Flip to `true` once the client-side resume path is understood, and validate
+/// against a real client before trusting it: the resume MUST force an IDR (see
+/// `ControlMsg::PauseEncode`), and pausing must never happen while Moonlight
+/// owns the pipeline — a GameStream client is not pinned and does not ping the
+/// way an Echo client does, so its idle reading means something different.
+pub(crate) const ENCODE_SUPPRESSION_ENABLED: bool = false;
+
+/// How long the pinned Echo peer must be silent before encoding is suspended.
+///
+/// A granted session pings every 500 ms, so this is six missed pings — short
+/// enough to save most of a background/lock interlude, long enough that a
+/// burst of UDP loss cannot reach it. Deliberately far below the 30 s detach:
+/// this suspends work, the detach changes session STATE, and conflating the
+/// two would start a grace clock every time somebody's phone hiccupped.
+pub(crate) const ENCODE_SUPPRESS_AFTER: Duration = Duration::from_secs(3);
+
 /// CLI overrides — all optional; omitted fields fall back to nova.toml values.
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Nova Server")]
@@ -805,6 +832,10 @@ async fn session_watcher(
 ) {
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut configured_generation: Option<u64> = None;
+    // Last `PauseEncode` this loop sent, so the message goes out on the EDGE
+    // rather than 20 times a second. Reset to "running" is implicit: a Worker
+    // that respawns comes up unpaused, and the next edge re-states it.
+    let mut encode_paused_sent = false;
     // The generation we last saw with streaming_active=true — used to detect
     // the active→inactive edge (disconnect / RTSP TEARDOWN / cancel) exactly
     // once per session, even when a fresh /launch has already overwritten
@@ -847,6 +878,42 @@ async fn session_watcher(
     let mut echo_blocked_generation: Option<u64> = None;
     loop {
         poll.tick().await;
+
+        // ── Encode suspension (gated OFF — see ENCODE_SUPPRESSION_ENABLED) ──
+        //
+        // Live 2026-08-19: a phone stopped listening and Nova kept encoding and
+        // pushing 2.1 MB/s at it for 27 s, because the media-idle DETACH only
+        // fires at 30 s. Suspending the work is not the same as detaching the
+        // session, and this does only the former.
+        //
+        // Three rules, each of which is a live bug if broken:
+        //
+        //   1. **Echo sessions only.** A Moonlight client is never pinned and
+        //      does not ping the way an Echo client does, so its idle reading
+        //      means something else entirely. Judging a GameStream stream by it
+        //      is the 2026-08-15 black-screen-at-30s bug wearing a new hat.
+        //   2. **`None` is "no news", never "dead".** One stray datagram from a
+        //      port scanner clears the reading, and pausing on that would freeze
+        //      a perfectly healthy stream.
+        //   3. **Lock order is session → RTP, always.** `live_peer()` is taken
+        //      and RELEASED before the RTP lock, exactly as `sweep` does it —
+        //      querying RTP while holding the session lock would be the only
+        //      inversion in the system and the only deadlock opportunity.
+        if ENCODE_SUPPRESSION_ENABLED {
+            let peer = echo_sessions.as_ref().and_then(|s| s.live_peer());
+            let want_paused = match peer {
+                Some(peer) => rtp_sender
+                    .lock()
+                    .unwrap()
+                    .idle_since(peer)
+                    .is_some_and(|idle| idle >= ENCODE_SUPPRESS_AFTER),
+                None => false,
+            };
+            if want_paused != encode_paused_sent {
+                encode_paused_sent = want_paused;
+                worker_link.send(ControlMsg::PauseEncode { paused: want_paused });
+            }
+        }
         let Some(client) = client_info.lock().unwrap().clone() else { continue };
 
         if !client.streaming_active {
@@ -1486,6 +1553,21 @@ async fn media_supervisor(
                         let sealed = echo_sessions
                             .as_ref()
                             .and_then(|s| s.seal_video(frame_index, frame_type, &data));
+                        // The LAST point at which the bitstream is readable. Once
+                        // sealed it is ciphertext, so `RtpSender`'s own scan finds
+                        // nothing and correctly reports that it cannot tell — which
+                        // leaves this the only place a decoder problem can be
+                        // attributed to what the encoder actually emitted (a missing
+                        // VPS/SPS/PPS ahead of an IDR looks identical, on the wire, to
+                        // a client that mishandled a good one).
+                        if frame_index <= 10 || is_idr {
+                            let is_hevc = rtp_sender.lock().unwrap().is_hevc();
+                            let names: Vec<&str> = rtp::list_nal_types(&data, is_hevc)
+                                .iter()
+                                .map(|t| rtp::nal_type_name(*t, is_hevc))
+                                .collect();
+                            println!("🎞️  frame {frame_index} plaintext NALs: {names:?}");
+                        }
                         let payload: &[u8] = sealed.as_deref().unwrap_or(&data);
 
                         // The Worker chose frame_index (== the NVENC timestamp);
@@ -2139,6 +2221,9 @@ fn log_static_desktop(
 enum WorkerCommand {
     Configure(ipc::ConfigureStart),
     Deactivate { cancelled: bool },
+    /// Suspend or resume capture/encode/transmit without touching session
+    /// state — see `ipc::ControlMsg::PauseEncode`.
+    PauseEncode { paused: bool },
     Stop,
 }
 
@@ -2834,6 +2919,11 @@ pub async fn run_worker() -> Result<()> {
                                         break; // main loop gone
                                     }
                                 }
+                                Some(Ok(ipc::ControlMsg::PauseEncode { paused })) => {
+                                    if cmd_tx.send(WorkerCommand::PauseEncode { paused }).is_err() {
+                                        break; // main loop gone
+                                    }
+                                }
                                 Some(Ok(ipc::ControlMsg::SetDisplayMode {
                                     display_id, width, height, refresh_hz, hdr,
                                 })) => {
@@ -2892,6 +2982,10 @@ pub async fn run_worker() -> Result<()> {
 
     let mut out_buffer = vec![0u8; 8 * 1024 * 1024];
     let mut client_connected = false;
+    // Suspended by the Master when the pinned peer stops talking. NOT part of
+    // `client_connected`: the session, the virtual display, audio capture and
+    // the input path all stay up, and only capture/encode/transmit is skipped.
+    let mut encode_paused = false;
     let mut first_idr_sent = false;
     let mut frames_encoded = 0u64;
     // Wire frame index (== NVENC inputTimeStamp), 1-based like Moonlight expects.
@@ -2975,6 +3069,10 @@ pub async fn run_worker() -> Result<()> {
                                     // deserves a clean slate (see reset()).
                                     qos.reset();
                                     client_connected = true;
+                                    // A fresh or re-adopted session always starts
+                                    // running; a stale pause must never outlive the
+                                    // session that caused it.
+                                    encode_paused = false;
                                     first_idr_sent = false;
                                     // 1 for a fresh session; a mid-session adoption
                                     // (Worker respawn) continues the client's frame
@@ -3013,11 +3111,29 @@ pub async fn run_worker() -> Result<()> {
                                 Err(e) => println!("❌ apply_configure_start failed: {e}"),
                             }
                         }
+                        Some(WorkerCommand::PauseEncode { paused }) => {
+                            if paused != encode_paused {
+                                encode_paused = paused;
+                                if paused {
+                                    println!("⏸️  Encode suspended — the client has gone quiet \
+                                        (session, display and audio all held)");
+                                } else {
+                                    // Everything the encoder would emit now
+                                    // references frames that were never sent, so a
+                                    // P-frame here decodes into garbage. Resume on
+                                    // a keyframe or do not resume at all.
+                                    enc.request_idr();
+                                    next_frame_time = Instant::now();
+                                    println!("▶️  Encode resumed — client is back, forcing an IDR");
+                                }
+                            }
+                        }
                         Some(WorkerCommand::Deactivate { cancelled }) => {
                             deactivate_worker(cancelled, &mut vd, &mut capturer, &mut enc, &mut audio_manager);
                             // A VDD teardown changes the topology too.
                             publish_display_inventory(&reply_tx, &vd);
                             client_connected = false;
+                            encode_paused = false;
                             first_idr_sent = false;
                             send_queue_drops = 0;
                             pending_configure = None;
@@ -3060,6 +3176,8 @@ pub async fn run_worker() -> Result<()> {
                             // Fresh session ⇒ clear the QoS link memory (see reset()).
                             qos.reset();
                             client_connected = true;
+                            // See the select!-arm twin above.
+                            encode_paused = false;
                             first_idr_sent = false;
                             // See the select!-arm twin above: fresh session ⇒ 1,
                             // mid-session adoption ⇒ continue the timeline.
@@ -3090,11 +3208,26 @@ pub async fn run_worker() -> Result<()> {
                         Err(e) => println!("❌ apply_configure_start failed: {e}"),
                     }
                 }
+                WorkerCommand::PauseEncode { paused } => {
+                    // See the select!-arm twin above.
+                    if paused != encode_paused {
+                        encode_paused = paused;
+                        if paused {
+                            println!("⏸️  Encode suspended — the client has gone quiet \
+                                (session, display and audio all held)");
+                        } else {
+                            enc.request_idr();
+                            next_frame_time = Instant::now();
+                            println!("▶️  Encode resumed — client is back, forcing an IDR");
+                        }
+                    }
+                }
                 WorkerCommand::Deactivate { cancelled } => {
                     deactivate_worker(cancelled, &mut vd, &mut capturer, &mut enc, &mut audio_manager);
                     // See the select!-arm twin above.
                     publish_display_inventory(&reply_tx, &vd);
                     client_connected = false;
+                    encode_paused = false;
                     first_idr_sent = false;
                     send_queue_drops = 0;
                     pending_configure = None;
@@ -3172,6 +3305,15 @@ pub async fn run_worker() -> Result<()> {
         // have been denied and garbled the frame — see desktop_is_secure).
         // Now that the interactive desktop is back (user logged in), re-run it
         // so the VDD comes up cleanly, WITHOUT re-launching the app.
+        // Suspended: hold the slot cadence but do no capture, encode or send.
+        // Everything else in this loop — the control channel, audio, the
+        // deferred VDD activation below — keeps running, which is the whole
+        // difference between this and a deactivation.
+        if encode_paused {
+            next_frame_time =
+                advance_frame_deadline(next_frame_time, frame_interval, Instant::now());
+        }
+
         if client_connected && vdd_activation_pending && !desktop_is_secure() {
             if let Some(mut cs) = pending_configure.clone() {
                 cs.launch_app = false; // already launched at the original configure

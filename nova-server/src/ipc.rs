@@ -79,6 +79,7 @@ mod tag {
     pub const CLEAR_PAIRED: u8 = 19;
     pub const SET_DISPLAY_MODE: u8 = 20;
     pub const DISPLAY_INVENTORY: u8 = 21;
+    pub const PAUSE_ENCODE: u8 = 22;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -311,6 +312,21 @@ pub enum ControlMsg {
     /// useless for this). Master reacts by starting/stopping the SYSTEM input
     /// helper and re-routing `InjectInput` to it — see `input.rs`'s UIPI note.
     SecureDesktopChanged { secure: bool },
+
+    /// Master → Worker: stop (or resume) spending the GPU and the uplink on a
+    /// client that has gone quiet, WITHOUT ending its session.
+    ///
+    /// Deliberately NOT `Deactivate { cancelled: false }`, which is the
+    /// existing "client vanished" state: that tears down audio capture and the
+    /// virtual display and starts the detach grace clock. This is a much
+    /// smaller thing — the session, the display, the audio and the input path
+    /// all stay exactly as they are, and only the capture/encode/transmit step
+    /// is skipped. A client that comes back gets a fresh IDR and carries on.
+    ///
+    /// Resuming MUST force an IDR: everything the encoder would otherwise emit
+    /// references frames that were never sent, so a P-frame on resume decodes
+    /// into garbage — the same failure mode as feeding a decoder mid-GOP.
+    PauseEncode { paused: bool },
     /// Master -> Worker: a pairing request arrived (`getservercert`) and the
     /// Master is blocked waiting for a PIN — pop the tray's pair dialog in
     /// the user session. The Master is headless in Session 0 and cannot show
@@ -547,6 +563,7 @@ impl ControlMsg {
             ControlMsg::SecureDesktopChanged { secure } => {
                 vec![tag::SECURE_DESKTOP_CHANGED, *secure as u8]
             }
+            ControlMsg::PauseEncode { paused } => vec![tag::PAUSE_ENCODE, *paused as u8],
             ControlMsg::WorkerCapabilities { vdd_capable, native_width, native_height } => {
                 let mut out = vec![tag::WORKER_CAPABILITIES, *vdd_capable as u8];
                 write_u32(&mut out, *native_width);
@@ -625,6 +642,9 @@ impl ControlMsg {
             tag::OPEN_PAIR_DIALOG => Ok(ControlMsg::OpenPairDialog),
             tag::SECURE_DESKTOP_CHANGED => Ok(ControlMsg::SecureDesktopChanged {
                 secure: rest.first().copied().unwrap_or(0) != 0,
+            }),
+            tag::PAUSE_ENCODE => Ok(ControlMsg::PauseEncode {
+                paused: rest.first().copied().unwrap_or(0) != 0,
             }),
             tag::WORKER_CAPABILITIES => {
                 let (&vdd, sizes) = rest
@@ -923,6 +943,8 @@ mod tests {
             ControlMsg::PinRelay { pin: "1234".to_string(), device: "PiXeL".to_string() },
             ControlMsg::SecureDesktopChanged { secure: true },
             ControlMsg::SecureDesktopChanged { secure: false },
+            ControlMsg::PauseEncode { paused: true },
+            ControlMsg::PauseEncode { paused: false },
             // Negative origins are real (a monitor left of/above the primary)
             // and must survive the u32 round-trip on the wire.
             ControlMsg::CaptureRect { origin_x: 0, origin_y: 0, width: 3840, height: 2160 },
