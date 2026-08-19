@@ -72,9 +72,9 @@ the next task**
 The `lan_rendezvous` RPC exists on the host and has no caller; writing the
 client-side staged selector (gather candidates → attempt LAN → abandon → fall
 through to `open_path`) is where this picks up. See the 2026-08-19 section below
-for what landed and what is still inert. The one open client question is whether
-the MediaCodec teardown/rebuild fix (`e87f702`) actually restores the picture on
-resume — code complete, never run on a phone.
+for what landed and what is still inert. **No open client bugs** — the MediaCodec
+teardown/rebuild fix (`e87f702`) is live-confirmed on the phone: background and
+resume restores the picture.
 
 ## Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
 
@@ -177,8 +177,9 @@ while the app is backgrounded", which the client currently handles by discarding
 
 ### Echo client: the black screen after backgrounding
 
-Four commits (`26a5240`, `dc5778a`, `5ba0968`, `e87f702`). Lock-screen connect is
-**live-confirmed fixed**; the backgrounding fix is **not yet run on a phone**.
+Four commits (`26a5240`, `dc5778a`, `5ba0968`, `e87f702`). **Both live-confirmed
+on 2026-08-19** — lock-screen connect, and background → resume restoring the
+picture. NOT AN ACTIVE ITEM; do not re-propose.
 
 **The failure that mattered, and it is a good lesson.** A `MediaCodec` configured
 for a Surface allocates its **output** buffers from that Surface's BufferQueue.
