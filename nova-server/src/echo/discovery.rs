@@ -186,7 +186,7 @@ async fn wait_for_fingerprint() -> Option<String> {
 /// a thread that owns its own state and keeps polling after every handle drops,
 /// so both records outlive the function that registered them — which is already
 /// how the `_nvstream` record survives `start_master_network` returning.
-pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig, local_ip: &str) {
+pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig) {
     if !cfg.enabled {
         println!("📡 Echo mDNS: [echo] enabled = false — not advertising");
         return;
@@ -196,9 +196,20 @@ pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig, local_ip: &str) {
     let port = cfg.port;
     let relay_url = cfg.signaling.url.clone();
     let relay_pin = cfg.signaling.relay_cert_sha256.clone();
-    let ip = local_ip.to_string();
 
     tokio::spawn(async move {
+        // Resolved HERE, not at the call site. The address is a startup fact
+        // that arrives on its own schedule, exactly like the certificate below,
+        // and a boot-time start used to capture `0.0.0.0` before any NIC had an
+        // address — advertising an Echo endpoint no client can open, with the
+        // relay URL rewritten to `https://0.0.0.0:8443` for good measure.
+        let Some(ip) = crate::wait_for_local_ip().await else {
+            println!(
+                "⚠️ Echo mDNS: no LAN address available — not advertising (Nova is \
+                 still reachable by address, just not discoverable)"
+            );
+            return;
+        };
         let Some(fingerprint) = wait_for_fingerprint().await else {
             println!(
                 "⚠️ Echo mDNS: no pairing identity published after {IDENTITY_WAIT:?} — \

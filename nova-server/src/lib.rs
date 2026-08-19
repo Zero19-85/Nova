@@ -92,10 +92,72 @@ struct Args {
     #[arg(long)] fec:     Option<u32>,
 }
 
+/// This machine's LAN address, or `None` while the network stack has not
+/// produced one.
+///
+/// The `connect` targets a routable address that is never contacted; it exists
+/// only to make the kernel choose a source interface. **Its failure is the
+/// entire reason this returns an `Option`.** On a service that starts at boot,
+/// before any NIC has an address, `connect` fails — and the previous version
+/// swallowed that with `.ok()`, leaving the socket bound to the wildcard.
+/// `local_addr()` then returns `0.0.0.0` as a perfectly good `Ok`, so the
+/// `127.0.0.1` fallback never fired and the string `"0.0.0.0"` was handed to
+/// every consumer.
+///
+/// Measured live on 2026-08-19: a boot-time start advertised both `_nvstream`
+/// and `_echo._tcp` at 0.0.0.0 and rewrote the relay URL to
+/// `https://0.0.0.0:8443/v1/signal`, so no client could discover or reach the
+/// host until Nova was restarted after the network came up. `0.0.0.0` means
+/// "every local interface" to a listener and nothing at all to a peer, which is
+/// why it must never leave this function.
+fn usable_local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() => {
+            Some(ip.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// How long the mDNS records wait for the machine to have an address.
+///
+/// Same budget as `echo::discovery`'s wait for the pairing certificate, and for
+/// the same reason: both are startup facts that arrive on their own schedule,
+/// and advertising before either is ready publishes a record that is worse than
+/// no record — a client fills its fields from it and then cannot connect.
+const LOCAL_IP_WAIT: Duration = Duration::from_secs(60);
+
+/// Poll until this machine has a LAN address, or give up after [`LOCAL_IP_WAIT`].
+///
+/// Polling rather than subscribing to an interface-change notification because
+/// this resolves on the first attempt on every machine that is already on a
+/// network, and the case it exists for — a cold boot racing DHCP — is measured
+/// in seconds, not minutes.
+async fn wait_for_local_ip() -> Option<String> {
+    let deadline = tokio::time::Instant::now() + LOCAL_IP_WAIT;
+    let mut announced = false;
+    loop {
+        if let Some(ip) = usable_local_ip() {
+            return Some(ip);
+        }
+        if !announced {
+            println!(
+                "🌐 mDNS: no LAN address yet (the network stack is still coming up) — \
+                 holding the service records back rather than advertising 0.0.0.0"
+            );
+            announced = true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 fn get_local_ip() -> String {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind UDP for IP discovery");
-    socket.connect("8.8.8.8:80").ok();
-    socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
+    usable_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 /// Recreates the NVENC encoder at `width`x`height` on the capturer's device
@@ -370,29 +432,54 @@ pub async fn start_master_network() -> MasterHandles {
         global_pin.clone(),
     ));
 
-    // mDNS — Sunshine-compatible service record, unchanged.
+    // mDNS — Sunshine-compatible service record.
+    //
+    // Registered from a task rather than inline because the address it
+    // advertises may not exist yet. `start_master_network` runs at boot, before
+    // sign-in and sometimes before DHCP; publishing there captured whatever
+    // `get_local_ip` happened to return, which on a cold boot was `0.0.0.0` —
+    // an address no client can connect to, baked into a record that was never
+    // revisited. Binding the LISTENERS early is still right; advertising early
+    // is not, and the two are now separated.
     let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
-    let svc = ServiceInfo::new(
-        "_nvstream._tcp.local.",
-        "Nova",
-        "nova.local.",
-        local_ip.as_str(),
-        47989,
-        &[
-            ("txtvers", "1"),
-            ("port",     "47989"),
-            ("mac",      server_mac),
-            ("uniqueid", server_id),
-        ][..],
-    )
-    .unwrap();
-    let _ = mdns.register(svc);
-    println!("📡 mDNS broadcaster started for Nova (Master)");
+    {
+        let mdns = mdns.clone();
+        let server_mac = server_mac.to_string();
+        let server_id = server_id.to_string();
+        tokio::spawn(async move {
+            let Some(ip) = wait_for_local_ip().await else {
+                println!(
+                    "⚠️ mDNS: still no LAN address after {LOCAL_IP_WAIT:?} — Nova is not \
+                     discoverable by Moonlight on this boot (restart once the network is up)"
+                );
+                return;
+            };
+            match ServiceInfo::new(
+                "_nvstream._tcp.local.",
+                "Nova",
+                "nova.local.",
+                ip.as_str(),
+                47989,
+                &[
+                    ("txtvers", "1"),
+                    ("port",     "47989"),
+                    ("mac",      server_mac.as_str()),
+                    ("uniqueid", server_id.as_str()),
+                ][..],
+            ) {
+                Ok(svc) => {
+                    let _ = mdns.register(svc);
+                    println!("📡 mDNS broadcaster started for Nova (Master) on {ip}");
+                }
+                Err(e) => println!("❌ mDNS: could not build the _nvstream record: {e}"),
+            }
+        });
+    }
 
     // The Echo record — a second service type on the same daemon, for Echo
     // clients rather than Moonlight ones. Registered on a task because it must
-    // wait for the pairing certificate; see `echo::discovery`.
-    echo::discovery::spawn(&mdns, &cfg.echo, &local_ip);
+    // wait for the pairing certificate AND for an address; see `echo::discovery`.
+    echo::discovery::spawn(&mdns, &cfg.echo);
 
     let rtp_sender = Arc::new(Mutex::new(
         rtp::RtpSender::new(ECHO_MEDIA_PORT)
@@ -3696,7 +3783,7 @@ pub async fn run() -> Result<()> {
     // The Echo record — a second service type on the same daemon, for Echo
     // clients rather than Moonlight ones. Registered on a task because it must
     // wait for the pairing certificate; see `echo::discovery`.
-    echo::discovery::spawn(&mdns, &cfg.echo, &local_ip);
+    echo::discovery::spawn(&mdns, &cfg.echo);
 
     // Bind to the GameStream video port (47998) so RTP packets arrive from the
     // port advertised in the RTSP SETUP response — Moonlight validates the source port.
