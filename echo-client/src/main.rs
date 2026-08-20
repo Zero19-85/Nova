@@ -79,6 +79,20 @@ enum Command {
         /// Seconds to keep punching before giving up.
         #[arg(long, default_value_t = 8)]
         punch_secs: u64,
+        /// Try this LAN address first: `10.0.0.5` or `10.0.0.5:48011`.
+        ///
+        /// Stage 1 of the cascade — a candidate exchange over the host's TCP
+        /// control port, then a direct punch. Skipped entirely when absent,
+        /// because dialling a private address from another network is time
+        /// spent to learn nothing.
+        #[arg(long)]
+        lan: Option<String>,
+        /// Offer this WAN endpoint as an extra punch candidate.
+        ///
+        /// For a host behind a port forward whose reflexive candidate is wrong.
+        /// A bare address borrows the port the relay reports for the host.
+        #[arg(long)]
+        wan: Option<String>,
     },
 
     /// Punch a path, ask the host for a session, and receive media.
@@ -100,6 +114,12 @@ enum Command {
         /// non-private addresses, so this is not a WAN fallback.
         #[arg(long)]
         control: Option<String>,
+        /// Try this LAN address first. See `connect --lan`.
+        #[arg(long)]
+        lan: Option<String>,
+        /// Offer this WAN endpoint as an extra punch candidate. See `connect --wan`.
+        #[arg(long)]
+        wan: Option<String>,
         #[arg(long, default_value_t = 8)]
         punch_secs: u64,
         /// Seconds of media to receive before stopping. 0 = until Ctrl-C.
@@ -192,12 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Command::Connect { relay, relay_pin, host, punch_secs } => {
+        Command::Connect { relay, relay_pin, host, punch_secs, lan, wan } => {
             let opts = ConnectOptions {
                 relay_url: relay,
                 relay_pin,
                 host_fingerprint: host,
                 punch_timeout: Duration::from_secs(punch_secs),
+                lan_endpoint: lan,
+                wan_endpoint: wan,
+                lan_timeout: session::DEFAULT_LAN_TIMEOUT,
             };
             session::open_path(&identity, &opts, &mut progress).await?;
             println!();
@@ -209,6 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relay_pin,
             host,
             control,
+            lan,
+            wan,
             punch_secs,
             seconds,
             res,
@@ -221,6 +246,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 relay_pin,
                 host_fingerprint: host.clone(),
                 punch_timeout: Duration::from_secs(punch_secs),
+                lan_endpoint: lan,
+                wan_endpoint: wan,
+                lan_timeout: session::DEFAULT_LAN_TIMEOUT,
             };
             let path = session::open_path(&identity, &connect, &mut progress).await?;
 
@@ -336,8 +364,23 @@ impl Progress for ConsoleProgress {
             Event::Punching { interval, timeout } => {
                 println!("🥊 Blasting every {interval:?} for up to {timeout:?}…")
             }
-            Event::PathOpen { peer, rounds, proof, local } => {
-                println!("✅ Path open to {peer} after {rounds} round(s) — confirmed by {proof}");
+            Event::LanAttempt { endpoint } => {
+                println!("🏠 Trying the LAN first: {endpoint}…")
+            }
+            Event::LanRendezvous { offered, host_candidates } => {
+                println!(
+                    "🤝 LAN rendezvous accepted — offered {offered}, host answers from {}",
+                    host_candidates.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                )
+            }
+            Event::LanAbandoned { reason } => {
+                println!("↪️  LAN route abandoned ({reason}) — falling through to the relay")
+            }
+            Event::PathOpen { peer, rounds, proof, local, transport } => {
+                println!(
+                    "✅ Path open to {peer} after {rounds} round(s) — confirmed by {proof} [{}]",
+                    transport.as_str()
+                );
                 println!("   The NAT pinhole is open on {local}.");
             }
             Event::PunchFailed { endpoint_dependent, error } => {

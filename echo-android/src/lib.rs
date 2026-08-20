@@ -291,9 +291,17 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativePair<'local>(
 ///   "relay_pin": "<64 hex>",
 ///   "host_fingerprint": "<64 hex>",
 ///   "res": "1080p", "fps": 60, "codec": "hevc", "bitrate_kbps": 20000,
-///   "punch_secs": 8
+///   "punch_secs": 8,
+///   "lan_endpoint": "10.0.0.205:48011",
+///   "wan_endpoint": "203.0.113.7:47998",
+///   "lan_timeout_ms": 500
 /// }
 /// ```
+///
+/// The last three are the transport cascade and are all optional. Omitting
+/// `lan_endpoint` skips the LAN attempt outright — which is what a caller with
+/// no locally-observed address for this host should do, since a wrong guess is
+/// paid for on every connect and buys nothing.
 #[no_mangle]
 pub extern "system" fn Java_com_nova_echo_EchoNative_nativeConnect<'local>(
     mut env: JNIEnv<'local>,
@@ -889,12 +897,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
 
     let identity_dir = str_field(&cfg, "identity_dir")?;
-    let connect = ConnectOptions {
-        relay_url: str_field(&cfg, "relay_url")?,
-        relay_pin: str_field(&cfg, "relay_pin")?,
-        host_fingerprint: str_field(&cfg, "host_fingerprint")?,
-        punch_timeout: Duration::from_secs(cfg.get("punch_secs").and_then(|v| v.as_u64()).unwrap_or(8)),
-    };
+    let connect = connect_options(&cfg)?;
     // Unbounded, and that is a considered choice: the producer is the UI thread
     // delivering pointer events, so any bound would mean either blocking the UI
     // or silently discarding input. The consumer only forwards to the control
@@ -1249,20 +1252,175 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRelease<'local>(
     }
 }
 
+/// Ask the relay whether it currently knows how to reach this host.
+///
+/// **Blocking**, like [`Java_com_nova_echo_EchoNative_nativeRelease`], and for
+/// the same reason: one request-response with no ongoing state.
+///
+/// This is what turns a card's OFFLINE badge into an honest one. A TCP connect
+/// to the relay proves only that *the relay* is up; it says nothing about the
+/// host, and a relay running happily beside a Nova that is switched off would
+/// show a green light for a machine that cannot answer. `lookup` asks the
+/// question that matters — is this host announced right now — because Nova
+/// re-announces on a keepalive, so a stale registration ages out.
+///
+/// Config JSON is the same shape `nativeConnect` takes; only `identity_dir`,
+/// `relay_url`, `relay_pin` and `host_fingerprint` are read.
+///
+/// Returns JSON: `{"registered": bool, "candidates": [..], "detail": "..."}`.
+/// A relay that cannot be reached is reported as `registered: false` with the
+/// reason in `detail` — **not** thrown. Being unable to reach a relay is the
+/// ordinary condition this call exists to detect, not an exceptional one.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRelayLookup<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config: JString<'local>,
+) -> jni::sys::jstring {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let config: String = env
+            .get_string(&config)
+            .map_err(|e| format!("read config argument: {e}"))?
+            .into();
+        relay_lookup_blocking(&config)
+    }));
+
+    // Both arms produce JSON, so Kotlin has one shape to parse rather than a
+    // string on success and an exception on failure.
+    let json = match flatten(result) {
+        Ok(json) => json,
+        Err(msg) => serde_json::json!({
+            "registered": false,
+            "candidates": [],
+            "detail": msg,
+        })
+        .to_string(),
+    };
+    match env.new_string(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn relay_lookup_blocking(config_json: &str) -> Result<String, String> {
+    use nova_core::relay::{identity_params, parse_candidates, RelayConnection, RelayTarget};
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
+    let identity_dir = str_field(&cfg, "identity_dir")?;
+    let relay_url = str_field(&cfg, "relay_url")?;
+    let relay_pin = str_field(&cfg, "relay_pin")?;
+    let host_fingerprint = str_field(&cfg, "host_fingerprint")?;
+
+    let identity = Identity::load_or_create_rsa2048(
+        std::path::Path::new(&identity_dir),
+        "echo",
+        "echo-android",
+    )?;
+    let target = RelayTarget::parse(&relay_url).map_err(|e| format!("relay URL: {e}"))?;
+    let pin = nova_core::identity::parse_fingerprint(&relay_pin)
+        .map_err(|e| format!("relay pin: {e}"))?;
+    let tls = std::sync::Arc::new(nova_core::identity::client_config_pinned(&identity, pin)?);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("start runtime: {e}"))?;
+
+    runtime.block_on(async move {
+        // Bounded, and short. This runs while a user is looking at a list of
+        // cards; an unreachable relay must resolve to a grey badge quickly, not
+        // hold the dashboard in "checking…" for a TCP timeout.
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(RELAY_LOOKUP_TIMEOUT_SECS),
+            RelayConnection::connect(&target, tls),
+        );
+        let mut conn = match connect.await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Ok(unreachable_json(&format!("{e}"))),
+            Err(_) => return Ok(unreachable_json("the relay did not answer in time")),
+        };
+
+        let mut params = identity_params(&identity);
+        params.insert("host".into(), serde_json::json!(host_fingerprint));
+        let answer = match tokio::time::timeout(
+            std::time::Duration::from_secs(RELAY_LOOKUP_TIMEOUT_SECS),
+            conn.call("lookup", params),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => return Ok(unreachable_json(&format!("relay refused the lookup: {e}"))),
+            Err(_) => return Ok(unreachable_json("the relay did not answer the lookup in time")),
+        };
+
+        let candidates = parse_candidates(answer.get("candidates"));
+        Ok(serde_json::json!({
+            // Registered means the relay is holding live candidates for this
+            // host — i.e. Nova is announcing to it right now. An empty list is
+            // a relay that is up and a host that is not.
+            "registered": !candidates.is_empty(),
+            "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "detail": if candidates.is_empty() {
+                "the relay is up but this host is not announcing to it".to_string()
+            } else {
+                String::new()
+            },
+        })
+        .to_string())
+    })
+}
+
+/// How long the dashboard's reachability question may take.
+const RELAY_LOOKUP_TIMEOUT_SECS: u64 = 4;
+
+fn unreachable_json(detail: &str) -> String {
+    serde_json::json!({ "registered": false, "candidates": [], "detail": detail }).to_string()
+}
+
+/// Build the transport cascade's options from the config Kotlin passed down.
+///
+/// Shared by the streaming connect and the release path so the two cannot drift
+/// — a release that took a different route than the session it is ending is a
+/// bug that would only show up on the one network nobody tests from.
+///
+/// `lan_endpoint` absent means "do not try the LAN", which is the honest
+/// default: a client that has never seen this host locally has no address worth
+/// dialling, and a wrong guess costs the user the LAN timeout on every connect.
+fn connect_options(cfg: &serde_json::Value) -> Result<ConnectOptions, String> {
+    let optional = |key: &str| {
+        cfg.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Ok(ConnectOptions {
+        relay_url: str_field(cfg, "relay_url")?,
+        relay_pin: str_field(cfg, "relay_pin")?,
+        host_fingerprint: str_field(cfg, "host_fingerprint")?,
+        punch_timeout: Duration::from_secs(
+            cfg.get("punch_secs").and_then(|v| v.as_u64()).unwrap_or(8),
+        ),
+        lan_endpoint: optional("lan_endpoint"),
+        wan_endpoint: optional("wan_endpoint"),
+        lan_timeout: cfg
+            .get("lan_timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_millis)
+            .unwrap_or(session::DEFAULT_LAN_TIMEOUT),
+    })
+}
+
 fn release_blocking(config_json: &str) -> Result<String, String> {
     let cfg: serde_json::Value =
         serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
 
     let identity_dir = str_field(&cfg, "identity_dir")?;
     let host_fingerprint = str_field(&cfg, "host_fingerprint")?;
-    let connect = ConnectOptions {
-        relay_url: str_field(&cfg, "relay_url")?,
-        relay_pin: str_field(&cfg, "relay_pin")?,
-        host_fingerprint: host_fingerprint.clone(),
-        punch_timeout: Duration::from_secs(
-            cfg.get("punch_secs").and_then(|v| v.as_u64()).unwrap_or(8),
-        ),
-    };
+    // The same cascade as a streaming connect, and for the same reason: ending
+    // a session held on a host two feet away should not need the internet.
+    let connect = connect_options(&cfg)?;
 
     let identity =
         Identity::load_or_create_rsa2048(std::path::Path::new(&identity_dir), "echo", "echo-android")?;

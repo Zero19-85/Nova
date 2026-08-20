@@ -54,6 +54,20 @@ pub struct ControlChannel {
     write: tokio::io::WriteHalf<Stream>,
     read: BufReader<tokio::io::ReadHalf<Stream>>,
     next_id: u64,
+    /// The local address this channel went out from — TCP only.
+    ///
+    /// Recorded because the LAN rendezvous has to offer the host a candidate on
+    /// **the address the host will see this connection coming from**: the host
+    /// refuses any candidate whose IP does not match the TCP source, and that
+    /// check is what stops an authenticated client naming a third party. Asking
+    /// the routing table separately (`stun::local_host_candidate`) answers a
+    /// subtly different question, and on a phone holding Wi-Fi and a cellular
+    /// interface at once it can answer it with the wrong interface.
+    ///
+    /// `None` over the WAN tunnel, where the concept does not apply — the
+    /// stream there is RUDP over a punched socket, and the address that matters
+    /// is the punched one.
+    local: Option<SocketAddr>,
 }
 
 impl ControlChannel {
@@ -88,7 +102,7 @@ impl ControlChannel {
             },
         ));
 
-        Self::handshake(Box::new(stream), identity, host_pin, &format!("{peer} (WAN tunnel)")).await
+        Self::handshake(Box::new(stream), identity, host_pin, &format!("{peer} (WAN tunnel)"), None).await
     }
 
     /// Connect over TCP to the host's LAN control port.
@@ -103,7 +117,10 @@ impl ControlChannel {
         // Nagle would coalesce small commands on a channel whose whole point is
         // being responsive.
         let _ = tcp.set_nodelay(true);
-        Self::handshake(Box::new(tcp), identity, host_pin, &addr.to_string()).await
+        // Read BEFORE the stream is boxed for TLS: once it is erased behind
+        // `Duplex` there is no way back to the TcpStream to ask.
+        let local = tcp.local_addr().ok();
+        Self::handshake(Box::new(tcp), identity, host_pin, &addr.to_string(), local).await
     }
 
     async fn handshake(
@@ -111,6 +128,7 @@ impl ControlChannel {
         identity: &Identity,
         host_pin: [u8; 32],
         label: &str,
+        local: Option<SocketAddr>,
     ) -> Result<Self, String> {
         let tls = nova_core::identity::client_config_pinned(identity, host_pin)?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
@@ -127,7 +145,15 @@ impl ControlChannel {
             .map_err(|e| format!("TLS handshake with {label}: {e} — is this fingerprint really this host?"))?;
 
         let (read, write) = tokio::io::split(Box::new(stream) as Stream);
-        Ok(Self { write, read: BufReader::new(read), next_id: 1 })
+        Ok(Self { write, read: BufReader::new(read), next_id: 1, local })
+    }
+
+    /// The local address this channel went out from, when it went out over TCP.
+    ///
+    /// See the field: this is the address the host sees as the connection
+    /// source, and therefore the only IP it will accept a LAN candidate on.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local
     }
 
     /// Send a command and wait for its reply.
@@ -190,7 +216,7 @@ impl ControlChannel {
     #[cfg(test)]
     fn over(stream: Stream) -> Self {
         let (read, write) = tokio::io::split(stream);
-        Self { write, read: BufReader::new(read), next_id: 1 }
+        Self { write, read: BufReader::new(read), next_id: 1, local: None }
     }
 
     /// Send a command without waiting for a reply.

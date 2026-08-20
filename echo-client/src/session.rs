@@ -40,6 +40,53 @@ use serde_json::{json, Value};
 use crate::control::{self, ControlChannel};
 use crate::receiver::{self, FrameSink, ReceiveStats};
 
+/// Which route the media path actually took.
+///
+/// **Determined from the peer that was latched, never from which branch of the
+/// cascade ran.** Those are not the same question and the difference is the
+/// whole reason this is an enum rather than a boolean: the relay is a
+/// *signalling* channel, so a session that used the relay to trade candidates
+/// and then punched to a private address is carrying media entirely on the
+/// local segment — LAN by every measure that affects latency. Reporting it as
+/// WAN because the relay was involved would put a cyan badge on the fastest
+/// path Echo has, and send anyone debugging latency looking at the internet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Media flows to a private address: same subnet, no internet involved.
+    Lan,
+    /// A punched path to a public address, via relay signalling.
+    WanPunch,
+    /// A punched path to the endpoint the user configured by hand.
+    DirectWan,
+}
+
+impl Transport {
+    /// The wire name. Kotlin branches on this string, so it is API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Lan => "lan",
+            Transport::WanPunch => "wan_punch",
+            Transport::DirectWan => "direct_wan",
+        }
+    }
+}
+
+/// Whether an address is one only reachable from inside a local network.
+///
+/// The same test the host applies in `rpc.rs::is_lan_peer`, and it must stay
+/// the same: the two ends classifying one path differently is how a badge ends
+/// up disagreeing with the host log about what just happened.
+fn is_private_addr(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 /// Something worth telling the user about.
 ///
 /// Deliberately *not* the media path: frames go to a [`FrameSink`], events go
@@ -60,7 +107,22 @@ pub enum Event {
     HostCandidates { addrs: Vec<SocketAddr> },
     Offered,
     Punching { interval: Duration, timeout: Duration },
-    PathOpen { peer: SocketAddr, rounds: u32, proof: String, local: SocketAddr },
+    /// Stage 1 of the cascade is dialling the host's LAN control port.
+    LanAttempt { endpoint: SocketAddr },
+    /// The LAN rendezvous succeeded and the host named where to punch.
+    LanRendezvous { offered: SocketAddr, host_candidates: Vec<SocketAddr> },
+    /// Stage 1 was given up on. **Not an error** — it is the expected outcome
+    /// from anywhere except the host's own network, and the session continues
+    /// down the cascade. Reported because "why is this slow when both machines
+    /// are in the same room" needs an answer that names the step that failed.
+    LanAbandoned { reason: String },
+    PathOpen {
+        peer: SocketAddr,
+        rounds: u32,
+        proof: String,
+        local: SocketAddr,
+        transport: Transport,
+    },
     /// The punch failed. `endpoint_dependent` distinguishes "this network
     /// cannot do P2P" from "something is misconfigured" — a difference worth
     /// surfacing, because only one of them is worth retrying.
@@ -108,12 +170,26 @@ impl Event {
             Event::Punching { timeout, .. } => {
                 json!({"type": "punching", "timeout_ms": timeout.as_millis() as u64})
             }
-            Event::PathOpen { peer, rounds, proof, local } => json!({
+            Event::LanAttempt { endpoint } => {
+                json!({"type": "lan_attempt", "endpoint": endpoint.to_string()})
+            }
+            Event::LanRendezvous { offered, host_candidates } => json!({
+                "type": "lan_rendezvous",
+                "offered": offered.to_string(),
+                "candidates": host_candidates.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            }),
+            Event::LanAbandoned { reason } => {
+                json!({"type": "lan_abandoned", "reason": reason})
+            }
+            Event::PathOpen { peer, rounds, proof, local, transport } => json!({
                 "type": "path_open",
                 "peer": peer.to_string(),
                 "rounds": rounds,
                 "proof": proof,
                 "local": local.to_string(),
+                // The badge reads this. It is the one field on this event a UI
+                // cannot derive for itself.
+                "transport": transport.as_str(),
             }),
             Event::PunchFailed { endpoint_dependent, error } => json!({
                 "type": "punch_failed",
@@ -175,7 +251,41 @@ pub struct ConnectOptions {
     /// the pin for the control channel are all this one value.
     pub host_fingerprint: String,
     pub punch_timeout: Duration,
+    /// The host's LAN control endpoint, for stage 1 of the cascade.
+    ///
+    /// `host:port`, or a bare address for [`DEFAULT_CONTROL_PORT`]. `None`
+    /// skips the LAN attempt entirely, which is what a caller that has never
+    /// seen this host on a local network should pass — dialling a cached
+    /// address from a different network is a guaranteed timeout, and the point
+    /// of the cascade is to reach the relay faster, not slower.
+    pub lan_endpoint: Option<String>,
+    /// A WAN address the user configured by hand, offered as an extra punch
+    /// candidate. See [`open_path`] for what this can and cannot do.
+    pub wan_endpoint: Option<String>,
+    /// Budget for the LAN dial — TCP connect plus the TLS handshake.
+    ///
+    /// Short on purpose. Every millisecond here is added to the time a cellular
+    /// user waits for a picture, and it buys nothing on their network: a
+    /// private address from outside its network fails immediately with
+    /// "unreachable" or not at all.
+    pub lan_timeout: Duration,
 }
+
+/// Nova's Echo control port. Matches `nova-server/src/echo/rpc.rs`.
+pub const DEFAULT_CONTROL_PORT: u16 = 48011;
+
+/// Budget for the LAN control dial when a caller does not choose one.
+pub const DEFAULT_LAN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long to blast on a LAN rendezvous before giving up.
+///
+/// Deliberately equal to the host's `wan::LAN_PUNCH_TIMEOUT`. The two sides
+/// blast at each other and both must stay in it for the same window: a client
+/// that gave up earlier would abandon a punch the host was still completing,
+/// and one that stayed longer would sit waiting on a host that had already
+/// stopped. On a LAN there is no NAT to open, so this converges in one or two
+/// 25 ms rounds — anything unconfirmed at 1.5 s is blocked, not slow.
+pub const LAN_PUNCH_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// How often the control round trip is measured.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
@@ -296,6 +406,9 @@ impl Default for StreamOptions {
 pub struct OpenPath {
     pub socket: tokio::net::UdpSocket,
     pub peer: SocketAddr,
+    /// How this path was reached. Carried so the UI can say which route it got
+    /// rather than guessing from what it asked for.
+    pub transport: Transport,
 }
 
 /// Gather, trade candidates through the relay, and punch.
@@ -312,6 +425,51 @@ pub async fn open_path(
         .map_err(|e| format!("bind media socket: {e}"))?;
     let local = socket.local_addr().map_err(|e| format!("local address: {e}"))?;
     progress.event(Event::SocketBound { local });
+
+    // ── Stage 1: the LAN ────────────────────────────────────────────────────
+    //
+    // Tried first because when it works it is both the fastest path and the
+    // cheapest to establish: one TCP round trip and one or two punch rounds,
+    // no STUN, no relay, no internet. Tried on THIS socket, because the socket
+    // is the path — anything that binds a fresh one has thrown away the very
+    // thing being negotiated.
+    //
+    // Staged rather than raced against the relay, deliberately. Racing would
+    // put two concurrent writers on the host's latch cell and leave which one
+    // wins to timing; the loser would still be blasting at a host that had
+    // moved on. A failed LAN attempt costs `lan_timeout` plus, at worst, a
+    // punch window — and on a network where the host is absent, the dial fails
+    // immediately rather than timing out, because a private address off its own
+    // network is unreachable rather than silent.
+    if let Some(endpoint) = &opts.lan_endpoint {
+        match open_lan_path(identity, opts, endpoint, &socket, progress).await {
+            Ok(peer) => return Ok(OpenPath { socket, peer, transport: Transport::Lan }),
+            // Never fatal. Every reason to abandon the LAN is a reason the relay
+            // exists, and the relay is the next thing this function does.
+            Err(reason) => progress.event(Event::LanAbandoned { reason }),
+        }
+    }
+
+    // ── Stages 2 and 3 both need the relay ──────────────────────────────────
+    //
+    // Checked before STUN rather than after, so a LAN-only host — one paired
+    // over the local network with no `[echo.signaling]` configured at all —
+    // fails with the reason a user can act on instead of a relay-URL parse
+    // error thirty lines later. That configuration is now legitimate rather
+    // than broken: stage 1 needs no relay, no STUN and no internet, so a host
+    // that answers on the LAN streams with nothing else set up.
+    if opts.relay_url.trim().is_empty() || opts.relay_pin.trim().is_empty() {
+        return Err(match &opts.lan_endpoint {
+            Some(endpoint) => format!(
+                "{endpoint} did not answer and no relay is configured for this host — either \
+                 bring the host onto this network, or set a relay so it can be reached from \
+                 anywhere"
+            ),
+            None => "no relay is configured for this host and no LAN address is known for it — \
+                     there is no route to try"
+                .into(),
+        });
+    }
 
     let servers = resolve_default_stun(progress).await;
     if servers.is_empty() {
@@ -330,15 +488,41 @@ pub async fn open_path(
     let target = RelayTarget::parse(&opts.relay_url).map_err(|e| format!("relay URL: {e}"))?;
     let pin = parse_fingerprint(&opts.relay_pin).map_err(|e| format!("relay pin: {e}"))?;
     let tls = Arc::new(client_config_pinned(identity, pin)?);
-    let mut conn = RelayConnection::connect(&target, tls)
-        .await
-        .map_err(|e| format!("connect to relay: {e}"))?;
+    let mut conn = RelayConnection::connect(&target, tls).await.map_err(|e| {
+        // A relay on a private address is reachable from the host's own network
+        // and nowhere else, so this is the failure every cellular connect
+        // produces on a LAN-only deployment — and "connect to relay: connection
+        // timed out" sends the reader looking at the phone, the app and the
+        // cascade before they look at the URL. Naming it converts the whole
+        // investigation into one sentence.
+        //
+        // Detected from the URL rather than from our own connectivity: we
+        // cannot know what this network can reach, but we can know that
+        // 10.x/192.168.x/127.x is never routable from outside the network that
+        // owns it.
+        let private_relay = target
+            .host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| is_private_addr(&SocketAddr::new(ip, 0)))
+            .unwrap_or(false);
+        if private_relay {
+            format!(
+                "the relay for this host is {}, a private address — it can only be reached \
+                 from the host's own network, so there is no route to it from here. Point \
+                 [echo.signaling] at a relay with a public address (or a forwarded port) to \
+                 stream from anywhere. ({e})",
+                target.host
+            )
+        } else {
+            format!("connect to relay: {e}")
+        }
+    })?;
     progress.event(Event::RelayConnected { authority: target.authority().to_string() });
 
     let mut params = identity_params(identity);
     params.insert("host".into(), json!(opts.host_fingerprint));
     let result = conn.call("lookup", params).await.map_err(|e| format!("relay lookup: {e}"))?;
-    let host_candidates = parse_candidates(result.get("candidates"));
+    let mut host_candidates = parse_candidates(result.get("candidates"));
     if host_candidates.is_empty() {
         return Err(format!(
             "the relay knows no candidates for host {}… — is Nova running with \
@@ -368,6 +552,49 @@ pub async fn open_path(
     conn.call("offer", params).await.map_err(|e| format!("relay offer: {e}"))?;
     progress.event(Event::Offered);
 
+    // ── Stage 3: the manually configured WAN endpoint ───────────────────────
+    //
+    // Added as an EXTRA CANDIDATE to the relay-mediated punch rather than as a
+    // standalone dial, and that is a limitation of the host, not a shortcut
+    // here. The host latches a peer only in the arm that runs when it has been
+    // *told* to punch — by a relay offer or a LAN rendezvous. An unsolicited
+    // probe is answered (a cooperative obligation: our reply completes the
+    // peer's side) but never latched, and `start_session` refuses with
+    // `no_path` when nothing is latched. So a client that dialled a manual
+    // endpoint with no signalling would see its punch succeed and the session
+    // refused immediately afterwards — the worst shape of failure, one that
+    // looks like it worked.
+    //
+    // Offered here, it is real: the relay offer authorises the host to blast,
+    // and if the direct address is the one that answers, media flows straight
+    // to it and never touches a relay-discovered candidate. That is worth
+    // having on a host behind a port forward whose reflexive candidate is
+    // wrong. See the handoff for what a standalone direct dial would need.
+    let direct = opts.wan_endpoint.as_deref().and_then(|text| {
+        // A bare address is completed with the port the relay says the host's
+        // media socket is on. Guessing a port would be worse than useless: the
+        // punch would blast at something that is not listening and the failure
+        // would read as "the host is unreachable".
+        let fallback_port = host_candidates.first().map(SocketAddr::port);
+        match parse_endpoint_with(text, fallback_port) {
+            Some(addr) => Some(addr),
+            None => {
+                progress.event(Event::Warning {
+                    message: format!(
+                        "manual WAN endpoint \"{text}\" has no port and the relay named no \
+                         candidate to borrow one from — ignoring it"
+                    ),
+                });
+                None
+            }
+        }
+    });
+    if let Some(addr) = direct {
+        if !host_candidates.contains(&addr) {
+            host_candidates.push(addr);
+        }
+    }
+
     // ── 4. Punch ────────────────────────────────────────────────────────────
     // Both sides are now sending. Early packets are expected to be dropped by
     // the far NAT; retrying through that window is the mechanism, not a
@@ -380,13 +607,25 @@ pub async fn open_path(
     let cfg = punch::PunchConfig { timeout: opts.punch_timeout, ..Default::default() };
     match punch::punch_io(&mut io, &host_candidates, cfg).await {
         Ok(result) => {
+            // Classified from the address that answered, not from the branch
+            // that got here. A relay-signalled punch that landed on a private
+            // address IS a LAN path — same subnet, no internet — and calling it
+            // WAN would mislabel the fastest route Echo has.
+            let transport = if is_private_addr(&result.peer) {
+                Transport::Lan
+            } else if Some(result.peer) == direct {
+                Transport::DirectWan
+            } else {
+                Transport::WanPunch
+            };
             progress.event(Event::PathOpen {
                 peer: result.peer,
                 rounds: result.rounds,
                 proof: format!("{:?}", result.proof),
                 local,
+                transport,
             });
-            Ok(OpenPath { socket, peer: result.peer })
+            Ok(OpenPath { socket, peer: result.peer, transport })
         }
         Err(e) => {
             let endpoint_dependent = behavior == MappingBehavior::EndpointDependent;
@@ -407,6 +646,141 @@ pub async fn open_path(
     }
 }
 
+/// Stage 1: trade candidates over the host's LAN control port and punch.
+///
+/// Returns the peer the punch latched on, or the reason this route was
+/// abandoned. **Every error here is ordinary.** Being on a different network is
+/// the common case, not a fault, so nothing in this function is worth failing a
+/// session over — the caller reports the reason and moves to the relay.
+///
+/// ## A rendezvous, not a transport
+///
+/// The TCP channel exchanges candidates and is then dropped. It carries no
+/// control traffic and no session's liveness depends on it, which is
+/// load-bearing rather than tidy: the host's detach/sweep model is bound to the
+/// punched tunnel — `transport.rs`'s `release_session_of` fires when *that*
+/// closes — and this port has no equivalent. A second long-lived control
+/// transport would need every one of those invariants re-derived for it.
+///
+/// Everything downstream is unchanged. This function's only product is a peer
+/// address, exactly like the relay path's, so `stream()` cannot tell which
+/// route produced it.
+async fn open_lan_path(
+    identity: &Identity,
+    opts: &ConnectOptions,
+    endpoint: &str,
+    socket: &tokio::net::UdpSocket,
+    progress: &mut impl Progress,
+) -> Result<SocketAddr, String> {
+    let addr = tokio::time::timeout(
+        opts.lan_timeout,
+        resolve_endpoint(endpoint, DEFAULT_CONTROL_PORT),
+    )
+    .await
+    .map_err(|_| format!("looking up \"{endpoint}\" took longer than {:?}", opts.lan_timeout))?
+    .ok_or_else(|| format!("\"{endpoint}\" is not an address this client can dial"))?;
+    progress.event(Event::LanAttempt { endpoint: addr });
+
+    let pin = parse_fingerprint(&opts.host_fingerprint)
+        .map_err(|e| format!("host fingerprint: {e}"))?;
+
+    // One budget over connect AND handshake. Splitting them would let a host
+    // that accepts TCP and then stalls in TLS — a half-open connection through
+    // a firewall, a machine mid-suspend — hold the whole cascade open for as
+    // long as the handshake felt like taking.
+    let mut channel =
+        tokio::time::timeout(opts.lan_timeout, ControlChannel::connect_lan(addr, identity, pin))
+            .await
+            .map_err(|_| format!("{addr} did not answer within {:?}", opts.lan_timeout))??;
+
+    // The address the HOST sees this connection coming from. The host refuses
+    // any candidate whose IP does not match it — that check is what stops an
+    // authenticated client from pointing the host's blast at a third party —
+    // so offering anything else is offering something guaranteed to be refused.
+    let source = channel
+        .local_addr()
+        .ok_or_else(|| "the LAN channel reported no local address".to_string())?;
+    let media_port = socket
+        .local_addr()
+        .map_err(|e| format!("media socket address: {e}"))?
+        .port();
+    let offered = SocketAddr::new(source.ip(), media_port);
+
+    let mut params = serde_json::Map::new();
+    params.insert("candidates".into(), json!([offered.to_string()]));
+    let result = channel
+        .call("lan_rendezvous", params)
+        .await
+        .map_err(|e| format!("lan_rendezvous: {e}"))?;
+
+    // Plain strings here, not the relay's `{"addr": …}` objects — a different
+    // wire shape for a different protocol, so `relay::parse_candidates` does
+    // not apply and silently returns nothing if used.
+    let host_candidates: Vec<SocketAddr> = result
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(|c| c.as_str()?.parse().ok()).collect())
+        .unwrap_or_default();
+    if host_candidates.is_empty() {
+        return Err("the host accepted the rendezvous but named no candidate".into());
+    }
+    progress.event(Event::LanRendezvous { offered, host_candidates: host_candidates.clone() });
+
+    // Done with TCP. The host is already blasting — `punch_toward` is
+    // fire-and-forget into the gatherer task, and does not depend on this
+    // connection staying up.
+    drop(channel);
+
+    let mut io = punch::UdpPunchIo::new(socket);
+    let cfg = punch::PunchConfig { timeout: LAN_PUNCH_TIMEOUT, ..Default::default() };
+    let result = punch::punch_io(&mut io, &host_candidates, cfg)
+        .await
+        .map_err(|e| format!("LAN punch: {e}"))?;
+    progress.event(Event::PathOpen {
+        peer: result.peer,
+        rounds: result.rounds,
+        proof: format!("{:?}", result.proof),
+        local: SocketAddr::new(source.ip(), media_port),
+        transport: Transport::Lan,
+    });
+    Ok(result.peer)
+}
+
+/// Parse `host:port`, or `host` with a default port, resolving a name if it is
+/// one.
+///
+/// Literals are handled without touching the resolver, which matters on a phone:
+/// the common input is an IPv4 literal from the host list, and a DNS round trip
+/// for it would be latency spent to learn what was already known.
+async fn resolve_endpoint(text: &str, default_port: u16) -> Option<SocketAddr> {
+    let text = text.trim();
+    if let Some(addr) = parse_endpoint_with(text, Some(default_port)) {
+        return Some(addr);
+    }
+    // A name. `lookup_host` needs a port in the string to answer at all.
+    let with_port =
+        if text.contains(':') { text.to_string() } else { format!("{text}:{default_port}") };
+    tokio::net::lookup_host(with_port).await.ok()?.next()
+}
+
+/// Parse an address literal, supplying `fallback_port` when the text has none.
+///
+/// Returns `None` for a portless address with no fallback — the caller must
+/// decide what to do about that, because inventing a port produces a punch at
+/// something that is not listening and a failure that reads as "host
+/// unreachable".
+fn parse_endpoint_with(text: &str, fallback_port: Option<u16>) -> Option<SocketAddr> {
+    let text = text.trim();
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    // A bare IP. Bracketed IPv6 without a port (`[::1]`) is accepted too, since
+    // that is how it is written everywhere else.
+    let bare = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')).unwrap_or(text);
+    let ip: std::net::IpAddr = bare.parse().ok()?;
+    Some(SocketAddr::new(ip, fallback_port?))
+}
+
 /// Ask the host for a session over the punched path, then receive it until
 /// `stop` is set.
 ///
@@ -425,7 +799,7 @@ pub async fn stream(
     uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
     let pin = parse_fingerprint(host_fingerprint).map_err(|e| format!("host fingerprint: {e}"))?;
-    let OpenPath { socket, peer } = path;
+    let OpenPath { socket, peer, .. } = path;
     let socket = Arc::new(socket);
 
     // The socket must have exactly one reader, so demultiplexing starts before
@@ -879,6 +1253,76 @@ mod tests {
         let stats = ReceiveStats { frames_dropped_before_keyframe: 3, ..Default::default() };
         assert_eq!(Event::Ended { stats }.to_json()["frames_dropped_before_keyframe"], json!(3));
     }
+
+    // ── The transport cascade ───────────────────────────────────────────────
+
+    #[test]
+    fn the_transport_reaches_kotlin_on_the_path_open_event() {
+        // The badge is driven by this string. A rename here is a UI change.
+        let ev = Event::PathOpen {
+            peer: "203.0.113.7:47998".parse().unwrap(),
+            rounds: 2,
+            proof: "RoundTrip".into(),
+            local: "192.168.1.9:51000".parse().unwrap(),
+            transport: Transport::DirectWan,
+        };
+        assert_eq!(ev.to_json()["transport"], json!("direct_wan"));
+        assert_eq!(Transport::Lan.as_str(), "lan");
+        assert_eq!(Transport::WanPunch.as_str(), "wan_punch");
+    }
+
+    #[test]
+    fn a_private_peer_is_a_lan_path_however_it_was_signalled() {
+        // The classification that matters most, and the one most easily got
+        // wrong: the relay is a SIGNALLING channel, so a relay-mediated punch
+        // that landed on a private address is carrying media on the local
+        // segment. Calling it WAN would mislabel the fastest path Echo has.
+        for addr in ["192.168.1.50:47998", "10.0.0.205:47998", "172.16.4.4:1", "127.0.0.1:9"] {
+            assert!(is_private_addr(&addr.parse().unwrap()), "{addr} is private");
+        }
+        for addr in ["203.0.113.7:47998", "8.8.8.8:53", "172.32.0.1:1"] {
+            assert!(!is_private_addr(&addr.parse().unwrap()), "{addr} is public");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_may_omit_its_port_only_when_a_fallback_exists() {
+        // A bare WAN address borrows the port the relay named for the host.
+        // Without one there is nothing to borrow, and inventing a port would
+        // blast at something that is not listening — a failure that reads as
+        // "the host is unreachable" and sends the search in the wrong
+        // direction entirely.
+        assert_eq!(
+            parse_endpoint_with("10.0.0.205", Some(48011)),
+            Some("10.0.0.205:48011".parse().unwrap())
+        );
+        assert_eq!(
+            parse_endpoint_with("10.0.0.205:9999", Some(48011)),
+            Some("10.0.0.205:9999".parse().unwrap()),
+            "an explicit port always wins over the fallback"
+        );
+        assert_eq!(parse_endpoint_with("203.0.113.7", None), None);
+        assert_eq!(parse_endpoint_with("  10.0.0.205  ", Some(1)), Some("10.0.0.205:1".parse().unwrap()));
+        assert_eq!(parse_endpoint_with("not-an-address", Some(1)), None, "a name is not a literal");
+    }
+
+    #[test]
+    fn ipv6_literals_survive_both_spellings() {
+        assert_eq!(parse_endpoint_with("[::1]:48011", None), Some("[::1]:48011".parse().unwrap()));
+        assert_eq!(parse_endpoint_with("[::1]", Some(48011)), Some("[::1]:48011".parse().unwrap()));
+        assert_eq!(parse_endpoint_with("::1", Some(48011)), Some("[::1]:48011".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_literal_endpoint_resolves_without_touching_the_resolver() {
+        // Not a performance nicety: this runs on a phone, where the common
+        // input is an IPv4 literal from the host list and a DNS round trip for
+        // it would be latency spent to learn what was already known.
+        assert_eq!(
+            resolve_endpoint("10.0.0.205", 48011).await,
+            Some("10.0.0.205:48011".parse().unwrap())
+        );
+    }
 }
 
 /// End whatever session the host is holding for this device, **without starting
@@ -911,7 +1355,7 @@ pub async fn release(
     progress: &mut impl Progress,
 ) -> Result<(), String> {
     let pin = parse_fingerprint(host_fingerprint).map_err(|e| format!("host fingerprint: {e}"))?;
-    let OpenPath { socket, peer } = path;
+    let OpenPath { socket, peer, .. } = path;
     let socket = Arc::new(socket);
 
     // Same rule as `stream`: the socket must have exactly one reader, and the
