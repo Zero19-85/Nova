@@ -50,6 +50,20 @@ object EchoNative {
     external fun nativePollEvent(handle: Long, timeoutMs: Int): String?
 
     /**
+     * Ask the relay whether it can currently reach a host. **Blocks** — call it
+     * from a worker thread.
+     *
+     * Answers `{"registered": bool, "candidates": [..], "detail": "..."}`. An
+     * unreachable relay is `registered: false` with a reason, never a throw:
+     * "cannot reach the relay" is the ordinary condition this exists to detect.
+     *
+     * Stronger evidence than a TCP connect to the relay, which proves only that
+     * the relay is up. A relay running beside a switched-off Nova would answer
+     * a TCP probe happily and tell the user nothing true about the host.
+     */
+    external fun nativeRelayLookup(configJson: String): String
+
+    /**
      * Copy the next frame into [buf], which must be a **direct** ByteBuffer — in
      * practice a MediaCodec input buffer, which is what makes this a single copy
      * into memory the decoder already owns.

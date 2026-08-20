@@ -1,6 +1,5 @@
 package com.nova.echo
 
-import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -14,8 +13,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -23,8 +20,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -56,8 +51,11 @@ class MainActivity : ComponentActivity() {
         controller = EchoController.of(applicationContext)
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(color = Color.Black) { EchoScreen(controller) }
+            EchoTheme {
+                // Pure black rather than the theme surface: this is the ground
+                // the video sits on, and any lift at all glows around the frame
+                // on an OLED panel.
+                Surface(color = Void) { EchoScreen(controller) }
             }
         }
     }
@@ -247,6 +245,7 @@ private fun EchoScreen(controller: EchoController) {
             StreamOverlay(
                 visible = controlsVisible,
                 status = state.status,
+                transport = state.transport,
                 lastSource = lastSource,
                 captureHeld = captureHeld,
                 captureWhy = captureWhy,
@@ -283,7 +282,7 @@ private fun EchoScreen(controller: EchoController) {
                 stats = { controller.stats() },
             )
         } else {
-            ControlPanel(controller, state)
+            EchoDashboard(controller, state)
         }
     }
 
@@ -303,6 +302,7 @@ private fun EchoScreen(controller: EchoController) {
 private fun BoxScope.StreamOverlay(
     visible: Boolean,
     status: String,
+    transport: String?,
     lastSource: String,
     captureHeld: Boolean,
     captureWhy: String,
@@ -326,15 +326,16 @@ private fun BoxScope.StreamOverlay(
 ) {
     if (!visible) {
         TextButton(onClick = onToggle, modifier = Modifier.align(Alignment.TopEnd)) {
-            Text("☰", color = Color.White.copy(alpha = 0.55f), fontSize = 22.sp)
+            Text("☰", color = Ion.copy(alpha = 0.75f), fontSize = 22.sp)
         }
         return
     }
 
     Surface(
         modifier = Modifier.align(Alignment.TopCenter).padding(12.dp),
-        color = Color.Black.copy(alpha = 0.9f),
-        shape = MaterialTheme.shapes.medium,
+        color = Carbon.copy(alpha = 0.94f),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(6.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Edge),
     ) {
         Column(
             Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
@@ -344,9 +345,21 @@ private fun BoxScope.StreamOverlay(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(status, color = Color.White, fontSize = 13.sp)
-                Button(onClick = onStop) { Text("Stop") }
-                TextButton(onClick = onToggle) { Text("Resume") }
+                Text(status.uppercase(), style = TelemetryStrong)
+                // The route this session actually took. It belongs here as much
+                // as on the card: mid-stream is when a user is asking why it
+                // feels the way it does, and the dashboard is not on screen to
+                // be asked. "WAN_PUNCH on the sofa" is the answer to a whole
+                // class of latency reports.
+                transport?.let { Badge(transportPresence(it).label(), transportPresence(it).accent()) }
+                Button(
+                    onClick = onStop,
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Crimson, contentColor = Void),
+                ) { Text("STOP", style = TelemetryStrong.copy(color = Void)) }
+                TextButton(onClick = onToggle) {
+                    Text("RESUME", style = TelemetryStrong.copy(color = Ion))
+                }
             }
 
             OverlayToggle("Send input to PC", inputEnabled, onInputEnabled)
@@ -363,8 +376,7 @@ private fun BoxScope.StreamOverlay(
                 Text(
                     if (videoDelayMs > 0) "video held ${videoDelayMs}ms to match audio"
                     else "measuring audio latency…",
-                    color = Color.White.copy(alpha = 0.65f),
-                    fontSize = 11.sp,
+                    style = Telemetry,
                 )
             }
 
@@ -375,8 +387,7 @@ private fun BoxScope.StreamOverlay(
             if (micEnabled && !micActive) {
                 Text(
                     micProblem ?: "microphone starting…",
-                    color = Color.White.copy(alpha = 0.65f),
-                    fontSize = 11.sp,
+                    style = Telemetry,
                 )
             }
 
@@ -394,14 +405,12 @@ private fun BoxScope.StreamOverlay(
                         "It is released while this panel is open (a grabbed mouse " +
                         "can't tap these controls) — close it to grab the mouse.\n" +
                         "last attempt: " + captureWhy.ifEmpty { "none yet" },
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 11.sp,
+                    style = Telemetry,
                 )
             } else {
                 Text(
                     "capture is off — the mouse works, but stops at the screen edges.",
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 11.sp,
+                    style = Telemetry,
                 )
             }
 
@@ -410,9 +419,7 @@ private fun BoxScope.StreamOverlay(
             Text(
                 "capture: ${if (captureHeld) "held" else "off"}   " +
                     "last input source: $lastSource",
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
+                style = Telemetry,
             )
 
             // Live pipeline latency. The one number that separates "the host
@@ -435,9 +442,7 @@ private fun BoxScope.StreamOverlay(
             if (pipeline.isNotEmpty()) {
                 Text(
                     pipeline,
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
+                    style = Telemetry,
                 )
             }
         }
@@ -450,276 +455,18 @@ private fun OverlayToggle(label: String, checked: Boolean, onChange: (Boolean) -
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Switch(checked = checked, onCheckedChange = onChange)
-        Text(label, color = Color.White, fontSize = 12.sp)
-    }
-}
-
-/**
- * A text field backed by SharedPreferences.
- *
- * `rememberSaveable` alone survives rotation but not a process restart, and
- * during bring-up the app gets killed and relaunched constantly. Retyping a
- * 64-character fingerprint on a phone keyboard each time is not a reasonable
- * thing to ask of anyone.
- */
-@Composable
-private fun rememberPref(key: String, default: String): MutableState<String> {
-    val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("echo", Context.MODE_PRIVATE) }
-    val state = rememberSaveable { mutableStateOf(prefs.getString(key, default) ?: default) }
-    LaunchedEffect(state.value) { prefs.edit().putString(key, state.value).apply() }
-    return state
-}
-
-/**
- * How long "Searching…" may claim to be making progress before the UI admits it
- * has found nothing.
- *
- * Long enough for a first mDNS round trip on a busy network with a retry in it,
- * short enough that nobody sits watching it. Expiry changes only the message —
- * the browse keeps running, so a host that boots a minute from now still
- * appears on its own without anyone pressing anything.
- */
-private const val SEARCH_SETTLE_MS = 8_000L
-
-@Composable
-private fun ControlPanel(controller: EchoController, state: UiState) {
-    var host by rememberPref("host", "10.0.0.205")
-    var deviceName by rememberPref("device_name", "Echo Android")
-    var relayUrl by rememberPref("relay_url", "https://10.0.0.205:8443/v1/signal")
-    var relayPin by rememberPref("relay_pin", "")
-    var hostFp by rememberPref("host_fp", "")
-
-    // Once pairing succeeds the fingerprint is known; carry it into the stream
-    // field so nobody has to copy 64 hex characters by hand.
-    LaunchedEffect(state.hostFingerprint) {
-        state.hostFingerprint?.let { if (it.isNotBlank()) hostFp = it }
-    }
-
-    // Browse the LAN only while this screen is up. During a session there is
-    // nothing to choose, and a browse that outlives its UI is just multicast
-    // traffic and a wakelock nobody asked for.
-    val context = LocalContext.current
-    val discovery = remember { HostDiscovery(context) }
-    DisposableEffect(discovery) {
-        discovery.start()
-        onDispose { discovery.stop() }
-    }
-    val found by discovery.hosts.collectAsState()
-    val browsing by discovery.browsing.collectAsState()
-
-    // "Searching…" is a promise that something is about to happen, and after a
-    // few seconds on a quiet network it stops being true. This bounds it: the
-    // browse itself keeps running — a host that boots in a minute still appears
-    // — but the UI stops claiming progress it is not making and says what to
-    // check instead. Without this the spinner sat there indefinitely with no
-    // way to tell "still looking" from "nothing here" (2026-08-18).
-    var searchStartedAt by remember { mutableStateOf(System.currentTimeMillis()) }
-    var settled by remember { mutableStateOf(false) }
-    LaunchedEffect(searchStartedAt) {
-        settled = false
-        kotlinx.coroutines.delay(SEARCH_SETTLE_MS)
-        settled = true
-    }
-    val searching = browsing && !settled
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .padding(20.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text("Echo", style = MaterialTheme.typography.headlineMedium)
-        Text(state.status, style = MaterialTheme.typography.bodyLarge)
-
-        state.pin?.let { pin ->
-            Card(Modifier.fillMaxWidth()) {
-                Column(
-                    Modifier.fillMaxWidth().padding(16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text("Type this PIN into Nova on the PC", textAlign = TextAlign.Center)
-                    Text(pin, fontSize = 48.sp, fontFamily = FontFamily.Monospace)
-                }
-            }
-        }
-
-        state.error?.let {
-            Text(it, color = MaterialTheme.colorScheme.error)
-        }
-
-        // ── Found on this network ───────────────────────────────────────────
-        // Tapping a host fills the address and, when it advertises one, the
-        // relay pair. It deliberately does NOT fill Nova's fingerprint: that
-        // field is the trust decision, and mDNS is unauthenticated. Anything on
-        // this Wi-Fi can advertise `_echo._tcp` and claim any fingerprint, so
-        // the advertised one is used only to recognise a host already paired
-        // with — never to establish that trust. Pairing writes that field.
-        //
-        // The header is part of the state rather than a fixed label. As a
-        // constant it read as a result — "Found on this network" sitting above
-        // "Searching…" looks like a success message, and it was taken for one
-        // (2026-08-18) while the list underneath was in fact empty.
-        Text(
-            when {
-                found.isNotEmpty() -> "Found on this network"
-                searching -> "Looking for Nova on this network"
-                else -> "No hosts found"
-            },
-            style = MaterialTheme.typography.titleSmall,
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Void,
+                checkedTrackColor = Ion,
+                checkedBorderColor = Ion,
+                uncheckedThumbColor = TextDim,
+                uncheckedTrackColor = Carbon,
+                uncheckedBorderColor = Edge,
+            ),
         )
-        when {
-            found.isNotEmpty() -> found.forEach { h ->
-                val isPaired = hostFp.isNotBlank() && h.fingerprint.equals(hostFp, ignoreCase = true)
-                OutlinedButton(
-                    onClick = {
-                        host = h.address
-                        if (h.hasRelay) {
-                            relayUrl = h.relayUrl!!
-                            relayPin = h.relayPin!!
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column(Modifier.fillMaxWidth()) {
-                        Text("${h.name} — ${h.address}")
-                        Text(
-                            listOf(
-                                if (isPaired) "paired" else "not paired yet",
-                                if (h.hasRelay) "relay advertised" else "LAN only",
-                            ).joinToString(" · "),
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.secondary,
-                        )
-                    }
-                }
-            }
-            searching -> Text(
-                "Searching…",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.secondary,
-            )
-            else -> {
-                Text(
-                    "Nothing answered on this network. Check the phone and the PC are on " +
-                        "the same Wi-Fi, and that Nova is running a build that advertises " +
-                        "itself — nova-service.log logs \"Echo mDNS: advertising\" at startup " +
-                        "when it does. You can still enter the address by hand below.",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.secondary,
-                )
-                TextButton(onClick = {
-                    discovery.restart()
-                    searchStartedAt = System.currentTimeMillis()
-                }) { Text("Search again") }
-            }
-        }
-
-        HorizontalDivider(Modifier.padding(vertical = 6.dp))
-
-        // Named arguments throughout: OutlinedTextField has a TextFieldValue
-        // overload, and positional args let the compiler pick it, at which point
-        // the lambda's `it` no longer resolves.
-        OutlinedTextField(
-            value = host,
-            onValueChange = { host = it },
-            label = { Text("Host LAN address") },
-            singleLine = true,
-        )
-        OutlinedTextField(
-            value = deviceName,
-            onValueChange = { deviceName = it },
-            label = { Text("This device's name") },
-            singleLine = true,
-        )
-        Button(onClick = { controller.pair(host, deviceName) }, Modifier.fillMaxWidth()) {
-            Text("Pair (LAN only)")
-        }
-
-        HorizontalDivider(Modifier.padding(vertical = 6.dp))
-
-        OutlinedTextField(
-            value = relayUrl,
-            onValueChange = { relayUrl = it },
-            label = { Text("Relay URL") },
-            singleLine = true,
-        )
-        OutlinedTextField(
-            value = relayPin,
-            onValueChange = { relayPin = it },
-            label = { Text("Relay fingerprint") },
-            singleLine = true,
-        )
-        OutlinedTextField(
-            value = hostFp,
-            onValueChange = { hostFp = it },
-            label = { Text("Nova fingerprint") },
-            singleLine = true,
-        )
-        // A disabled button that does not say why is a dead end, and this one
-        // has two independent preconditions. Naming the missing ones turns
-        // "nothing happens" into an instruction.
-        val missing = buildList {
-            if (hostFp.isBlank()) add("Nova's fingerprint — pair first")
-            if (relayPin.isBlank()) add("the relay's fingerprint — nova-relay prints it at startup")
-        }
-        if (missing.isNotEmpty()) {
-            Text(
-                "Stream needs ${missing.joinToString(" and ")}.",
-                color = MaterialTheme.colorScheme.secondary,
-                fontSize = 12.sp,
-            )
-        }
-        Button(
-            onClick = { controller.connect(relayUrl, relayPin, hostFp) },
-            enabled = missing.isEmpty(),
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Stream") }
-
-        // Always present, and it always does something. With a live handle it
-        // stops the session directly; without one it reconnects first, because
-        // the host may still be HOLDING a session this app has no handle for —
-        // an app that was swiped away or lost the network never sent
-        // `stop_session`, so the host detached and is keeping the display up for
-        // the grace period.
-        //
-        // Two earlier versions of this button were both wrong. It used to call
-        // `stop()` unconditionally, which sent nothing at all once the handle
-        // had been freed — a button that looked live and did nothing. Hiding it
-        // in that state was honest but useless: it removed the only control that
-        // could have released the held session, leaving the tray on the PC as
-        // the sole way out. Naming what will happen is better than either.
-        OutlinedButton(
-            onClick = {
-                if (state.connected) controller.stop()
-                else controller.releaseHostSession(relayUrl, relayPin, hostFp)
-            },
-            enabled = state.connected || hostFp.isNotBlank(),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(if (state.connected) "Stop" else "End session on host")
-        }
-        if (!state.connected) {
-            Text(
-                "Use this if the PC still shows a stream after the app was closed.",
-                color = MaterialTheme.colorScheme.secondary,
-                fontSize = 12.sp,
-            )
-        }
-
-        Text(
-            "This device: ${state.myFingerprint}",
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace,
-        )
-
-        if (state.log.isNotEmpty()) {
-            HorizontalDivider(Modifier.padding(vertical = 6.dp))
-            state.log.forEach {
-                Text(it, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-            }
-        }
+        Text(label, color = Text, fontSize = 12.sp)
     }
 }

@@ -49,6 +49,12 @@ dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.10.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
+    // Both arrive transitively through material3 today. Declared anyway because
+    // this app uses them directly — `combinedClickable` for the host card's tap
+    // and hold, and the gear glyph in the top bar — and a transitive dependency
+    // that a future material3 drops takes the build with it.
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

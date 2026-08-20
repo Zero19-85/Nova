@@ -36,6 +36,19 @@ data class UiState(
      * was still holding.
      */
     val connected: Boolean = false,
+    /**
+     * Which route the live path took: `lan`, `wan_punch`, `direct_wan`.
+     *
+     * Set from the `path_open` event and cleared when the session ends, so it
+     * is never a stale claim about a path that no longer exists.
+     *
+     * **The engine decides this, not the app.** Rust classifies from the peer
+     * address the punch actually latched — which is why a relay-signalled
+     * session that landed on a private address correctly reports `lan`. Any
+     * attempt to infer it here from what was configured would get exactly that
+     * case wrong, and it is the case that matters most: it is the fast one.
+     */
+    val transport: String? = null,
     val error: String? = null,
     val log: List<String> = emptyList(),
     /** The user's intent for the microphone; persists across sessions. */
@@ -133,6 +146,12 @@ class EchoController private constructor(private val context: android.content.Co
 
     fun init() {
         EchoNative.nativeInit()
+        // The microphone switch is *intent* and is persisted, so it has to be
+        // restored here rather than defaulting off on every process start —
+        // otherwise the settings sheet and the controller disagree about a
+        // setting the user already made, and the mic silently fails to start at
+        // the next grant.
+        post { it.copy(micEnabled = EchoSettings.of(context).prefsState.micEnabled) }
         thread(name = "echo-identity") {
             // RSA-2048 generation on first run; off the main thread because it
             // is the one call here that takes a noticeable moment.
@@ -151,18 +170,52 @@ class EchoController private constructor(private val context: android.content.Co
         start(config.toString(), pairing = true)
     }
 
-    fun connect(relayUrl: String, relayPin: String, hostFingerprint: String) {
-        val config = JSONObject()
-            .put("identity_dir", filesDir)
-            .put("relay_url", relayUrl)
-            .put("relay_pin", relayPin)
-            .put("host_fingerprint", hostFingerprint)
-            .put("res", "1920x1080")
-            .put("fps", 60)
-            .put("codec", "hevc")
-            .put("bitrate_kbps", 20000)
-        start(config.toString(), pairing = false)
+    /**
+     * Open a streaming session.
+     *
+     * [prefs] carries the user's opening bid for the stream. It is a REQUEST:
+     * the host negotiates from it and the grant is authoritative, which is why
+     * [onGranted] configures the decoder from the event rather than from these
+     * values. A host that caps H264 at 24 fps for Level 5.2, or clamps the
+     * bitrate to the resolution ceiling, is doing its job.
+     *
+     * Takes the whole [KnownHost] rather than four strings. The relay URL, its
+     * pin, the fingerprint and the endpoints are four values that only mean
+     * anything together — passing them separately is how a caller ends up
+     * dialling one host's relay with another host's fingerprint, which fails at
+     * the TLS pin with a message about certificates rather than about the mixup.
+     */
+    fun connect(host: KnownHost, prefs: StreamPrefs) {
+        start(transportConfig(host).apply {
+            put("res", prefs.resolution)
+            put("fps", prefs.fps)
+            put("codec", prefs.codec)
+            put("bitrate_kbps", prefs.bitrateKbps)
+        }.toString(), pairing = false)
     }
+
+    /**
+     * The half of the session config that decides *how* the host is reached.
+     *
+     * Shared by [connect] and [releaseHostSession] so both take the same route.
+     * A release that went over the relay while the session it is ending was on
+     * the LAN would be a bug visible only from the one network nobody tests on.
+     *
+     * `lan_endpoint` is omitted when this host has no locally-observed address:
+     * Rust skips stage 1 entirely when it is absent, and that is the honest
+     * default — an address we have never seen this host answer on is a guess
+     * paid for on every connect.
+     */
+    private fun transportConfig(host: KnownHost): JSONObject = JSONObject()
+        .put("identity_dir", filesDir)
+        .put("relay_url", host.relayUrl ?: "")
+        .put("relay_pin", host.relayPin ?: "")
+        .put("host_fingerprint", host.fingerprint)
+        .apply {
+            host.lanAddress?.takeIf { it.isNotBlank() }
+                ?.let { put("lan_endpoint", "$it:${host.port}") }
+            host.wanEndpoint?.takeIf { it.isNotBlank() }?.let { put("wan_endpoint", it) }
+        }
 
     /**
      * End a session still held on the host when this app has no handle to it.
@@ -181,13 +234,9 @@ class EchoController private constructor(private val context: android.content.Co
      * the user pressed the button four times for two teardowns (2026-08-17).
      * Ending a session never needed a session.
      */
-    fun releaseHostSession(relayUrl: String, relayPin: String, hostFingerprint: String) {
+    fun releaseHostSession(host: KnownHost) {
         post { it.copy(status = "Ending the session on the host…", error = null) }
-        val config = JSONObject()
-            .put("identity_dir", filesDir)
-            .put("relay_url", relayUrl)
-            .put("relay_pin", relayPin)
-            .put("host_fingerprint", hostFingerprint)
+        val config = transportConfig(host)
         thread(name = "echo-release") {
             try {
                 val answer = EchoNative.nativeRelease(config.toString())
@@ -207,7 +256,20 @@ class EchoController private constructor(private val context: android.content.Co
 
     private fun start(configJson: String, pairing: Boolean) {
         stop()
-        post { it.copy(status = if (pairing) "Pairing…" else "Connecting…", error = null, pin = null, log = emptyList()) }
+        post {
+            it.copy(
+                status = if (pairing) "Pairing…" else "Connecting…",
+                error = null,
+                pin = null,
+                log = emptyList(),
+                // Cleared for a pairing run so the fingerprint that arrives is
+                // unambiguously THIS handshake's. The dashboard attributes it to
+                // whichever card started the flow, and a value left over from a
+                // previous pairing would be attributed to the wrong machine —
+                // marking a host paired that never was.
+                hostFingerprint = if (pairing) null else it.hostFingerprint,
+            )
+        }
 
         val h = try {
             if (pairing) EchoNative.nativePair(configJson) else EchoNative.nativeConnect(configJson)
@@ -273,10 +335,19 @@ class EchoController private constructor(private val context: android.content.Co
                         hostFingerprint = event.optString("fingerprint", it.hostFingerprint ?: ""),
                     )
                 }
+                // The route the engine settled on. Recorded before the grant
+                // arrives, so the badge is already right when the picture
+                // appears rather than a frame behind it.
+                "path_open" -> post {
+                    it.copy(transport = event.optString("transport").ifBlank { null })
+                }
                 "granted" -> onGranted(event, h)
                 "error" -> post { it.copy(status = "Failed", error = event.optString("message")) }
                 "closed", "ended" -> {
-                    post { it.copy(status = "Ended", streaming = false) }
+                    // `transport` goes with the session. Leaving it set would
+                    // leave a card claiming a live LAN path to a host nothing
+                    // is connected to.
+                    post { it.copy(status = "Ended", streaming = false, transport = null) }
                     return
                 }
             }
@@ -404,6 +475,11 @@ class EchoController private constructor(private val context: android.content.Co
      */
     fun setMicEnabled(enabled: Boolean) {
         post { it.copy(micEnabled = enabled, micProblem = if (enabled) it.micProblem else null) }
+        // Persisted here rather than at the call sites, because there are two of
+        // them — the settings sheet and the in-stream overlay — and a switch
+        // that only sticks when flipped from one of them is worse than one that
+        // never sticks at all.
+        EchoSettings.of(context).edit { it.copy(micEnabled = enabled) }
         if (enabled) {
             val h = synchronized(lock) { handle }
             if (h != 0L && state.streaming) startMic(h)
@@ -423,6 +499,7 @@ class EchoController private constructor(private val context: android.content.Co
     fun onMicPermissionResult(granted: Boolean) {
         if (!granted) {
             post { it.copy(micEnabled = false, micProblem = "microphone permission denied") }
+            EchoSettings.of(context).edit { it.copy(micEnabled = false) }
             return
         }
         EchoService.start(context)
@@ -517,7 +594,16 @@ class EchoController private constructor(private val context: android.content.Co
         // though the stop itself had failed. `pin` goes too, since a pairing
         // that was abandoned mid-flight would otherwise leave a stale code on
         // screen for a handshake nobody is running any more.
-        post { it.copy(status = "Idle", error = null, pin = null, streaming = false, connected = false) }
+        post {
+            it.copy(
+                status = "Idle",
+                error = null,
+                pin = null,
+                streaming = false,
+                connected = false,
+                transport = null,
+            )
+        }
     }
 
     private fun describe(event: JSONObject): String = when (event.optString("type")) {
@@ -526,7 +612,11 @@ class EchoController private constructor(private val context: android.content.Co
         "local_candidate" -> "lan ${event.optString("addr")}"
         "relay_connected" -> "relay ${event.optString("authority")}"
         "host_candidates" -> "host candidates ${event.optJSONArray("addrs")}"
-        "path_open" -> "path open ${event.optString("peer")} (${event.optInt("rounds")} rounds)"
+        "lan_attempt" -> "LAN first: ${event.optString("endpoint")}"
+        "lan_rendezvous" -> "LAN rendezvous accepted, host at ${event.optJSONArray("candidates")}"
+        "lan_abandoned" -> "LAN abandoned — ${event.optString("reason")}"
+        "path_open" -> "path open ${event.optString("peer")} via ${event.optString("transport")} " +
+            "(${event.optInt("rounds")} rounds)"
         "control_authenticated" -> "tunnel authenticated"
         "granted" -> "session ${event.optInt("session_id")} granted"
         "refused" -> "refused: ${event.optString("reason")}"

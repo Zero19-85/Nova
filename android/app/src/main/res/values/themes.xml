@@ -1,3 +1,11 @@
 <resources>
-    <style name="Theme.Echo" parent="android:Theme.Material.NoActionBar.Fullscreen" />
+    <!-- The window background is painted before Compose draws its first frame.
+         Left at the platform default it flashes the framework grey on launch and
+         again on every configuration change, which on a pitch-black app reads as
+         a glitch rather than a theme. -->
+    <style name="Theme.Echo" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/ion_void</item>
+        <item name="android:navigationBarColor">@color/ion_void</item>
+        <item name="android:statusBarColor">@color/ion_void</item>
+    </style>
 </resources>

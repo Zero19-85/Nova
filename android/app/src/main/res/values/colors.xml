@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mirrors Theme.kt. Only the window ground lives here: the Compose theme
+         owns every other colour, and duplicating the palette in XML would give
+         two places to change it and one to forget. -->
+    <color name="ion_void">#FF050508</color>
+</resources>
