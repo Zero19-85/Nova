@@ -125,6 +125,42 @@ static DEPTH: AtomicU64 = AtomicU64::new(0);
 static WORST_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Whether a session currently wants the microphone cable.
+///
+/// The render endpoint is opened when this goes true and **closed when it goes
+/// false**, which is the whole point: before this existed, [`start`] opened
+/// VB-CABLE's render endpoint at Master startup and held it for the life of the
+/// process, whether or not anybody was streaming. Nova sat holding a device
+/// nobody was using, across every detach, every network switch and every idle
+/// hour between sessions.
+///
+/// Driven from `echo::session::WorkerMediaPlane`'s `begin`/`end`, so it follows
+/// the session lifecycle exactly — including the paths that are easy to forget,
+/// because *every* ending goes through `plane.end`: an explicit stop, a detach
+/// on silence, the reaper expiring a detached session, and the tray's force-end.
+///
+/// An atomic rather than a channel so the render thread observes it on its own
+/// clock and nothing can block a caller: `end` runs while the session lock is
+/// held, and a mic renderer must never be able to stall a teardown.
+static WANTED: AtomicBool = AtomicBool::new(false);
+
+/// A session is live: open the cable if it is not already open.
+///
+/// Idempotent, and safe on a host with no virtual cable at all — with no render
+/// thread running there is nobody to read the flag.
+pub fn session_started() {
+    WANTED.store(true, Ordering::Relaxed);
+}
+
+/// No session holds the microphone: release the cable.
+///
+/// Called for **both** end modes. A detached session is not streaming, so
+/// holding its microphone open would keep the endpoint busy for the whole grace
+/// period on behalf of a client that has gone.
+pub fn session_ended() {
+    WANTED.store(false, Ordering::Relaxed);
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MicRenderStats {
     pub rendered: u64,
@@ -299,12 +335,11 @@ fn render_loop(device: Vec<u16>, rx: Receiver<MicPacket>) {
     };
 
     let (mut frames, mut hr) = (0u32, 0i32);
-    if unsafe { InitMicRender(device.as_ptr(), &mut frames, &mut hr) } != 0 {
-        println!("🎤 Microphone disabled: could not open the render endpoint (hr 0x{:08X})", hr as u32);
-        return;
-    }
-    RUNNING.store(true, Ordering::Relaxed);
-    println!("🎤 Microphone ready — rendering into \"{DEFAULT_RENDER_DEVICE}\"");
+    // NOT opened here. The endpoint is acquired when a session asks for it and
+    // released when the session ends — see [`WANTED`]. Opening it at startup is
+    // what left Nova holding VB-CABLE across every detach and every idle hour.
+    let mut open = false;
+    println!("🎤 Microphone wired — the cable is opened on demand, per session");
 
     // Ordered by sequence, which is what makes a reordered arrival play in its
     // right place rather than out of turn.
@@ -329,6 +364,71 @@ fn render_loop(device: Vec<u16>, rx: Receiver<MicPacket>) {
             Err(RecvTimeoutError::Timeout) => {}
             // The sink was dropped: the session ended.
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // ── Acquire and release the cable around the session ────────────────
+        //
+        // Checked here rather than on a signal so the transition happens on
+        // this thread, between playout steps, where the device is not in use.
+        // Closing a WASAPI render client from another thread mid-`RenderMicFrames`
+        // is exactly the kind of race that produces an intermittent crash in a
+        // LocalSystem service.
+        let wanted = WANTED.load(Ordering::Relaxed);
+        if wanted && !open {
+            if unsafe { InitMicRender(device.as_ptr(), &mut frames, &mut hr) } != 0 {
+                println!(
+                    "🎤 Microphone unavailable this session: could not open the render \
+                     endpoint (hr 0x{:08X})",
+                    hr as u32
+                );
+                // Not fatal and not retried in a tight loop: the flag stays
+                // true, so the next session start re-attempts. Everything else
+                // about the stream works without a microphone.
+                WANTED.store(false, Ordering::Relaxed);
+            } else {
+                open = true;
+                RUNNING.store(true, Ordering::Relaxed);
+                println!("🎤 Microphone ready — rendering into \"{DEFAULT_RENDER_DEVICE}\"");
+            }
+        } else if !wanted && open {
+            unsafe { CleanupMicRender() };
+            open = false;
+            RUNNING.store(false, Ordering::Relaxed);
+            // Give the operator their microphone back. Claim-once, so this is a
+            // no-op when the session never sent any audio and the swap never
+            // happened.
+            crate::audio::restore_default_capture();
+            // The jitter buffer belongs to the session that just ended. Carrying
+            // it into the next one would play the departing client's last words
+            // to whoever connects next — and `next_seq` from a finished session
+            // would make every packet of the new one look like a late arrival
+            // and be dropped, which is precisely "the mic is broken after a
+            // reconnect".
+            buffer.clear();
+            playing = false;
+            next_seq = 0;
+            silent_for = Duration::ZERO;
+            silence = SilenceRun::default();
+            DEPTH.store(0, Ordering::Relaxed);
+            println!("🎤 Microphone released — the cable is free for other applications");
+        }
+        if !open {
+            // No session: drop whatever arrived rather than letting it pile up.
+            // Packets are session-sealed, so this should be empty in practice;
+            // the drain is what keeps "should be" from becoming a leak.
+            buffer.clear();
+            continue;
+        }
+
+        // Point Windows' default microphone at the cable — but only once audio
+        // is genuinely arriving. Engaging at session start would change the
+        // operator's recording device for every stream, including the ones
+        // where the user never switched the microphone on, and this side of the
+        // wire has no other evidence of that switch: the client simply sends,
+        // or does not. Idempotent, so the cost after the first packet is one
+        // atomic-free mutex check per step.
+        if !buffer.is_empty() {
+            crate::audio::engage_default_capture();
         }
 
         let depth = buffer.len() as u64;
@@ -422,8 +522,18 @@ fn render_loop(device: Vec<u16>, rx: Receiver<MicPacket>) {
         }
     }
 
-    unsafe { CleanupMicRender() };
+    // Only if the loop exited while still holding it — the ordinary path
+    // releases at session end, above. Calling `CleanupMicRender` twice is
+    // harmless (it nulls what it releases), but this keeps the log honest.
+    if open {
+        unsafe { CleanupMicRender() };
+    }
+    // Unconditional: the render thread is ending, so this is the last chance
+    // this process has to put the operator's microphone back on any path that
+    // reaches here — including a render failure that broke out of the loop.
+    crate::audio::restore_default_capture();
     RUNNING.store(false, Ordering::Relaxed);
+    WANTED.store(false, Ordering::Relaxed);
     println!("🎤 Microphone renderer stopped");
 }
 
@@ -435,6 +545,22 @@ mod tests {
     /// renderer oscillates: if the drop bound were at or below the start depth,
     /// every refill would immediately trigger a drop and playback would stutter
     /// permanently. Asserted rather than left to two independent constants.
+    #[test]
+    fn the_cable_is_wanted_only_between_a_session_start_and_its_end() {
+        // The invariant the detach bug violated. `end` runs for every ending —
+        // stop, detach, reap, force-end — so "ended" must always mean "not
+        // wanted", including the detach that keeps the display up.
+        session_started();
+        assert!(WANTED.load(Ordering::Relaxed), "a live session holds the cable");
+        session_ended();
+        assert!(!WANTED.load(Ordering::Relaxed), "a detach releases it");
+        // Idempotent: several endings can reach here for one session (a sweep
+        // detaches in the same tick the tunnel closes), and the second must not
+        // resurrect anything.
+        session_ended();
+        assert!(!WANTED.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn the_buffer_bounds_cannot_fight_each_other() {
         assert!(

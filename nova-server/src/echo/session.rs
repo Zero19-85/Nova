@@ -534,6 +534,15 @@ impl MediaPlane for WorkerMediaPlane {
             ));
         }
 
+        // The microphone cable is acquired per session, here, and released in
+        // `end`. Deliberately AFTER the refusal above — a start that never
+        // happens must not leave the endpoint held — and deliberately on this
+        // path rather than at the RPC, so a reclaimed (detached → resumed)
+        // session re-acquires it too: `begin` runs for a reclaim exactly as it
+        // does for a fresh start, which is what makes an instant reconnect get
+        // its microphone back.
+        crate::mic::session_started();
+
         // Ordering here is load-bearing:
         //
         //   1. `reset()` first — it clears the previous session's wire index,
@@ -617,6 +626,21 @@ impl MediaPlane for WorkerMediaPlane {
     }
 
     fn end(&self, mode: EndMode) {
+        // Released on BOTH modes, and this is the detach fix: a detached
+        // session is not streaming, so holding VB-CABLE open for the whole
+        // grace period keeps a device busy on behalf of a client that has gone.
+        //
+        // Every ending reaches here — an explicit `stop_session`, a detach on
+        // silence, the reaper expiring a detached session, the tray's
+        // force-end, and a restart ending the previous session — which is why
+        // the hook belongs on the plane rather than at any one call site.
+        //
+        // The host's *speakers* need no equivalent here: the Worker's
+        // `deactivate_worker` already calls `audio_manager.stop_and_release()`
+        // unconditionally on the `Deactivate` this sends, which runs the
+        // claim-once endpoint restore. See lib.rs.
+        crate::mic::session_ended();
+
         // Deactivate first, then reset: the Worker stops producing frames
         // before the sender forgets where they were going, so no frame is
         // encoded into a sender with no target.

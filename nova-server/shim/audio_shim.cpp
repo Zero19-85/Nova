@@ -170,6 +170,39 @@ int GetDefaultAudioDeviceId(WCHAR* out_id, int cch)
     return ret;
 }
 
+// The current default endpoint for either flow.
+//
+// GetDefaultAudioDeviceId above is render-only and stays that way — it has
+// callers that would silently start asking a different question if it grew a
+// parameter. This is the capture-aware twin, used to remember the operator's
+// real microphone before Echo points the default at the virtual cable.
+extern "C" __declspec(dllexport)
+int GetDefaultEndpointId(int is_capture, WCHAR* out_id, int cch)
+{
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    LPWSTR id = nullptr;
+    int ret = -2;
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(hr))
+        hr = en->GetDefaultAudioEndpoint(is_capture ? eCapture : eRender, eConsole, &dev);
+    if (SUCCEEDED(hr)) hr = dev->GetId(&id);
+    if (SUCCEEDED(hr) && id && (int)wcslen(id) < cch) {
+        wcscpy_s(out_id, cch, id);
+        ret = 0;
+    }
+
+    if (id)  CoTaskMemFree(id);
+    if (dev) dev->Release();
+    if (en)  en->Release();
+    return ret;
+}
+
 // Case-insensitive substring search (CRT-only; shlwapi's StrStrIW would add a
 // link dependency for one call).
 static bool contains_icase(const WCHAR* hay, const WCHAR* needle)

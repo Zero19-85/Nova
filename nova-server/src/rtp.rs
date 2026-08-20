@@ -31,6 +31,25 @@ const FRAME_HEADER_SIZE: usize = 8;
 // configurable via `configure()`; percentage 0 disables FEC entirely
 // (A/B test knob for RS matrix compatibility).
 const DEFAULT_FEC_PERCENTAGE: usize = 20;
+
+/// Wire value of a keyframe in the GameStream frame header. See
+/// [`detect_frame_type`], which is the only producer.
+const FRAME_TYPE_IDR: u8 = 2;
+
+/// How much more parity a keyframe carries than the rest of the stream.
+///
+/// Doubling rather than a fixed figure so this tracks whatever baseline the
+/// operator set: a wired LAN at 5% gives IDRs 10%, congested WiFi at 10% gives
+/// them 20%, and `fec_percentage = 0` — FEC deliberately off — stays off.
+const KEYFRAME_FEC_MULTIPLIER: usize = 2;
+
+/// Ceiling on any single frame's parity.
+///
+/// 50% is already one parity shard per two data shards. Beyond that the
+/// bandwidth is better spent on a lower bitrate, which reduces the loss instead
+/// of paying to repair it — the lesson from 2026-08-07, where 20% at 4K120
+/// saturated the very link it was protecting.
+const MAX_FEC_PERCENTAGE: usize = 50;
 const DEFAULT_MIN_PARITY_SHARDS: usize = 2;
 
 // Packet pacing: a ~45-packet IDR blasted in one sub-millisecond burst can
@@ -866,7 +885,25 @@ impl TxEngine {
         let mut last_payload_len = (stream_len % payload_per_packet) as u16;
         if last_payload_len == 0 { last_payload_len = payload_per_packet as u16; }
 
-        let mut fec_percentage = self.fec_percentage;
+        // Keyframes get more parity than the rest of the stream.
+        //
+        // Cheap, because under an infinite GOP they are rare — Nova emits one
+        // on request, not on a period — so the extra bytes cost a fraction of a
+        // percent of the session's bitrate rather than the flat surcharge a
+        // higher baseline would apply to all 120 frames a second.
+        //
+        // Worth it because losing part of an IDR is the most expensive loss
+        // available: the client cannot decode it, discards everything that
+        // references it, and asks for another one, so a single dropped packet
+        // becomes a visible stall plus a second large frame on a link that just
+        // demonstrated it was struggling. A P-frame loss smears a region; an
+        // IDR loss costs the whole picture.
+        let boosted = frame_type == FRAME_TYPE_IDR;
+        let mut fec_percentage = if boosted {
+            (self.fec_percentage * KEYFRAME_FEC_MULTIPLIER).min(MAX_FEC_PERCENTAGE)
+        } else {
+            self.fec_percentage
+        };
         let mut parity_shards  = (data_shards * fec_percentage + 99) / 100;
         if fec_percentage != 0 && parity_shards < self.min_parity_shards {
             parity_shards  = self.min_parity_shards;
@@ -1211,6 +1248,45 @@ fn read_leb128(data: &[u8]) -> (u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parity a frame of `data_shards` gets at a given baseline, mirroring
+    /// `TxEngine::send_frame`'s arithmetic.
+    fn parity_for(data_shards: usize, baseline: usize, frame_type: u8) -> usize {
+        let pct = if frame_type == FRAME_TYPE_IDR {
+            (baseline * KEYFRAME_FEC_MULTIPLIER).min(MAX_FEC_PERCENTAGE)
+        } else {
+            baseline
+        };
+        (data_shards * pct + 99) / 100
+    }
+
+    #[test]
+    fn a_keyframe_carries_more_parity_than_a_delta_frame() {
+        // Losing part of an IDR costs the whole picture and a re-request;
+        // losing part of a P-frame smears a region. They are not worth the same
+        // insurance, and under an infinite GOP keyframes are rare enough that
+        // the extra bytes are nearly free.
+        let p = parity_for(60, 10, 1);
+        let idr = parity_for(60, 10, FRAME_TYPE_IDR);
+        assert_eq!(p, 6, "10% of 60 shards");
+        assert_eq!(idr, 12, "a keyframe doubles it");
+    }
+
+    #[test]
+    fn fec_disabled_stays_disabled_even_for_keyframes() {
+        // `fec_percentage = 0` is an operator saying "no parity". Multiplying it
+        // must not quietly turn that into some parity on the largest frames.
+        assert_eq!(parity_for(60, 0, FRAME_TYPE_IDR), 0);
+        assert_eq!(parity_for(60, 0, 1), 0);
+    }
+
+    #[test]
+    fn the_keyframe_boost_is_capped() {
+        // Past 50% the bandwidth is better spent lowering the bitrate, which
+        // removes the loss rather than paying to repair it — 2026-08-07's
+        // lesson, where parity saturated the link it was protecting.
+        assert_eq!(parity_for(100, 40, FRAME_TYPE_IDR), 50, "80% would be capped to 50%");
+    }
 
     fn ping(sock: &UdpSocket, dst: std::net::SocketAddr, n: usize) {
         for _ in 0..n {

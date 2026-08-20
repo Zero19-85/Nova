@@ -72,6 +72,11 @@ extern "C" {
     fn FindRealAudioDevice(out_id: *mut u16, cch: i32) -> i32;
     fn FindAudioDeviceByName(needle: *const u16, out_id: *mut u16, cch: i32) -> i32;
     fn SetDefaultAudioDevice(device_id: *const u16) -> i32;
+    /// Flow-aware twin of [`GetDefaultAudioDeviceId`]. `is_capture != 0` asks
+    /// about the recording default.
+    fn GetDefaultEndpointId(is_capture: i32, out_id: *mut u16, cch: i32) -> i32;
+    /// Flow-aware endpoint search by friendly-name substring or exact id.
+    fn FindEndpointByName(needle: *const u16, is_capture: i32, out_id: *mut u16, cch: i32) -> i32;
 }
 
 // ── Streaming-sink selection ──────────────────────────────────────────────────
@@ -264,6 +269,215 @@ fn restore_original_endpoint() {
 /// no-ops. Safe to call with no session active.
 pub fn emergency_restore_default_endpoint() {
     restore_original_endpoint();
+    // The microphone default is armed on the same kind of process-death path
+    // and must come back with it. Claim-once, so a normal stop that already ran
+    // makes this a no-op.
+    restore_default_capture();
+}
+
+// ── Microphone routing (eCapture) ────────────────────────────────────────────
+//
+// The mirror of the sink routing above, for the other direction. Echo's client
+// microphone is decoded on the host and rendered into VB-CABLE's *input*; an
+// application that wants to hear it has to record from the cable's *output*.
+// Windows will not do that by itself, so until this existed the passthrough
+// worked perfectly and nothing on the host could hear it unless the operator
+// had already selected "CABLE Output" as their recording device by hand.
+//
+// **This deliberately reverses an earlier decision**, and the reason it is safe
+// now is the reason it was refused then. The old rule was "Nova never chooses
+// anyone's microphone", written when nothing here had a restore path: an
+// override with no way back is a setting the operator has to repair themselves,
+// which is worse than doing nothing. What makes it correct is the same
+// claim-once arm/restore the render side has used since Phase 15.1 — the
+// original device is captured before the swap and put back on every ending,
+// including the ones nobody plans for.
+//
+// Two further guards keep it honest: it engages only when the client is
+// actually SENDING microphone audio (not merely when a session exists), and it
+// refuses to arm the cable itself as a restore target.
+
+/// The capture endpoint that pairs with [`crate::mic`]'s render target.
+///
+/// VB-CABLE presents two halves: audio rendered into "CABLE Input" comes out of
+/// "CABLE Output". `mic.rs` renders into the former, so this is the one an
+/// application must record from. Matched as a case-insensitive substring, so
+/// the full name ("CABLE Output (VB-Audio Virtual Cable)") matches.
+const MIC_CAPTURE_DEVICE: &str = "CABLE Output";
+
+/// The operator's real recording device, remembered across a session.
+///
+/// Same claim-once discipline as [`ORIGINAL_ENDPOINT`] and for the same reason:
+/// several paths can end a session and exactly one of them must perform the
+/// restore, with the rest finding `None` and doing nothing.
+static ORIGINAL_CAPTURE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+fn lock_original_capture() -> MutexGuard<'static, Option<Vec<u16>>> {
+    ORIGINAL_CAPTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Point Windows' default recording device at the virtual cable.
+///
+/// Call when the client's microphone audio actually starts arriving — not when
+/// a session begins. A session whose user never switched the microphone on must
+/// not have their recording device changed, and "packets are arriving" is the
+/// only evidence on this side of the wire that the switch is on.
+///
+/// Idempotent: a second call while already engaged does nothing.
+pub fn engage_default_capture() {
+    let mut slot = lock_original_capture();
+    if slot.is_some() {
+        return; // already engaged this session
+    }
+
+    let Some(cable) = find_capture_id(MIC_CAPTURE_DEVICE) else {
+        println!(
+            "🎤 Audio: no \"{MIC_CAPTURE_DEVICE}\" recording endpoint — leaving the default \
+             microphone alone (install VB-CABLE for host-side microphone passthrough)"
+        );
+        return;
+    };
+
+    let mut cur = [0u16; DEVICE_ID_CCH];
+    if unsafe { GetDefaultEndpointId(1, cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } != 0 {
+        eprintln!("⚠️  Audio: could not query the current default microphone — not switching it");
+        return;
+    }
+    let cur_id = wide_id(&cur);
+
+    // Already the cable — from a previous unclean exit, or because the operator
+    // chose it themselves. Arming it would make "restore" mean "put the cable
+    // back", which is the stuck-silent bug the render side documents.
+    if cur_id == cable {
+        println!("🎤 Audio: the default microphone is already \"{MIC_CAPTURE_DEVICE}\" — nothing to switch");
+        return;
+    }
+
+    if unsafe { SetDefaultAudioDevice(cable.as_ptr()) } != 0 {
+        eprintln!("⚠️  Audio: could not make \"{MIC_CAPTURE_DEVICE}\" the default microphone");
+        return;
+    }
+    // Stored only AFTER the swap succeeded. Arming first would leave a restore
+    // target for a change that never happened, and the restore would then move
+    // the operator's default for no reason.
+    //
+    // Written to disk as well as memory, so a Master that is terminated rather
+    // than stopped still has a way back. Best-effort: failing to write must not
+    // abort a working microphone, it only costs the cross-process safety net.
+    if let Err(e) = std::fs::write(mic_restore_file(), String::from_utf16_lossy(strip_nul(&cur_id)))
+    {
+        eprintln!("⚠️  Audio: could not record the microphone restore target ({e}) — a hard kill \
+                   would leave the default on the cable");
+    }
+    *slot = Some(cur_id);
+    println!(
+        "🎤 Audio: default microphone switched to \"{MIC_CAPTURE_DEVICE}\" — the host now hears \
+         the client (original device will be restored)"
+    );
+}
+
+/// Claim-once restore of the operator's recording device.
+///
+/// Unlike the render side there is no live-query fallback, and that is
+/// deliberate: with nothing armed we do not know which microphone was theirs,
+/// and guessing — picking "some real capture device" — could hand their default
+/// to a webcam they never use. Nothing armed means we never changed it, so the
+/// right action is none.
+pub fn restore_default_capture() {
+    let Some(id) = lock_original_capture().take() else {
+        return;
+    };
+    if unsafe { SetDefaultAudioDevice(id.as_ptr()) } == 0 {
+        println!("🎤 Audio: default microphone restored to the pre-stream device");
+    } else {
+        eprintln!("⚠️  Audio: failed to restore the pre-stream microphone — check Windows sound settings");
+    }
+    // The cross-process net is only needed while the swap is in effect. Removed
+    // even when the restore failed: the file's job is to describe an outstanding
+    // swap, and re-applying a device Windows just refused would not help.
+    let _ = std::fs::remove_file(mic_restore_file());
+}
+
+/// A NUL-terminated wide id without its terminator, for writing as text.
+fn strip_nul(id: &[u16]) -> &[u16] {
+    match id.iter().position(|&c| c == 0) {
+        Some(end) => &id[..end],
+        None => id,
+    }
+}
+
+/// Where the armed microphone is remembered ACROSS processes.
+///
+/// The in-memory arm covers every ending this process gets to run code for.
+/// It does not cover the one that matters most for a LocalSystem service: the
+/// Master being terminated — an installer upgrade, `sc stop` landing mid-call,
+/// a crash — at which point a detached render thread never reaches its tail and
+/// the operator is left recording from a silent cable with no idea why.
+///
+/// A file makes the recovery exact rather than a guess. This is the same
+/// reasoning as `virtual_display`'s `nova_display_baseline.txt`, and it is why
+/// there is no "pick any real microphone" fallback: we either know which device
+/// was theirs or we leave it alone.
+const MIC_RESTORE_PATH: &str = "nova_mic_restore.txt";
+
+/// Next to the exe, never CWD-relative — the SCM sets CWD to System32.
+fn mic_restore_file() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(MIC_RESTORE_PATH)))
+        .unwrap_or_else(|| std::path::PathBuf::from(MIC_RESTORE_PATH))
+}
+
+/// Put back a microphone a previous process swapped and never restored.
+///
+/// Called once at Master startup. Does nothing unless a restore file exists AND
+/// the default really is the cable — so an operator who chose "CABLE Output"
+/// deliberately after the crash keeps their choice, and a stale file from a
+/// clean run is simply cleared.
+pub fn heal_capture_endpoint_at_startup() {
+    let path = mic_restore_file();
+    let Ok(saved) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let saved = saved.trim();
+    if saved.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+
+    let mut cur = [0u16; DEVICE_ID_CCH];
+    let current_is_cable = unsafe { GetDefaultEndpointId(1, cur.as_mut_ptr(), DEVICE_ID_CCH as i32) }
+        == 0
+        && find_capture_id(MIC_CAPTURE_DEVICE).is_some_and(|cable| cable == wide_id(&cur));
+
+    if current_is_cable {
+        let id: Vec<u16> = saved.encode_utf16().chain(std::iter::once(0)).collect();
+        if unsafe { SetDefaultAudioDevice(id.as_ptr()) } == 0 {
+            println!(
+                "🎤 Audio: restored the microphone a previous run left switched to \
+                 \"{MIC_CAPTURE_DEVICE}\""
+            );
+        } else {
+            eprintln!("⚠️  Audio: could not restore the microphone recorded in {MIC_RESTORE_PATH}");
+        }
+    }
+    // Cleared either way: a file that outlives its usefulness would re-apply an
+    // ever-staler device at every future startup.
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Resolve a capture endpoint by friendly-name substring.
+fn find_capture_id(name: &str) -> Option<Vec<u16>> {
+    let needle: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut out = [0u16; DEVICE_ID_CCH];
+    if unsafe { FindEndpointByName(needle.as_ptr(), 1, out.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0
+    {
+        Some(wide_id(&out))
+    } else {
+        None
+    }
 }
 
 // ── Sink routing ──────────────────────────────────────────────────────────────
