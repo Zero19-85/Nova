@@ -112,6 +112,7 @@ rustls-pki-types = "1.14.1"
 # Already in the tree via rustls — direct dep only for EndEntityCert::verify_signature,
 # which checks the client's RSA signature over the pairing secret (Apollo crypto::verify256).
 rustls-webpki = { version = "0.103", features = ["aws-lc-rs"] }
+igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
 
 [build-dependencies]
 cc = "1.0"

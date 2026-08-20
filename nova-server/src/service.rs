@@ -373,6 +373,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 
     service_worker(stop, wake);
 
+    // Close the holes in the router before telling the SCM we are stopped.
+    //
+    // Best-effort and time-boxed inside `release_port_mappings`: a router that
+    // has stopped answering must not hold a service stop open, and it does not
+    // need to — the mappings carry a finite lease precisely so that every path
+    // which never reaches this line still closes them, just later.
+    crate::upnp::release_port_mappings();
+
     report_status(SERVICE_STOPPED, 0, 0);
     let _ = CloseHandle(stop);
     let _ = CloseHandle(wake);

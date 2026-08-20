@@ -105,9 +105,22 @@ pub struct NetworkConfig {
     /// the cheapest headroom in the whole pipeline: at the 90 Mbps a 4K120
     /// session negotiates, 20% parity was adding ~20 Mbps and pushing the wire
     /// rate to ~111 Mbps — enough to saturate the link and starve the ENet
-    /// control channel until it timed out (live 2026-08-07). 5% is a sane
-    /// baseline for the wired/stable networks Nova actually targets; raise it
-    /// only for genuinely lossy links (congested WiFi, powerline).
+    /// control channel until it timed out (live 2026-08-07).
+    ///
+    /// **10% since 2026-08-20, and the arithmetic is why it is not a relapse.**
+    /// The failure above was 20% of 90 Mbps = ~20 Mbps of parity on a link that
+    /// could not carry it. A 1080p120 Echo session runs ~43 Mbps, where 10% is
+    /// ~4 Mbps and lands at ~47 — nowhere near the earlier cliff. What it buys
+    /// is the case the old comment already anticipated: on congested WiFi a
+    /// dropped packet in a P-frame smears a region that an infinite GOP never
+    /// repairs until the intra-refresh sweep reaches it, up to 2.5 s later at
+    /// 120 fps. Live 2026-08-20, that showed as ghost mouse cursors trailing
+    /// behind the real one, and it vanished when the bitrate was lowered.
+    ///
+    /// Still a per-link setting rather than a universal answer. On a wired LAN
+    /// 5% remains ample and this is 5% of a bitrate spent on nothing; on a link
+    /// bad enough that 10% does not cover it, lowering the bitrate is the
+    /// better lever, because parity that does not fit is loss with extra steps.
     pub fec_percentage: u32,
 
     /// Bandwidth held back from the video encoder for the audio pipelines, in
@@ -126,6 +139,19 @@ pub struct NetworkConfig {
     /// `qos::MAX_RESERVE_FRACTION` — so raising this for a fat link cannot
     /// starve a thin one.
     pub audio_reserve_kbps: u32,
+
+    /// Ask the router to forward Nova's WAN ports over UPnP.
+    ///
+    /// On by default, because the alternative is telling every user to log into
+    /// their router — and a streaming host that only works on its own LAN is
+    /// half a product. See `upnp.rs` for exactly which ports are opened (two)
+    /// and which is deliberately never opened (48011, the LAN control port).
+    ///
+    /// Turn it off on a network where port forwarding is somebody else's
+    /// decision — a corporate LAN, a shared house, a machine already reached
+    /// through a VPN. Nothing else changes: LAN sessions are unaffected, and a
+    /// relay that is reachable by other means still works.
+    pub upnp: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +204,26 @@ pub struct SignalingConfig {
     /// How long the relay may hold a long-poll open. Clamped to 5–55 s —
     /// middleboxes commonly cut idle HTTP requests around 60 s.
     pub poll_timeout_secs: u32,
+
+    /// The relay URL to **advertise to clients**, when it differs from the one
+    /// Nova itself dials.
+    ///
+    /// These are genuinely two different questions and conflating them breaks
+    /// one of them. `url` is how *this host* reaches the relay, and for a
+    /// self-hosted relay the right answer is `https://127.0.0.1:8443/…`:
+    /// loopback, always up, no NAT involved. This is how *a phone on cellular*
+    /// reaches it, which has to be a public address.
+    ///
+    /// Setting `url` to the public address to solve the second problem creates
+    /// a new one — the host would then dial its own public IP and need NAT
+    /// hairpinning to talk to a relay running on the same machine.
+    ///
+    /// Leave empty and Nova works it out: UPnP's mapped address if the router
+    /// gave one, otherwise this host's LAN address. Set it when you have
+    /// forwarded a port by hand, or when your relay is behind a DNS name you
+    /// maintain. An explicit value here always wins — an operator who typed an
+    /// address means it.
+    pub advertise_url: String,
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
@@ -206,6 +252,7 @@ impl Default for SignalingConfig {
             url: String::new(),
             relay_cert_sha256: String::new(),
             poll_timeout_secs: 30,
+            advertise_url: String::new(),
         }
     }
 }
@@ -240,7 +287,7 @@ impl Default for AudioConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { fec_percentage: 5, audio_reserve_kbps: 512 }
+        Self { fec_percentage: 10, audio_reserve_kbps: 512, upnp: true }
     }
 }
 
@@ -279,15 +326,25 @@ endpoint_override = ""  # Windows audio endpoint friendly name or GUID;
                         # leave blank to use the system default device
 
 [network]
-fec_percentage = 5      # Reed-Solomon FEC parity % (0 = disabled).
-                        # Pure overhead on top of the video bitrate — 5% suits
-                        # wired/stable LANs. Raise for lossy links (WiFi,
-                        # powerline); 20% at 4K120 added ~20 Mbps of parity.
+fec_percentage = 10     # Reed-Solomon FEC parity % (0 = disabled).
+                        # Pure overhead on top of the video bitrate. 10% covers
+                        # the WiFi drops that leave smeared macroblocks an
+                        # infinite GOP cannot repair until the intra-refresh
+                        # sweep arrives. Drop to 5 on a wired LAN; do not go
+                        # near 20 at high bitrates — 20% at 4K120 added ~20
+                        # Mbps of parity and saturated the link (2026-08-07).
 audio_reserve_kbps = 512 # bandwidth held back from video for the Opus audio
                         # pipeline. Measured cost is ~140 Kbps (128 Kbps Opus +
                         # framing), so this is ~3.5x headroom. Never takes more
                         # than a quarter of a session's ceiling, so a thin link
                         # degrades its audio share instead of losing its picture.
+upnp = true             # Ask the router to forward Nova's WAN ports, so Echo
+                        # reaches this host from outside the LAN with no manual
+                        # port forwarding. Opens exactly two: the relay's TCP
+                        # port and the media UDP port. The Echo control port
+                        # 48011 is never opened — it is LAN-only by design.
+                        # Leases are finite and renewed, so a crashed Nova
+                        # stops renewing and the holes close by themselves.
 
 [echo]
 # Echo side-channel — the control/telemetry RPC for Nova's native client.
@@ -305,6 +362,11 @@ port    = 48011
 url               = ""   # https:// URL of the signaling relay ("" = disabled)
 relay_cert_sha256 = ""   # SHA-256 of the relay's TLS cert, 64 hex chars
 poll_timeout_secs = 30   # long-poll hold time (clamped to 5-55)
+advertise_url     = ""   # relay URL to ADVERTISE, when it differs from the one
+                         # Nova dials. Leave empty and Nova works it out (UPnP
+                         # address, else this host's LAN address). Set it when
+                         # you forwarded a port by hand: keep `url` on loopback
+                         # so the host still reaches its own relay locally.
 
 [hdr]
 # HDR10 HEVC SEI luminance parameters — tune to your TV's spec sheet.

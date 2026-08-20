@@ -42,6 +42,7 @@ mod shutdown;
 /// whichever capture loop is running and read by the tray's Server Stats
 /// window. Lock-free atomics — see the module docs for why it is not a channel.
 mod stats;
+mod upnp;
 pub mod tray;
 mod virtual_display;
 
@@ -162,6 +163,69 @@ const LOCAL_IP_WAIT: Duration = Duration::from_secs(60);
 /// this resolves on the first attempt on every machine that is already on a
 /// network, and the case it exists for — a cold boot racing DHCP — is measured
 /// in seconds, not minutes.
+/// The ports Nova asks the router to forward, and the only ones it ever will.
+///
+/// **48011 is absent deliberately.** `echo::rpc`'s listener drops non-private
+/// sources before TLS to keep an internet-facing TCP surface off a LocalSystem
+/// service; forwarding it would open the door that fence exists to close, and
+/// every packet arriving through it would then be refused anyway. WAN control
+/// travels the punched tunnel, which needs no mapping.
+fn upnp_mappings(cfg: &config::NovaConfig) -> Vec<upnp::Mapping> {
+    let mut mappings = vec![upnp::Mapping {
+        // The punched path is what carries media, and a forwarded port is what
+        // rescues the one case a punch cannot solve by itself: an
+        // endpoint-dependent (symmetric) NAT, where the address STUN reports is
+        // not the one a peer can reach.
+        protocol: igd_next::PortMappingProtocol::UDP,
+        port: ECHO_MEDIA_PORT,
+        label: "Nova Echo media",
+    }];
+
+    // The relay's port comes from the configured URL rather than a constant:
+    // an operator who moved the relay off 8443 would otherwise get a mapping
+    // for a port nothing is listening on, and a silent one at that.
+    let url = cfg.echo.signaling.url.trim();
+    if !url.is_empty() {
+        match nova_core::relay::RelayTarget::parse(url) {
+            Ok(target) => mappings.push(upnp::Mapping {
+                protocol: igd_next::PortMappingProtocol::TCP,
+                port: target.port,
+                label: "Nova Echo relay",
+            }),
+            Err(e) => println!("🌐 UPnP: not forwarding the relay port — its URL does not parse ({e})"),
+        }
+    }
+    mappings
+}
+
+/// Start the UPnP lease, if the operator has not switched it off.
+fn spawn_upnp(cfg: &config::NovaConfig) {
+    if !cfg.network.upnp {
+        println!("🌐 UPnP: disabled by [network] upnp = false — WAN needs a reachable relay");
+        return;
+    }
+    let mappings = upnp_mappings(cfg);
+    tokio::spawn(async move {
+        // The address is read HERE rather than passed in, for the reason the
+        // 2026-08-19 mDNS fix records: a network fact read at process start is
+        // a guess, and on a cold boot the interface frequently has no address
+        // yet. A mapping pointed at the wrong local IP forwards the world's
+        // traffic to nowhere.
+        let Some(ip) = wait_for_local_ip().await else {
+            println!("🌐 UPnP: no local address to forward to — not mapping");
+            upnp::give_up();
+            return;
+        };
+        match ip.parse() {
+            Ok(local) => upnp::spawn(local, mappings),
+            Err(_) => {
+                println!("🌐 UPnP: local address {ip} is not IPv4 — not mapping");
+                upnp::give_up();
+            }
+        }
+    });
+}
+
 async fn wait_for_local_ip() -> Option<String> {
     let deadline = tokio::time::Instant::now() + LOCAL_IP_WAIT;
     let mut announced = false;
@@ -503,6 +567,12 @@ pub async fn start_master_network() -> MasterHandles {
         });
     }
 
+    // Ask the router to open the WAN ports, before the Echo record is
+    // registered: the advertisement waits briefly for the answer so it can
+    // publish a relay URL that works from outside this network. See
+    // `echo::discovery::spawn`.
+    spawn_upnp(&cfg);
+
     // The Echo record — a second service type on the same daemon, for Echo
     // clients rather than Moonlight ones. Registered on a task because it must
     // wait for the pairing certificate AND for an address; see `echo::discovery`.
@@ -689,6 +759,11 @@ fn spawn_mic_passthrough(
     rtp_sender: Arc<Mutex<rtp::RtpSender>>,
     sessions: Arc<echo::session::SessionManager>,
 ) {
+    // Before the renderer exists, so a microphone a previous run left pointed at
+    // the cable is put back at startup rather than at the end of the next
+    // session — which could be days away, or never.
+    audio::heal_capture_endpoint_at_startup();
+
     let sink = match mic::start(Some(endpoint_override)) {
         Ok(sink) => sink,
         Err(why) => {

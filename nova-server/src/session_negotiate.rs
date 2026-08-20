@@ -245,12 +245,12 @@ mod tests {
         client.video_format = 0x0002; // HEVC
         client.bitrate_kbps = 100_000; // the slider went to 100 Mbps at 1080p
 
-        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 512 };
+        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 512, upnp: false };
         let n = negotiate(&client, &StreamConfig::default(), &net, None);
         assert_eq!(n.bitrate_kbps, 40_000 - 512, "1080p cap, less the audio reserve");
 
         // With no reservation configured, the cap alone applies.
-        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 0 };
+        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 0, upnp: false };
         let n = negotiate(&client, &StreamConfig::default(), &net, None);
         assert_eq!(n.bitrate_kbps, 40_000);
     }
@@ -265,7 +265,7 @@ mod tests {
         client.video_format = 0x0001; // H264 ⇒ Level 5.2 fps cap applies
         client.bitrate_kbps = 500_000;
 
-        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 0 };
+        let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 0, upnp: false };
         let n = negotiate(&client, &StreamConfig::default(), &net, None);
         assert!(n.fps < 120, "precondition: fps was capped, got {}", n.fps);
         assert_eq!(

@@ -63,6 +63,14 @@ const TXT_VERSION: &str = "1";
 /// advertising nothing — the app would helpfully fill its field with the blank.
 const IDENTITY_WAIT: Duration = Duration::from_secs(60);
 
+/// How long the advertisement waits for the router's answer.
+///
+/// Longer than `upnp::SEARCH_TIMEOUT`, so the ordinary outcomes — a router that
+/// answers, or one that is not there — are already decided and this returns
+/// immediately. The margin covers the slow middle case: a router that answers
+/// the search and then takes its time over the mapping itself.
+const UPNP_WAIT: Duration = Duration::from_secs(12);
+
 /// Poll interval while waiting. A human-scale event, so this is not hot.
 const IDENTITY_POLL: Duration = Duration::from_millis(100);
 
@@ -83,6 +91,8 @@ fn txt_records(
     relay_url: &str,
     relay_pin: &str,
     local_ip: &str,
+    public_ip: Option<&str>,
+    advertise_override: &str,
 ) -> Vec<(String, String)> {
     let mut txt = vec![
         ("txtvers".to_string(), TXT_VERSION.to_string()),
@@ -93,7 +103,38 @@ fn txt_records(
     let url = relay_url.trim();
     let pin = relay_pin.trim();
     if !url.is_empty() && !pin.is_empty() {
-        txt.push(("relay".to_string(), relay_reachable_from(url, local_ip)));
+        // The address a client should dial, in preference order: the public one
+        // if the router forwarded a port for us, otherwise this host's LAN
+        // address.
+        //
+        // The public address wins because of WHEN a client uses the relay at
+        // all. Echo's cascade tries the LAN directly first and only falls
+        // through to the relay when that fails — which, in practice, means the
+        // client is not on this network. Advertising the LAN address to a phone
+        // that will next open the app on cellular gives it a URL guaranteed to
+        // fail there, and the phone has no way to learn a better one, because
+        // learning it would require the mDNS it can no longer hear.
+        //
+        // The trade, stated plainly: a client that IS on this LAN and whose
+        // direct attempt failed now reaches the relay by its public address,
+        // which needs NAT hairpinning — and not every router does it. That case
+        // is narrow (stage 1 covers the LAN, and it is live-confirmed) and the
+        // failure is recoverable by hand; the cellular case is the common one
+        // and had no recovery at all.
+        let advertised = match public_ip {
+            Some(public) => relay_for_wan(url, public),
+            None => relay_reachable_from(url, local_ip),
+        };
+        // `[echo.signaling] advertise_url` overrides everything above. An
+        // operator who typed an address has answered this question themselves,
+        // and it is the only source here that can know about a forwarded port
+        // or a DNS name Nova has no way to discover.
+        let advertised = if advertise_override.trim().is_empty() {
+            advertised
+        } else {
+            advertise_override.trim().to_string()
+        };
+        txt.push(("relay".to_string(), advertised));
         txt.push(("relaypin".to_string(), pin.to_string()));
     }
 
@@ -149,6 +190,48 @@ fn relay_reachable_from(relay_url: &str, local_ip: &str) -> String {
     parsed.to_string()
 }
 
+/// Rewrite a relay URL that only works inside this network to the public
+/// address the router is forwarding.
+///
+/// Broader than [`relay_reachable_from`], and deliberately so: that one repairs
+/// loopback, because loopback is the only address that is *always* wrong in a
+/// broadcast. This one repairs loopback **and private space**, because the
+/// question here is different — not "will anyone on this network understand
+/// it?" but "will the phone that reads this understand it after it leaves?".
+/// `https://10.0.0.205:8443/…` is a perfectly good answer to the first question
+/// and a useless one to the second, and the second is the question a record
+/// stored for later has to answer.
+///
+/// A URL naming a public host or a domain is left alone: an operator who put a
+/// real address there has already answered this, and overwriting their DNS name
+/// with a raw IP would break the one setup that needs no help at all.
+fn relay_for_wan(relay_url: &str, public_ip: &str) -> String {
+    let trimmed = relay_url.trim();
+    let Ok(mut parsed) = url::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    let local_only = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        // A name, including "localhost". Anything resolvable is the operator's
+        // own choice and is left to them; localhost is the one exception,
+        // because it resolves to the reader rather than to us.
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if !local_only {
+        return trimmed.to_string();
+    }
+
+    if public_ip.trim().is_empty() || parsed.set_host(Some(public_ip.trim())).is_err() {
+        return trimmed.to_string();
+    }
+    parsed.to_string()
+}
+
 /// A human-readable name for this machine, for the app's device list.
 ///
 /// Cosmetic only. The app must key its saved records by fingerprint, because a
@@ -196,6 +279,7 @@ pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig) {
     let port = cfg.port;
     let relay_url = cfg.signaling.url.clone();
     let relay_pin = cfg.signaling.relay_cert_sha256.clone();
+    let advertise_override = cfg.signaling.advertise_url.clone();
 
     tokio::spawn(async move {
         // Resolved HERE, not at the call site. The address is a startup fact
@@ -218,16 +302,43 @@ pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig) {
             return;
         };
 
+        // Wait for the router, but not for long. The record a client stores now
+        // is the one it will dial from cellular later, so publishing before the
+        // public address is known would hand it a LAN URL it can never correct
+        // — correcting it needs the mDNS it will no longer be able to hear.
+        //
+        // Bounded because a network with no UPnP router is a perfectly ordinary
+        // one and must not delay discovery: the search itself gives up first and
+        // reports `Unavailable`, so this returns early in every case except a
+        // router that is answering slowly.
+        let public = match crate::upnp::await_outcome(UPNP_WAIT).await {
+            crate::upnp::Outcome::Public(ip) => Some(ip.to_string()),
+            crate::upnp::Outcome::Unavailable => None,
+            crate::upnp::Outcome::Pending => {
+                println!(
+                    "📡 Echo mDNS: the router has not answered after {UPNP_WAIT:?} — advertising \
+                     the LAN relay for now (a WAN client will need the address by hand)"
+                );
+                None
+            }
+        };
+
         let label = host_label();
-        let records = txt_records(&fingerprint, &label, &relay_url, &relay_pin, &ip);
+        let records =
+            txt_records(&fingerprint, &label, &relay_url, &relay_pin, &ip, public.as_deref(), &advertise_override);
         // Say so when the advertised URL is not the configured one, so the log
         // explains an address the operator never typed.
         if let Some((_, advertised)) = records.iter().find(|(k, _)| k == "relay") {
             if advertised != relay_url.trim() {
                 println!(
-                    "📡 Echo mDNS: relay {} is loopback — advertising {} so clients can reach it",
+                    "📡 Echo mDNS: advertising relay {advertised} in place of the configured {} \
+                     ({})",
                     relay_url.trim(),
-                    advertised
+                    if public.is_some() {
+                        "reachable from outside this network"
+                    } else {
+                        "the configured address means nothing to a client"
+                    }
                 );
             }
         }
@@ -271,7 +382,7 @@ mod tests {
 
     #[test]
     fn always_publishes_version_fingerprint_and_name() {
-        let txt = txt_records(FP, "GAMING-PC", "", "", LAN);
+        let txt = txt_records(FP, "GAMING-PC", "", "", LAN, None, "");
         assert_eq!(get(&txt, "txtvers"), Some("1"));
         assert_eq!(get(&txt, "fp"), Some(FP));
         assert_eq!(get(&txt, "name"), Some("GAMING-PC"));
@@ -279,21 +390,21 @@ mod tests {
 
     #[test]
     fn relay_keys_appear_only_when_both_are_configured() {
-        let both = txt_records(FP, "PC", "https://relay:8443/v1/signal", FP, LAN);
+        let both = txt_records(FP, "PC", "https://relay:8443/v1/signal", FP, LAN, None, "");
         assert_eq!(get(&both, "relay"), Some("https://relay:8443/v1/signal"));
         assert_eq!(get(&both, "relaypin"), Some(FP));
 
         // A URL with no pin is not a usable relay: the pin is what authenticates
         // it. Publishing the URL alone would have the app fill one field and
         // leave the user hunting for the other.
-        let url_only = txt_records(FP, "PC", "https://relay:8443/v1/signal", "", LAN);
+        let url_only = txt_records(FP, "PC", "https://relay:8443/v1/signal", "", LAN, None, "");
         assert_eq!(get(&url_only, "relay"), None);
         assert_eq!(get(&url_only, "relaypin"), None);
 
-        let pin_only = txt_records(FP, "PC", "", FP, LAN);
+        let pin_only = txt_records(FP, "PC", "", FP, LAN, None, "");
         assert_eq!(get(&pin_only, "relay"), None);
 
-        let neither = txt_records(FP, "PC", "", "", LAN);
+        let neither = txt_records(FP, "PC", "", "", LAN, None, "");
         assert_eq!(get(&neither, "relay"), None);
         assert_eq!(get(&neither, "relaypin"), None);
     }
@@ -302,14 +413,14 @@ mod tests {
     fn whitespace_only_relay_config_counts_as_unconfigured() {
         // `nova.toml` ships these keys as `""`, and an operator clearing one by
         // hand commonly leaves a space behind.
-        let txt = txt_records(FP, "PC", "   ", "  ", LAN);
+        let txt = txt_records(FP, "PC", "   ", "  ", LAN, None, "");
         assert_eq!(get(&txt, "relay"), None);
     }
 
     #[test]
     fn relay_values_are_trimmed() {
         let padded_pin = format!(" {FP} ");
-        let txt = txt_records(FP, "PC", "  https://r:8443/v1/signal \n", &padded_pin, LAN);
+        let txt = txt_records(FP, "PC", "  https://r:8443/v1/signal \n", &padded_pin, LAN, None, "");
         assert_eq!(get(&txt, "relay"), Some("https://r:8443/v1/signal"));
         assert_eq!(get(&txt, "relaypin"), Some(FP));
     }
@@ -326,6 +437,8 @@ mod tests {
             "https://relay.example.com:8443/v1/signal",
             FP,
             LAN,
+            None,
+            "",
         );
         for (k, v) in &txt {
             assert!(k.len() + v.len() + 1 <= 255, "TXT string {k} exceeds 255 bytes");
@@ -381,6 +494,74 @@ mod tests {
         assert!(out.ends_with("/v1/signal"), "path lost: {out}");
     }
 
+    // ── The WAN rewrite ─────────────────────────────────────────────────────
+
+    const WAN: &str = "73.213.125.252";
+
+    #[test]
+    fn the_wan_rewrite_replaces_private_addresses_as_well_as_loopback() {
+        // The difference from `relay_reachable_from`, and the reason both
+        // exist: a LAN address is a fine answer for a client on this network
+        // and a useless one for the same client tomorrow on cellular. The
+        // record is stored and reused, so it has to answer the harder question.
+        for url in [
+            "https://127.0.0.1:8443/v1/signal",
+            "https://10.0.0.205:8443/v1/signal",
+            "https://192.168.1.10:8443/v1/signal",
+            "https://172.16.4.4:8443/v1/signal",
+            "https://localhost:8443/v1/signal",
+        ] {
+            let out = relay_for_wan(url, WAN);
+            assert!(out.contains(WAN), "{url} kept a local-only address: {out}");
+            assert!(out.contains(":8443"), "port lost: {out}");
+            assert!(out.ends_with("/v1/signal"), "path lost: {out}");
+        }
+    }
+
+    #[test]
+    fn the_wan_rewrite_leaves_an_operators_own_address_alone() {
+        // Someone who put a real address or a DNS name there has already solved
+        // this, and replacing their name with a raw IP would break the one
+        // deployment that needed no help — including the certificate-pinned
+        // hostname case, where the name is the thing they maintain.
+        for url in [
+            "https://relay.example.com:8443/v1/signal",
+            "https://203.0.113.9:8443/v1/signal",
+        ] {
+            assert_eq!(relay_for_wan(url, WAN), url, "{url} should pass through");
+        }
+    }
+
+    #[test]
+    fn the_advertised_relay_prefers_the_public_address_when_there_is_one() {
+        // The whole point of the UPnP work, asserted at the layer a client
+        // actually reads.
+        let txt = txt_records(FP, "PC", "https://127.0.0.1:8443/v1/signal", FP, LAN, Some(WAN), "");
+        let relay = txt.iter().find(|(k, _)| k == "relay").expect("relay advertised").1.clone();
+        assert!(relay.contains(WAN), "expected the public address, got {relay}");
+
+        // And falls back to the LAN address when the router gave us nothing,
+        // which must keep working exactly as it did before.
+        let txt = txt_records(FP, "PC", "https://127.0.0.1:8443/v1/signal", FP, LAN, None, "");
+        let relay = txt.iter().find(|(k, _)| k == "relay").expect("relay advertised").1.clone();
+        assert!(relay.contains(LAN), "expected the LAN address, got {relay}");
+    }
+
+    #[test]
+    fn an_explicit_advertise_url_beats_everything_nova_worked_out() {
+        // The escape hatch for a hand-forwarded port or a DNS name, and the one
+        // source here that can know something Nova cannot discover. It has to
+        // win over the UPnP address too, or an operator's deliberate setting
+        // would be silently replaced the moment a router started answering.
+        const MANUAL: &str = "https://home.example.net:8443/v1/signal";
+        for public in [None, Some(WAN)] {
+            let txt =
+                txt_records(FP, "PC", "https://127.0.0.1:8443/v1/signal", FP, LAN, public, MANUAL);
+            let relay = txt.iter().find(|(k, _)| k == "relay").expect("relay advertised").1.clone();
+            assert_eq!(relay, MANUAL, "the operator's address must win (public={public:?})");
+        }
+    }
+
     #[test]
     fn a_routable_relay_is_never_touched() {
         // The overwhelmingly common case, and the one where rewriting would be
@@ -415,7 +596,7 @@ mod tests {
     fn the_rewrite_reaches_the_advertised_record() {
         // The unit above proves the helper; this proves it is actually wired
         // into what goes on the wire.
-        let txt = txt_records(FP, "PC", "https://127.0.0.1:8443/v1/signal", FP, LAN);
+        let txt = txt_records(FP, "PC", "https://127.0.0.1:8443/v1/signal", FP, LAN, None, "");
         assert_eq!(get(&txt, "relay"), Some("https://10.0.0.205:8443/v1/signal"));
         assert_eq!(get(&txt, "relaypin"), Some(FP));
     }
