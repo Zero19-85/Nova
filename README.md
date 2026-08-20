@@ -4,9 +4,11 @@ A zero-copy, native Rust + C++ NVENC game-streaming host that speaks the Moonlig
 
 ---
 
-## Current State — **Alpha 2.0** (Phase 16: Session-Survival Architecture)
+## Current State — **Alpha 2.0** (Session-Survival Architecture, Phase 17)
 
 Alpha 2.0's headline feature is **full lock-screen streaming**: reboot the host, connect from Moonlight, see the Windows login screen, and type your PIN with the remote mouse and keyboard. Getting there required splitting Nova into two processes and adding a third, short-lived one — see [Architecture](#architecture).
+
+Since then the same idea has been extended past the host: a session now survives the *client* disappearing too, and Echo finds the PC without being told where it is.
 
 | Layer | Status |
 |---|---|
@@ -37,6 +39,9 @@ Alpha 2.0's headline feature is **full lock-screen streaming**: reboot the host,
 | **Lock-screen streaming — connect pre-login, see the PIN screen** | ✅ Working |
 | **Remote PIN entry — SYSTEM input helper defeats the UIPI swallow** | ✅ Working |
 | SYSTEM launcher service (`NovaService`) — no logon task needed | ✅ Working |
+| **Detached sessions — a client that vanishes keeps its display for 10 min** | ✅ Working |
+| Per-session bitrate budget (resolution/fps ceiling, audio reserve) | ✅ Working |
+| Physical display-mode baseline — the monitor comes back as it was | ✅ Working |
 | Emergency display restore (logoff/shutdown/crash paths) | ✅ Working |
 | `nova.toml` runtime config (no recompile needed) | ✅ Working |
 | Inno Setup installer (driver + service install, upgrade-safe) | ✅ Working |
@@ -64,6 +69,10 @@ encoder and audio pipeline wholesale — Echo added framing, not media.
 | **Microphone passthrough — the phone becomes the PC's mic** | ✅ Working |
 | **Game audio downstream — host → client, Opus, jitter-buffered** | ✅ Working |
 | **A/V sync engine — video delayed to meet audio's hardware floor** | ✅ Working |
+| **Zero-config discovery — the phone finds the PC by itself (`_echo._tcp`)** | ✅ Working |
+| Reconnect into a detached session — display and desktop still there | ✅ Working |
+| Survives backgrounding, screen lock and Activity teardown | ✅ Working |
+| LAN-direct path (skip the relay on the same subnet) | 🚧 Host half only |
 | Gamepad over Echo | 🔜 Planned |
 
 ### Audio, both directions
@@ -92,6 +101,31 @@ pipeline's own latency reading automatically.
 frame is a delayed view of your own mouse. Right for watching something, wrong
 for playing something. The toggle lives in the stream's control panel and says
 so.
+
+### Finding the host
+
+The phone discovers the PC by itself. Nova advertises `_echo._tcp` over mDNS —
+a **second** service record, never extra keys on the `_nvstream` one Moonlight
+reads — carrying the host's name, its certificate fingerprint, and the relay URL
+and pin when both are configured. Tapping a result fills the connection form in.
+
+The fingerprint in that record is **a hint that pre-fills a field, and nothing
+more**. mDNS is unauthenticated: anything on the LAN can advertise a service and
+claim any fingerprint. Echo never adopts it as the host's identity — that is
+written only by a completed PIN handshake — and uses it solely to label a
+discovered host as one you have already paired with.
+
+### Leaving and coming back
+
+A client that goes quiet — backgrounded, screen locked, phone in a pocket, signal
+lost — no longer ends its session. Encoding and transmission stop immediately, so
+neither the GPU nor the uplink is spent on someone who is gone, while the virtual
+display and everything running on it are **held** for ten minutes. Reconnecting
+resumes into the same desktop rather than rebuilding it.
+
+The wire distinction is *"said goodbye"* versus *"went quiet"*: a client that
+deliberately stops sends `stop_session` first, and that still tears down in full.
+Only a silent vanish detaches.
 
 Details, and the bugs that shaped all of it, are in `HANDOFF_ECHO_AUDIO.md`,
 `HANDOFF_ECHO_INPUT.md`, `HANDOFF_ECHO_P2P.md` and `HANDOFF_ECHO_ANDROID.md`.
@@ -312,10 +346,10 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 
 ## Known Limitations
 
-- **Signing out mid-stream leaves the client on a black screen.** The stream does not automatically recover to the login screen; disconnect and reconnect in Moonlight to get it back. Reboot → lock screen → remote PIN entry works correctly; this affects the *sign-out* transition specifically. Fix planned for the next polish pass (see [Roadmap](#roadmap)).
 - **H.264 at 4K@120fps** exceeds H.264 decoder Level 5.2 on some clients (e.g. Xbox) — use HEVC or AV1 at high resolutions/refresh rates.
 - **AV1 is 8-bit SDR only** for now (Main8). HDR sessions negotiate HEVC Main10; AV1 Main10 is planned.
-- **mDNS auto-discovery** may not work across WiFi APs with multicast isolation — add the host IP manually in Moonlight.
+- **mDNS auto-discovery** may not work across WiFi APs with multicast isolation — add the host IP manually in Moonlight, or the host's address by hand in Echo.
+- **Echo still reaches the host through the relay, even on the same LAN.** The host-side rendezvous exists; the client-side selector that would use it does not, so a phone one metre from the PC currently takes the long way round.
 - **Cursor on the secure desktop** is blended manually on the DDA path (all shape types, SDR + HDR); minor visual differences vs. DWM compositing are possible during UAC/lock-screen interludes.
 - **Bundled Virtual Audio Driver (MTT) cannot load** under Secure Boot — it is code-signed but not Microsoft attestation-signed (device problem code 52). Steam Streaming Speakers or VB-CABLE serve as the ghost sink instead; do not work around this by disabling Secure Boot.
 - **Scheduled-task deployment** (`--install`) still works but cannot capture the secure desktop or lock screen, and does not get the Master/Worker split — the service deployment is required for those.
@@ -339,7 +373,8 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 | 14 | Per-client cert trust, phantom-monitor cleanup, emergency display restore, HDR/120Hz negotiation | ✅ Complete |
 | 15 | Secure-desktop capture (WGC↔DDA), SYSTEM launcher service, audio single-owner, AV1 | ✅ Complete |
 | **16** | **Master/Worker split, lock-screen streaming + remote PIN entry (SYSTEM input helper), strict frame pacing, universal VDD app routing** | ✅ **Alpha 2.0** |
-| 17 | Sign-out stream recovery, AV1 Main10/HDR, attestation-signed audio driver | 🔜 Planned |
+| 17 | Sign-out stream recovery, detached sessions with hot reconnect, per-session bitrate budget, physical display-mode baseline | ✅ Complete |
+| 18 | AV1 Main10/HDR, attestation-signed audio driver | 🔜 Planned |
 
 Echo's own track, numbered separately because it is a parallel product:
 
@@ -348,5 +383,7 @@ Echo's own track, numbered separately because it is a parallel product:
 | E1–E5 | Hole punching, relay signalling, sealed media, RUDP tunnel, keyframe gate | ✅ Complete |
 | E6 | Android client — JNI bridge, MediaCodec decode, PIN pairing | ✅ Complete |
 | E7 | Mouse + keyboard input, own unreliable channel; microphone passthrough | ✅ Complete |
-| **E8–E9** | **Ghost-sink isolation, downstream game audio, A/V sync engine** | ✅ **Complete** |
-| E10 | Gamepad over Echo; software Opus PLC on the client | 🔜 Planned |
+| E8–E9 | Ghost-sink isolation, downstream game audio, A/V sync engine | ✅ Complete |
+| **E10** | **Zero-config LAN discovery (`_echo._tcp`), detached-session reconnect, decoder lifecycle across backgrounding** | ✅ **Complete** |
+| E11 | LAN-direct path selection — host rendezvous built, client selector next | 🚧 Half built |
+| E12 | Gamepad over Echo; software Opus PLC on the client | 🔜 Planned |
