@@ -10,6 +10,8 @@ Alpha 2.0's headline feature is **full lock-screen streaming**: reboot the host,
 
 Since then the same idea has been extended past the host: a session now survives the *client* disappearing too, and Echo finds the PC without being told where it is.
 
+**Echo now streams over the internet with nothing configured by hand** — live-confirmed 2026-08-20 to a phone on 5G. Nova asks the router for its port mappings over UPnP, publishes the public endpoint it gets back, and the client picks LAN or WAN per connection. See [Streaming from anywhere](#streaming-from-anywhere--zero-config-wan).
+
 | Layer | Status |
 |---|---|
 | Pairing (RSA/AES-ECB, PEM plaincert) | ✅ Xbox & Android confirmed |
@@ -114,6 +116,59 @@ more**. mDNS is unauthenticated: anything on the LAN can advertise a service and
 claim any fingerprint. Echo never adopts it as the host's identity — that is
 written only by a completed PIN handshake — and uses it solely to label a
 discovered host as one you have already paired with.
+
+### Streaming from anywhere — zero-config WAN
+
+Live-confirmed 2026-08-20: frames from the PC to a phone on Verizon 5G, with no
+port forwarding configured by hand.
+
+Echo picks its route per connection, in order, and stops at the first that works:
+
+| Stage | Route | When it wins |
+|---|---|---|
+| 1 | **LAN direct** — candidate exchange over the host's TCP control port, then a UDP punch | phone and PC on the same network |
+| 2 | **Relay + STUN hole punch** — candidates traded through the relay, media punched peer-to-peer | anywhere else, including cellular |
+| 3 | **Direct WAN** — a manually configured endpoint, offered as an extra punch candidate | a host behind a port forward whose reflexive address is wrong |
+
+Stage 2 is what makes remote streaming work, and the relay only ever carries
+*signalling* — the two ends trade addresses through it and then send media
+directly to each other. Your video never passes through a third-party server.
+
+**Two things have to be true for stage 2 to work by itself:**
+
+**1. UPnP must be enabled on your router.** At startup Nova asks the gateway for
+its public address and for two port mappings — the relay's TCP port and the
+media UDP port. Nothing else is opened; Echo's LAN control port is deliberately
+never forwarded. The log says what happened:
+
+```
+🌐 UPnP: router found at 10.0.0.1:49153
+🌐 UPnP: forwarded UDP 47998 + TCP 8443 to 10.0.0.205 — this host is reachable at <public IP>
+```
+
+`🌐 UPnP: no router answered` means UPnP is switched off on the gateway (it
+often ships that way), or the router does not support it. Enable it in the
+router's admin page and restart the service. Mappings carry a lease and are
+renewed while Nova runs, so a Nova that stops running stops holding them open.
+
+If your ISP puts you behind carrier-grade NAT, Nova detects it — an "external"
+address in `100.64.0.0/10` cannot be forwarded to — and says so rather than
+advertising an address nothing can reach.
+
+**2. Pair on Wi-Fi first, then leave.** The public address reaches the app
+through the mDNS record, and mDNS only works on the local network. So a phone
+must see the host at least once on Wi-Fi to store the endpoint it will dial from
+cellular later. In practice: pair at home, then it works from anywhere.
+
+Changed your relay or public address? Open the app once on Wi-Fi to let the new
+value propagate, or set it by hand with a long-press on the host card →
+**Edit endpoints**.
+
+**No UPnP, or you would rather forward the port yourself:** forward TCP 8443 and
+UDP 47998 to the host, and set `advertise_url` (see
+[Configuration](#configuration--novatoml)). Leave `url` on loopback — that is how
+*Nova* reaches its own relay, and pointing it at your public address would make
+the host depend on NAT hairpinning to talk to a relay on the same machine.
 
 ### Leaving and coming back
 
@@ -286,7 +341,27 @@ endpoint_override = ""         # friendly-name substring or endpoint ID of the
                                # list: Steam Streaming Speakers, VB-CABLE)
 
 [network]
-fec_percentage = 20            # Reed-Solomon parity % (0 = disabled)
+fec_percentage = 10            # Reed-Solomon parity % (0 = disabled). 10 covers
+                               # the WiFi drops that leave smeared macroblocks an
+                               # infinite GOP cannot repair until the intra-refresh
+                               # sweep arrives; keyframes get double automatically.
+                               # 5 is ample on a wired LAN. Do not go near 20 at
+                               # high bitrates — the parity saturates the link.
+audio_reserve_kbps = 512       # held back from video for the Opus pipelines
+upnp = true                    # ask the router to forward the WAN ports at startup.
+                               # Opens exactly two — the relay's TCP port and the
+                               # media UDP port — never Echo's LAN control port.
+                               # Leases are renewed while Nova runs.
+
+[echo.signaling]
+url               = ""         # how THIS HOST reaches the relay. Loopback is right
+                               # for a relay on the same machine.
+relay_cert_sha256 = ""         # SHA-256 of the relay's TLS certificate
+advertise_url     = ""         # how a REMOTE CLIENT reaches the relay, when that
+                               # differs. Empty = worked out automatically (the
+                               # UPnP address, else this host's LAN address). Set
+                               # it if you forwarded a port by hand or your relay
+                               # is behind a DNS name — and leave `url` alone.
 
 [hdr]
 max_luminance_nits = 1000      # match your TV: HDR600 / HDR1000 / HDR2000
@@ -349,7 +424,9 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 - **H.264 at 4K@120fps** exceeds H.264 decoder Level 5.2 on some clients (e.g. Xbox) — use HEVC or AV1 at high resolutions/refresh rates.
 - **AV1 is 8-bit SDR only** for now (Main8). HDR sessions negotiate HEVC Main10; AV1 Main10 is planned.
 - **mDNS auto-discovery** may not work across WiFi APs with multicast isolation — add the host IP manually in Moonlight, or the host's address by hand in Echo.
-- **Echo still reaches the host through the relay, even on the same LAN.** The host-side rendezvous exists; the client-side selector that would use it does not, so a phone one metre from the PC currently takes the long way round.
+- **Swapping networks mid-session (Wi-Fi ↔ 5G) can leave a black screen** until the stream is stopped and started again. The session survives the change and reconnects, but the picture does not always come back with it. Under investigation; stop and reconnect is the workaround.
+- **A phone must see the host on Wi-Fi once before it can stream over cellular.** The public endpoint travels in the mDNS record, and mDNS is local-only — so there is no way for a phone that has never been on the network to learn where to dial. Pair at home, then it works from anywhere.
+- **Zero-config WAN needs UPnP enabled on the router**, and cannot work at all behind carrier-grade NAT. Nova detects both and says which; the fallback is a forwarded port plus `advertise_url`.
 - **Cursor on the secure desktop** is blended manually on the DDA path (all shape types, SDR + HDR); minor visual differences vs. DWM compositing are possible during UAC/lock-screen interludes.
 - **Bundled Virtual Audio Driver (MTT) cannot load** under Secure Boot — it is code-signed but not Microsoft attestation-signed (device problem code 52). Steam Streaming Speakers or VB-CABLE serve as the ghost sink instead; do not work around this by disabling Secure Boot.
 - **Scheduled-task deployment** (`--install`) still works but cannot capture the secure desktop or lock screen, and does not get the Master/Worker split — the service deployment is required for those.

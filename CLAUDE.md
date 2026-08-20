@@ -66,15 +66,45 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-08-19): LAN-direct — **host half done, client selector is
-the next task**
+## Current Phase (2026-08-20): **ZERO-CONFIG WAN IS LIVE** — streamed to a phone
+on 5G with nothing forwarded by hand
 
-The `lan_rendezvous` RPC exists on the host and has no caller; writing the
-client-side staged selector (gather candidates → attempt LAN → abandon → fall
-through to `open_path`) is where this picks up. See the 2026-08-19 section below
-for what landed and what is still inert. **No open client bugs** — the MediaCodec
-teardown/rebuild fix (`e87f702`) is live-confirmed on the phone: background and
-resume restores the picture.
+The transport story is complete and live-confirmed end to end. `open_path` is a
+staged cascade — **LAN rendezvous → relay + STUN punch → a manual WAN endpoint
+offered as an extra candidate** — and the host asks the router for its own port
+mappings over UPnP, then publishes the public endpoint it gets back in the mDNS
+record. Full engineering record: `HANDOFF_ECHO_LANDIRECT.md`.
+
+**The four rules from this phase that are most likely to be broken by accident:**
+
+1. **The transport is classified from the LATCHED PEER, never from which branch
+   of the cascade ran.** A relay-signalled punch that landed on a private
+   address IS a LAN path — the relay is signalling, not transport. Getting this
+   backwards mislabels the fastest path Echo has.
+2. **UPnP's SSDP search must bind the host's LAN IP, never `0.0.0.0`.** This box
+   has five IPv4 addresses, four of them dead `169.254.x` stubs; a `0.0.0.0`
+   bind sent the multicast out one of those and nothing answered — which looks
+   exactly like a router with UPnP disabled. Bind `0.0.0.0` → 0 responders;
+   bind `10.0.0.205` → the gateway answers. On any multi-homed host this decides
+   whether discovery works at all.
+3. **Never UPnP-map 48011.** `echo::rpc` drops non-private sources before TLS to
+   keep an internet-facing TCP surface off a LocalSystem service. Forwarding it
+   opens the door that fence exists to close, and every packet through it would
+   be refused anyway. Only the relay's TCP port and the media UDP port are mapped.
+4. **`[echo.signaling] url` and `advertise_url` answer different questions.**
+   `url` is how *the host* reaches the relay (loopback, for a co-located one);
+   `advertise_url` is how *a remote client* reaches it. Setting `url` to the
+   public address makes the host depend on NAT hairpinning to talk to a relay on
+   its own machine.
+
+**Open edge case for the next session:** swapping networks (Wi-Fi ↔ 5G) during a
+suspended/detached session occasionally comes back to a **black screen** until a
+full stop and restart. The session survives the change and reconnects — the
+picture does not always come back with it. Suspect the decoder/Surface path or a
+missing IDR after the path swaps, not the transport: the cascade re-establishes
+correctly and the host log shows the new path opening. Start by checking whether
+the host sees a keyframe request after the swap and whether `Configure` is
+replayed to the returning client.
 
 ## Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
 

@@ -347,3 +347,146 @@ eligible as a "real" output. Endpoint matching also reads
 `PKEY_DeviceInterface_FriendlyName`, because NVIDIA names its render endpoints
 after the attached display — the adapter name is the only place "NVIDIA Virtual
 Audio" appears.
+
+---
+
+## The microphone cable is now per-session (2026-08-20)
+
+Reported as: on detach, Nova held the Virtual Audio Cable instead of restoring
+the physical endpoints, and the mic was broken after reconnecting. Half of that
+was already handled and half was real. Both halves are worth recording, because
+the already-handled half is the one most likely to be "fixed" again by mistake.
+
+### Already correct — the ghost sink (speakers). Do not re-implement.
+
+`WorkerMediaPlane::end` sends `Deactivate { cancelled }` for **both** end modes,
+and the Worker's `deactivate_worker` (lib.rs) opens with an unconditional
+`audio_manager.stop_and_release()` — which joins the capture thread and runs the
+claim-once `restore_original_endpoint()`. So a detach already restores the host's
+real default output.
+
+The resume side is equally covered: `apply_configure_start` calls
+`audio::arm_endpoint_restore()` on **both** branches — the fast
+`resume_suspended` reclaim and the full activation — and the Worker calls
+`audio_manager.start_for_stream(...)` after every `Configure`, which a reclaim
+also sends. The ghost sink is therefore re-engaged on an instant reconnect
+without anything new being written.
+
+### Real, and fixed — the microphone renderer was process-lifetime
+
+`mic::start()` was called once from the Master's `mic_supervisor` at startup, and
+`render_loop` called `InitMicRender` before its loop and `CleanupMicRender` only
+after it exited. The loop only exits when the sink is dropped, and the sink lives
+as long as the process. **Nova therefore held VB-CABLE's render endpoint open
+from service start to service stop** — across every detach, every network
+switch, and every idle hour between sessions. Nothing in the session lifecycle
+touched it.
+
+Now: `mic::session_started()` / `mic::session_ended()` set a `WANTED` flag, and
+the render loop acquires the endpoint when it goes true and releases it when it
+goes false. The hooks sit in `WorkerMediaPlane::begin` and `::end`, which is the
+choke point every ending passes through — an explicit `stop_session`, a detach on
+silence, the reaper expiring a detached session, the tray's force-end, and a
+restart ending the previous session. Putting them at any one call site would have
+missed at least three of those.
+
+**Two details that are load-bearing:**
+
+1. **The transition happens on the render thread**, between playout steps, by
+   polling the flag — not by another thread closing the device. Releasing a
+   WASAPI render client underneath a live `RenderMicFrames` is the shape of race
+   that produces an intermittent crash in a LocalSystem service.
+2. **The jitter buffer is reset on release.** `next_seq` from a finished session
+   would make every packet of the next one look like a late arrival and be
+   dropped — which is exactly "the mic is broken after reconnecting". Carrying
+   the buffer would also play the departing client's last words to whoever
+   connects next.
+
+`begin` runs for a reclaimed session as well as a fresh one, so an instant
+reconnect re-acquires the cable with no extra path.
+
+### NOT fixed, because Nova cannot: the default *capture* device
+
+If the host's microphone is silent in other applications, that is the documented
+VB-CABLE behaviour (see CLAUDE.md): installing the cable adds a **capture**
+endpoint, "CABLE Output", and Windows makes a newly-arrived capture device the
+default. Every app then reads digital silence from a device that is working
+exactly as designed.
+
+Nova has never called `SetDefaultAudioDevice` with a capture endpoint — only
+render endpoints, for the ghost sink — so there is nothing for it to restore, and
+adding an automatic "fix" would mean silently overriding a device choice the
+operator may have made deliberately. Diagnose and repair it with the shipped
+tool:
+
+```
+nova-server.exe --mic-probe listen default 5 <log>
+nova-server.exe --mic-probe default "Microphone" 0 <log>
+```
+
+---
+
+## Microphone endpoint routing — Nova now sets the default CAPTURE device (2026-08-20)
+
+**This reverses a decision recorded in CLAUDE.md as deliberate.** The old rule
+was "Nova has never called `SetDefaultAudioDevice` with a capture endpoint, and
+doing so would mean silently overriding a device choice the operator may have
+made on purpose." That reasoning was sound *at the time* for a specific reason:
+nothing on the capture side had a restore path, and an override with no way back
+is a setting the user has to repair by hand — worse than doing nothing.
+
+What changed is not the judgement about overriding, it is that the way back now
+exists, built to the same standard the render side has had since Phase 15.1.
+
+### What it does
+
+`audio::engage_default_capture()` finds the `CABLE Output` **capture** endpoint
+(the recording half of the cable `mic.rs` renders into), records the operator's
+current default recording device, and points Windows at the cable via the same
+`IPolicyConfig` swap the ghost sink uses. `restore_default_capture()` puts it
+back, claim-once.
+
+New shim export: `GetDefaultEndpointId(is_capture, out, cch)`.
+`GetDefaultAudioDeviceId` is render-only and stays that way — it has callers
+that would silently start answering a different question if it grew a parameter.
+`FindEndpointByName` already took an `is_capture` flag and needed no change.
+
+### Four guards, each load-bearing
+
+1. **It engages on TRAFFIC, not on session start.** The hook is in `mic.rs`'s
+   render loop, the first time a session's jitter buffer is non-empty. A user
+   who never switched their microphone on never has their recording device
+   touched, and "packets are arriving" is the only evidence this side of the
+   wire has that the switch is on — the client sends, or it does not.
+2. **It refuses to arm the cable as a restore target.** If the default is
+   already `CABLE Output` — an unclean previous exit, or the operator's own
+   choice — nothing is armed and nothing is swapped. Arming it would make
+   "restore" mean "put the cable back", which is the stuck-silent bug the render
+   side documents.
+3. **The restore target is stored only after the swap SUCCEEDS.** Arming first
+   would leave a restore target for a change that never happened, and the
+   restore would then move the operator's default for no reason.
+4. **There is no live-query fallback, deliberately.** The render side falls back
+   to `recover_stuck_sink()` when nothing is armed, because "any real playback
+   device" is a safe guess. The equivalent guess here is not: picking "some real
+   capture device" could hand the operator's default to a webcam they never use.
+   Nothing armed means we never changed it, so the right action is none.
+
+### The cross-process net
+
+`nova_mic_restore.txt`, next to the exe, written when the swap engages and
+removed when it is undone. The in-memory arm covers every ending this process
+runs code for; it does not cover the Master being *terminated* — an installer
+upgrade, `sc stop` landing mid-call, a crash — where a detached render thread
+never reaches its tail. `audio::heal_capture_endpoint_at_startup()` reads the
+file at Master startup and restores **only if the default really is the cable**,
+so an operator who chose `CABLE Output` themselves after a crash keeps their
+choice. Same reasoning as `nova_display_baseline.txt`; deleting it is safe.
+
+### Still true, and still not Nova's to fix
+
+If the host microphone is silent in other applications *while no Echo session is
+running*, that remains the VB-CABLE default-capture behaviour described in
+CLAUDE.md, and `nova-server.exe --mic-probe` is the tool. What is fixed here is
+the opposite direction: the host now hears the client without anyone selecting
+the cable by hand.

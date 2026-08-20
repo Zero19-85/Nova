@@ -533,3 +533,150 @@ declarations by name (checked mechanically), but no native method has ever been
 *called*, so `UnsatisfiedLinkError` from a signature mismatch remains possible.
 And the host still needs redeploying — the live binary has no WAN control
 transport, so the phone will hit the same `tls handshake eof` the CLI did.
+
+---
+
+## UI overhaul: the Ion dashboard, persistent hosts, per-host controls (2026-08-20)
+
+Built and installed on the Pixel 9 Pro XL; a stream ran end to end on this build.
+The setup screen — five text fields, two 64-character hex strings and a raw event
+log — is gone. Nothing on the protocol side changed: no Rust file was touched,
+and `cargo test --workspace` is 147 passed / 0 failed.
+
+### New files (all `android/app/src/main/java/com/nova/echo/`)
+
+| File | Owns |
+|---|---|
+| `Theme.kt` | The palette and the telemetry type. One place colour is decided. |
+| `HostStore.kt` | The persistent host list — the vanishing-host fix |
+| `EchoSettings.kt` | Global stream prefs behind the gear |
+| `Probe.kt` | TCP reachability for the badges and the diagnostics panel |
+| `Dashboard.kt` | The host list, cards, badges, top bar |
+| `Sheets.kt` | The settings sheet, the long-press host sheet, add-host dialog |
+
+`MainActivity.kt` lost `ControlPanel` and `rememberPref` and now hosts the
+Activity, the streaming overlay, and nothing else.
+
+### The rule the store exists to enforce
+
+**mDNS is evidence, not the list.** The old screen rendered `HostDiscovery`
+directly, so a host vanished when Nova restarted, when the phone moved to
+cellular, or whenever the platform resolver dropped a record — taking with it the
+only route to a machine that was still perfectly reachable over the relay. A
+`KnownHost` now persists the alias, the relay pair, the last LAN address and the
+paired identity; a sighting is folded in with `observed()`, and absence only
+changes the badge.
+
+Two things that must stay true:
+
+1. **An advertised fingerprint is a LABEL, never a promotion.** `observed()` will
+   adopt `fp` for a record that has none, and it never sets `paired`. Only
+   `HostStore.paired()`, called from a completed PIN handshake, does that — the
+   same boundary `HostDiscovery` documents from the other side.
+2. **The legacy adoption runs exactly once and writes its flag first.** The
+   pre-dashboard setup screen kept one host in five loose `echo` prefs, and the
+   pairing those describe is real, so `adoptLegacySetup` promotes or creates the
+   matching card. Guarded because a host the user deliberately forgets must not
+   come back on the next launch. Verified live: APEX came back `PAIRED` without a
+   re-pair.
+
+### Presence is three states, not two
+
+`Presence.{Lan, Wan, Cached}` → `ONLINE // LAN` (green), `ONLINE // WAN_PUNCH`
+(cyan), `OFFLINE // CACHED` (dim). Green is reserved for "answered on the local
+segment"; a card not on the LAN is probed against its relay so the badge can tell
+"one hop away" from "no route at all". The probe is a TCP connect, because
+Android hands an unprivileged app no raw sockets — so it is never called a ping in
+the UI.
+
+### Settings are a REQUEST, not the running configuration
+
+Codec / resolution / framerate / bitrate go into `connect()` as `StreamPrefs` and
+the host negotiates from there. `onGranted` still configures the decoder from the
+grant, which is what makes an H264 session capped at 24 fps by Level 5.2, or a
+bitrate clamped to the resolution ceiling, correct rather than a mismatch. The
+sheet says so on screen.
+
+The microphone switch is the one setting the controller owns rather than the
+settings object: two UIs toggle it (the sheet and the in-stream overlay), and
+`setMicEnabled` persists it centrally so they cannot disagree.
+
+### Not done
+
+- **The WAN endpoint field is stored and displayed but never dialled.**
+  `session::open_path` is still unconditionally relay-mediated, so this is a
+  place to put the address the LAN-direct selector will need, not a working
+  override. Wire it when the client-side staged selector lands.
+- Network switching (Wi-Fi to 5G) was verified by construction and by the
+  on-disk store, not by physically moving the phone — adb runs over that Wi-Fi.
+- `network_security_config.xml` still lists IP literals that match no real host
+  (pre-existing, still inert).
+
+---
+
+## Zero-config WAN, live to 5G (2026-08-20)
+
+The Android client now streams over cellular with nothing forwarded by hand.
+Verified end to end on Verizon 5G to the Pixel 9 Pro XL.
+
+### What the client does
+
+`session::open_path` runs a staged cascade and stops at the first route that
+works: **LAN rendezvous** (TCP 48011 + punch, ~500 ms dial / 1.5 s punch) →
+**relay + STUN punch** → the manual WAN endpoint offered as an extra candidate
+inside stage 2. The badge on each host card reports the route the engine
+actually took, because `path_open` now carries a `transport` field
+(`lan` / `wan_punch` / `direct_wan`) — that string is API between Rust and
+Kotlin.
+
+**Classified from the latched peer, not the branch that ran.** A relay-signalled
+punch that lands on a private address is `lan`, because the relay is signalling
+and not transport.
+
+### The host side of it, and the bug worth remembering
+
+Nova asks the router over UPnP for its public address and two port mappings, then
+publishes the public relay URL in the `_echo._tcp` record — which is how the
+phone learns an endpoint it can dial from cellular.
+
+**The failure that cost a round: SSDP bound to `0.0.0.0`.** The dev box has five
+IPv4 addresses, four of them dead `169.254.x` stubs on disconnected Wi-Fi and
+Bluetooth adapters. The multicast search left through one of those and nothing
+answered, which is indistinguishable from a router with UPnP switched off — and
+was diagnosed as exactly that, wrongly, because the three PowerShell probes used
+to check it *shared the same bind bug*. Three agreeing probes meant one mistake
+made three times. Binding the host's LAN address fixes it:
+
+```
+bind 0.0.0.0     -> 0 responders
+bind 10.0.0.205  -> 1 responder: http://10.0.0.1:49153/IGDdevicedesc_brlan0.xml
+```
+
+### The discovery rule this creates, which the UI depends on
+
+**A phone must see the host on Wi-Fi once before it can stream over cellular.**
+The public endpoint travels in the mDNS record and mDNS is local-only, so a phone
+that has never been on the network has no way to learn where to dial. `HostStore`
+persists it — that is what the store is for — and `observed()` refreshes it from
+each sighting, so changing the relay means opening the app once on Wi-Fi (or
+editing the endpoint by hand from the host card's long-press sheet).
+
+### Known edge case — next session starts here
+
+**Swapping networks (Wi-Fi ↔ 5G) during a suspended session occasionally returns
+to a black screen** until the stream is stopped and restarted. The session
+survives and reconnects; the picture does not always come back with it.
+
+Suspect the client decoder/Surface path rather than the transport — the cascade
+re-establishes correctly and the host log shows the new path opening. The
+2026-08-19 MediaCodec wedge is the obvious neighbour (a codec whose Surface died
+never recovers, and nothing throws), but this is a *different* trigger: the
+Surface is alive throughout. Worth checking first:
+
+1. Does the host log a keyframe request after the swap? A flood means the client
+   queue is overflowing and nothing is consuming — see
+   `mediacodec-surface-wedge`. Silence means the client never asked.
+2. Is `ConfigureStart` replayed to the reconnecting client, and does the RTP
+   sender re-pin to the new peer address?
+3. Does `VideoPlayer` still hold a codec configured for the pre-swap session, and
+   would `nativeRequestIdr` alone unstick it?
