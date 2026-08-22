@@ -1564,6 +1564,29 @@ extern "C" __declspec(dllexport) int InitEncoder(
                 av1.matrixCoefficients      = NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 av1.colorRange              = 0;
             }
+            if (kEnableIntraRefresh) {
+                // AV1's repair path, and the reason this block exists.
+                //
+                // Nova runs AV1 with idrPeriod = NVENC_INFINITE_GOPLENGTH, and
+                // RFI is inert for every Moonlight client measured so far (they
+                // send 0x0302 IDR requests, never 0x0301 invalidations). Without
+                // a rolling refresh that leaves AV1 with NO mechanism to repair a
+                // broken reference chain: one lost tail packet corrupts the lower
+                // part of the picture permanently, and it clears only if the
+                // client happens to ask for an IDR. H264/HEVC take the identical
+                // loss and scrub it within one sweep, which is exactly why the
+                // corruption reads as AV1-specific rather than as packet loss.
+                //
+                // NOTE: there is deliberately no singleSliceIntraRefresh here.
+                // That field exists only on NV_ENC_CONFIG_H264/HEVC — AV1 has no
+                // slices, so its gradual refresh is expressed over TILES and the
+                // knob does not exist on NV_ENC_CONFIG_AV1. Copying the H264
+                // block wholesale does not compile; this three-field form is the
+                // AV1 equivalent.
+                av1.enableIntraRefresh  = 1;
+                av1.intraRefreshPeriod  = kIntraRefreshPeriod;
+                av1.intraRefreshCnt     = kIntraRefreshCnt;
+            }
         }
 
         ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
@@ -1596,6 +1619,36 @@ extern "C" __declspec(dllexport) int InitEncoder(
                              codecGuid, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0;
         ShimLog("🧩 RFI (reference-frame invalidation) support for %s: %s (DPB holds %u ref frames)\n",
                codec, g_rfiSupported ? "YES" : "no", g_refFramesInDpb);
+
+        // Intra refresh is Nova's repair path on every codec, so whether this
+        // GPU actually honours it for this codec is worth stating rather than
+        // assuming. The capability is reported per codec GUID.
+        const bool irSupported = g_nvEncoder->GetCapabilityValue(
+                                     codecGuid, NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0;
+        ShimLog("[IR] Intra refresh for %s: cap=%s, requested=%s (period=%u, sweep=%u frames)\n",
+               codec, irSupported ? "YES" : "no",
+               kEnableIntraRefresh ? "ON" : "OFF",
+               kIntraRefreshPeriod, kIntraRefreshCnt);
+        if (kEnableIntraRefresh && !irSupported) {
+            ShimLog("[IR] WARNING: intra refresh requested but UNSUPPORTED for %s on this GPU "
+                    "- this codec has no repair path for lost packets.\n", codec);
+        }
+
+        if (codecGuid == NV_ENC_CODEC_AV1_GUID) {
+            // Tile geometry was never logged, so the partitioning Nova actually
+            // ships was simply unknown. It matters when reading a corruption
+            // report: a damaged band that aligns to a tile-row boundary is a
+            // different fault from one that does not. 0 means "the smallest
+            // number of tiles the standard allows", resolved by the driver; a
+            // non-zero value is rounded DOWN to a power of two. These are the
+            // values submitted at CreateEncoder, so a 0 here is a question the
+            // driver answered internally, not a committed geometry.
+            const NV_ENC_CONFIG_AV1& av1cfg = g_encConfig.encodeCodecConfig.av1Config;
+            ShimLog("[AV1] tiles: numTileColumns=%u numTileRows=%u customTileConfig=%u "
+                    "(0 = driver picks the standard minimum) at %dx%d\n",
+                   av1cfg.numTileColumns, av1cfg.numTileRows,
+                   (unsigned)av1cfg.enableCustomTileConfig, width, height);
+        }
 
         ShimLog("✅ NVENC READY (%s%s @ %dx%d, %d Kbps, %d fps)\n",
                codec, is_hdr ? "/HDR10/Main10" : "", width, height, bitrate_kbps, fps);
@@ -1913,12 +1966,37 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // re-pointed (older, good) frame, so the wire must mark it type 5.
     g_lastFrameRecovery.store(g_rfiConfirm.exchange(false));
 
-    int total_size = 0;
+    int  total_size  = 0;
+    int  wanted_size = 0;
+    bool truncated   = false;
     for (const auto& packet : vPacket) {
         int chunk = (int)packet.frame.size();
-        if (total_size + chunk > max_size) break;
+        wanted_size += chunk;
+        if (total_size + chunk > max_size) { truncated = true; continue; }
         memcpy(out_buffer + total_size, packet.frame.data(), chunk);
         total_size += chunk;
+    }
+    if (truncated) {
+        // What leaves here is a STRUCTURALLY INCOMPLETE temporal unit: the
+        // client cannot decode it, and every frame that references it inherits
+        // the damage. This used to be a bare `break` — no error, no log, and
+        // indistinguishable downstream from a healthy small frame.
+        //
+        // Behaviour is deliberately unchanged (still a partial frame, not an
+        // error return): the point of this pass is to make the condition
+        // FALSIFIABLE. If it ever fires, the correct fix is to drop the frame
+        // and force an IDR, which is a real behaviour change and wants its own
+        // decision. Throttled because this is the per-frame hot path — loud on
+        // the first occurrence, then about once a second at 120 fps.
+        static std::atomic<uint64_t> s_truncCount{0};
+        const uint64_t n = s_truncCount.fetch_add(1) + 1;
+        if (n == 1 || (n % 120) == 0) {
+            ShimLog("[X] EncodeFrame TRUNCATED frame %llu: encoder produced %d bytes across %zu "
+                    "packet(s), caller buffer holds %d, sent %d (occurrence #%llu). "
+                    "The client CANNOT decode this frame.\n",
+                    (unsigned long long)frame_index, wanted_size, vPacket.size(),
+                    max_size, total_size, (unsigned long long)n);
+        }
     }
 
     return total_size;
