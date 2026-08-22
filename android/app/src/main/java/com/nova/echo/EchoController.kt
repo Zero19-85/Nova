@@ -191,13 +191,75 @@ class EchoController private constructor(private val context: android.content.Co
      * either launches that app or it does not.
      */
     fun connect(host: KnownHost, prefs: StreamPrefs, appId: Int = LaunchMode.Mirror.appId) {
+        val asked = prefs
+        val effective = decodableOrDowngraded(prefs)
+        if (effective == null) {
+            post {
+                it.copy(status = "Failed", error =
+                    "This device cannot decode ${asked.resolution} at any supported " +
+                    "codec or frame rate. Pick a lower resolution.")
+            }
+            return
+        }
+        if (effective.codec != asked.codec || effective.fps != asked.fps) {
+            // Logged, not posted: the downgrade becomes visible to the user in
+            // the status line the moment video starts ("Streaming 3840x2160@60
+            // av1"), which reports the mode actually running rather than a
+            // claim about it. Adding a UiState field that no screen renders
+            // would be dead weight carried for one message.
+            Log.w(TAG, "requested ${asked.codec}@${asked.fps} at ${asked.resolution} " +
+                       "is not decodable by this device — asking the host for " +
+                       "${effective.codec}@${effective.fps} instead")
+        }
         start(transportConfig(host).apply {
-            put("res", prefs.resolution)
-            put("fps", prefs.fps)
-            put("codec", prefs.codec)
-            put("bitrate_kbps", prefs.bitrateKbps)
+            put("res", effective.resolution)
+            put("fps", effective.fps)
+            put("codec", effective.codec)
+            put("bitrate_kbps", effective.bitrateKbps)
             put("app_id", appId)
         }.toString(), pairing = false)
+    }
+
+    /**
+     * [prefs], adjusted to something this device's decoder will actually accept,
+     * or null if nothing at this resolution will do.
+     *
+     * This is where the "renegotiation" happens, and it happens BEFORE the
+     * request rather than after the grant. Echo has no in-band way for a client
+     * to tell a host "that format is unsupported" — and it needs none, because
+     * the client is what proposes res/fps/codec in `start_session`. Asking for
+     * a mode this phone cannot decode and then backing out costs a round trip,
+     * a display activation on the host, and a torn-down session, all to learn
+     * something `MediaCodecInfo` would have answered for free.
+     *
+     * The bitrate is recomputed for the mode actually requested: it was chosen
+     * for the old frame rate, and carrying it across unchanged would ask for a
+     * 120fps budget on a 60fps stream.
+     */
+    private fun decodableOrDowngraded(prefs: StreamPrefs): StreamPrefs? {
+        val (w, h) = parseResolution(prefs.resolution) ?: return prefs
+        val mode = VideoPlayer.Support.bestSupported(prefs.codec, w, h, prefs.fps) ?: return null
+        if (mode.codec == prefs.codec && mode.fps == prefs.fps) return prefs
+        return prefs.copy(
+            codec = mode.codec,
+            fps = mode.fps,
+            bitrateKbps = EchoSettings.recommendedBitrateKbps(prefs.resolution, mode.fps),
+        )
+    }
+
+    /**
+     * `"1920x1080"` to a pixel pair. Returns null for anything unrecognised, and
+     * the caller then passes the request through untouched — an unparsed
+     * resolution is not evidence that the mode is unsupported, and refusing on
+     * it would break a perfectly good session over a spelling this function
+     * does not happen to know.
+     */
+    private fun parseResolution(text: String): Pair<Int, Int>? {
+        val parts = text.lowercase().split('x', '*')
+        if (parts.size != 2) return null
+        val w = parts[0].trim().toIntOrNull() ?: return null
+        val h = parts[1].trim().toIntOrNull() ?: return null
+        return if (w > 0 && h > 0) w to h else null
     }
 
     /**
@@ -372,8 +434,12 @@ class EchoController private constructor(private val context: android.content.Co
         val width = event.optInt("width", 1920)
         val height = event.optInt("height", 1080)
         val codec = event.optString("codec", "hevc")
+        // Same rule as width/height: read what the host GRANTED, never what was
+        // requested. The decoder is configured for this cadence, so a wrong
+        // value here misconfigures it rather than merely mislabelling a log.
+        val fps = event.optInt("fps", 60)
 
-        player = VideoPlayer(h, target, width, height, codec) { message ->
+        player = VideoPlayer(h, target, width, height, fps, codec) { message ->
             post { it.copy(status = "Failed", error = message) }
         }.also { it.start() }
         // Re-read the field: a surfaceCreated that landed while the decoder was
@@ -382,7 +448,7 @@ class EchoController private constructor(private val context: android.content.Co
         // Cheap, and skipped entirely when nothing changed.
         surface?.let { current -> if (current !== target) player?.setSurface(current) }
 
-        post { it.copy(status = "Streaming ${width}x$height $codec", streaming = true) }
+        post { it.copy(status = "Streaming ${width}x$height@${fps} $codec", streaming = true) }
 
         // The microphone starts only once a session exists. Its channel is
         // created with the handle, but nothing drains it until the host grants

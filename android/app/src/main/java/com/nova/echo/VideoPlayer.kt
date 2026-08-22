@@ -1,6 +1,8 @@
 package com.nova.echo
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
@@ -78,6 +80,17 @@ class VideoPlayer(
     surface: Surface,
     private val width: Int,
     private val height: Int,
+    /**
+     * The negotiated frame rate, passed to the decoder as `KEY_FRAME_RATE`.
+     *
+     * Not cosmetic. Without it the decoder is told a resolution and nothing
+     * about cadence, so it cannot pick an operating point for the load it is
+     * about to get, and cannot refuse a mode it has no chance of sustaining —
+     * it simply falls behind. It is also what `areSizeAndRateSupported` needs
+     * to answer honestly, which is how [findHardwareDecoder] reports whether
+     * this device can really do 4K120 rather than guessing.
+     */
+    private val fps: Int,
     codec: String,
     private val onError: (String) -> Unit,
 ) {
@@ -122,7 +135,7 @@ class VideoPlayer(
         restarts = 0
         feeder = thread(name = "echo-feeder") { feedLoop(c) }
         renderer = thread(name = "echo-render") { renderLoop(c) }
-        Log.i(TAG, "decoder started: $mime ${width}x$height")
+        Log.i(TAG, "decoder started: ${c.name} $mime ${width}x$height @${fps}fps")
     }
 
     private fun createCodec(target: Surface): MediaCodec? {
@@ -134,16 +147,109 @@ class VideoPlayer(
         // ignored, so setting both is safe and covers far more hardware.
         format.setInteger("vdec-lowlatency", 1)
 
-        return try {
-            MediaCodec.createDecoderByType(mime).also {
-                it.configure(format, target, null, 0)
-                it.start()
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+
+        // Ask for a HARDWARE decoder by name rather than taking whatever
+        // `createDecoderByType` hands back.
+        //
+        // `createDecoderByType` returns the first entry the platform lists for
+        // the MIME type, and that is not required to be the hardware one. For
+        // `video/av01` in particular a device can carry Google's software
+        // decoder (`c2.android.av1.decoder`) ahead of the SoC block it also
+        // has. HEVC never showed this because its hardware decoder is what
+        // enumerates first, which is exactly why AV1 and HEVC diverged at
+        // IDENTICAL pixel rates: 1080p120 HEVC ran clean at 0.01 keyframe
+        // requests/sec while 1080p120 AV1 flooded at 0.43-1.07/sec, on a link
+        // with 3ms RTT and zero host-side packet loss (measured 2026-08-22).
+        // Software AV1 cannot sustain those rates; the frame queue backs up,
+        // and a client that has stopped consuming asks for keyframes forever.
+        //
+        // Falls back to the platform default when no hardware decoder exists or
+        // the one we picked refuses the format — a software picture beats none.
+        // A hardware decoder that will not claim this size and rate is REFUSED,
+        // not forced — and there is no software fallback for a mode nothing
+        // supports, because that fallback is a slower way to reach the same
+        // crash.
+        //
+        // Confirmed on a Pixel 9 Pro XL (Tensor G4), 2026-08-22: the hardware
+        // AV1 block reports areSizeAndRateSupported(3840, 2160, 120.0) == false.
+        // Driving it anyway backed the pipeline up until MediaCodec threw
+        // "Pending dequeue output buffer request cancelled" in a loop. That is
+        // the silicon's pixel-clock limit, and the decoder said so before a
+        // single frame was queued — the only mistake was not listening.
+        //
+        // So: refuse here, cleanly, with a message naming the mode. Nothing is
+        // started, so nothing can wedge. [Support.bestSupported] is what stops
+        // a session from being requested in this state at all; this is the
+        // backstop for a host that grants a mode we did not ask for.
+        val hardware = findHardwareDecoder()
+        if (hardware == null) {
+            if (!Support.anyDecoderClaims(mime, width, height, fps)) {
+                Log.e(TAG, "no decoder on this device claims $mime ${width}x${height}@${fps}fps — refusing")
+                onError(Support.unsupportedMessage(mime, width, height, fps))
+                return null
             }
+            Log.w(TAG, "no HARDWARE decoder for $mime ${width}x${height}@${fps}fps, " +
+                       "but a software one claims it — falling back to the platform default")
+        }
+        val codec = hardware?.let { openCodec(it, format, target) }
+            ?: openCodec(null, format, target)
+        if (codec == null) {
+            onError("decoder for $mime at ${width}x${height}@${fps}fps: no usable decoder")
+        }
+        return codec
+    }
+
+    /**
+     * Open one decoder, by name or by MIME, returning null if it refuses.
+     *
+     * A codec that throws from `configure`/`start` still holds resources, so it
+     * is released here before the caller tries the next candidate.
+     */
+    private fun openCodec(name: String?, format: MediaFormat, target: Surface): MediaCodec? {
+        var c: MediaCodec? = null
+        return try {
+            c = if (name != null) MediaCodec.createByCodecName(name)
+                else MediaCodec.createDecoderByType(mime)
+            c.configure(format, target, null, 0)
+            c.start()
+            c
         } catch (e: Exception) {
-            onError("decoder for $mime at ${width}x$height: ${e.message}")
+            runCatching { c?.release() }
+            Log.w(TAG, "decoder ${name ?: "(platform default)"} refused " +
+                       "$mime ${width}x${height}@${fps}fps: ${e.message}")
             null
         }
     }
+
+    /**
+     * The name of a hardware decoder for [mime], or null if the device has none.
+     *
+     * Every candidate is logged with what it claims, because that enumeration is
+     * the whole diagnostic: it says in one line whether this device actually has
+     * a hardware AV1 block, and whether that block will admit to handling the
+     * mode being asked of it. `areSizeAndRateSupported` is the honest answer to
+     * "can this phone do 4K120" — better to read it from the decoder than to
+     * infer it from a corrupted picture.
+     *
+     * Where several hardware decoders qualify, one that claims this exact
+     * size-and-rate wins over one that does not.
+     */
+    private fun findHardwareDecoder(): String? = runCatching {
+        val candidates = Support.decoders(mime)
+        candidates.forEach { info ->
+            Log.i(TAG, "  decoder candidate ${info.name}: hardware=${Support.hw(info)}, " +
+                       "claims ${width}x${height}@${fps}fps=" +
+                       "${Support.claims(info, mime, width, height, fps)}")
+        }
+        // FILTER, not sort. An earlier version ordered candidates by whether
+        // they claimed the mode and took the best one, which still selected a
+        // decoder that had already answered "no" when it was the only hardware
+        // block present. `areSizeAndRateSupported` is a hard gate here.
+        candidates.filter { Support.hw(it) && Support.claims(it, mime, width, height, fps) }
+            .firstOrNull()
+            ?.name
+    }.getOrNull()
 
     /**
      * Point the decoder at a new Surface, or at none while one is unavailable.
@@ -503,6 +609,90 @@ class VideoPlayer(
         stopThreadsAndCodec()
         stopDrain()
     }
+
+    /**
+     * What this device can actually decode, asked before a session is requested.
+     *
+     * ## Why this is the renegotiation
+     *
+     * Echo has no in-band "that format is unsupported" message, and does not
+     * need one: the CLIENT chooses the mode. `start_session` carries res, fps
+     * and codec, and the host grants against them — so the honest place to
+     * refuse an impossible mode is BEFORE the ask, not after the grant. A
+     * round trip that exists only to be rejected is a round trip that did not
+     * need to happen, and it costs a display activation on the host.
+     *
+     * [bestSupported] is therefore called on the way into `connect`, and the
+     * check inside [createCodec] is the backstop for the one case it cannot
+     * cover: a host that grants something other than what was asked for.
+     */
+    object Support {
+        /** MIME for a codec name as it travels on the wire. */
+        fun mimeOf(codec: String): String = when (codec.lowercase()) {
+            "h264", "avc" -> MediaFormat.MIMETYPE_VIDEO_AVC
+            "av1" -> MediaFormat.MIMETYPE_VIDEO_AV1
+            else -> MediaFormat.MIMETYPE_VIDEO_HEVC
+        }
+
+        /** Whether any decoder — hardware or software — claims this exact mode. */
+        fun anyDecoderClaims(mime: String, width: Int, height: Int, fps: Int): Boolean =
+            decoders(mime).any { claims(it, mime, width, height, fps) }
+
+        /** Whether a HARDWARE decoder claims this exact mode. */
+        fun hardwareClaims(mime: String, width: Int, height: Int, fps: Int): Boolean =
+            decoders(mime).any { hw(it) && claims(it, mime, width, height, fps) }
+
+        /**
+         * The closest mode to the one requested that this device's hardware can
+         * actually decode, or null if nothing on the ladder works.
+         *
+         * The ladder drops frame rate before it changes codec, because fps is
+         * the cheaper concession: 4K60 AV1 keeps the codec the operator chose,
+         * while falling to HEVC discards it. Resolution is never lowered here —
+         * it is the one parameter the user picked for how the picture LOOKS,
+         * and silently halving it would be a worse surprise than a lower
+         * cadence.
+         */
+        fun bestSupported(codec: String, width: Int, height: Int, fps: Int): Mode? {
+            val ladder = buildList {
+                add(Mode(codec, fps))
+                if (fps > 60) add(Mode(codec, 60))
+                if (!codec.equals("hevc", true)) {
+                    add(Mode("hevc", fps))
+                    if (fps > 60) add(Mode("hevc", 60))
+                }
+            }
+            return ladder.firstOrNull { hardwareClaims(mimeOf(it.codec), width, height, it.fps) }
+        }
+
+        /** One line naming the mode and what the device said about it. */
+        fun unsupportedMessage(mime: String, width: Int, height: Int, fps: Int): String =
+            "this device has no decoder for $mime at ${width}x${height}@${fps}fps"
+
+        fun decoders(mime: String): List<MediaCodecInfo> = runCatching {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { info ->
+                !info.isEncoder && info.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+            }
+        }.getOrDefault(emptyList())
+
+        fun hw(info: MediaCodecInfo): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                info.isHardwareAccelerated
+            } else {
+                !info.name.startsWith("c2.android.", ignoreCase = true) &&
+                    !info.name.startsWith("OMX.google.", ignoreCase = true)
+            }
+
+        fun claims(info: MediaCodecInfo, mime: String, w: Int, h: Int, fps: Int): Boolean =
+            runCatching {
+                info.getCapabilitiesForType(mime)
+                    .videoCapabilities
+                    .areSizeAndRateSupported(w, h, fps.toDouble())
+            }.getOrDefault(false)
+    }
+
+    /** A decodable combination of codec and frame rate. */
+    data class Mode(val codec: String, val fps: Int)
 
     private companion object {
         const val TAG = "EchoVideo"
