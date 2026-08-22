@@ -380,6 +380,15 @@ pub struct StreamOptions {
     pub fps: u32,
     pub codec: String,
     pub bitrate_kbps: u32,
+    /// Which Nova app the session opens into — `app_launcher::APP_ID_*`,
+    /// where 1 is Desktop.
+    ///
+    /// The host defaults this to 1 when the parameter is absent, so sending it
+    /// is not strictly required; it is sent unconditionally anyway. A session
+    /// that names its app is one whose log line says what the user pressed,
+    /// and "absent means Desktop" is a convention only one side of the wire
+    /// can see.
+    pub app_id: u32,
     /// `Some` = debug over the host's LAN TCP control port instead of the
     /// punched tunnel. The host refuses that port from non-private addresses,
     /// so this is not a WAN fallback and must not be presented as one.
@@ -393,6 +402,7 @@ impl Default for StreamOptions {
             fps: 60,
             codec: "hevc".into(),
             bitrate_kbps: 20000,
+            app_id: 1,
             control: None,
         }
     }
@@ -884,6 +894,7 @@ async fn stream_inner(
     params.insert("fps".into(), json!(opts.fps));
     params.insert("codec".into(), json!(opts.codec));
     params.insert("bitrate_kbps".into(), json!(opts.bitrate_kbps));
+    params.insert("app_id".into(), json!(opts.app_id));
 
     let grant = match ctl.call("start_session", params).await {
         Ok(g) => g,

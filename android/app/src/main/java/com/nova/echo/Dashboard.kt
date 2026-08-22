@@ -1,10 +1,17 @@
 package com.nova.echo
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.indication
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -15,8 +22,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -77,6 +89,36 @@ fun transportPresence(transport: String): Presence = when (transport) {
     "direct_wan" -> Presence.DirectWan
     else -> Presence.Wan
 }
+
+/**
+ * What a session should open INTO, chosen before it starts.
+ *
+ * [appId] is Nova's own `app_launcher::APP_ID_*` value and is wire API between
+ * the two halves — the host routes on it twice: once to decide whether the
+ * session is headless (`uses_virtual_display`: 2/3/4/5 always are) and once to
+ * decide what to spawn. Label and id therefore live in one place. A mode whose
+ * id has drifted is not a dead button, it is a session that opens on the wrong
+ * desktop, which is far harder to recognise as a bug.
+ *
+ * [Mirror] is app 1 (Desktop) — the one mode that shows the physical primary
+ * rather than a virtual display, which is why it earns a button beside the
+ * three launchers.
+ */
+enum class LaunchMode(val label: String, val appId: Int) {
+    Steam("STEAM", 2),
+    Xbox("XBOX", 3),
+    RetroArch("RETROARCH", 4),
+    Mirror("MIRROR", 1),
+}
+
+/**
+ * What a double-tap opens: app 5, Virtual Desktop.
+ *
+ * A top-level constant rather than a fifth [LaunchMode], because
+ * `LaunchMode.entries` IS the launch row — adding it there would draw a fifth
+ * button for the mode whose whole point is that it needs no button.
+ */
+const val QUICK_START_APP_ID = 5
 
 /**
  * The dashboard: what Echo shows when nothing is streaming.
@@ -146,6 +188,18 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
     var activeHostId by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(state.connected) { if (!state.connected) activeHostId = null }
 
+    // Which card has its launch row open. Hoisted out of the card so that at
+    // most ONE is ever open — an accordion is the right shape for a list of
+    // machines, since two open panels are two identical sets of buttons with
+    // nothing saying which belongs to which. It also has to live above the
+    // card because card-local state is lost every time the store re-emits,
+    // which it does on every mDNS sighting.
+    var expandedHostId by remember { mutableStateOf<String?>(null) }
+
+    // A session starting is the end of choosing. Collapsing here also means the
+    // panel is not still sitting open behind the stream when it ends.
+    LaunchedEffect(state.connected) { if (state.connected) expandedHostId = null }
+
     fun presence(host: KnownHost): Presence = when {
         // A live path outranks every probe. The engine classifies from the peer
         // the punch latched, which is the only source that can distinguish a
@@ -180,7 +234,14 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
         scope.launch { snackbar.showSnackbar(message) }
     }
 
-    fun activate(host: KnownHost) {
+    /**
+     * Start a session on [host], opening into [appId].
+     *
+     * The unpaired and unroutable branches come first because they are not
+     * failures of the app id — no app id is reachable on a host with no route,
+     * and saying so is more use than a session that cannot open.
+     */
+    fun activate(host: KnownHost, appId: Int = LaunchMode.Mirror.appId) {
         when {
             !host.paired -> {
                 val address = host.lanAddress
@@ -196,10 +257,28 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
             !host.streamable -> say("No route to this host — hold the card to set an address or a relay.")
             else -> {
                 activeHostId = host.id
-                controller.connect(host, prefs)
+                controller.connect(host, prefs, appId)
             }
         }
     }
+
+    /**
+     * A launch button was pressed: stream, opening into that mode's app.
+     *
+     * The panel closes on its own when the session starts — the collapse is
+     * driven by `state.connected`, not from here, so a connect that never
+     * lands leaves the row open with the other three modes still in reach.
+     */
+    fun launch(host: KnownHost, mode: LaunchMode) = activate(host, mode.appId)
+
+    /**
+     * Double-tap: straight into a stream, no panel, no choice.
+     *
+     * App 5 is Virtual Desktop, the mode that exists precisely to be the one
+     * you take without thinking about it — which is why it is the gesture with
+     * no menu in front of it.
+     */
+    fun quickStart(host: KnownHost) = activate(host, QUICK_START_APP_ID)
 
     Scaffold(
         containerColor = Void,
@@ -259,14 +338,29 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
                 EmptyState(browsing)
             } else {
                 known.forEach { host ->
+                    // A host that cannot stream yet keeps the old meaning of a
+                    // tap. Expanding into four launch buttons that would all
+                    // fail is a worse answer than starting the pairing the card
+                    // is already telling the user to start.
+                    val expandable = host.paired && host.streamable
                     HostCard(
                         host = host,
                         presence = presence(host),
                         relay = wan[host.id],
                         showTelemetry = prefs.showTelemetry,
                         busy = state.connected && !state.streaming,
-                        onClick = { activate(host) },
-                        onLongClick = { sheetHostId = host.id },
+                        expandable = expandable,
+                        expanded = expandable && expandedHostId == host.id,
+                        onTap = {
+                            if (expandable) {
+                                expandedHostId = if (expandedHostId == host.id) null else host.id
+                            } else {
+                                activate(host)
+                            }
+                        },
+                        onDoubleTap = { quickStart(host) },
+                        onLongPress = { sheetHostId = host.id },
+                        onLaunch = { mode -> launch(host, mode) },
                     )
                 }
             }
@@ -411,11 +505,21 @@ private fun EmptyState(browsing: Boolean) {
 /**
  * One machine.
  *
- * Tap connects, hold configures — [combinedClickable] rather than a row of
- * buttons because the card IS the control, and a card with four little icons on
- * it is the cluttered thing this replaced.
+ * Three gestures, routed by one [detectTapGestures] rather than by
+ * `combinedClickable`: tap opens the launch row, double-tap skips it and
+ * streams, hold configures. The card IS the control — a card wearing four
+ * little icons at all times is the cluttered thing this replaced.
+ *
+ * **The cost of the double-tap, stated plainly:** once a detector has an
+ * `onDoubleTap`, it can no longer report a single tap until the double-tap
+ * window has passed, so [onTap] fires roughly 300 ms late. That is inherent to
+ * the gesture, not a tunable — and it is why [onDoubleTap] is the one wired to
+ * streaming: the fast path stays fast, and the delay lands on opening a panel,
+ * where nobody can feel it.
+ *
+ * [expanded] is passed in rather than remembered here so the list behaves as an
+ * accordion; see the note at its declaration in [EchoDashboard].
  */
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HostCard(
     host: KnownHost,
@@ -423,14 +527,55 @@ private fun HostCard(
     relay: RelayStatus?,
     showTelemetry: Boolean,
     busy: Boolean,
-    onClick: () -> Unit,
-    onLongClick: () -> Unit,
+    expandable: Boolean,
+    expanded: Boolean,
+    onTap: () -> Unit,
+    onDoubleTap: () -> Unit,
+    onLongPress: () -> Unit,
+    onLaunch: (LaunchMode) -> Unit,
 ) {
     val accent = presence.accent()
+
+    // The gesture detector is keyed on Unit so a recomposition never restarts it
+    // mid-gesture — which means it captures the FIRST callbacks it is given, and
+    // those close over state that moves (which card is expanded, this host's
+    // current record). rememberUpdatedState is what keeps the frozen detector
+    // calling today's lambdas.
+    val currentTap by rememberUpdatedState(onTap)
+    val currentDoubleTap by rememberUpdatedState(onDoubleTap)
+    val currentLongPress by rememberUpdatedState(onLongPress)
+
+    // combinedClickable brought its own ripple and its own semantics; a raw
+    // pointerInput brings neither. Both are re-supplied here rather than
+    // dropped: without the first the card stops acknowledging touches at all,
+    // and without the second it becomes invisible to TalkBack.
+    val interaction = remember { MutableInteractionSource() }
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+            .indication(interaction, ripple())
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    // Feeds the ripple above. onPress is the only hook that
+                    // knows where the finger landed and when it left, which is
+                    // exactly what a bounded ripple needs.
+                    onPress = { offset ->
+                        val press = PressInteraction.Press(offset)
+                        interaction.emit(press)
+                        if (tryAwaitRelease()) interaction.emit(PressInteraction.Release(press))
+                        else interaction.emit(PressInteraction.Cancel(press))
+                    },
+                    onTap = { currentTap() },
+                    onDoubleTap = { currentDoubleTap() },
+                    onLongPress = { currentLongPress() },
+                )
+            }
+            .semantics(mergeDescendants = true) {
+                onClick(label = if (expandable) "Launch modes" else "Connect") {
+                    currentTap(); true
+                }
+                onLongClick(label = "Configure host") { currentLongPress(); true }
+            },
         colors = CardDefaults.cardColors(containerColor = Carbon),
         // The border is the glow: an online host is outlined in its accent, a
         // cached one in the hairline edge. It reads at a glance across a room,
@@ -438,59 +583,141 @@ private fun HostCard(
         border = BorderStroke(1.dp, if (presence == Presence.Cached) Edge else accent.copy(alpha = 0.55f)),
         shape = RoundedCornerShape(6.dp),
     ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
+        // animateContentSize sits on the OUTER column, which owns no padding of
+        // its own, so the height it animates is exactly the panel's. It clips to
+        // the animating bounds too, and that is what makes the row read as
+        // sliding out from under the metrics rather than popping in beneath them.
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .animateContentSize(animationSpec = tween(durationMillis = 180))
+        ) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        host.displayName,
+                        color = Text,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Badge(presence.label(), accent)
+                }
+
                 Text(
-                    host.displayName,
-                    color = Text,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    "ENDPOINT: " + (host.lanAddress?.let { "$it:${host.port}" }
+                        ?: host.wanEndpoint
+                        ?: "not set"),
+                    style = Telemetry,
                 )
-                Badge(presence.label(), accent)
+
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Tag(if (host.paired) "PAIRED" else "NOT PAIRED", if (host.paired) Matrix else Amber)
+                    Tag(if (host.hasRelay) "RELAY" else "NO RELAY", if (host.hasRelay) Ion else TextDim)
+                }
+
+                // What tapping will do, when it is not "open the launch row". A
+                // card that quietly does something other than what it says is
+                // worse than a card that says so.
+                val hint = when {
+                    busy -> "session starting…"
+                    !host.paired -> "TAP TO PAIR — Nova shows a PIN on the PC"
+                    !host.streamable -> "HOLD TO SET AN ADDRESS OR A RELAY — no route to try"
+                    // Reachable here and nowhere else. Worth saying plainly rather
+                    // than letting the user discover it on the train.
+                    !host.hasRelay -> "LAN ONLY — add a relay to reach this host from elsewhere"
+                    // Why the badge says OFFLINE, in the relay's own words. Without
+                    // this the card states a conclusion and withholds the evidence,
+                    // which is the difference between "it is broken" and "the relay
+                    // is up and this host is not announcing to it".
+                    presence == Presence.Cached && relay != null && relay.detail.isNotBlank() ->
+                        relay.detail.uppercase()
+                    expandable && !expanded -> "TAP FOR MODES — DOUBLE-TAP STREAMS — HOLD CONFIGURES"
+                    expandable -> "DOUBLE-TAP ANYWHERE ON THE CARD TO STREAM NOW"
+                    else -> null
+                }
+                hint?.let { Text(it, style = Telemetry.copy(color = if (host.streamable) TextDim else Amber)) }
+
+                if (showTelemetry) {
+                    HorizontalDivider(color = Edge)
+                    Text("NOVA FP  ${host.fingerprint.ifBlank { "—" }}", style = Telemetry)
+                    Text("RELAY FP ${host.relayPin ?: "—"}", style = Telemetry)
+                    host.relayUrl?.let { Text("RELAY    $it", style = Telemetry) }
+                }
             }
 
-            Text(
-                "ENDPOINT: " + (host.lanAddress?.let { "$it:${host.port}" }
-                    ?: host.wanEndpoint
-                    ?: "not set"),
-                style = Telemetry,
-            )
+            if (expanded) LaunchRow(onLaunch)
+        }
+    }
+}
 
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Tag(if (host.paired) "PAIRED" else "NOT PAIRED", if (host.paired) Matrix else Amber)
-                Tag(if (host.hasRelay) "RELAY" else "NO RELAY", if (host.hasRelay) Ion else TextDim)
-            }
-
-            // What tapping will do, when it is not "stream". A card that silently
-            // does something other than connect is worse than a card that says so.
-            val hint = when {
-                busy -> "session starting…"
-                !host.paired -> "TAP TO PAIR — Nova shows a PIN on the PC"
-                !host.streamable -> "HOLD TO SET AN ADDRESS OR A RELAY — no route to try"
-                // Reachable here and nowhere else. Worth saying plainly rather
-                // than letting the user discover it on the train.
-                !host.hasRelay -> "LAN ONLY — add a relay to reach this host from elsewhere"
-                // Why the badge says OFFLINE, in the relay's own words. Without
-                // this the card states a conclusion and withholds the evidence,
-                // which is the difference between "it is broken" and "the relay
-                // is up and this host is not announcing to it".
-                presence == Presence.Cached && relay != null && relay.detail.isNotBlank() ->
-                    relay.detail.uppercase()
-                else -> null
-            }
-            hint?.let { Text(it, style = Telemetry.copy(color = if (host.streamable) TextDim else Amber)) }
-
-            if (showTelemetry) {
-                HorizontalDivider(color = Edge)
-                Text("NOVA FP  ${host.fingerprint.ifBlank { "—" }}", style = Telemetry)
-                Text("RELAY FP ${host.relayPin ?: "—"}", style = Telemetry)
-                host.relayUrl?.let { Text("RELAY    $it", style = Telemetry) }
+/**
+ * The four launch modes, revealed under a card's metrics.
+ *
+ * Ground is [Void], not [Carbon] — the panel drops to the pitch black the rest
+ * of the app sits on, so on an OLED screen the buttons float in what looks like
+ * a hole cut out of the card. That is the whole visual trick and it costs
+ * nothing: unlit pixels are the cheapest thing this screen can draw.
+ */
+@Composable
+private fun LaunchRow(onLaunch: (LaunchMode) -> Unit) {
+    Column(Modifier.fillMaxWidth()) {
+        HorizontalDivider(color = Edge)
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(Void)
+                .padding(vertical = 10.dp, horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            LaunchMode.entries.forEach { mode ->
+                LaunchAction(mode.label) { onLaunch(mode) }
             }
         }
+    }
+}
+
+
+/**
+ * One text-only launch button.
+ *
+ * Deliberately not a [TextButton]: Material's 48dp minimum target plus its own
+ * horizontal content padding makes four of these overflow a phone-width card,
+ * and its container defaults fight the black ground the panel exists to show.
+ * This is a Box with a ripple, which is all a text button really is.
+ *
+ * The labels rest in [Ion] against [Void] — neon on black, lit rather than
+ * printed. Press therefore cannot be signalled by going cyan, since they
+ * already are, so it goes the other way: the label flares up to near-white for
+ * 90 ms, the way a filament does when the current rises. The [Ion] ripple
+ * underneath is the other half; on pitch black a ripple alone is easy to miss
+ * at the arm's length these are actually pressed from.
+ */
+@Composable
+private fun LaunchAction(label: String, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val color by animateColorAsState(
+        targetValue = if (pressed) Text else Ion,
+        animationSpec = tween(durationMillis = 90),
+        label = "launchActionColor",
+    )
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable(
+                interactionSource = interaction,
+                indication = ripple(color = Ion),
+                onClick = onClick,
+            )
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, style = TelemetryStrong.copy(color = color, fontSize = 11.sp, letterSpacing = 1.sp))
     }
 }
 

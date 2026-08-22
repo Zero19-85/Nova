@@ -291,6 +291,7 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativePair<'local>(
 ///   "relay_pin": "<64 hex>",
 ///   "host_fingerprint": "<64 hex>",
 ///   "res": "1080p", "fps": 60, "codec": "hevc", "bitrate_kbps": 20000,
+///   "app_id": 5,
 ///   "punch_secs": 8,
 ///   "lan_endpoint": "10.0.0.205:48011",
 ///   "wan_endpoint": "203.0.113.7:47998",
@@ -918,6 +919,13 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
             .get("bitrate_kbps")
             .and_then(|v| v.as_u64())
             .unwrap_or(defaults.bitrate_kbps as u64) as u32,
+        // Which app the session opens into. Absent means Desktop, matching the
+        // host's own default, so an older build of the app that does not send
+        // it behaves exactly as it did before.
+        app_id: cfg
+            .get("app_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(defaults.app_id as u64) as u32,
         // The LAN debug door is deliberately not exposed to Kotlin: the host
         // refuses that port from non-private addresses, so offering it in an app
         // would only produce confusing failures.

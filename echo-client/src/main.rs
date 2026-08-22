@@ -134,6 +134,10 @@ enum Command {
         codec: String,
         #[arg(long, default_value_t = 20000)]
         bitrate_kbps: u32,
+        /// Nova app to open: 1 Desktop, 2 Steam, 3 Xbox, 4 RetroArch,
+        /// 5 Virtual Desktop. Anything but 1 makes the host launch a process.
+        #[arg(long, default_value_t = 1)]
+        app_id: u32,
     },
 }
 
@@ -240,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fps,
             codec,
             bitrate_kbps,
+            app_id,
         } => {
             let connect = ConnectOptions {
                 relay_url: relay,
@@ -263,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = stop_tx.send(true);
             });
 
-            let opts = StreamOptions { res, fps, codec, bitrate_kbps, control };
+            let opts = StreamOptions { res, fps, codec, bitrate_kbps, app_id, control };
             let mut sink = LoggingSink::default();
             let stats = session::stream(
                 &identity,

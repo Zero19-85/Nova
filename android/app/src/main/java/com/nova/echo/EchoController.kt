@@ -184,13 +184,19 @@ class EchoController private constructor(private val context: android.content.Co
      * anything together — passing them separately is how a caller ends up
      * dialling one host's relay with another host's fingerprint, which fails at
      * the TLS pin with a message about certificates rather than about the mixup.
+     *
+     * [appId] is which Nova app the session opens into — see [LaunchMode] and
+     * [QUICK_START_APP_ID]. It defaults to Desktop so every existing caller
+     * keeps its behaviour, and unlike [prefs] it is NOT negotiable: the host
+     * either launches that app or it does not.
      */
-    fun connect(host: KnownHost, prefs: StreamPrefs) {
+    fun connect(host: KnownHost, prefs: StreamPrefs, appId: Int = LaunchMode.Mirror.appId) {
         start(transportConfig(host).apply {
             put("res", prefs.resolution)
             put("fps", prefs.fps)
             put("codec", prefs.codec)
             put("bitrate_kbps", prefs.bitrateKbps)
+            put("app_id", appId)
         }.toString(), pairing = false)
     }
 
