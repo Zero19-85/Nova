@@ -2392,6 +2392,15 @@ impl VirtualDisplay {
         Resume::Reused
     }
 
+    /// Is the virtual display currently activated for a stream?
+    ///
+    /// Read by `apply_configure_start` on the Desktop path: app 1 mirrors the
+    /// physical monitor, and it cannot do that while the VDD holds the desktop
+    /// — so a live VDD there has to be released, not merely not-activated.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// GDI device name (`\\.\DISPLAYn`) of the virtual monitor, once
     /// [`activate_for_stream`] has run. Used by the capture re-hook
     /// (`rebind_capture_and_encoder` in lib.rs) to pick the right

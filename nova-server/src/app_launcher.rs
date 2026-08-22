@@ -25,14 +25,28 @@ pub const APP_ID_VIRTUAL_DESKTOP: u32 = 5;
 /// Returns `true` when the given `app_id` should activate the Virtual Display
 /// Driver (headless mode) for its session.
 ///
-/// When `headless_for_all` is `true` (the default from `nova.toml`), every app
-/// routes through the VDD regardless of ID — capture always targets the virtual
-/// display, and the physical monitors are detached for the duration of the
-/// stream. When `false`, only App 1 (Desktop) mirrors the host's physical
-/// primary display; Steam, the Xbox app, RetroArch, and Virtual Desktop all
-/// spin up the virtual monitor and run headless — a game session should never
-/// depend on (or wake) the physical panel.
+/// **App 1 (Desktop) always mirrors the physical primary and is never routed
+/// through the VDD.** It is the one app whose entire purpose is to show the
+/// monitor attached to the PC — Echo labels it MIRROR — so a config flag that
+/// silently sent it to a virtual display made the mode a lie. That is exactly
+/// what happened: `headless_for_all` used to short-circuit ahead of this
+/// check, and with `nova.toml`'s default of `true` (the shipped value) Desktop
+/// detached the physical monitors and streamed the VDD like everything else.
+///
+/// So `headless_for_all_apps` now means "every app that has something to
+/// launch", which is what an operator setting it actually wants — Steam, the
+/// Xbox app, RetroArch and Virtual Desktop all spin up the virtual monitor and
+/// run headless, because a game session should never depend on (or wake) the
+/// physical panel. Setting it `false` restricts the VDD to those four by ID
+/// instead; either way Desktop mirrors.
+///
+/// The one thing this gives up: there is no longer any setting that runs
+/// Desktop headless. Nothing asked for one, and the app whose name is the
+/// physical screen is the wrong place to discover you had enabled it.
 pub fn uses_virtual_display(app_id: u32, headless_for_all: bool) -> bool {
+    if app_id == APP_ID_DESKTOP {
+        return false;
+    }
     headless_for_all
         || matches!(
             app_id,
@@ -324,4 +338,39 @@ fn extract_7z(archive: &Path, dir: &Path) -> bool {
         dir.display()
     );
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this exists for: Echo's MIRROR button opened on the
+    /// virtual display, because the shipped `nova.toml` sets
+    /// `headless_for_all_apps = true` and that used to win over the app id.
+    #[test]
+    fn desktop_mirrors_the_physical_display_whatever_the_config_says() {
+        assert!(!uses_virtual_display(APP_ID_DESKTOP, true));
+        assert!(!uses_virtual_display(APP_ID_DESKTOP, false));
+    }
+
+    #[test]
+    fn every_launching_app_still_runs_headless() {
+        for app in [
+            APP_ID_STEAM,
+            APP_ID_XBOX,
+            APP_ID_RETROARCH,
+            APP_ID_VIRTUAL_DESKTOP,
+        ] {
+            assert!(uses_virtual_display(app, true), "app {app} with the flag on");
+            assert!(uses_virtual_display(app, false), "app {app} with the flag off");
+        }
+    }
+
+    /// An id Nova does not know is not Desktop, so it is still subject to the
+    /// flag — the flag is what "for all apps" has left to mean.
+    #[test]
+    fn an_unknown_app_still_follows_the_flag() {
+        assert!(uses_virtual_display(99, true));
+        assert!(!uses_virtual_display(99, false));
+    }
 }

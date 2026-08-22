@@ -33,10 +33,17 @@ pub struct StreamConfig {
     /// when HDRPlus=true is set in vdd_settings.xml but the CCD query is slow
     /// to reflect the new capability after a devnode cycle.
     pub enable_hdr:            bool,
-    /// Route every app (Desktop, Steam, Xbox, RetroArch, …) through the
-    /// Virtual Display Driver, regardless of which app ID Moonlight launched.
-    /// When false, only App 5 (Virtual Desktop) activates headless mode.
-    /// Default true — universal headless is the recommended configuration.
+    /// Route the launching apps (Steam, Xbox, RetroArch, Virtual Desktop)
+    /// through the Virtual Display Driver regardless of which app ID the
+    /// client asked for. When false, the VDD is restricted to those same four
+    /// by ID — which today is the same set, so the flag is close to inert.
+    ///
+    /// **App 1 (Desktop) is never affected either way**: it mirrors the
+    /// physical primary, which is the whole point of that app. See
+    /// [`crate::app_launcher::uses_virtual_display`] for why that exemption
+    /// outranks this flag.
+    ///
+    /// Default true.
     pub headless_for_all_apps: bool,
     /// Seconds a **detached** session is held before Nova tears it down.
     ///
@@ -308,8 +315,9 @@ fps           = 60      # boot frame rate; Moonlight negotiates the final value
 codec                = "h264"  # "h264" | "hevc" | "av1"
 enable_hdr           = false   # set true to allow HDR10/HEVC-Main10 even when the VDD
                                 # capability query is slow to reflect HDRPlus=true
-headless_for_all_apps = true   # route ALL apps through the VDD (recommended);
-                                # set false to restrict headless mode to App 5 only
+headless_for_all_apps = true   # route launching apps (Steam/Xbox/RetroArch/Virtual
+                                # Desktop) through the VDD. App 1 (Desktop) ALWAYS
+                                # mirrors the physical monitor and ignores this.
 detach_grace_secs    = 600     # a client that vanishes without saying goodbye
                                 # (network drop, app backgrounded) leaves the
                                 # session DETACHED: encoding and transmission

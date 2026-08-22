@@ -1985,6 +1985,26 @@ fn apply_configure_start(
                 println!("🖥️  No VDD on this host (pre-login SYSTEM fallback) — streaming the \
                     physical display, scaled to the session's {}x{}.", cs.width, cs.height);
             }
+        } else if vd.is_active() {
+            // Desktop wants the panel on the desk, and the VDD is still up —
+            // left there by a session that detached rather than ended, or by a
+            // Worker that died holding it. Rebinding to "the primary" would
+            // find the VIRTUAL display, because in true-headless the physical
+            // outputs are not merely secondary, they are detached from the
+            // desktop entirely. Mirror would then faithfully mirror the wrong
+            // screen, which is the bug this whole path exists to fix.
+            //
+            // Releasing is safe here: a ConfigureStart for this app has already
+            // arrived, so whatever session held that display is over.
+            // `deactivate_after_stream` is idempotent and display-only — the
+            // audio endpoint restore moved to `crate::audio` in Phase 15.1 —
+            // and it re-asserts the physical mode baseline on the way out, so
+            // the monitor comes back at its own resolution rather than whatever
+            // the headless topology last persisted.
+            println!("🪞 Desktop session — releasing the virtual display so the physical monitor is primary");
+            if let Err(e) = vd.deactivate_after_stream() {
+                println!("⚠️  Could not release the virtual display: {e} — mirroring may show the VDD");
+            }
         }
         // No wait-for-monitor hint (nothing is driving the VDD to that size),
         // but the ENCODER still holds the session's geometry — the shim scales
