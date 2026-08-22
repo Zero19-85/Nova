@@ -1860,8 +1860,28 @@ fn apply_configure_start(
         *enc = Encoder::new(capturer.device(), EncoderConfig {
             width: cs.width as i32,
             height: cs.height as i32,
-            fps: enc.config.fps,
-            bitrate_kbps: enc.config.bitrate_kbps,
+            // From `cs`, NOT from `enc.config`. `enc.config` still describes the
+            // session being torn down: a codec switch arrives with the NEW
+            // session already negotiated, so reading fps/bitrate off the old
+            // encoder pins NVENC to the previous session's values. The two
+            // assignments just below update the Rust-side struct only, so
+            // nothing ever tells NVENC — and the mismatch then survives the
+            // whole session, because ReconfigureBitrate only acts on a CHANGE
+            // and `enc.config` already claims the correct numbers.
+            //
+            // Live on 2026-08-22: session 11 negotiated 1080p@120fps / 41488
+            // Kbps; the encoder was built @60fps / 59488 Kbps carried over from
+            // session 10. The single-frame VBV is sized bitrate/fps, so it came
+            // out at 991466 bits = 123933 bytes, and filler data padded every
+            // frame to exactly that - at 120fps, not the 60 it was sized for.
+            // 123933 x 8 x 120 = 118976 Kbps, which is the logged encoder
+            // output to the digit, against a 41488 Kbps budget: 2.9x over.
+            //
+            // Note the sibling sites are NOT this bug: the HDR rebuild below
+            // runs after `enc.config` has been refreshed from `cs`, and the
+            // post-disconnect rebuild has no `cs` in scope at all.
+            fps: cs.fps as i32,
+            bitrate_kbps: cs.bitrate_kbps as i32,
             codec,
             is_hdr: false,
         }).map_err(|e| format!("Failed to recreate NVENC for codec change: {e}"))?;
