@@ -957,19 +957,31 @@ async fn stream_inner(
     // reference chain recovers only by asking — see `FrameSink::
     // take_keyframe_request`. The channel exists so the request crosses from
     // the receive loop to the control channel without either owning the other.
-    let (idr_tx, mut idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (idr_tx, mut idr_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::receiver::RepairRequest>();
     let ctl = std::sync::Arc::new(tokio::sync::Mutex::new(ctl));
     let idr_task = tokio::spawn({
         let ctl = ctl.clone();
         async move {
-            while idr_rx.recv().await.is_some() {
+            while let Some(repair) = idr_rx.recv().await {
                 // Best-effort: a failed request is retried by the next drop,
                 // and a lost session is about to end the loop anyway.
-                let _ = ctl
-                    .lock()
-                    .await
-                    .call("request_idr", serde_json::Map::new())
-                    .await;
+                let (command, params) = match repair {
+                    crate::receiver::RepairRequest::Keyframe => {
+                        ("request_idr", serde_json::Map::new())
+                    }
+                    crate::receiver::RepairRequest::Invalidate { first, last } => {
+                        // The host answers this with a type-5 recovery frame
+                        // when NVENC can honour it and a plain keyframe when
+                        // it cannot, so the client needs no fallback of its
+                        // own -- the gate opens on either.
+                        let mut p = serde_json::Map::new();
+                        p.insert("first".into(), first.into());
+                        p.insert("last".into(), last.into());
+                        ("invalidate_ref_frames", p)
+                    }
+                };
+                let _ = ctl.lock().await.call(command, params).await;
             }
         }
     });

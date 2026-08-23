@@ -497,6 +497,20 @@ pub trait MediaPlane: Send + Sync + 'static {
     /// this the picture freezes permanently on the last good frame while the
     /// host streams on, which is exactly what happened live on 2026-08-15.
     fn request_idr(&self);
+    /// Invalidate the reference frames `first..=last` (wire indices).
+    ///
+    /// The cheap repair. `request_idr` costs a full intra-coded frame -- a
+    /// bitrate spike the client sees as a smear under CBR -- and with an
+    /// infinite GOP it was the only thing Echo could ask for, which is why
+    /// the rolling intra refresh had to stay on as a second repair path.
+    /// This instead tells NVENC to drop the lost frames from the DPB so the
+    /// next P-frame codes against an older good reference: the same repair,
+    /// a fraction of the bits, and no visible sweep.
+    ///
+    /// Best-effort by construction: the Worker falls back to an IDR when
+    /// NVENC cannot honour the range (gap >= DPB depth), so a caller never
+    /// has to decide that for itself.
+    fn invalidate_ref_frames(&self, first: u32, last: u32);
 }
 
 /// Production plane: retargets `RtpSender` and configures the live Worker.
@@ -623,6 +637,14 @@ impl MediaPlane for WorkerMediaPlane {
 
     fn request_idr(&self) {
         self.worker_link.send(ControlMsg::RequestIdr);
+    }
+
+    fn invalidate_ref_frames(&self, first: u32, last: u32) {
+        // The identical message the GameStream control path sends for
+        // PT_INVALIDATE_REF_FRAMES, so Echo's repair meets the shim at the
+        // same place Moonlight's does -- including the IDR fallback the
+        // Worker applies when NVENC refuses the range.
+        self.worker_link.send(ControlMsg::InvalidateRefFrames { first, last });
     }
 
     fn end(&self, mode: EndMode) {
@@ -1309,6 +1331,41 @@ impl SessionManager {
         Ok(session.id)
     }
 
+    /// Invalidate a range of reference frames on behalf of the session's owner.
+    ///
+    /// The cheap counterpart to [`request_idr`](Self::request_idr), and
+    /// owner-checked for the same reason: it costs encoder work and degrades
+    /// the picture for whoever is watching, so an authenticated device that
+    /// holds no session must not be able to trigger it.
+    ///
+    /// `first`/`last` are **wire indices** -- the same 1-based per-session
+    /// counter `seal_video` stamps on every frame it sends, which is what
+    /// makes the client's frame numbers land on the encoder's DPB entries
+    /// without a translation table. An inverted range is refused here; an
+    /// unsatisfiable one is not, because only the Worker's shim knows the DPB
+    /// depth and it already answers that with an IDR.
+    pub fn invalidate_ref_frames(
+        &self,
+        device: &EchoIdentity,
+        first: u32,
+        last: u32,
+    ) -> Result<u64, HandoffError> {
+        if first == 0 || last < first {
+            return Err(HandoffError::BadRequest(format!(
+                "invalid reference range {first}-{last}"
+            )));
+        }
+        let guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return Err(HandoffError::NotTheOwner);
+        };
+        if session.device_fingerprint != device.fingerprint {
+            return Err(HandoffError::NotTheOwner);
+        }
+        self.plane.invalidate_ref_frames(first, last);
+        Ok(session.id)
+    }
+
     /// Drop the session without an owner check — for host-side teardown
     /// (shutdown, a Worker that will never come back, the tray's "End
     /// Stream"), never for a remote request.
@@ -1355,6 +1412,7 @@ mod tests {
         /// turns on which one each caller asks for.
         end_modes: Mutex<Vec<EndMode>>,
         idrs: Mutex<usize>,
+        invalidations: Mutex<Vec<(u32, u32)>>,
         injected: Mutex<Vec<Vec<u8>>>,
         fail: Option<HandoffError>,
     }
@@ -1380,6 +1438,9 @@ mod tests {
         }
         fn request_idr(&self) {
             *self.idrs.lock().unwrap() += 1;
+        }
+        fn invalidate_ref_frames(&self, first: u32, last: u32) {
+            self.invalidations.lock().unwrap().push((first, last));
         }
         fn inject_input(&self, packet: Vec<u8>) {
             self.injected.lock().unwrap().push(packet);
@@ -1558,6 +1619,98 @@ mod tests {
 
         assert_eq!(f.mgr.stop(&device("Pixel", 2)), Err(HandoffError::MoonlightActive));
         assert_eq!(*f.plane.ended.lock().unwrap(), 0, "the Moonlight session is untouched");
+    }
+
+    /// An oversized client request is clamped to the resolution ceiling before
+    /// it ever reaches the encoder.
+    ///
+    /// This is the guard that stops a client flooding the link out of the gate.
+    /// The Echo app derives its default from its own table, so the two can
+    /// drift -- and did: on 2026-08-23 the app defaulted 1440p120 to 75 Mbps
+    /// while the host permitted ~118, and the resulting loss cost ~200 repair
+    /// requests per session. Both tables were retuned, but the clamp is what
+    /// makes an app that was never updated harmless rather than fatal.
+    #[test]
+    fn an_oversized_request_is_clamped_to_the_resolution_ceiling() {
+        let ceiling = crate::qos::resolution_ceiling(2560, 1440, 120);
+
+        let asked = SessionRequest {
+            width: 2560,
+            height: 1440,
+            fps: 120,
+            bitrate_kbps: 150_000, // the old app's slider maximum
+            ..SessionRequest::default()
+        };
+        let params = asked.validate(512).expect("a sane mode must still validate");
+
+        assert!(
+            params.bitrate_kbps <= ceiling,
+            "{} kbps must not exceed the {ceiling} kbps ceiling",
+            params.bitrate_kbps
+        );
+        assert_eq!(
+            params.bitrate_kbps,
+            ceiling - 512,
+            "the audio reserve comes off the CAPPED ceiling, not the request"
+        );
+        assert!(
+            ceiling < 60_000,
+            "1440p120 should ceiling near 50 Mbps after the 2026-08-23 retune, got {ceiling}"
+        );
+    }
+
+    /// The cheap repair carries the same ownership rule as the expensive one,
+    /// and for a sharper reason: invalidating a stranger's reference frames
+    /// degrades the picture for whoever is actually watching.
+    #[test]
+    fn only_the_owner_can_invalidate_reference_frames() {
+        let f = fixture(Some(peer()));
+
+        assert_eq!(
+            f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12),
+            Err(HandoffError::NotTheOwner),
+            "no session exists, so nobody owns one"
+        );
+
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+
+        assert_eq!(
+            f.mgr.invalidate_ref_frames(&device("Pixel", 2), 10, 12),
+            Err(HandoffError::NotTheOwner)
+        );
+        assert!(
+            f.plane.invalidations.lock().unwrap().is_empty(),
+            "an authenticated stranger must not be able to corrupt the owner's stream"
+        );
+
+        assert!(f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12).is_ok());
+        assert_eq!(*f.plane.invalidations.lock().unwrap(), vec![(10, 12)]);
+    }
+
+    /// An inverted or zero range is refused before it reaches the encoder.
+    /// Wire indices are 1-based, so frame 0 never existed; and `last < first`
+    /// would invalidate nothing while reading as a successful repair to the
+    /// client, which then stops asking and stares at a broken picture.
+    #[test]
+    fn a_nonsense_reference_range_is_refused() {
+        let f = fixture(Some(peer()));
+        f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        let owner = device("Xbox", 1);
+
+        for (first, last) in [(0u32, 5u32), (9, 4)] {
+            assert!(
+                matches!(
+                    f.mgr.invalidate_ref_frames(&owner, first, last),
+                    Err(HandoffError::BadRequest(_))
+                ),
+                "{first}-{last} should be refused"
+            );
+        }
+        assert!(f.plane.invalidations.lock().unwrap().is_empty());
+
+        // The degenerate-but-valid single-frame range still goes through.
+        assert!(f.mgr.invalidate_ref_frames(&owner, 7, 7).is_ok());
+        assert_eq!(*f.plane.invalidations.lock().unwrap(), vec![(7, 7)]);
     }
 
     /// A keyframe request is the client's ONLY repair path under an infinite

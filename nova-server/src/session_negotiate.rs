@@ -247,12 +247,12 @@ mod tests {
 
         let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 512, upnp: false };
         let n = negotiate(&client, &StreamConfig::default(), &net, None);
-        assert_eq!(n.bitrate_kbps, 40_000 - 512, "1080p cap, less the audio reserve");
+        assert_eq!(n.bitrate_kbps, 18_000 - 512, "1080p cap, less the audio reserve");
 
         // With no reservation configured, the cap alone applies.
         let net = NetworkConfig { fec_percentage: 5, audio_reserve_kbps: 0, upnp: false };
         let n = negotiate(&client, &StreamConfig::default(), &net, None);
-        assert_eq!(n.bitrate_kbps, 40_000);
+        assert_eq!(n.bitrate_kbps, 18_000);
     }
 
     /// The budget must be computed against the fps the session will ACTUALLY

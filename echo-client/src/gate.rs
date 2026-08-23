@@ -59,7 +59,12 @@ impl KeyframeGate {
         if self.open {
             return true;
         }
-        if frame.is_keyframe() {
+        if frame.is_keyframe() || frame.is_recovery() {
+            // A recovery frame opens the gate for the same reason a keyframe
+            // does: both are decodable without anything the decoder missed.
+            // An IDR carries its own reference; a recovery frame points at an
+            // older one the encoder confirmed is still good. See
+            // `DecodedFrame::is_recovery`.
             self.open = true;
             return true;
         }
@@ -75,10 +80,12 @@ impl KeyframeGate {
     /// stream is undecodable until the next IDR regardless of what the gate
     /// does; what the gate adds is that the decoder is not asked to *try*.
     ///
-    /// Note the standing limitation: Echo has no client→host path yet, so it
-    /// cannot *request* an IDR. Recovery waits for the host's next scheduled
-    /// one. Once input exists, this is the natural place to trigger that
-    /// request.
+    /// The client can now *ask* for that repair rather than waiting: a sink
+    /// that knows which wire indices it lost reports them, and the receive
+    /// loop turns that into an `invalidate_ref_frames` request (falling back
+    /// to a keyframe when it cannot name them). The gate re-opens on the
+    /// host's answer either way, because a type-5 recovery frame admits like
+    /// a keyframe -- see `DecodedFrame::is_recovery`.
     pub fn close(&mut self) {
         self.open = false;
     }

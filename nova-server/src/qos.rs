@@ -34,10 +34,18 @@ use crate::encoder;
 /// Bitrate anchors: what each resolution tier is allowed to reach **at 60 fps**,
 /// in Kbps.
 ///
-/// Roughly 2x Moonlight's own recommended bitrate for the same mode. The factor
-/// is the whole design: Moonlight's numbers are what a mode *needs* to look
-/// good, and an operator who deliberately asks for more should get headroom
-/// rather than an argument. What they should NOT get is the ability to ask for a
+/// Roughly Moonlight's own recommended bitrate for the same mode -- these were
+/// 2x that until 2026-08-23, and the doubling did not survive measurement.
+/// Live at 1440p120 the old table permitted ~118 Mbps, the client negotiated
+/// 75, and that flooded the link: sustained packet loss, ~200 repair requests
+/// per session, and a rate controller spending its time reacting to congestion
+/// it had been authorised to cause. Dropped to 50 Mbps the flooding stopped
+/// immediately. Headroom an operator cannot use is not generosity; it is a
+/// licence for the encoder to saturate the link before QoS can pull it back.
+///
+/// The ceiling still is not a link estimator -- `QosController` owns the link.
+/// This is the point past which more bits buy no more picture. What they
+/// should NOT get is the ability to ask for a
 /// rate no amount of 1080p detail can consume, which is where the received
 /// wisdom "just send what the client requested" ends up — the client's slider
 /// goes to 150 Mbps regardless of the mode it is set to.
@@ -45,11 +53,17 @@ use crate::encoder;
 /// Tune here, not at the call sites. Interpolated on pixel count (see
 /// [`resolution_ceiling`]), so intermediate and ultrawide modes land on the same
 /// curve rather than needing their own rows.
+/// **Coupled to `EchoSettings.BITRATE_TIERS`** (Kotlin, echo-android), which
+/// derives the app's default from the same pixel-count curve and must land
+/// just under these figures. Tuning one table alone lets the app default above
+/// the host's ceiling, which is exactly how 1440p120 came to default to 75 Mbps
+/// against a ceiling of ~118. Bump that file's SCHEMA_VERSION when these move,
+/// or existing installs keep the old number.
 const TIERS: [(u64, u32); 4] = [
-    (1280 * 720, 20_000),
-    (1920 * 1080, 40_000),
-    (2560 * 1440, 70_000),
-    (3840 * 2160, 120_000),
+    (1280 * 720, 10_000),
+    (1920 * 1080, 18_000),
+    (2560 * 1440, 30_000),
+    (3840 * 2160, 50_000),
 ];
 
 /// Exponent applied to the frame-rate ratio when scaling a tier anchor away
@@ -226,14 +240,27 @@ pub fn video_budget(
 
 // ── Layer 2: the closed-loop controller ───────────────────────────────────────
 
-/// One ramp-back step: +10% of the current bitrate, never past `target`.
+/// One ramp-back step: +3% of the current bitrate, never past `target`.
 ///
-/// `+ cur / 10` (not `* 11 / 10`) so the arithmetic cannot overflow at any
+/// `+ cur / 33` (not `* 103 / 100`) so the arithmetic cannot overflow at any
 /// plausible bitrate, and `max(1)` on the increment guarantees forward
-/// progress — an integer +10% of a very low bitrate would otherwise round to
+/// progress — an integer +3% of a very low bitrate would otherwise round to
 /// zero and the ramp would stall below the target forever.
+///
+/// ### Why 3% and not 10%
+///
+/// Every step calls `reconfigure_bitrate`, which moves the CBR target and so
+/// moves QP. A 10% jump is a visible quality step; three 3% jumps over the
+/// same interval converge at the same rate (1.03^3 = 1.093) while being three
+/// times finer, so the change reads as drift rather than a stair.
+///
+/// This is only affordable because a reconfigure no longer forces a keyframe
+/// (`ReconfigureBitrate` in shim.cpp). While it did, raising the step *rate*
+/// would have tripled the number of 4K IDRs -- the opposite of the intent.
+/// Do not re-introduce `forceIDR` on the rate path without also reverting
+/// this pair of constants.
 fn qos_ramp_step(cur: u32, target: u32) -> u32 {
-    cur.saturating_add((cur / 10).max(1)).min(target)
+    cur.saturating_add((cur / 33).max(1)).min(target)
 }
 
 /// Dynamic-bitrate (QoS) controller: AIMD **with memory of the rate that
@@ -290,7 +317,7 @@ impl QosController {
     /// Minimum gap between two reductions.
     const REDUCE_COOLDOWN: Duration = Duration::from_secs(2);
     /// Quiet period before stepping the bitrate back up.
-    const RAMP_INTERVAL: Duration = Duration::from_secs(3);
+    const RAMP_INTERVAL: Duration = Duration::from_secs(1);
     /// Quiet period parked at the target before probing above it. Short so a
     /// link that has actually healed recovers in seconds, not minutes — during
     /// genuine congestion the reduce path keeps firing and resets this clock,
@@ -420,7 +447,7 @@ impl QosController {
                 self.last_event = Instant::now();
                 self.last_probe = Instant::now();
                 let held = if ramped == target { " — holding here" } else { "" };
-                println!("📈 Congestion: ramped bitrate → {ramped} Kbps (+10%, target {target}){held}");
+                println!("📈 Congestion: ramped bitrate → {ramped} Kbps (+3%, target {target}){held}");
             }
         } else if target < ceiling_kbps && self.last_probe.elapsed() >= Self::PROBE_INTERVAL {
             // Parked at the safe target and clean for a full minute: the link
@@ -450,8 +477,8 @@ mod tests {
     fn a_1080p_session_cannot_ask_for_100_megabits() {
         let b = video_budget(100_000, 1920, 1080, 60, 0);
         assert!(b.was_capped());
-        assert_eq!(b.resolution_cap_kbps, 40_000);
-        assert_eq!(b.video_kbps, 40_000);
+        assert_eq!(b.resolution_cap_kbps, 18_000);
+        assert_eq!(b.video_kbps, 18_000);
     }
 
     /// A request BELOW the ceiling is honoured exactly. The cap is a ceiling,
@@ -471,10 +498,10 @@ mod tests {
     /// ceiling than a smaller one.
     #[test]
     fn the_tier_curve_hits_its_anchors_and_never_dips() {
-        assert_eq!(resolution_ceiling(1280, 720, 60), 20_000);
-        assert_eq!(resolution_ceiling(1920, 1080, 60), 40_000);
-        assert_eq!(resolution_ceiling(2560, 1440, 60), 70_000);
-        assert_eq!(resolution_ceiling(3840, 2160, 60), 120_000);
+        assert_eq!(resolution_ceiling(1280, 720, 60), 10_000);
+        assert_eq!(resolution_ceiling(1920, 1080, 60), 18_000);
+        assert_eq!(resolution_ceiling(2560, 1440, 60), 30_000);
+        assert_eq!(resolution_ceiling(3840, 2160, 60), 50_000);
 
         // Walk the whole range in 16-pixel-wide steps at a fixed height.
         let mut prev = 0;
@@ -492,7 +519,7 @@ mod tests {
     fn ultrawide_lands_between_the_anchors() {
         let uw = resolution_ceiling(3440, 1440, 60);
         assert!(
-            uw > 70_000 && uw < 120_000,
+            uw > 30_000 && uw < 50_000,
             "3440x1440 should interpolate between 1440p and 4K, got {uw}"
         );
     }
@@ -510,11 +537,16 @@ mod tests {
         assert!(at_120 < at_60 * 2, "120 fps must not allow double — prediction improves");
         assert!(at_30 < at_60 && at_30 > at_60 / 2);
 
-        // A 4K120 session must still clear the ~90 Mbps such clients actually
-        // negotiate, or the cap would bite a mode Nova is known to serve well.
+        // 4K120 lands at ~84 Mbps. This assertion used to demand >90 Mbps on
+        // the grounds that such clients "actually negotiate" that much and the
+        // cap must not bite a mode Nova serves well -- but measurement went the
+        // other way: at those rates the link flooded and the session spent
+        // itself on repairs. The floor here now guards against the opposite
+        // mistake, a table retuned so far down that 4K stops being viable.
+        let uhd120 = resolution_ceiling(3840, 2160, 120);
         assert!(
-            resolution_ceiling(3840, 2160, 120) > 90_000,
-            "4K120 must not be capped below what it already streams"
+            uhd120 > 80_000 && uhd120 < 100_000,
+            "4K120 should sit near 84 Mbps, got {uhd120}"
         );
     }
 
@@ -525,12 +557,14 @@ mod tests {
         // Request above the cap: reserve applies to the cap.
         let b = video_budget(100_000, 1920, 1080, 60, 512);
         assert_eq!(b.audio_reserve_kbps, 512);
-        assert_eq!(b.video_kbps, 40_000 - 512);
+        assert_eq!(b.video_kbps, 18_000 - 512);
 
-        // Request below the cap: reserve applies to the request.
-        let b = video_budget(20_000, 1920, 1080, 60, 512);
+        // Request below the cap: reserve applies to the request. (12 Mbps, not
+        // 20 -- the 1080p60 ceiling is 18 Mbps since the 2026-08-23 retune, so
+        // the old figure would now be capped and stop testing this branch.)
+        let b = video_budget(12_000, 1920, 1080, 60, 512);
         assert_eq!(b.audio_reserve_kbps, 512);
-        assert_eq!(b.video_kbps, 20_000 - 512);
+        assert_eq!(b.video_kbps, 12_000 - 512);
     }
 
     /// The reservation must never starve video on a thin link. 512 Kbps is
@@ -566,7 +600,7 @@ mod tests {
         let b = video_budget(100_000, 1920, 1080, 60, 512);
         let line = b.describe(1920, 1080, 60).expect("a binding budget must log");
         assert!(line.contains("100000"), "{line}");
-        assert!(line.contains("39488"), "{line}");
+        assert!(line.contains("17488"), "{line}");
         assert!(line.contains("reserved for audio"), "{line}");
     }
 

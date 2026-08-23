@@ -566,10 +566,17 @@ the **controller** walks up and down underneath it.
 
 - **Cap first, then reserve** — reserving from the raw request would let a client dodge the
   reservation by asking for more.
-- `resolution_ceiling()` interpolates a tier table (720p 20 / 1080p 40 / 1440p 70 /
-  4K 120 Mbps at 60 fps, ~2x Moonlight's recommendation) on pixel count, scaled by
+- `resolution_ceiling()` interpolates a tier table (720p 10 / 1080p 18 / 1440p 30 /
+  4K 50 Mbps at 60 fps, ~1x Moonlight's recommendation) on pixel count, scaled by
   `(fps/60)^0.75` — sub-linear because inter-frame prediction improves as cadence rises.
   Tune the table, not the call sites.
+- **The tiers were halved on 2026-08-23, and the old 2x doubling is the mistake to
+  avoid repeating.** At 1440p120 the old table permitted ~118 Mbps; the client
+  negotiated 75, and that flooded the link — sustained loss, ~200 repair requests per
+  session, and a rate controller busy reacting to congestion it had been authorised
+  to cause. At 50 Mbps the flooding stopped immediately. The ceiling is not a link
+  estimator (`QosController` owns the link); it is the point past which more bits buy
+  no more picture, and headroom an operator cannot use is a licence to saturate.
 - Applied at **both** negotiators (`session_negotiate::negotiate` and
   `SessionRequest::validate`) and computed against the **negotiated** fps, not the
   requested one — an H264 session capped to 24 fps by Level 5.2 must not be budgeted for

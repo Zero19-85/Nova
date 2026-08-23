@@ -66,6 +66,23 @@ pub struct StreamConfig {
     /// existing `nova.toml` keeps working. Read only through
     /// [`Self::detach_grace`].
     pub idle_teardown_secs: Option<u32>,
+    /// Allow a 16-frame DPB at 1440p and below, which requires the client to
+    /// decode HEVC **level 6.0 or higher**.
+    ///
+    /// Off by default, and that default protects the ecosystem rather than
+    /// the host. A deeper DPB lets reference-frame invalidation repair a
+    /// larger burst with a P-frame instead of a keyframe, which is a real
+    /// quality win -- but level 5.1 decoders (Apple TV, Raspberry Pi, budget
+    /// Android) cap out at 12, and a stream asking for more is REFUSED by the
+    /// decoder, not degraded by it. One over-eager host setting would present
+    /// to those users as "Nova does not work", with nothing in the client to
+    /// explain why.
+    ///
+    /// Nothing in either handshake reports a decoder level -- Moonlight never
+    /// sends one, and Echo's SessionRequest carries no capability field -- so
+    /// this cannot be negotiated today. Enable it only when you know every
+    /// client that reaches this host is level 6.0 capable.
+    pub allow_level6_dpb:     bool,
 }
 
 /// Default for [`StreamConfig::detach_grace_secs`] — 10 minutes.
@@ -282,6 +299,7 @@ impl Default for StreamConfig {
             headless_for_all_apps: true,
             detach_grace_secs:    None,
             idle_teardown_secs:   None,
+            allow_level6_dpb:     false,
         }
     }
 }
@@ -328,6 +346,17 @@ detach_grace_secs    = 600     # a client that vanishes without saying goodbye
                                 # been sent. 0 = hold indefinitely. An explicit
                                 # "End Stream" ignores this and ends immediately.
                                 # (Old name idle_teardown_secs still works.)
+allow_level6_dpb     = false   # allow a 16-frame DPB at 1440p and below, so
+                                # reference-frame invalidation can repair a
+                                # bigger burst with a P-frame instead of a
+                                # keyframe. REQUIRES every client to decode
+                                # HEVC level 6.0+. Level 5.1 decoders (Apple
+                                # TV, Raspberry Pi, budget Android) cap at 12
+                                # and REFUSE a deeper stream outright rather
+                                # than degrading, and no handshake reports a
+                                # decoder level, so Nova cannot detect this
+                                # for you. Leave false unless you know every
+                                # client on this host qualifies.
 
 [audio]
 endpoint_override = ""  # Windows audio endpoint friendly name or GUID;

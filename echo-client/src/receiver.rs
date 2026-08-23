@@ -108,6 +108,22 @@ impl DecodedFrame {
     pub fn is_keyframe(&self) -> bool {
         self.frame_type == 2
     }
+
+    /// Whether this frame is an **RFI recovery frame** (wire type 5).
+    ///
+    /// The host sends this after honouring an `invalidate_ref_frames`
+    /// request: it is a P-frame, but one the encoder coded against a
+    /// reference it proved survives the invalidated range. So it is a valid
+    /// re-entry point into the stream without being a keyframe, which is the
+    /// entire point -- it costs a fraction of an IDR's bits.
+    ///
+    /// Treating it as an ordinary P-frame would be the worst possible bug
+    /// here: a gate that re-armed on loss would refuse the very frame sent to
+    /// repair it, and the picture would stay frozen while the host believed
+    /// it had already answered.
+    pub fn is_recovery(&self) -> bool {
+        self.frame_type == 5
+    }
 }
 
 /// Why a datagram or frame was discarded. Counted rather than logged per
@@ -162,6 +178,16 @@ pub struct VideoDepacketizer {
     /// Highest frame index completed, so a late duplicate of an old frame is
     /// dropped instead of re-emitted out of order to the decoder.
     last_completed: u32,
+    /// Index of the last frame actually handed out, so a gap between
+    /// consecutive deliveries can be recognised as transit loss.
+    ///
+    /// Distinct from `last_completed`, which also advances for frames that
+    /// were seen but abandoned. This one only moves when a frame really
+    /// reached the caller, which is exactly the set the decoder saw.
+    last_delivered: u32,
+    /// Inclusive range of indices that never completed, widened as further
+    /// gaps appear and cleared by `take_transit_loss`.
+    transit_loss: Option<(u32, u32)>,
     pub stats: ReceiveStats,
 }
 
@@ -171,6 +197,8 @@ impl VideoDepacketizer {
             keys,
             pending: HashMap::new(),
             last_completed: 0,
+            last_delivered: 0,
+            transit_loss: None,
             stats: ReceiveStats::default(),
         }
     }
@@ -345,7 +373,48 @@ impl VideoDepacketizer {
         if frame_type == 2 {
             self.stats.keyframes += 1;
         }
+
+        // Transit loss: a jump in delivered indices means the frames in
+        // between never completed -- lost beyond what FEC could repair, or
+        // abandoned as stale. They are exactly the frames the decoder will
+        // never see, so they are exactly what the encoder must invalidate.
+        //
+        // This is the loss the queue-overflow path cannot see: nothing was
+        // ever dropped locally, so no sink ever noticed. Before this the only
+        // repair for it was the host's rolling intra refresh, which is why a
+        // clean-looking link still smeared after a burst.
+        //
+        // The first delivery of a session is not a gap: `last_delivered`
+        // starts at 0 and the host's wire indices are 1-based, so a session
+        // opening at frame 1 is continuous. A session that opens mid-GOP is
+        // handled by the keyframe gate instead -- there is no reference to
+        // repair yet, so asking to invalidate one would be meaningless.
+        if self.last_delivered != 0 && index > self.last_delivered + 1 {
+            let (first, last) = (self.last_delivered + 1, index - 1);
+            self.transit_loss = Some(match self.transit_loss {
+                Some((have_first, have_last)) => {
+                    (have_first.min(first), have_last.max(last))
+                }
+                None => (first, last),
+            });
+        }
+        self.last_delivered = index;
+
         Some(DecodedFrame { index, frame_type, data, first_shard_at: partial.first_shard_at })
+    }
+
+    /// The range of wire indices that never arrived, clearing it as it
+    /// reports it.
+    ///
+    /// Reported the moment the gap is observed rather than on a timer: the
+    /// encoder can only re-point a reference while the lost frames are still
+    /// inside its DPB, which holds five. Live 2026-08-22, every one of 24
+    /// invalidation requests arrived 30-80 frames late and was refused
+    /// (`RFI range 154965-155019 >= DPB 5`) purely because the client batched
+    /// them onto a 500 ms tick. Latency here is not a nicety; it decides
+    /// whether the cheap repair is possible at all.
+    pub fn take_transit_loss(&mut self) -> Option<(u32, u32)> {
+        self.transit_loss.take()
     }
 }
 
@@ -364,6 +433,110 @@ fn reconstruct(partial: &mut PartialFrame) -> Result<(), ()> {
     let rs = ReedSolomon::new(partial.data_shards, parity).map_err(|_| ())?;
     rs.reconstruct(&mut partial.shards).map_err(|_| ())?;
     Ok(())
+}
+
+/// What a sink wants the host to do about a broken reference chain.
+///
+/// The two are not interchangeable, and picking the wrong one is a real bug
+/// in each direction. An IDR is the only repair that works when the decoder
+/// holds no usable reference at all (it was just rebuilt, or the session is
+/// starting) -- an invalidation there would re-point at a reference the
+/// decoder never had. Conversely, when the client knows exactly which frames
+/// it lost, an IDR is a bitrate spike bought for nothing: under CBR every
+/// surrounding frame pays for it, which is the smear that follows a drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairRequest {
+    /// Send a full keyframe: nothing here is decodable against anything.
+    Keyframe,
+    /// These wire indices never reached the decoder. Drop them from the DPB
+    /// and code the next frame against an older reference. The host falls
+    /// back to a keyframe on its own if it cannot honour the range, so this
+    /// is always safe to ask for.
+    Invalidate { first: u32, last: u32 },
+}
+
+/// Shortest spacing between repair requests.
+///
+/// A burst of loss produces a gap per frame, and one RPC per frame would be
+/// its own denial of service on the control tunnel. Coalescing instead of
+/// dropping is what keeps that safe: requests that arrive inside the window
+/// widen the pending range rather than being discarded, so nothing is ever
+/// lost -- it is only delayed to the next flush.
+///
+/// Deliberately far below the 500 ms keepalive tick this used to ride on.
+/// See `VideoDepacketizer::take_transit_loss` for what that cost.
+///
+/// **This interval is part of the repair window, not just a politeness
+/// limit.** Every millisecond spent holding a request is time the encoder
+/// spends coding more frames onto the broken reference, and the host can only
+/// re-point while the lost frames are still in a DPB that holds five. At
+/// 120 fps that whole budget is 41 ms, so the first value tried here -- 50 ms
+/// -- could on its own push a repair out of reach.
+///
+/// Measured live 2026-08-22 at 4K120, which is what set this number:
+///
+/// | reporting delay | observed span | outcome         |
+/// |-----------------|---------------|-----------------|
+/// | 500 ms tick     | 30-80 frames  | 0/24 succeeded  |
+/// | 50 ms limiter   | 5-24 frames   | 20 succeeded, most still refused |
+///
+/// 10 ms is ~1 frame at 120 fps and under one at 60, so the limiter stops
+/// being a meaningful term in the span while still collapsing a burst of
+/// per-frame gaps into a single request. The cost of asking slightly too
+/// often is a few hundred bytes of NDJSON; the cost of asking slightly too
+/// late is a full 4K intra frame, which is four orders of magnitude worse.
+const REPAIR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Accumulates repair requests and releases them at a bounded rate.
+#[derive(Default)]
+struct RepairOutbox {
+    keyframe: bool,
+    range: Option<(u32, u32)>,
+    last_sent: Option<std::time::Instant>,
+}
+
+impl RepairOutbox {
+    fn note_keyframe(&mut self) {
+        self.keyframe = true;
+    }
+
+    fn note_range(&mut self, first: u32, last: u32) {
+        self.range = Some(match self.range {
+            Some((f, l)) => (f.min(first), l.max(last)),
+            None => (first, last),
+        });
+    }
+
+    /// Send at most one request, oldest-loss-first, if the rate allows.
+    ///
+    /// A keyframe request outranks an invalidation: it is only raised when
+    /// the decoder holds no usable reference at all, and no amount of
+    /// re-pointing helps in that state. Taking both clears both, so a stale
+    /// invalidation cannot surface after the keyframe that already repaired
+    /// it.
+    fn flush(&mut self, tx: Option<&tokio::sync::mpsc::UnboundedSender<RepairRequest>>) {
+        if !self.keyframe && self.range.is_none() {
+            return;
+        }
+        let due = self
+            .last_sent
+            .is_none_or(|t| t.elapsed() >= REPAIR_MIN_INTERVAL);
+        if !due {
+            return; // still pending; the next flush carries the widened range
+        }
+        let repair = if self.keyframe {
+            RepairRequest::Keyframe
+        } else {
+            let (first, last) = self.range.expect("checked above");
+            RepairRequest::Invalidate { first, last }
+        };
+        self.keyframe = false;
+        self.range = None;
+        self.last_sent = Some(std::time::Instant::now());
+        if let Some(tx) = tx {
+            let _ = tx.send(repair);
+        }
+    }
 }
 
 /// Where reassembled frames go. A trait so the headless CLI can count them
@@ -385,6 +558,15 @@ pub trait FrameSink {
     /// `LoggingSink` never drops anything, so it never needs to ask.
     fn take_keyframe_request(&mut self) -> bool {
         false
+    }
+
+    /// The inclusive range of wire indices the sink lost, clearing it as it
+    /// reports it -- the cheap repair, preferred over a keyframe whenever the
+    /// sink can name what it missed.
+    ///
+    /// Defaults to `None` for sinks that never drop frames.
+    fn take_invalidation_request(&mut self) -> Option<(u32, u32)> {
+        None
     }
 }
 
@@ -440,10 +622,11 @@ pub async fn run_receiver(
     keys: Option<SessionKeys>,
     sink: &mut impl FrameSink,
     stop: tokio::sync::watch::Receiver<bool>,
-    idr_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    repair_tx: Option<tokio::sync::mpsc::UnboundedSender<RepairRequest>>,
 ) -> std::io::Result<ReceiveStats> {
     let mut depack = VideoDepacketizer::new(keys);
     let mut gate = crate::gate::KeyframeGate::new();
+    let mut outbox = RepairOutbox::default();
     let mut keepalive = tokio::time::interval(std::time::Duration::from_millis(500));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stop = stop;
@@ -462,25 +645,46 @@ pub async fn run_receiver(
                 // pinned its target and ignores these entirely.
                 let _ = socket.send_to(b"PING", peer).await;
 
-                // Same tick carries the sink's repair request. Checking here
-                // rather than on the frame path keeps the hot loop free of it,
-                // and 500 ms is well inside what a viewer perceives as "it
-                // recovered" while being far too slow to spam the encoder.
+                // The tick is now only a backstop. Repairs are raised on the
+                // frame path the moment loss is observed, because the encoder
+                // can only re-point a reference while the lost frames are
+                // still in its DPB -- batching them here is what made every
+                // one of them arrive too late to honour. This still catches a
+                // request raised by a sink after the last frame arrived, and a
+                // range held back by the rate limiter when the stream stops.
                 if sink.take_keyframe_request() {
-                    if let Some(tx) = &idr_tx {
-                        let _ = tx.send(());
-                    }
+                    outbox.note_keyframe();
                 }
+                if let Some((first, last)) = sink.take_invalidation_request() {
+                    outbox.note_range(first, last);
+                }
+                outbox.flush(repair_tx.as_ref());
             }
             datagram = media_rx.recv() => {
                 match datagram {
                     Some(d) => {
                         if let Some(frame) = depack.push(&d) {
+                            // Frames the network lost, seen the instant the
+                            // gap appears rather than up to 500 ms later.
+                            if let Some((first, last)) = depack.take_transit_loss() {
+                                outbox.note_range(first, last);
+                            }
                             // The gate, not the sink, decides whether a frame is
                             // decodable yet — see this function's docs.
                             if gate.admit(&frame) {
                                 sink.on_frame(frame);
                             }
+                            // The sink may have just dropped something of its
+                            // own on that push, so collect both before
+                            // flushing: one request covering everything beats
+                            // two the rate limiter would have to merge anyway.
+                            if sink.take_keyframe_request() {
+                                outbox.note_keyframe();
+                            }
+                            if let Some((first, last)) = sink.take_invalidation_request() {
+                                outbox.note_range(first, last);
+                            }
+                            outbox.flush(repair_tx.as_ref());
                         }
                     }
                     // demultiplexer stopped
@@ -682,6 +886,88 @@ mod tests {
         assert!(frame.is_keyframe());
         assert_eq!(frame.data, body, "padding must be trimmed, not decoded");
         assert_eq!(d.stats.frames_completed, 1);
+    }
+
+    /// Frames the network swallowed must be reported as a range, because that
+    /// range is the only thing that lets the host repair them with a P-frame
+    /// instead of a keyframe.
+    #[test]
+    fn a_gap_in_delivered_frames_is_reported_as_transit_loss() {
+        let body = vec![7u8; 300];
+        let mut d = VideoDepacketizer::new(None);
+
+        for p in packetize(1, 2, &body, 200, TEST_FEC_PCT) {
+            d.push(&p);
+        }
+        assert_eq!(d.take_transit_loss(), None, "the first frame is not a gap");
+
+        for p in packetize(2, 1, &body, 200, TEST_FEC_PCT) {
+            d.push(&p);
+        }
+        assert_eq!(d.take_transit_loss(), None, "consecutive frames are continuous");
+
+        // 3, 4 and 5 never arrive at all -- no shard of them is ever seen, so
+        // nothing local drops and only the index jump reveals them.
+        for p in packetize(6, 1, &body, 200, TEST_FEC_PCT) {
+            d.push(&p);
+        }
+        assert_eq!(
+            d.take_transit_loss(),
+            Some((3, 5)),
+            "the whole missing run must be named, not just its edges"
+        );
+        assert_eq!(d.take_transit_loss(), None, "one gap, one report");
+    }
+
+    /// A burst of loss must coalesce into one widened range rather than one
+    /// request per frame -- and nothing may be silently discarded on the way,
+    /// because a dropped range leaves those frames in the DPB forever.
+    #[test]
+    fn repair_requests_coalesce_instead_of_flooding() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut outbox = RepairOutbox::default();
+
+        outbox.note_range(10, 12);
+        outbox.flush(Some(&tx));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RepairRequest::Invalidate { first: 10, last: 12 }),
+            "the first loss goes out immediately"
+        );
+
+        // Inside the rate-limit window: these must widen the pending range,
+        // not vanish.
+        outbox.note_range(20, 22);
+        outbox.flush(Some(&tx));
+        outbox.note_range(30, 31);
+        outbox.flush(Some(&tx));
+        assert!(rx.try_recv().is_err(), "the rate limiter holds them back");
+
+        std::thread::sleep(REPAIR_MIN_INTERVAL);
+        outbox.flush(Some(&tx));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RepairRequest::Invalidate { first: 20, last: 31 }),
+            "everything held back must still be covered"
+        );
+    }
+
+    /// A keyframe request outranks a pending invalidation, and clears it:
+    /// re-pointing a reference cannot help a decoder that has none, and the
+    /// keyframe repairs the earlier gap anyway.
+    #[test]
+    fn a_keyframe_request_supersedes_a_pending_invalidation() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut outbox = RepairOutbox::default();
+
+        outbox.note_range(5, 6);
+        outbox.note_keyframe();
+        outbox.flush(Some(&tx));
+        assert_eq!(rx.try_recv().ok(), Some(RepairRequest::Keyframe));
+
+        std::thread::sleep(REPAIR_MIN_INTERVAL);
+        outbox.flush(Some(&tx));
+        assert!(rx.try_recv().is_err(), "the superseded range must not resurface");
     }
 
     /// Shards do not arrive in order on a real network, and the frame must not

@@ -127,6 +127,57 @@ static std::atomic<bool>    g_force_idr{false};
 //                             expands its range up to this (Sunshine nvenc_base parity).
 static bool                 g_rfiSupported = false;
 static uint32_t             g_refFramesInDpb = 5;
+// Whether this host is permitted to ask for a DPB deep enough to require
+// HEVC level 6.0 at 1440p. OFF by default, and that default is the product
+// decision, not a placeholder -- see SetDeepDpbAuthorized.
+static bool                 g_deepDpbAuthorized = false;
+
+// How many reference frames the DPB may hold at a given picture size.
+//
+// This is a DECODER limit, not an encoder preference: both H.264 and HEVC cap
+// the DPB by level AND picture size, and a stream that asks for more than the
+// client's level allows is rejected outright rather than degraded. So the
+// number is derived, never tuned.
+//
+//   HEVC A.4.2: MaxDpbSize collapses to maxDpbPicBuf (6) once
+//   PicSizeInSamplesY exceeds 3/4 of the level's MaxLumaPs. At 3840x2160
+//   (8,294,400 samples) against level 5.1's MaxLumaPs of 8,912,896 that
+//   threshold is 6,684,672 -- so 4K is hard-capped at 6, and we stay one
+//   under it. At 2560x1440 (3,686,400) the picture fits inside MaxLumaPs/2
+//   (4,456,448), which yields min(2 * 6, 16) = 12.
+//
+//   H.264 A.3.1 lands in the same place by a different route: MaxDpbMbs /
+//   FrameSizeInMbs is 184320/32400 = 5 at 4K and 184320/14400 = 12 at 1440p.
+//
+//   AV1 has exactly 8 reference slots, so it clamps there regardless.
+//
+// Why this matters (measured live 2026-08-22, 4K120): an invalidation can only
+// be honoured while the lost frames are still in the DPB. The client reports
+// loss ~10 frames after it happens, so a DPB of 5 refused 297 of 300 requests
+// and every one became an IDR. Twelve covers that pipeline comfortably; five
+// cannot, at any latency we can reach. Hence: RFI does real work at <=1440p
+// and falls back honestly at 4K, instead of being uniformly useless.
+static uint32_t dpb_depth_for_geometry(int width, int height, const GUID& codecGuid,
+                                       bool deepAuthorized) {
+    const uint64_t pixels = (uint64_t)(width > 0 ? width : 0)
+                          * (uint64_t)(height > 0 ? height : 0);
+    // 2560x1440. Anything at or below this has the level headroom for a deep
+    // DPB; anything above it (4K and up) does not.
+    const uint64_t kDeepDpbPixelLimit = 3686400ull;
+    uint32_t depth = (pixels != 0 && pixels <= kDeepDpbPixelLimit) ? 12u : 5u;
+    // 16 needs level 6.0 at 1440p (the picture then fits inside MaxLumaPs/4,
+    // giving min(4 * 6, 16)). Level 5.1 decoders -- Apple TV, Raspberry Pi,
+    // budget Android -- cannot hold it, and a DPB the decoder cannot honour
+    // is not a degraded stream, it is a refused one. So the deep tier is
+    // opt-in and 12 stays the universal default.
+    if (deepAuthorized && depth == 12u) {
+        depth = 16u;
+    }
+    if (codecGuid == NV_ENC_CODEC_AV1_GUID && depth > 8u) {
+        depth = 8u; // AV1 has 8 reference slots, full stop
+    }
+    return depth;
+}
 static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
 //   g_rfiConfirm         — set true when an invalidation succeeds; the NEXT
 //                          encoded frame is the recovery frame.
@@ -161,7 +212,22 @@ static std::atomic<bool>    g_lastFrameRecovery{false};
 // Keep it, at the references' values: a slow sweep (299 frames) once every 300
 // — ~2.5 s at 120 fps instead of every second — and single-sliced, which Nova
 // never set. Same repair property, a fraction of the visible cost.
-static const bool     kEnableIntraRefresh  = true;
+// OFF since 2026-08-23. The rolling sweep was Nova's repair path of last
+// resort, and it is no longer needed: reference-frame invalidation now
+// services ~68% of repairs with a P-frame (135/198 live at 1440p120 with a
+// 16-frame DPB), the rest fall back to on-demand IDRs, and the client asks
+// aggressively -- 198 repair requests in a single session, against the ~2 per
+// session that originally made a passive repair path necessary.
+//
+// What it cost while it ran: a band of intra macroblocks crossing every frame
+// forever, visible on crisp UI edges as a sweeping line, and under CBR those
+// intra blocks are paid for by the content around them on every single frame.
+//
+// Re-enabling this is the correct move if RFI is ever turned off, if a client
+// stops requesting repairs, or if the DPB drops back to 5 (4K) AND the IDR
+// fallback proves insufficient. It is a safety net, not a quality feature --
+// do not switch it back on to "improve" a picture.
+static const bool     kEnableIntraRefresh  = false;
 static const uint32_t kIntraRefreshPeriod  = 300;
 static const uint32_t kIntraRefreshCnt     = 299;
 
@@ -1370,6 +1436,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
         g_encoderCodec = 2;
     }
     g_isHdr = is_hdr;
+    // Derived from the negotiated geometry, and read by all three codec
+    // config blocks below plus InvalidateRefFrames' range check -- they must
+    // never disagree, which is why it is computed exactly once, here.
+    g_refFramesInDpb = dpb_depth_for_geometry(width, height, codecGuid, g_deepDpbAuthorized);
 
     ShimLog("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
            codec, is_hdr ? "/HDR10" : "", width, height, bitrate_kbps, fps);
@@ -1474,7 +1544,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
             // Deep DPB for future reference-frame invalidation; any single
             // frame still only references one frame back (numRefL0).
-            h264.maxNumRefFrames   = 5;
+            h264.maxNumRefFrames   = g_refFramesInDpb;
             h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_1;
             // Filler data keeps CBR byte-accurate on static frames: NVENC pads
             // easy (low-motion) frames to the full bit budget rather than
@@ -1502,7 +1572,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.idrPeriod            = NVENC_INFINITE_GOPLENGTH;
             hevc.sliceMode            = 3;
             hevc.sliceModeData        = 1;
-            hevc.maxNumRefFramesInDPB = 5;
+            hevc.maxNumRefFramesInDPB = g_refFramesInDpb;
             hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
             // Same filler-data rationale as H264: prevents CBR QP oscillation on static frames.
             hevc.enableFillerDataInsertion = 1;
@@ -1546,7 +1616,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             av1.enableBitstreamPadding = 1; // CBR filler on static frames (H264/HEVC parity)
             av1.inputBitDepth          = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
             av1.outputBitDepth         = is_hdr ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
-            av1.maxNumRefFramesInDPB   = 5;
+            av1.maxNumRefFramesInDPB   = g_refFramesInDpb;
             av1.numFwdRefs             = NV_ENC_NUM_REF_FRAMES_1;
             // level/tier stay at the preset default (autoselect) — Apollo parity;
             // NVENC derives a correct seq_level_idx from resolution/fps/bitrate.
@@ -1617,8 +1687,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
         g_lastEncodedFrameIndex = 0;
         g_rfiSupported = g_nvEncoder->GetCapabilityValue(
                              codecGuid, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0;
-        ShimLog("🧩 RFI (reference-frame invalidation) support for %s: %s (DPB holds %u ref frames)\n",
-               codec, g_rfiSupported ? "YES" : "no", g_refFramesInDpb);
+        ShimLog("🧩 RFI (reference-frame invalidation) support for %s: %s (DPB holds %u ref frames at %dx%d, %s)\n",
+               codec, g_rfiSupported ? "YES" : "no", g_refFramesInDpb, width, height,
+               g_refFramesInDpb >= 12 ? "deep enough to repair a typical loss"
+                                      : "shallow, most invalidations fall back to IDR");
 
         // Intra refresh is Nova's repair path on every codec, so whether this
         // GPU actually honours it for this codec is worth stating rather than
@@ -2029,7 +2101,22 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
     NV_ENC_RECONFIGURE_PARAMS rp = { NV_ENC_RECONFIGURE_PARAMS_VER };
     rp.reInitEncodeParams              = g_initParams;
     rp.reInitEncodeParams.encodeConfig = &g_encConfig;
-    rp.forceIDR = 1; // rate/fps target changed — start clean at the new budget
+    // An IDR here is NOT required to change the rate, and forcing one was
+    // expensive in a way that hid behind the QoS loop. `resetEncoder` stays 0,
+    // so the reference chain survives a reconfigure untouched: NVENC simply
+    // spends a new budget from the next P-frame onward.
+    //
+    // Measured live 2026-08-22 at 4K120: the ramp fires roughly every few
+    // seconds, and 161 ramp events meant 161 forced 4K keyframes -- each one a
+    // CBR spike that the frames around it pay for, which is exactly the
+    // "bright blocks and blur" the stream was being judged on. The repair
+    // IDRs were being blamed for artefacts the rate controller was creating.
+    //
+    // An fps change is different: the VBV is sized per frame and the cadence
+    // the decoder is pacing to has moved, so a clean restart there is worth
+    // one keyframe. That path is rare (a codec/geometry renegotiation), unlike
+    // the bitrate ramp which runs continuously.
+    rp.forceIDR = fpsChanged ? 1 : 0;
 
     try {
         g_nvEncoder->Reconfigure(&rp);
@@ -2089,6 +2176,25 @@ extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, u
 
 // Whether this GPU/codec supports RFI (probed at InitEncoder). Rust reads this
 // to decide whether to advertise refPicInvalidation:1 to the client.
+// Authorize the deep (16-frame) DPB tier. Call BEFORE InitEncoder, exactly
+// like SetHdrMetadata -- InitEncoder reads it once when it sizes the DPB.
+//
+// This exists because NOTHING IN THE HANDSHAKE REPORTS A DECODER LEVEL.
+// Moonlight never sends one: Nova already has to infer H.264 Level 5.2 from
+// client behaviour rather than read it (see session_negotiate's fps cap), and
+// Echo's SessionRequest carries geometry and codec but no decoder capability
+// either. With no way to ask, the only safe assumption is the weakest client
+// on the network -- so the deep tier is an explicit operator assertion
+// (`[stream] allow_level6_dpb`), not something guessed per session.
+//
+// Deliberately a parameter rather than a config read inside the shim: when a
+// client CAN eventually declare its level (Echo is ours to extend, and
+// MediaCodec exposes profileLevels), that per-session answer feeds this same
+// input and the tier logic below does not change at all.
+extern "C" __declspec(dllexport) void SetDeepDpbAuthorized(int authorized) {
+    g_deepDpbAuthorized = (authorized != 0);
+}
+
 extern "C" __declspec(dllexport) int RfiSupported() {
     return g_rfiSupported ? 1 : 0;
 }

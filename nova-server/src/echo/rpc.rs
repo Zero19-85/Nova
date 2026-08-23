@@ -838,6 +838,9 @@ impl Handler {
             "start_session" => self.handle_start_session(id, &req.params, identity),
             "stop_session" => self.handle_stop_session(id, identity),
             "request_idr" => self.handle_request_idr(id, identity),
+            "invalidate_ref_frames" => {
+                self.handle_invalidate_ref_frames(id, &req.params, identity)
+            }
             "input" => self.handle_input(id, &req.params, identity),
             "list_displays" => {
                 let seats = self.orchestrator.seats();
@@ -1131,6 +1134,60 @@ impl Handler {
             Ok(session_id) => {
                 println!("🔑 Echo: \"{}\" requested a keyframe", identity.device_name);
                 RpcResponse::ok(id, json!({ "session_id": session_id, "requested": true }))
+            }
+            Err(e) => RpcResponse::err(id, handoff_code(&e), e.to_string()),
+        }
+    }
+
+    /// The client's *cheap* repair path.
+    ///
+    /// `request_idr` was Echo's only way to repair a broken reference chain,
+    /// and a keyframe is expensive: under CBR the spike is paid for by every
+    /// other frame around it, which is the smearing that follows a drop. When
+    /// the client can name the frames it actually failed to decode, the
+    /// encoder can drop just those from the DPB and code the next P-frame
+    /// against an older good one instead.
+    ///
+    /// Both bounds are **wire indices** -- the 1-based per-session counter the
+    /// host stamps on every sealed frame -- so no translation is needed at
+    /// either end. A range NVENC cannot satisfy is not an error here: the
+    /// Worker turns it into an IDR, which is exactly what the client would
+    /// have asked for anyway.
+    fn handle_invalidate_ref_frames(
+        &self,
+        id: Option<u64>,
+        params: &Map<String, Value>,
+        identity: &EchoIdentity,
+    ) -> RpcResponse {
+        let Some(mgr) = &self.sessions else {
+            return RpcResponse::err(id, E_NO_SESSION_LAYER, "no session layer on this host");
+        };
+        // Absent bounds are a malformed request, not a request to invalidate
+        // frame 0 -- defaulting either one would silently repair the wrong
+        // part of the stream.
+        let (Some(first), Some(last)) = (
+            params.get("first").and_then(|v| v.as_u64()),
+            params.get("last").and_then(|v| v.as_u64()),
+        ) else {
+            return RpcResponse::err(
+                id,
+                E_BAD_REQUEST,
+                "invalidate_ref_frames needs integer `first` and `last`",
+            );
+        };
+        if first > u32::MAX as u64 || last > u32::MAX as u64 {
+            return RpcResponse::err(id, E_BAD_REQUEST, "frame index out of range");
+        }
+        match mgr.invalidate_ref_frames(identity, first as u32, last as u32) {
+            Ok(session_id) => {
+                println!(
+                    "🧩 Echo: \"{}\" invalidated frames {first}-{last}",
+                    identity.device_name
+                );
+                RpcResponse::ok(
+                    id,
+                    json!({ "session_id": session_id, "invalidated": true }),
+                )
             }
             Err(e) => RpcResponse::err(id, handoff_code(&e), e.to_string()),
         }

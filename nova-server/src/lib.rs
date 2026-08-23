@@ -457,6 +457,7 @@ pub async fn start_master_network() -> MasterHandles {
     app_launcher::set_launch_via_worker();
     let cfg = Arc::new(config::NovaConfig::load());
     encoder::set_hdr_metadata(cfg.hdr.max_luminance_nits, cfg.hdr.max_cll_nits, cfg.hdr.max_fall_nits);
+    encoder::set_deep_dpb_authorized(cfg.stream.allow_level6_dpb);
 
     let server_id  = "0123456789ABCDEF";
     let server_mac = "00:11:22:33:44:55";
@@ -2644,6 +2645,9 @@ pub async fn run_worker() -> Result<()> {
 
     let cfg = config::NovaConfig::load();
     encoder::set_hdr_metadata(cfg.hdr.max_luminance_nits, cfg.hdr.max_cll_nits, cfg.hdr.max_fall_nits);
+    // Both loops, per CLAUDE.md: a setting wired only into the monolithic
+    // path is dead in the deployed split, and this one decides DPB depth.
+    encoder::set_deep_dpb_authorized(cfg.stream.allow_level6_dpb);
     if !cfg.audio.endpoint_override.is_empty() {
         audio::set_sink_override(&cfg.audio.endpoint_override);
         audio::recover_stuck_sink();
@@ -3020,8 +3024,27 @@ pub async fn run_worker() -> Result<()> {
                                     // RFI recovery: invalidate the lost range so the
                                     // next P-frame recovers; fall back to an IDR if
                                     // NVENC can't honour it (range too large, etc).
+                                    //
+                                    // The OUTCOME is the congestion signal, and this is
+                                    // the only place in the process that knows it. A
+                                    // successful invalidation is a cheap repair -- a few
+                                    // hundred bytes of P-frame -- and says nothing about
+                                    // the link; signalling on those would collapse the
+                                    // bitrate over routine loss (135 of them in one live
+                                    // session on 2026-08-23). A fallback means the gap
+                                    // outran the DPB, which costs a full intra frame and
+                                    // IS the honest congestion indicator.
+                                    //
+                                    // Signalling here rather than at the request site is
+                                    // what finally gives QoS eyes on an ECHO session:
+                                    // Echo's repairs arrive over the RPC tunnel and never
+                                    // touch control.rs, so every producer of this signal
+                                    // lived on a path Echo does not use and dynamic
+                                    // bitrate was inert for it. Both client kinds reach
+                                    // this handler, so both are covered by one rule.
                                     if !encoder::invalidate_ref_frames(first as u64, last as u64) {
                                         encoder::request_idr_global();
+                                        encoder::signal_congestion_reduction();
                                     }
                                 }
                                 Some(Ok(ipc::ControlMsg::ConfigureStart(cs))) => {

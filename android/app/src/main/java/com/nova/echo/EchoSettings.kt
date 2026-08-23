@@ -74,7 +74,7 @@ class EchoSettings private constructor(context: Context) {
 
     private fun load(): StreamPrefs {
         val d = StreamPrefs()
-        return StreamPrefs(
+        val stored = StreamPrefs(
             codec = prefs.getString(KEY_CODEC, d.codec) ?: d.codec,
             bitrateKbps = prefs.getInt(KEY_BITRATE, d.bitrateKbps),
             resolution = prefs.getString(KEY_RES, d.resolution) ?: d.resolution,
@@ -83,6 +83,39 @@ class EchoSettings private constructor(context: Context) {
             showTelemetry = prefs.getBoolean(KEY_TELEMETRY, d.showTelemetry),
             deviceName = prefs.getString(KEY_DEVICE, d.deviceName) ?: d.deviceName,
         )
+        return migrate(stored)
+    }
+
+    /**
+     * Bring a stored bitrate forward when the recommended table changes.
+     *
+     * Retuning [BITRATE_TIERS] alone fixes nothing on a device that has already
+     * run the app: the chosen figure is persisted, and [load] reads it back in
+     * preference to any default. An install carrying the old 1440p120 figure of
+     * 75 Mbps would keep flooding its link until the user happened to touch the
+     * resolution or framerate control, which is the one thing someone with a
+     * working-looking app has no reason to do.
+     *
+     * Deliberately **only** re-derives the bitrate, and only once per schema
+     * bump. Everything else the user set -- device name, relay, codec, mic --
+     * is left exactly as it was; a migration that resets unrelated preferences
+     * to fix one of them is worse than the problem.
+     *
+     * A hand-picked bitrate is discarded here, on the same reasoning
+     * [selectResolution] already applies: the old number was chosen against a
+     * table that measurement has since shown to be wrong, and re-overriding it
+     * is one drag of a slider that now starts somewhere sane.
+     */
+    private fun migrate(stored: StreamPrefs): StreamPrefs {
+        if (prefs.getInt(KEY_SCHEMA, 0) >= SCHEMA_VERSION) return stored
+        val corrected = stored.copy(
+            bitrateKbps = recommendedBitrateKbps(stored.resolution, stored.fps)
+        )
+        prefs.edit()
+            .putInt(KEY_BITRATE, corrected.bitrateKbps)
+            .putInt(KEY_SCHEMA, SCHEMA_VERSION)
+            .apply()
+        return corrected
     }
 
     /**
@@ -126,6 +159,15 @@ class EchoSettings private constructor(context: Context) {
         private const val PREFS = "echo"
         private const val KEY_CODEC = "pref_codec"
         private const val KEY_BITRATE = "pref_bitrate_kbps"
+        private const val KEY_SCHEMA = "pref_schema_version"
+
+        /**
+         * Bumped whenever [BITRATE_TIERS] changes, so stored bitrates are
+         * re-derived once on the next launch. 1 = the 2026-08-23 retune that
+         * halved the tiers after 75 Mbps at 1440p120 was measured flooding an
+         * ordinary link.
+         */
+        private const val SCHEMA_VERSION = 1
         private const val KEY_RES = "pref_resolution"
         private const val KEY_FPS = "pref_fps"
         private const val KEY_MIC = "pref_mic"
@@ -153,17 +195,28 @@ class EchoSettings private constructor(context: Context) {
          * resolution that never appears in the UI still lands somewhere sane.
          * Tune the table, not the call sites.
          *
-         * These are working targets, roughly half of Nova's own ceiling in
-         * `qos::resolution_ceiling` — the host's figure is the most it will
-         * allow, which is the wrong thing to hand someone as a default. A
-         * default should look good on an ordinary home network; the slider is
-         * there for anyone who wants to spend the rest of their link.
+         * These track the host's anchors in `qos::resolution_ceiling` (Rust),
+         * and the two tables must be tuned together. They used to sit at
+         * roughly half the host's figure, on the reasoning that the ceiling is
+         * the most the host will ALLOW and so the wrong thing to hand someone
+         * as a default. That reasoning was sound; the host's numbers were not.
+         *
+         * Measured live 2026-08-23: the host permitted ~118 Mbps at 1440p120
+         * and this table defaulted to 75 (45 x 2^0.75), which flooded an
+         * ordinary home link — sustained packet loss, ~200 repair requests per
+         * session, and a stream that spent itself repairing rather than
+         * showing a picture. 50 Mbps at the same mode was stable immediately.
+         * The host anchors were halved and these follow, so a default now
+         * lands just under the ceiling instead of at 1.5x it.
+         *
+         * The slider still goes to MAX_MBPS for anyone who wants to spend the
+         * rest of their link; what changed is where an untouched app starts.
          */
         private val BITRATE_TIERS = listOf(
-            921_600L to 10,      // 1280x720
-            2_073_600L to 25,    // 1920x1080
-            3_686_400L to 45,    // 2560x1440
-            8_294_400L to 60,    // 3840x2160
+            921_600L to 10,      // 1280x720   -> 16 Mbps at 120 fps
+            2_073_600L to 18,    // 1920x1080  -> 30 Mbps at 120 fps
+            3_686_400L to 30,    // 2560x1440  -> 50 Mbps at 120 fps
+            8_294_400L to 50,    // 3840x2160  -> 84 Mbps at 120 fps
         )
 
         /**

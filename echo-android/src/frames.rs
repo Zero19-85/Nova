@@ -92,6 +92,20 @@ struct Inner {
     /// Live 2026-08-15: one overflow while the decoder warmed up froze the
     /// picture on the first frame for the rest of the session.
     keyframe_wanted: bool,
+    /// Inclusive range of wire indices this queue dropped, cleared when the
+    /// request has been passed on.
+    ///
+    /// The cheap counterpart to `keyframe_wanted`. An overflow drop is the
+    /// one loss the client can describe exactly: the frame arrived, was
+    /// authenticated, and was then discarded here, so its index is known.
+    /// That is precisely what the encoder needs to re-point a reference
+    /// instead of coding a whole intra frame.
+    ///
+    /// Widened rather than replaced while a request is outstanding: two
+    /// overflows before the next receive-loop tick broke the chain in both
+    /// places, and repairing only the later one leaves the earlier gap in the
+    /// DPB forever.
+    lost_frames: Option<(u32, u32)>,
     /// How long to hold each frame before the decoder may have it — the A/V
     /// sync delay. Zero disables the delay line entirely.
     delay: Duration,
@@ -129,6 +143,7 @@ impl FrameQueue {
                 closed: false,
                 stats: QueueStats::default(),
                 keyframe_wanted: false,
+                lost_frames: None,
                 delay: Duration::ZERO,
                 capacity: CAPACITY,
             }),
@@ -186,6 +201,16 @@ impl FrameQueue {
         std::mem::replace(&mut inner.keyframe_wanted, false)
     }
 
+    /// The range of wire indices this queue dropped, clearing it so one loss
+    /// produces one ask.
+    ///
+    /// Repeatable for the same reason as `take_keyframe_request`: if the
+    /// recovery frame is itself lost, the next overflow re-arms it.
+    pub fn take_invalidation_request(&self) -> Option<(u32, u32)> {
+        let mut inner = self.lock();
+        inner.lost_frames.take()
+    }
+
     /// Ask the host for a keyframe on the next receive-loop turn.
     ///
     /// Exists for the Android Surface lifecycle. Backgrounding destroys the
@@ -220,12 +245,25 @@ impl FrameQueue {
             return;
         }
         if inner.frames.len() >= inner.capacity {
-            inner.frames.pop_front();
+            let dropped = inner.frames.pop_front().map(|f| f.index);
             inner.stats.dropped_overflow += 1;
-            // The chain is broken; nothing is decodable until the next IDR —
-            // and under an infinite GOP one only exists if we ask for it.
+            // The chain is broken; nothing is decodable until the host repairs
+            // it -- under an infinite GOP that only happens if we ask.
             inner.gate.close();
-            inner.keyframe_wanted = true;
+            match dropped {
+                // We know exactly which frame the decoder will never see, so
+                // ask for the cheap repair. The host answers with a type-5
+                // recovery frame, or falls back to a keyframe by itself if
+                // NVENC cannot re-point that far -- either one re-opens the
+                // gate, so this is never a way to get stuck.
+                Some(index) => {
+                    let (first, last) = inner.lost_frames.unwrap_or((index, index));
+                    inner.lost_frames = Some((first.min(index), last.max(index)));
+                }
+                // An empty queue cannot report what it lost; only a full
+                // keyframe is guaranteed to repair an unknown gap.
+                None => inner.keyframe_wanted = true,
+            }
         }
         if !inner.gate.admit(&frame) {
             inner.stats.dropped_waiting_keyframe += 1;
@@ -340,6 +378,10 @@ impl FrameSink for QueueSink {
 
     fn take_keyframe_request(&mut self) -> bool {
         self.0.take_keyframe_request()
+    }
+
+    fn take_invalidation_request(&mut self) -> Option<(u32, u32)> {
+        self.0.take_invalidation_request()
     }
 }
 
@@ -474,6 +516,89 @@ mod tests {
             q.pop_timeout(Duration::from_millis(10)).unwrap().index,
             2,
             "frame 1 was the oldest and should have been evicted"
+        );
+    }
+
+    /// An overflow drop names the frame it lost, so the host can re-point a
+    /// reference instead of coding a whole intra frame. The expensive repair
+    /// must NOT also be requested -- asking for both would pay for the IDR
+    /// anyway and make the cheap path pointless.
+    #[test]
+    fn an_overflow_drop_names_the_frame_it_lost() {
+        let q = FrameQueue::new();
+        q.push(frame(1, 2, 4));
+        for i in 2..=(CAPACITY as u32) {
+            q.push(frame(i, 1, 4));
+        }
+        assert_eq!(q.take_invalidation_request(), None, "nothing has been dropped yet");
+
+        q.push(frame(99, 1, 4)); // fills past capacity, evicting frame 1
+        assert_eq!(q.stats().dropped_overflow, 1);
+        assert_eq!(
+            q.take_invalidation_request(),
+            Some((1, 1)),
+            "the evicted frame's index is exactly what the encoder needs"
+        );
+        assert!(!q.take_keyframe_request(), "a named loss must not also cost an IDR");
+        assert_eq!(q.take_invalidation_request(), None, "one loss, one ask");
+    }
+
+    /// Two drops before the receive loop's next tick must both be repaired.
+    /// Reporting only the later one leaves the earlier gap in the DPB, and
+    /// the picture stays broken in a way no further request would fix.
+    #[test]
+    fn drops_that_arrive_together_widen_into_one_range() {
+        let q = FrameQueue::new();
+        q.push(frame(1, 2, 4));
+        for i in 2..=(CAPACITY as u32) {
+            q.push(frame(i, 1, 4));
+        }
+        q.push(frame(98, 1, 4)); // evicts 1, and closes the gate
+
+        // A keyframe re-opens the gate, so the queue can fill and break a
+        // second time before the receive loop next collects the request.
+        q.push(frame(50, 2, 4));
+        for i in 51..=(CAPACITY as u32 + 49) {
+            q.push(frame(i, 1, 4));
+        }
+        q.push(frame(99, 1, 4)); // evicts 2
+
+        assert_eq!(q.stats().dropped_overflow, 2);
+        assert_eq!(
+            q.take_invalidation_request(),
+            Some((1, 2)),
+            "both losses must be covered by the range"
+        );
+    }
+
+    /// A recovery frame is a P-frame the encoder coded against a reference it
+    /// proved survives, so it re-opens the gate exactly like a keyframe. If it
+    /// did not, the answer to an invalidation would be refused as undecodable
+    /// and the picture would stay frozen while the host believed it had
+    /// already repaired the stream.
+    #[test]
+    fn a_recovery_frame_reopens_the_gate_after_a_drop() {
+        let q = FrameQueue::new();
+        q.push(frame(1, 2, 4));
+        for i in 2..=(CAPACITY as u32 + 2) {
+            q.push(frame(i, 1, 4));
+        }
+        assert!(q.stats().dropped_overflow > 0, "the gate should now be closed");
+        while q.pop_timeout(Duration::from_millis(10)).is_some() {}
+
+        let refused = q.stats().dropped_waiting_keyframe;
+        q.push(frame(200, 1, 4));
+        assert_eq!(
+            q.stats().dropped_waiting_keyframe,
+            refused + 1,
+            "an ordinary P-frame is still undecodable"
+        );
+
+        q.push(frame(201, 5, 4)); // the host's RFI recovery frame
+        assert_eq!(
+            q.pop_timeout(Duration::from_millis(10)).map(|f| f.index),
+            Some(201),
+            "a type-5 recovery frame must be admitted"
         );
     }
 

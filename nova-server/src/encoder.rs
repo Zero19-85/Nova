@@ -50,6 +50,7 @@ extern "C" {
     /// CLL/FALL).  Call once after loading nova.toml, before the first
     /// InitEncoder.  BT.2020 primaries are always the standard constants.
     fn SetHdrMetadata(max_luminance_nits: u32, max_cll_nits: u32, max_fall_nits: u32);
+    fn SetDeepDpbAuthorized(authorized: i32);
 
     /// Set the SDR white level (scRGB units, i.e. nits / 80) the SDR↔HDR
     /// conversion shaders use. See `set_sdr_white_level`.
@@ -141,6 +142,17 @@ fn reopen_shim_log() {
 /// Push nova.toml [hdr] luminance parameters to the shim before the first
 /// InitEncoder call.  BT.2020 primaries are standard constants and are not
 /// configurable; only the panel-specific luminance/CLL/FALL values vary.
+/// Authorize the 16-frame DPB tier at 1440p and below. Call BEFORE the first
+/// `Encoder::new`, like [`set_hdr_metadata`] -- `InitEncoder` reads it once
+/// when it sizes the DPB.
+///
+/// `false` (the default) keeps every session at a DPB the weakest Moonlight
+/// client can decode. See `[stream] allow_level6_dpb` for why this is an
+/// operator assertion rather than something negotiated.
+pub fn set_deep_dpb_authorized(authorized: bool) {
+    unsafe { SetDeepDpbAuthorized(authorized as i32) }
+}
+
 pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nits: u16) {
     unsafe {
         SetHdrMetadata(

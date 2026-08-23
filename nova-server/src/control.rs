@@ -455,8 +455,11 @@ fn handle_control_message(
                     match worker_link {
                         Some(link) => link.send(ControlMsg::InvalidateRefFrames { first, last }),
                         None => {
+                            // Same outcome-based rule as the Worker loop above --
+                            // mirror any change to both.
                             if !crate::encoder::invalidate_ref_frames(first as u64, last as u64) {
                                 crate::encoder::request_idr_global();
+                                crate::encoder::signal_congestion_reduction();
                             }
                         }
                     }
@@ -469,10 +472,12 @@ fn handle_control_message(
                     }
                 }
             }
-            if idr_request_is_congestion(client_info) {
-                println!("🎮 Control: ref-frame invalidation mid-stream — signalling bitrate reduction");
-                signal_congestion(worker_link);
-            }
+            // NO congestion signal on the request itself. An invalidation that
+            // succeeds is the cheap repair working as designed, and firing here
+            // charged it as congestion regardless of outcome -- and double-
+            // charged it once the fallback path started signalling. The signal
+            // now lives where the outcome is known: the fallback branch above,
+            // and its twin in the Worker loop.
         }
         // Loss stats arrive every ~50ms; payload[0] (i32 LE) is the loss count
         // since the last report. Signal congestion control on non-zero loss so
