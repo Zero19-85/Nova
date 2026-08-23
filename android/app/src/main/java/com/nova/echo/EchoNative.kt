@@ -100,6 +100,56 @@ object EchoNative {
 
     external fun nativeSendInput(handle: Long, kind: Int, a: Int, b: Int, c: Int, d: Int): Boolean
 
+    // ── Gamepad ─────────────────────────────────────────────────────────────
+    // Its own entry point rather than another `nativeSendInput` kind, because a
+    // controller snapshot needs ten fields and the four `Int`s there would have
+    // to be bit-packed to carry them. Packing is how a transposed shift becomes
+    // a controller that works *almost* right — the expensive kind of wrong. A
+    // pad is sampled at human speed, so the extra arguments cost nothing worth
+    // having.
+
+    /** Slots the host will plug a virtual pad into. Mirrors `MAX_PADS` on the host. */
+    const val MAX_GAMEPAD_SLOTS = 4
+
+    /**
+     * Post one controller **state snapshot**.
+     *
+     * `NV_MULTI_CONTROLLER_PACKET` carries the whole controller every time —
+     * all buttons, both triggers, all four axes — and the host applies it
+     * wholesale to a ViGEm pad. There is no "press A" message: the caller owns
+     * the running state and re-sends all of it on any change. Sending a packet
+     * built from one event alone releases everything else the user is holding.
+     *
+     * [activeMask] is the **plug**, not a description of the state: the host
+     * reads `activeMask and (1 shl controllerNumber)` and plugs a virtual Xbox
+     * 360 pad into that slot when the bit is set, unplugging it when clear. So
+     * a controller arriving is a neutral snapshot with its bit set, and one
+     * leaving is a snapshot with its bit clear.
+     *
+     * [buttons] are XInput `XINPUT_GAMEPAD` bits, which GameStream's low 16
+     * `buttonFlags` match exactly — the host does no translation, so neither
+     * should anything above this call. Triggers are `0..255`. Axes span the
+     * full `Short` range with **Y positive up**, which is XInput's convention
+     * and the opposite of Android's `AXIS_Y`; [ControllerHandler] negates.
+     *
+     * Values are clamped native-side, so a slightly out-of-range axis pins at
+     * the rail instead of wrapping to the opposite one. Returns false for a bad
+     * handle, a pairing handle, or a [controllerNumber] outside
+     * `0..<MAX_GAMEPAD_SLOTS` — never that the host refused it.
+     */
+    external fun nativeSendGamepad(
+        handle: Long,
+        controllerNumber: Int,
+        activeMask: Int,
+        buttons: Int,
+        leftTrigger: Int,
+        rightTrigger: Int,
+        leftStickX: Int,
+        leftStickY: Int,
+        rightStickX: Int,
+        rightStickY: Int,
+    ): Boolean
+
     // ── Microphone ──────────────────────────────────────────────────────────
 
     /**

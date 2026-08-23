@@ -99,6 +99,11 @@ pub const AUDIO_BAD_HANDLE: jint = -3;
 /// Unreachable with a buffer sized to `audio_channel::MAX_PAYLOAD`.
 pub const AUDIO_TOO_SMALL: jint = -4;
 
+/// ViGEm slots the host will plug a virtual pad into, matching `MAX_PADS` in
+/// `nova-server/src/input.rs`. A snapshot for a slot at or beyond this is
+/// dropped there without comment, so this side refuses it instead.
+const MAX_GAMEPAD_SLOTS: jint = 4;
+
 /// How long `nativeClose` waits for the session to tell the host it is done.
 ///
 /// Long enough for one RUDP round trip including a retransmit, short enough
@@ -618,6 +623,87 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendInput(
     u8::from(queued)
 }
 
+
+/// Post one controller state snapshot to the host.
+///
+/// Ten discrete arguments, deliberately. They would pack into the four `jint`s
+/// [`Java_com_nova_echo_EchoNative_nativeSendInput`] already has — two axes to
+/// an `int`, triggers into the spare bytes of another — and that packing is
+/// exactly the silent-corruption class this codebase keeps paying for. A
+/// transposed shift produces a controller that works *almost* right, which is
+/// far more expensive to find than one that does not work at all. A gamepad
+/// snapshot is sent at most once per input event on a device a human is
+/// holding, so nothing here is on a hot path worth that risk.
+///
+/// `controller_number` selects the ViGEm slot; `active_mask` is the plug. See
+/// [`echo_client::input::gamepad`] — a set bit at the controller's own index
+/// plugs a virtual Xbox 360 pad in host-side, a clear bit unplugs it, so
+/// arrival and removal are both just a snapshot with the right mask.
+///
+/// Values are clamped rather than rejected. A `jint` can hold anything Kotlin
+/// cares to pass, but every field on the wire is narrower, and the alternative
+/// to clamping is a wrapping cast that turns a stick pushed slightly too far
+/// into one slammed against the opposite rail. Out-of-range slots are the one
+/// exception and are refused outright: the host drops packets at or beyond
+/// `MAX_PADS` without comment, so accepting one would be input that silently
+/// goes nowhere.
+///
+/// Returns `true` if the snapshot was queued. `false` means a bad handle, a
+/// pairing handle, or a slot outside `0..=3` — never that the host refused it.
+/// Fire-and-forget, like all input on this bridge.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendGamepad(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    controller_number: jint,
+    active_mask: jint,
+    buttons: jint,
+    left_trigger: jint,
+    right_trigger: jint,
+    left_stick_x: jint,
+    left_stick_y: jint,
+    right_stick_x: jint,
+    right_stick_y: jint,
+) -> jni::sys::jboolean {
+    let queued = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(echo) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return false;
+        };
+        let Some(tx) = echo.input.as_ref() else {
+            return false; // a pairing handle has no session to inject into
+        };
+
+        // The host ignores slots it has no pad for, so sending one is input
+        // that vanishes. Refusing here makes it a visible `false` instead.
+        if !(0..MAX_GAMEPAD_SLOTS).contains(&controller_number) {
+            return false;
+        }
+
+        // Saturating, never wrapping — see the doc comment. A stick pushed past
+        // range must pin at the rail, not reappear at the opposite one.
+        let axis = |v: jint| v.clamp(i16::MIN as jint, i16::MAX as jint) as i16;
+        let trigger = |v: jint| v.clamp(0, u8::MAX as jint) as u8;
+
+        let packet = input::gamepad(
+            controller_number as u8,
+            (active_mask & 0xFFFF) as u16,
+            &input::GamepadState {
+                buttons: (buttons & 0xFFFF) as u16,
+                left_trigger: trigger(left_trigger),
+                right_trigger: trigger(right_trigger),
+                left_stick_x: axis(left_stick_x),
+                left_stick_y: axis(left_stick_y),
+                right_stick_x: axis(right_stick_x),
+                right_stick_y: axis(right_stick_y),
+            },
+        );
+        tx.send(packet).is_ok()
+    }))
+    .unwrap_or(false);
+
+    u8::from(queued)
+}
 /// Post one encoded microphone packet to the host.
 ///
 /// `buf` must be a **direct** `ByteBuffer` — in practice a MediaCodec *output*

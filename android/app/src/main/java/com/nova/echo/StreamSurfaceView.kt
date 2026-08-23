@@ -402,8 +402,20 @@ class StreamSurfaceView(context: Context) : SurfaceView(context), InputManager.I
     override fun onCapturedPointerEvent(event: MotionEvent): Boolean =
         handlePointer(event, captured = true) || super.onCapturedPointerEvent(event)
 
+    /**
+     * Joystick motion and uncaptured pointer motion arrive at the same
+     * callback, so the controller path is offered the event first.
+     *
+     * [ControllerHandler.onMotion] returns false for anything that is not a
+     * gamepad's `ACTION_MOVE`, so a mouse falls straight through to
+     * [handlePointer] as before. Order matters only because a joystick event
+     * carries `AXIS_X`/`AXIS_Y` too, and the pointer path would happily read a
+     * stick as a cursor.
+     */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean =
-        handlePointer(event, captured = false) || super.onGenericMotionEvent(event)
+        (active() != null && controller?.gamepads?.onMotion(event) == true) ||
+            handlePointer(event, captured = false) ||
+            super.onGenericMotionEvent(event)
 
     /**
      * An **uncaptured** mouse arrives here, and only here.

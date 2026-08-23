@@ -37,6 +37,11 @@ const MOUSE_BUTTON_DOWN: u32 = 0x0000_0008;
 const MOUSE_BUTTON_UP: u32 = 0x0000_0009;
 const SCROLL: u32 = 0x0000_000A;
 
+/// `NV_MULTI_CONTROLLER_PACKET`, magic `MULTI_CONTROLLER_MAGIC_GEN5`. Unlike
+/// every other packet in this file, its body is little-endian throughout —
+/// see [`gamepad`].
+const MULTI_CONTROLLER: u32 = 0x0000_000C;
+
 /// Mouse buttons, matching `moonlight-android`'s `MouseButtonPacket`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -64,14 +69,21 @@ impl MouseButton {
 }
 
 /// Start a packet: 4-byte length of everything after this field, then the
-/// magic. Both little-endian.
+/// magic. **The length is big-endian and the magic is little-endian** — the
+/// first of this protocol's several endianness reversals, and the one that is
+/// easiest to get wrong because the two fields are adjacent.
 fn header(magic: u32, body_len: usize) -> Vec<u8> {
     let mut p = Vec::with_capacity(HEADER_LEN + body_len);
-    // The host reads the magic at [4..8] and derives everything else from the
-    // packet's real length, so this field is informational — it is written
-    // correctly anyway, because a wrong value would mislead anyone reading a
-    // capture.
-    p.extend_from_slice(&((body_len + 4) as u32).to_le_bytes());
+    // `NV_INPUT_HEADER.size` is big-endian, matching the table at the top of
+    // `nova-server/src/input.rs` and what Sunshine reads.
+    //
+    // Nova itself never looks at this field: it dispatches on the magic at
+    // [4..8] and takes the length from the datagram framing, so the value here
+    // is informational. That is exactly why it is worth writing correctly —
+    // nothing will ever fail because it is wrong, so a wrong value survives
+    // indefinitely and misleads whoever next reads a capture. It was
+    // little-endian until 2026-08-22.
+    p.extend_from_slice(&((body_len + 4) as u32).to_be_bytes());
     p.extend_from_slice(&magic.to_le_bytes());
     p
 }
@@ -146,6 +158,112 @@ pub fn keyboard(key_code: u16, modifiers: u8, down: bool) -> Vec<u8> {
     p
 }
 
+// ── Gamepad ─────────────────────────────────────────────────────────────────
+
+// The four sentinel fields a real client writes. Nova's parser reads only the
+// magic and the value fields and never looks at these, so they exist to keep a
+// packet capture honest — and so a stricter host later is not a mystery to
+// debug.
+const GAMEPAD_HEADER_B: i16 = 0x001A;
+const GAMEPAD_MID_B: i16 = 0x0014;
+const GAMEPAD_TAIL_A: i16 = 0x009C;
+const GAMEPAD_TAIL_B: i16 = 0x0055;
+
+/// One controller's complete physical state.
+///
+/// `NV_MULTI_CONTROLLER_PACKET` is a **snapshot, not an event**: every packet
+/// carries all buttons, both triggers and all four axes, and the host applies
+/// it wholesale to a ViGEm virtual pad. Android hands the platform layer
+/// discrete `KeyEvent`s and batched `MotionEvent` axes instead, so whoever
+/// calls [`gamepad`] owns the running state and re-sends the whole thing on any
+/// change. There is no "press A" packet to send, and building one from a single
+/// event would release everything else the user is holding.
+///
+/// [`Default`] is the neutral resting state — nothing held, sticks centred,
+/// triggers released — which is what an arriving controller should announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GamepadState {
+    /// XInput's `XINPUT_GAMEPAD` button bits, unchanged.
+    ///
+    /// GameStream's low 16 `buttonFlags` are bit-for-bit identical to XInput's,
+    /// which is why the host hands them to `vigem_client::XButtons` with no
+    /// translation table at all. Turning `KEYCODE_BUTTON_*` into these bits is
+    /// the platform layer's job; nothing here reinterprets them.
+    pub buttons: u16,
+    /// Analog triggers, `0..=255`.
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    /// Stick axes over the full `i16` range, **Y positive is up**.
+    ///
+    /// That is XInput's convention, and the host forwards these to ViGEm
+    /// untouched. Android's `AXIS_Y` is positive *down*, so the platform layer
+    /// must negate. A sign flip here reads as inverted look — a preference
+    /// someone forgot to expose — rather than as a defect, which is what makes
+    /// it worth stating at the type.
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
+}
+
+/// Build a 34-byte `NV_MULTI_CONTROLLER_PACKET`.
+///
+/// ## The body is little-endian — all of it
+///
+/// The mouse builders above write their coordinates big-endian and the keyboard
+/// writes its key code little-endian. This packet is little-endian end to end.
+/// That is not a tidier rule arriving late; it is what
+/// `nova-server/src/input.rs::parse_multi_controller` reads. A flip produces
+/// sticks that slam to the rails and buttons that fire at random — input that
+/// looks like broken hardware rather than backwards bytes, which is the
+/// expensive kind of wrong.
+///
+/// ## `controller_number` and `active_mask` are the plug, not the state
+///
+/// The host derives ViGEm's *plug and unplug* from `active_mask & (1 <<
+/// controller_number)`: a set bit plugs a virtual Xbox 360 pad into that slot,
+/// a clear bit unplugs it. So announcing an arriving controller is this packet
+/// with its bit set and a [`GamepadState::default()`] body; removing one is the
+/// same packet with the bit clear.
+///
+/// **Ending a session needs one clear-bit packet per slot that was ever live.**
+/// [`release_all`] deliberately does not cover gamepads: it is a fixed list of
+/// modifiers and mouse buttons precisely because it needs no state to be
+/// correct, and which pads exist is exactly the state it refuses to carry.
+///
+/// The host ignores slots at or beyond its `MAX_PADS` of 4 without comment, so
+/// `controller_number` must stay in `0..=3`.
+///
+/// Returns a packet unconditionally — unlike [`mouse_move_relative`] or
+/// [`scroll`], an all-zero snapshot is meaningful rather than a no-op. It is
+/// how a controller says everything was let go, and dropping it would strand
+/// whatever was held at the moment the user released it.
+pub fn gamepad(controller_number: u8, active_mask: u16, state: &GamepadState) -> Vec<u8> {
+    // 26 bytes of body after the 8-byte header = 34 total. Offsets in the
+    // comments are from the start of the packet, matching the table in
+    // `nova-server/src/input.rs`.
+    let mut p = header(MULTI_CONTROLLER, 26);
+    p.extend_from_slice(&GAMEPAD_HEADER_B.to_le_bytes()); // @8  headerB
+    p.extend_from_slice(&(controller_number as i16).to_le_bytes()); // @10 controllerNumber
+    p.extend_from_slice(&active_mask.to_le_bytes()); // @12 activeGamepadMask
+    p.extend_from_slice(&GAMEPAD_MID_B.to_le_bytes()); // @14 midB
+    p.extend_from_slice(&state.buttons.to_le_bytes()); // @16 buttonFlags
+    p.push(state.left_trigger); // @18 leftTrigger
+    p.push(state.right_trigger); // @19 rightTrigger
+    p.extend_from_slice(&state.left_stick_x.to_le_bytes()); // @20 leftStickX
+    p.extend_from_slice(&state.left_stick_y.to_le_bytes()); // @22 leftStickY
+    p.extend_from_slice(&state.right_stick_x.to_le_bytes()); // @24 rightStickX
+    p.extend_from_slice(&state.right_stick_y.to_le_bytes()); // @26 rightStickY
+    p.extend_from_slice(&GAMEPAD_TAIL_A.to_le_bytes()); // @28 tailA
+    // @30 buttonFlags2 — Sunshine's extended buttons (paddles, touchpad, misc).
+    // XInput has no equivalent, so Nova parses the packet without them and
+    // forwards nothing to ViGEm. Zero until there is somewhere for them to go.
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p.extend_from_slice(&GAMEPAD_TAIL_B.to_le_bytes()); // @32 tailB
+    debug_assert_eq!(p.len(), 34, "the host reads fixed offsets up to 34");
+    p
+}
+
 /// Release everything that could be held down.
 ///
 /// A key-down travels as its own packet, so anything that stops input between
@@ -216,6 +334,24 @@ pub fn coalesce(packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         let previous = out.last().map(|p| magic_of(p));
 
         match (magic, previous) {
+            (Some(MULTI_CONTROLLER), Some(Some(MULTI_CONTROLLER)))
+                if controller_number_of(&packet)
+                    == out.last().and_then(|p| controller_number_of(p)) =>
+            {
+                // Superseded, for the same reason as an absolute position: the
+                // packet is a full state snapshot, so an older one describes a
+                // moment a newer one has already replaced in its entirety.
+                //
+                // Only for the *same* controller. Two pads are independent —
+                // pad 0's snapshot says nothing about pad 1's, and letting one
+                // supersede the other would drop a second player's input
+                // whenever both were pushed in the same tick. That is also why
+                // this compares against the immediately previous packet only,
+                // exactly as the absolute case does: an interleaved two-player
+                // burst simply does not collapse, which costs a few dozen bytes
+                // and cannot cost anyone a button press.
+                *out.last_mut().expect("previous exists") = packet;
+            }
             (Some(MOUSE_MOVE_ABS), Some(Some(MOUSE_MOVE_ABS))) => {
                 // Superseded: an older position tells the host nothing once a
                 // newer one exists.
@@ -302,6 +438,21 @@ fn magic_of(packet: &[u8]) -> Option<u32> {
         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
 }
 
+/// The controller slot a multi-controller packet addresses, or `None` for any
+/// other packet.
+///
+/// Exists for [`coalesce`], so one pad's snapshots can supersede each other
+/// without ever superseding another pad's. Reads offset 10 little-endian and
+/// narrows exactly as the host does.
+fn controller_number_of(packet: &[u8]) -> Option<u8> {
+    if magic_of(packet) != Some(MULTI_CONTROLLER) {
+        return None;
+    }
+    packet
+        .get(10..12)
+        .map(|b| i16::from_le_bytes(b.try_into().expect("2 bytes")) as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +472,38 @@ mod tests {
         assert_eq!(magic_of(&scroll(120).unwrap()), SCROLL);
         assert_eq!(magic_of(&keyboard(0x41, 0, true)), KEY_DOWN);
         assert_eq!(magic_of(&keyboard(0x41, 0, false)), KEY_UP);
+        assert_eq!(magic_of(&gamepad(0, 0x0001, &GamepadState::default())), MULTI_CONTROLLER);
+    }
+
+    /// `NV_INPUT_HEADER.size` is big-endian while the magic beside it is
+    /// little-endian.
+    ///
+    /// This test is the only thing holding the field correct. Nova never reads
+    /// it — it dispatches on the magic and takes the length from the datagram
+    /// framing — so a regression here breaks nothing at runtime and would be
+    /// found only by someone puzzling over a packet capture, which is the
+    /// slowest possible way to find it.
+    #[test]
+    fn the_header_length_is_big_endian_beside_a_little_endian_magic() {
+        // 34-byte gamepad packet: 30 bytes follow the length field.
+        let p = gamepad(0, 0x0001, &GamepadState::default());
+        assert_eq!(&p[0..4], &[0x00, 0x00, 0x00, 30], "length is big-endian");
+        assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()) as usize, p.len() - 4);
+
+        // And every other builder agrees, since they share `header`.
+        for packet in [
+            mouse_move_relative(1, 1).unwrap(),
+            mouse_move_absolute(1, 1, 2, 2).unwrap(),
+            mouse_button(MouseButton::Left, true),
+            scroll(120).unwrap(),
+            keyboard(0x41, 0, true),
+        ] {
+            assert_eq!(
+                u32::from_be_bytes(packet[0..4].try_into().unwrap()) as usize,
+                packet.len() - 4,
+                "every packet's length field counts the bytes after it"
+            );
+        }
     }
 
     /// Each builder must meet the host's minimum length, or `handle_input_packet`
@@ -504,5 +687,213 @@ mod tests {
         }
         assert!(MouseButton::from_code(0).is_none());
         assert!(MouseButton::from_code(6).is_none());
+    }
+
+    // ── Gamepad ─────────────────────────────────────────────────────────────
+
+    /// What `parse_multi_controller` produces on the host.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ParsedPad {
+        controller_number: u8,
+        active_gamepad_mask: u16,
+        button_flags: u16,
+        left_trigger: u8,
+        right_trigger: u8,
+        left_stick_x: i16,
+        left_stick_y: i16,
+        right_stick_x: i16,
+        right_stick_y: i16,
+    }
+
+    /// A transcription of `nova-server/src/input.rs::parse_multi_controller`,
+    /// offset for offset.
+    ///
+    /// Written to read like the original rather than like idiomatic test code:
+    /// the whole value of this test is that the two can be compared by eye. If
+    /// it is ever tidied into something cleverer it stops proving anything.
+    fn parse_multi_controller(p: &[u8]) -> ParsedPad {
+        assert!(p.len() >= 34, "the host returns None below 34 bytes");
+        assert_eq!(
+            u32::from_le_bytes(p[4..8].try_into().unwrap()),
+            MULTI_CONTROLLER,
+            "the host returns None on a magic it does not know"
+        );
+        ParsedPad {
+            controller_number: i16::from_le_bytes(p[10..12].try_into().unwrap()) as u8,
+            active_gamepad_mask: u16::from_le_bytes(p[12..14].try_into().unwrap()),
+            button_flags: u16::from_le_bytes(p[16..18].try_into().unwrap()),
+            left_trigger: p[18],
+            right_trigger: p[19],
+            left_stick_x: i16::from_le_bytes(p[20..22].try_into().unwrap()),
+            left_stick_y: i16::from_le_bytes(p[22..24].try_into().unwrap()),
+            right_stick_x: i16::from_le_bytes(p[24..26].try_into().unwrap()),
+            right_stick_y: i16::from_le_bytes(p[26..28].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_gamepad_magic_lands_where_the_host_dispatches_on_it() {
+        let p = gamepad(0, 0x0001, &GamepadState::default());
+        assert_eq!(magic_of(&p), MULTI_CONTROLLER);
+        assert_eq!(&p[4..8], &[0x0C, 0x00, 0x00, 0x00], "magic is little-endian");
+    }
+
+    /// Every field, at the offset the host reads it from.
+    ///
+    /// Values are deliberately byte-asymmetric so a big-endian slip cannot pass
+    /// by coincidence, and every field differs from every other so a transposed
+    /// pair (the easy mistake with four axes) fails loudly.
+    #[test]
+    fn every_gamepad_field_round_trips_through_the_hosts_offsets() {
+        let state = GamepadState {
+            buttons: 0x1234,
+            left_trigger: 0x7F,
+            right_trigger: 0xC8,
+            left_stick_x: 4386,    // 0x1122
+            left_stick_y: -13124,  // 0xCCBC
+            right_stick_x: 21862,  // 0x5566
+            right_stick_y: -21863, // 0xAA99
+        };
+        let parsed = parse_multi_controller(&gamepad(2, 0x000B, &state));
+
+        assert_eq!(
+            parsed,
+            ParsedPad {
+                controller_number: 2,
+                active_gamepad_mask: 0x000B,
+                button_flags: 0x1234,
+                left_trigger: 0x7F,
+                right_trigger: 0xC8,
+                left_stick_x: 4386,
+                left_stick_y: -13124,
+                right_stick_x: 21862,
+                right_stick_y: -21863,
+            }
+        );
+    }
+
+    /// The packet is exactly 34 bytes and the sentinels sit where a real client
+    /// puts them. Nova ignores all four, so nothing here fails at runtime — the
+    /// test is what keeps a capture readable and a stricter host from being a
+    /// surprise.
+    #[test]
+    fn the_gamepad_packet_is_34_bytes_with_its_sentinels_in_place() {
+        let p = gamepad(1, 0x0002, &GamepadState::default());
+        assert_eq!(p.len(), 34);
+        assert_eq!(i16::from_le_bytes([p[8], p[9]]), 0x001A, "headerB");
+        assert_eq!(i16::from_le_bytes([p[14], p[15]]), 0x0014, "midB");
+        assert_eq!(i16::from_le_bytes([p[28], p[29]]), 0x009C, "tailA");
+        assert_eq!(i16::from_le_bytes([p[32], p[33]]), 0x0055, "tailB");
+        assert_eq!(
+            u16::from_le_bytes([p[30], p[31]]),
+            0,
+            "buttonFlags2 has no XInput equivalent and must stay zero"
+        );
+    }
+
+    /// The trap this file already warns about, asserted at the byte level: the
+    /// mouse writes big-endian and this packet writes little, so the two live
+    /// side by side and only an explicit check separates them.
+    #[test]
+    fn the_gamepad_body_is_little_endian_unlike_the_mouse_fields() {
+        let p = gamepad(0, 0x0001, &GamepadState { buttons: 0x1234, ..Default::default() });
+        assert_eq!([p[16], p[17]], [0x34, 0x12], "buttonFlags is little-endian");
+
+        let p = gamepad(0, 0x0001, &GamepadState { left_stick_x: 4386, ..Default::default() });
+        assert_eq!([p[20], p[21]], [0x22, 0x11], "leftStickX is little-endian");
+    }
+
+    /// `active_mask` is what plugs and unplugs the virtual pad host-side, so
+    /// both directions are part of the wire contract, not a client convention.
+    #[test]
+    fn the_active_mask_bit_is_what_plugs_and_unplugs_a_slot() {
+        for slot in 0..4u8 {
+            let arrived =
+                parse_multi_controller(&gamepad(slot, 1 << slot, &GamepadState::default()));
+            assert_eq!(arrived.controller_number, slot);
+            assert_ne!(
+                arrived.active_gamepad_mask & (1 << slot),
+                0,
+                "slot {slot} must read as present"
+            );
+
+            let removed = parse_multi_controller(&gamepad(slot, 0, &GamepadState::default()));
+            assert_eq!(
+                removed.active_gamepad_mask & (1 << slot),
+                0,
+                "slot {slot} must read as gone"
+            );
+        }
+    }
+
+    /// A neutral snapshot is not a no-op and must never be dropped: it is how a
+    /// controller says everything was let go. Dropping it strands whatever was
+    /// held at the instant the user released it — the gamepad equivalent of a
+    /// stuck modifier.
+    #[test]
+    fn a_neutral_gamepad_snapshot_is_still_sent() {
+        let neutral = gamepad(0, 0x0001, &GamepadState::default());
+        assert_eq!(neutral.len(), 34);
+
+        let out = coalesce(vec![neutral.clone()]);
+        assert_eq!(out, vec![neutral], "coalesce must not discard a released pad");
+    }
+
+    /// Snapshots supersede within one controller, because only the newest state
+    /// of a pad means anything.
+    #[test]
+    fn gamepad_snapshots_supersede_within_one_controller() {
+        let out = coalesce(vec![
+            gamepad(0, 0x0001, &GamepadState { left_stick_x: 100, ..Default::default() }),
+            gamepad(0, 0x0001, &GamepadState { left_stick_x: 200, ..Default::default() }),
+            gamepad(0, 0x0001, &GamepadState { left_stick_x: 300, ..Default::default() }),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(parse_multi_controller(&out[0]).left_stick_x, 300);
+    }
+
+    /// ...and never across controllers. This is the two-player regression: one
+    /// pad's state says nothing about another's, so merging them would silently
+    /// drop a second player's input whenever both moved in the same tick.
+    #[test]
+    fn gamepad_snapshots_never_supersede_across_controllers() {
+        let out = coalesce(vec![
+            gamepad(0, 0x0003, &GamepadState { left_stick_x: 100, ..Default::default() }),
+            gamepad(1, 0x0003, &GamepadState { left_stick_x: 200, ..Default::default() }),
+        ]);
+        assert_eq!(out.len(), 2, "both players survive");
+        assert_eq!(parse_multi_controller(&out[0]).controller_number, 0);
+        assert_eq!(parse_multi_controller(&out[1]).controller_number, 1);
+    }
+
+    /// Order against other input is exact, and a snapshot does not reach back
+    /// past an unrelated packet to supersede an older one — the same rule as a
+    /// mouse move around a click.
+    #[test]
+    fn a_gamepad_snapshot_does_not_supersede_across_another_packet() {
+        let out = coalesce(vec![
+            gamepad(0, 0x0001, &GamepadState { buttons: 0x1000, ..Default::default() }),
+            keyboard(0x41, 0, true),
+            gamepad(0, 0x0001, &GamepadState { buttons: 0x2000, ..Default::default() }),
+        ]);
+        assert_eq!(out.len(), 3, "nothing is merged across the keystroke");
+        assert_eq!(magic_of(&out[1]), KEY_DOWN);
+        assert_eq!(parse_multi_controller(&out[0]).button_flags, 0x1000);
+        assert_eq!(parse_multi_controller(&out[2]).button_flags, 0x2000);
+    }
+
+    /// `controller_number_of` must answer only for the packet it understands.
+    /// If it answered `None` for everything else *and* for a malformed gamepad
+    /// packet alike, coalesce's guard would compare `None == None` across two
+    /// unrelated packet types and merge them into one.
+    #[test]
+    fn controller_number_is_read_only_from_a_multi_controller_packet() {
+        assert_eq!(
+            controller_number_of(&gamepad(3, 0x0008, &GamepadState::default())),
+            Some(3)
+        );
+        assert_eq!(controller_number_of(&keyboard(0x41, 0, true)), None);
+        assert_eq!(controller_number_of(&mouse_button(MouseButton::Left, true)), None);
+        assert_eq!(controller_number_of(&[]), None);
     }
 }

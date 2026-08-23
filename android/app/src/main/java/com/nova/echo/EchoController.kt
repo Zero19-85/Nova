@@ -123,6 +123,23 @@ class EchoController private constructor(private val context: android.content.Co
     @Volatile var inputEnabled: Boolean = true
 
     /**
+     * Physical controllers, and the virtual pads they own on the host.
+     *
+     * Lives here rather than on [StreamSurfaceView] because the two dispatch
+     * points are in different places: analog motion reaches the view, while
+     * buttons are taken by `MainActivity.dispatchKeyEvent` (a Compose
+     * `AndroidView` does not reliably hold focus, so keys never reach the view
+     * at all). This controller is the one thing both can see.
+     *
+     * Process-scoped like everything else here, which is also right for the
+     * hardware: a controller stays plugged in across an Activity teardown, and
+     * so should the host-side pad it is driving.
+     *
+     * Declared after [inputEnabled] on purpose — the sink lambda reads it.
+     */
+    val gamepads = ControllerHandler(context) { if (inputEnabled) this else null }
+
+    /**
      * Surface to decode onto, supplied by the SurfaceView as one appears and
      * disappears.
      *
@@ -146,6 +163,12 @@ class EchoController private constructor(private val context: android.content.Co
 
     fun init() {
         EchoNative.nativeInit()
+        // Registered for the process lifetime, which is this object's lifetime.
+        // It exists to notice a controller being UNPLUGGED — the host holds a
+        // virtual pad open until told otherwise, and nothing else observes
+        // that. Arrival needs no listener: a pad claims its slot on the first
+        // event it sends.
+        gamepads.start()
         // The microphone switch is *intent* and is persisted, so it has to be
         // restored here rather than defaulting off on every process start —
         // otherwise the settings sheet and the controller disagree about a
@@ -617,6 +640,35 @@ class EchoController private constructor(private val context: android.content.Co
 
     fun scroll(amount: Int) = send(EchoNative.INPUT_SCROLL, amount)
 
+    /**
+     * Post one controller state snapshot.
+     *
+     * Its own native entry point rather than a [send] kind: a snapshot carries
+     * ten fields and the four `Int`s there would have to be bit-packed to hold
+     * them. See [EchoNative.nativeSendGamepad].
+     *
+     * Takes the [ControllerHandler.Pad] whole so the field order lives in one
+     * place. Four axes passed positionally through two call sites is two
+     * chances to transpose a pair, and a transposed axis is a controller that
+     * works *almost* right.
+     */
+    fun gamepad(slot: Int, activeMask: Int, pad: ControllerHandler.Pad) {
+        val h = synchronized(lock) { handle }
+        if (h == 0L) return
+        EchoNative.nativeSendGamepad(
+            h,
+            slot,
+            activeMask,
+            pad.buttons,
+            pad.leftTrigger,
+            pad.rightTrigger,
+            pad.leftStickX,
+            pad.leftStickY,
+            pad.rightStickX,
+            pad.rightStickY,
+        )
+    }
+
     /** Returns whether the key was recognised — unmapped keys must not be sent. */
     fun key(androidKeyCode: Int, down: Boolean, metaState: Int): Boolean {
         val vk = Keycodes.toWindows(androidKeyCode)
@@ -626,12 +678,23 @@ class EchoController private constructor(private val context: android.content.Co
     }
 
     /**
-     * Release every modifier and mouse button on the host.
+     * Release every modifier, mouse button and controller on the host.
      *
      * Cheap and idempotent, so it is sent generously: whenever input stops
      * mid-gesture the key-up never went, and the host is left with a key held.
+     *
+     * The native [EchoNative.INPUT_RELEASE_ALL] covers only modifiers and mouse
+     * buttons — a fixed list, precisely so it needs no state to be correct.
+     * Controllers do need state (which slots are live), so they are released
+     * separately here. Both halves belong behind one call: every existing
+     * caller — backgrounding, the controls opening, input being switched off,
+     * the session stopping — is a moment when a held trigger is exactly as bad
+     * as a held key.
      */
-    fun releaseAllInput() = send(EchoNative.INPUT_RELEASE_ALL, 0)
+    fun releaseAllInput() {
+        send(EchoNative.INPUT_RELEASE_ALL, 0)
+        gamepads.releaseAll()
+    }
 
     fun stats(): String = synchronized(lock) {
         if (handle == 0L) "{}" else runCatching { EchoNative.nativeStats(handle) }.getOrDefault("{}")

@@ -108,6 +108,19 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_POWER -> return super.dispatchKeyEvent(event)
         }
 
+        // Controllers first, and BELOW the escape-hatch list above rather than
+        // above it. Many pads send KEYCODE_BACK for their select button, but
+        // Back is also the only way out of a fullscreen stream once the pointer
+        // is captured — so it stays with the system whatever sent it, and
+        // select comes from KEYCODE_BUTTON_SELECT instead.
+        //
+        // This is also the fix for the d-pad conflict: [Keycodes] maps
+        // KEYCODE_DPAD_UP to VK arrow-up, so before this line a controller's
+        // d-pad typed arrow keys at the host. ControllerHandler claims the
+        // event only when the DEVICE is a gamepad, so a real keyboard's arrows
+        // still reach the branch below.
+        if (controller.gamepads.onKey(event)) return true
+
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
                 // Android's auto-repeat is discarded: Windows generates its own
