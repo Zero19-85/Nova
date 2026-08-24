@@ -496,10 +496,10 @@ fn submit(bundle: &Bundle) -> Result<String, String> {
     };
 
     let body = issue_body(bundle, archive.as_deref());
-    let url = format!(
-        "https://github.com/{repository}/issues/new?title={}&body={}",
-        urlencode(&format!("[bug] {}", first_line(&bundle.description))),
-        urlencode(&body),
+    let url = issue_url(
+        repository,
+        &format!("[bug] {}", first_line(&bundle.description)),
+        &body,
     );
 
     // A durable, double-clickable way back to this exact prefilled form.
@@ -556,11 +556,64 @@ fn submit(bundle: &Bundle) -> Result<String, String> {
     })
 }
 
+/// The largest URL Windows will actually ACT on.
+///
+/// `INTERNET_MAX_URL_LENGTH` is 2083, and it is not advisory: past it the shell
+/// silently declines. Measured 2026-08-24 — a 2347-character `URL=` line in the
+/// `.url` shortcut produced a file Explorer parsed happily (the tooltip showed
+/// the full address) and clicking it did nothing at all. The same limit is why
+/// the browser never opened: the earlier launch test used the bare repo URL,
+/// which is 33 characters, rather than the real prefilled one.
+///
+/// The budget is spent below 2083 so that neither the shortcut nor the direct
+/// launch is anywhere near the edge.
+const MAX_SHELL_URL: usize = 1900;
+
+/// Build the issue URL, trimming the body until the whole thing fits.
+///
+/// Trimming the BODY rather than refusing: an issue form that opens with a
+/// slightly shortened description is worth far more than one that does not open.
+fn issue_url(repository: &str, title: &str, body: &str) -> String {
+    let build = |body: &str| {
+        format!(
+            "https://github.com/{repository}/issues/new?title={}&body={}",
+            urlencode(title),
+            urlencode(body),
+        )
+    };
+
+    let full = build(body);
+    if full.len() <= MAX_SHELL_URL {
+        return full;
+    }
+
+    // Percent-encoding expands unpredictably (1–9 bytes per character), so the
+    // fit is found by measurement rather than arithmetic. Shrinking by a
+    // proportion of the overshoot converges in a handful of passes on any input.
+    let mut keep = body.len();
+    loop {
+        let overshoot = build(&body[..body.floor_char_boundary(keep)]).len();
+        if overshoot <= MAX_SHELL_URL || keep == 0 {
+            break;
+        }
+        keep = keep.saturating_sub((keep / 4).max(64));
+    }
+    let trimmed = &body[..body.floor_char_boundary(keep)];
+    build(&format!("{trimmed}\n\n_(trimmed — the full report is in the attached zip)_"))
+}
+
 /// The Markdown the issue form opens already containing.
 ///
-/// Written so the user's only job is the first line. Everything Nova can answer
-/// is answered; everything it cannot is a prompt with a placeholder, because an
-/// empty heading gets skipped and a leading question gets replied to.
+/// **Deliberately short.** The first version put the whole diagnostic summary in
+/// here — host table, stream table, attachment list — which pushed the URL past
+/// the shell's limit and stopped it opening at all. It was the wrong content for
+/// this box anyway: everything in that summary is already in `report.md` inside
+/// the zip, so putting it in the URL duplicated it into the one place with a hard
+/// size cap, and greeted the reporter with a wall of generated text above the
+/// field they actually need to fill in.
+///
+/// What stays is what only a human can supply, and the instruction that makes
+/// the attachment happen.
 fn issue_body(bundle: &Bundle, archive: Option<&Path>) -> String {
     let attach = match archive {
         Some(path) => format!(
@@ -575,10 +628,23 @@ fn issue_body(bundle: &Bundle, archive: Option<&Path>) -> String {
             .to_string(),
     };
 
+    // One line of host context, not the whole table. Enough for triage to route
+    // the issue without opening the attachment; everything else is in there.
+    let stats = crate::stats::snapshot();
+    let context = if stats.streaming {
+        format!(
+            "Nova {} · {} {} @ {}",
+            env!("CARGO_PKG_VERSION"),
+            stats.resolution_text(),
+            stats.codec,
+            stats.target_fps,
+        )
+    } else {
+        format!("Nova {} · not streaming", env!("CARGO_PKG_VERSION"))
+    };
+
     format!(
-        "<!-- Thanks for reporting. Everything below was filled in automatically. \
-         Edit anything you like, and delete anything you would rather not share. -->\n\n\
-         ## What went wrong\n\n\
+        "## What went wrong\n\n\
          {description}\n\n\
          ## What I expected instead\n\n\
          _Replace this line._\n\n\
@@ -588,11 +654,10 @@ fn issue_body(bundle: &Bundle, archive: Option<&Path>) -> String {
          3. \n\n\
          ## Diagnostics\n\n\
          {attach}\n\n\
-         ---\n\n\
-         {summary}",
+         <sub>{context}</sub>",
         description = bundle.description.trim(),
         attach = attach,
-        summary = bundle.summary,
+        context = context,
     )
 }
 
@@ -853,6 +918,47 @@ mod tests {
     /// The URL is built from this, so an empty owner would produce
     /// `github.com//issues/new` — a 404 at the exact moment a user is trying to
     /// help.
+    /// The limit that made the shortcut inert and stopped the browser opening.
+    ///
+    /// Explorer parses a `.url` whose `URL=` line is any length — the tooltip
+    /// showed all 2347 characters — but the shell refuses to LAUNCH past
+    /// `INTERNET_MAX_URL_LENGTH` (2083), silently.
+    #[test]
+    fn the_issue_url_stays_launchable_however_long_the_report_is() {
+        let huge = "x".repeat(20_000);
+        let url = issue_url(DEFAULT_REPOSITORY, "[bug] something broke", &huge);
+        assert!(
+            url.len() <= MAX_SHELL_URL,
+            "URL is {} chars — Windows will not launch it",
+            url.len()
+        );
+        assert!(url.len() < 2083, "must stay under INTERNET_MAX_URL_LENGTH");
+        assert!(url.starts_with("https://github.com/"), "still a real issue URL");
+        assert!(url.contains("trimmed"), "a trimmed body must say so");
+    }
+
+    /// A body that already fits must be passed through untouched — trimming a
+    /// short report would lose the user's words for nothing.
+    #[test]
+    fn a_short_report_is_not_trimmed() {
+        let url = issue_url(DEFAULT_REPOSITORY, "[bug] x", "the screen went black");
+        assert!(url.len() <= MAX_SHELL_URL);
+        assert!(!url.contains("trimmed"));
+    }
+
+    /// The real shape, at the size it actually occurs — this is what regressed.
+    #[test]
+    fn a_realistic_report_fits_with_room_to_spare() {
+        let zip = PathBuf::from(r"C:\Users\x\Desktop\nova-report-20260824-101500.zip");
+        let bundle = a_bundle(
+            "I disabled Wi-Fi mid-stream and the picture froze, then the app said Failed",
+        );
+        let body = issue_body(&bundle, Some(&zip));
+        let url = issue_url(DEFAULT_REPOSITORY, "[bug] wifi handover froze", &body);
+        assert!(url.len() <= MAX_SHELL_URL, "realistic report produced {} chars", url.len());
+        assert!(!url.contains("trimmed"), "a normal report should never need trimming");
+    }
+
     #[test]
     fn the_default_repository_is_a_real_owner_and_repo() {
         let (owner, repo) = DEFAULT_REPOSITORY.split_once('/').expect("owner/repo");

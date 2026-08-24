@@ -258,13 +258,31 @@ std::string DescribeNalTypes(const std::vector<Nal>& nals) {
     return out.empty() ? std::string(" (none)") : out;
 }
 
-// Rewrite Annex-B as 4-byte-length-prefixed NALs.
-void ToLengthPrefixed(const std::vector<Nal>& nals, Bytes& out) {
+// Padding the encoder inserted to hold a constant bitrate, which is worth
+// nothing on disk.
+//
+// `enableFillerDataInsertion=1` is set for H.264 and HEVC deliberately — it
+// stops CBR's rate controller oscillating the QP on a static screen (the
+// "pulsing text" of Phase 10). That padding earns its place on the WIRE, where
+// the stream is rate-shaped; in a file it is bytes describing nothing. At
+// 47 Mbps CBR against a motionless desktop it can be most of the frame.
+//
+// Dropping it changes nothing a decoder can observe: filler carries no picture
+// data and is skipped by definition.
+bool IsFiller(const Nal& n, bool hevc) {
+    return hevc ? (n.type == 38) : (n.type == 12);
+}
+
+// Rewrite Annex-B as 4-byte-length-prefixed NALs, dropping filler.
+void ToLengthPrefixed(const std::vector<Nal>& nals, bool hevc, Bytes& out) {
     size_t total = 0;
-    for (const Nal& n : nals) total += 4 + n.size;
+    for (const Nal& n : nals) {
+        if (!IsFiller(n, hevc)) total += 4 + n.size;
+    }
     out.clear();
     out.reserve(total);
     for (const Nal& n : nals) {
+        if (IsFiller(n, hevc)) continue;
         PutBE(out, (uint64_t)n.size, 4);
         out.insert(out.end(), n.data, n.data + n.size);
     }
@@ -577,7 +595,7 @@ private:
         }
 
         Bytes payload;
-        ToLengthPrefixed(nals, payload);
+        ToLengthPrefixed(nals, hevc_, payload);
 
         Bytes block;
         PutSize(block, 1);                          // track number, as a vint

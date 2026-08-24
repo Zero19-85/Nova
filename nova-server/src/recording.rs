@@ -129,7 +129,26 @@ pub fn start() -> Result<PathBuf, String> {
     ) {
         0 => {
             *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
-            println!("⏺️  Recording to {}", path.display());
+            // **Force a keyframe, or the recording never starts.**
+            //
+            // Nova runs an INFINITE GOP: there is no periodic IDR, so keyframes
+            // happen only when something asks for one. A recording begun
+            // mid-session therefore sees nothing but P-slices — and a Matroska
+            // track cannot be written at all until the parameter sets arrive,
+            // because they are what CodecPrivate is made of.
+            //
+            // Measured 2026-08-24, and it is exactly this: 60 frames into a 4K
+            // HEVC recording the muxer had seen `NAL types 1, 38` — TRAIL_R
+            // slices and filler — no VPS/SPS/PPS, no track, 0 bytes on disk.
+            // On a healthy link with no loss to repair, that state is permanent.
+            //
+            // The IDR carries OUTPUT_SPSPPS (see the shim's EncodeFrame), so one
+            // request hands the muxer everything it needs on the very next frame.
+            // The live client pays one keyframe for it, which is the same cost it
+            // pays for any repair and is unnoticeable next to not having a
+            // recording at all.
+            encoder::request_idr_global();
+            println!("⏺️  Recording to {} (keyframe requested)", path.display());
             Ok(path)
         }
         -1 => Err("already recording".into()),
