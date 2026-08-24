@@ -7,49 +7,55 @@
 //! module asks the one question a human can answer and assembles the rest
 //! silently.
 //!
-//! ## The credential problem, stated plainly
+//! ## The shape: zip, then hand off to the browser
 //!
-//! The obvious implementation posts straight to the GitHub Issues API with a
-//! token compiled into the binary. **That token is not a secret.** Nova ships as
-//! an installer; anyone who has it can extract the token and post as whatever
-//! account it belongs to, and revoking it breaks every copy already deployed. It
-//! is a credential handed to everyone, with write access to the project's issue
-//! tracker.
+//! 1. Ask the one question.
+//! 2. Gather logs, hardware, stream telemetry and the last encoded frame.
+//! 3. Redact, and write it all to a folder.
+//! 4. Zip the folder to the user's Desktop.
+//! 5. Open GitHub's New Issue form, prefilled with a Markdown template, with an
+//!    Explorer window behind it showing the zip already selected.
 //!
-//! So there are three submission modes, and the DEFAULT is the one that needs no
-//! credential at all:
+//! The user drags the zip in, describes anything Nova could not, and submits —
+//! under their own account.
 //!
-//! 1. **Browser handoff (default).** The bundle is written to disk and GitHub's
-//!    prefilled-issue URL is opened. The user posts under their own account,
-//!    having read what they are sending, and attaches the bundle themselves.
-//!    Nothing is uploaded by Nova, and there is no secret to leak.
-//! 2. **Intake endpoint** (`[bugreport] endpoint`). A URL the project runs that
-//!    holds the GitHub credential server-side. This is the right answer for a
-//!    project that wants one-press reporting; the credential lives somewhere it
-//!    can be rotated.
-//! 3. **Direct token** (`[bugreport] github_token`). For a maintainer running
-//!    their own fork against their own tracker. Never shipped set.
+//! **There is no token in this program and no server behind it.** That is the
+//! standard open-source shape and it is chosen, not settled for: Nova ships as
+//! an installer, so a compiled-in credential is readable by everyone who has a
+//! copy and revocable only for all of them at once. An earlier draft carried an
+//! intake-endpoint mode and a direct-token mode; both were deleted rather than
+//! defaulted off, because a config field for a token is an invitation to put one
+//! there.
 //!
 //! ## Consent is not a formality here
 //!
 //! The bundle contains a log that names the machine, the user, every paired
-//! device, and every address the host has spoken to. [`redact`] removes the
-//! worst of it, and the dialog shows the user the bundle before anything leaves
-//! the machine. A reporter that quietly uploaded a desktop screenshot and a
-//! network trace would be doing something the user did not agree to, however
-//! good the intent.
+//! device, and every address the host has spoken to, plus a picture of whatever
+//! was on screen. [`redact`] removes the worst of it, and the final step is a
+//! human pressing submit on a page showing them exactly what they are sharing.
+//! A reporter that uploaded a desktop screenshot on someone's behalf would be
+//! doing something they never agreed to, however good the intent — so the manual
+//! last step is the feature, not a limitation of the approach.
 //!
-//! ## Why PowerShell for the dialogs and the upload
+//! ## Why PowerShell for the dialogs and the zip
 //!
 //! Precedent, and footprint. `tray.rs` already drives its pairing dialogs
 //! through `Microsoft.VisualBasic.Interaction`, and the ViGEmBus bootstrap
-//! already downloads through `Invoke-WebRequest`. Adding an HTTPS client to the
-//! host binary would mean a TLS stack and a root-certificate store for one
-//! button, in a project whose stated goal is a minimal portable exe.
+//! already shells out to `Invoke-WebRequest`. `Compress-Archive` ships with
+//! every supported Windows. Adding a zip crate and an HTTPS stack to the host
+//! binary for one button would fight the project's minimal-exe goal for no gain
+//! a user could perceive.
 
 use std::path::{Path, PathBuf};
 
 use crate::debug;
+
+/// The project's issue tracker.
+///
+/// A constant rather than only a config default, so a `nova.toml` that predates
+/// `[bugreport]` — or one where the field was blanked — still files against
+/// somewhere real instead of building a URL with an empty owner.
+pub const DEFAULT_REPOSITORY: &str = "Zero19-85/Nova";
 
 /// How much of the log tail to include.
 ///
@@ -456,145 +462,196 @@ fn read_tail(path: &Path, limit: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Hand the finished bundle off, by whichever route is configured.
+
+// ── Packaging and handoff ───────────────────────────────────────────────────
+
+/// Zip the bundle and open a prefilled issue in the user's browser.
+///
+/// **No credential, no server, no upload.** This is the standard open-source
+/// shape and it is chosen rather than settled for: Nova ships as an installer,
+/// so any token compiled into it is readable by everyone who has a copy and can
+/// only be revoked for everyone at once. An intake service would fix that and
+/// costs a server the project does not have.
+///
+/// So the flow is: Nova builds the evidence, the browser opens the issue form
+/// already written, and the user attaches the zip and presses submit. The user
+/// posts under their own account, sees exactly what they are sharing, and can
+/// edit or abandon it. That the last step is manual is the feature — a reporter
+/// that uploaded a screenshot of somebody's desktop on their behalf would be
+/// doing something they never agreed to.
 fn submit(bundle: &Bundle) -> Result<String, String> {
     let cfg = crate::config::NovaConfig::load();
-    let endpoint = cfg.bugreport.endpoint.trim();
-    let token = cfg.bugreport.github_token.trim();
+    let repository = cfg.bugreport.repository.trim();
+    let repository = if repository.is_empty() { DEFAULT_REPOSITORY } else { repository };
 
-    if !endpoint.is_empty() {
-        return post_to_endpoint(endpoint, bundle);
-    }
-    if !token.is_empty() {
-        return post_to_github(&cfg.bugreport.repository, token, bundle);
-    }
-    open_prefilled_issue(&cfg.bugreport.repository, bundle)
-}
-
-/// The default: let the user post it themselves.
-///
-/// GitHub's `/issues/new` accepts a URL-encoded title and body, so the issue
-/// opens already written. The user reads it, sees exactly what is being shared,
-/// and attaches the bundle directory Nova just opened for them.
-///
-/// The body is truncated because a URL has a practical length limit and browsers
-/// silently mangle long ones — so what goes in the link is the summary, and the
-/// logs stay as files the user drags in.
-fn open_prefilled_issue(repository: &str, bundle: &Bundle) -> Result<String, String> {
-    const URL_BODY_LIMIT: usize = 4000;
-    let body = if bundle.summary.len() > URL_BODY_LIMIT {
-        format!(
-            "{}\n\n_(truncated — the full report and logs are in the folder Nova opened)_",
-            &bundle.summary[..bundle.summary.floor_char_boundary(URL_BODY_LIMIT)]
-        )
-    } else {
-        bundle.summary.clone()
+    // The zip is the deliverable. If it cannot be produced the report is still
+    // worth filing — the folder is right there and the user can attach its
+    // contents — so this reports rather than aborts.
+    let archive = match zip_bundle(bundle, &cfg.bugreport.output_dir) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            println!("⚠️  Bug report: could not create the .zip ({e}) — the folder is still there");
+            None
+        }
     };
 
-    let title = first_line(&bundle.description);
+    let body = issue_body(bundle, archive.as_deref());
     let url = format!(
         "https://github.com/{repository}/issues/new?title={}&body={}",
-        urlencode(&format!("[report] {title}")),
+        urlencode(&format!("[bug] {}", first_line(&bundle.description))),
         urlencode(&body),
     );
 
-    // The folder first, so the attachments are already in front of the user when
-    // the browser lands on the issue form.
-    let _ = std::process::Command::new("explorer")
-        .arg(&bundle.directory)
-        .spawn();
+    // Reveal the zip BEFORE the browser, so the file the form asks for is
+    // already selected in an Explorer window behind it. Reversing these leaves
+    // the user on a page telling them to drag a file they now have to go and
+    // find.
+    match &archive {
+        Some(path) => reveal_in_explorer(path),
+        None => reveal_in_explorer(&bundle.directory),
+    }
     open_url(&url)?;
-    Ok(format!(
-        "Report prepared in {} — the issue form is open in your browser",
-        bundle.directory.display()
-    ))
+
+    Ok(match archive {
+        Some(path) => format!("Saved {} — the issue form is open in your browser", path.display()),
+        None => format!(
+            "Saved {} (no .zip — attach the files by hand) — the issue form is open",
+            bundle.directory.display()
+        ),
+    })
 }
 
-/// Post to a project-run intake service, which holds the GitHub credential.
-fn post_to_endpoint(endpoint: &str, bundle: &Bundle) -> Result<String, String> {
-    let payload = serde_json::json!({
-        "nova_version": env!("CARGO_PKG_VERSION"),
-        "title": first_line(&bundle.description),
-        "body": bundle.summary,
-    });
-    let response = powershell_post(endpoint, &payload.to_string(), &[])?;
-    Ok(format!("Report submitted ({})", first_line(&response)))
-}
-
-/// Post directly to the GitHub Issues API with a configured token.
+/// The Markdown the issue form opens already containing.
 ///
-/// Only reachable when an operator has put their own token in `nova.toml`. Never
-/// shipped set — see the credential note at the top of this module.
-fn post_to_github(repository: &str, token: &str, bundle: &Bundle) -> Result<String, String> {
-    let payload = serde_json::json!({
-        "title": format!("[report] {}", first_line(&bundle.description)),
-        "body": bundle.summary,
-    });
-    let url = format!("https://api.github.com/repos/{repository}/issues");
-    let response = powershell_post(
-        &url,
-        &payload.to_string(),
-        &[
-            ("Authorization", &format!("Bearer {token}")),
-            ("Accept", "application/vnd.github+json"),
-            ("X-GitHub-Api-Version", "2022-11-28"),
-            ("User-Agent", "nova-server"),
-        ],
-    )?;
-    Ok(format!("Issue filed ({})", first_line(&response)))
+/// Written so the user's only job is the first line. Everything Nova can answer
+/// is answered; everything it cannot is a prompt with a placeholder, because an
+/// empty heading gets skipped and a leading question gets replied to.
+fn issue_body(bundle: &Bundle, archive: Option<&Path>) -> String {
+    let attach = match archive {
+        Some(path) => format!(
+            "**Please drag `{}` into this box before submitting.**\n\n\
+             It is on your Desktop, and the Explorer window Nova just opened has it selected. \
+             It contains the host logs, this machine's specifications, and a snapshot of the \
+             last frame the encoder produced.",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        None => "**Please attach the report folder Nova just opened.** The `.zip` could not be \
+                 created automatically, so the individual files need attaching instead."
+            .to_string(),
+    };
+
+    format!(
+        "<!-- Thanks for reporting. Everything below was filled in automatically. \
+         Edit anything you like, and delete anything you would rather not share. -->\n\n\
+         ## What went wrong\n\n\
+         {description}\n\n\
+         ## What I expected instead\n\n\
+         _Replace this line._\n\n\
+         ## Steps to reproduce\n\n\
+         1. _Replace this line._\n\
+         2. \n\
+         3. \n\n\
+         ## Diagnostics\n\n\
+         {attach}\n\n\
+         ---\n\n\
+         {summary}",
+        description = bundle.description.trim(),
+        attach = attach,
+        summary = bundle.summary,
+    )
 }
 
-/// One HTTPS POST, through PowerShell.
+/// Compress the report directory into a single `.zip`.
 ///
-/// See the module header for why this is not a Rust HTTP client. The body is
-/// passed on **stdin** rather than interpolated into the command line: it
-/// contains a user's free text and a log, and a quoted-string command line is a
-/// shell-injection surface plus a length limit.
-fn powershell_post(url: &str, body: &str, headers: &[(&str, &str)]) -> Result<String, String> {
-    use std::io::Write;
+/// Uses PowerShell's `Compress-Archive` rather than a zip crate. The project's
+/// stated goal is a minimal portable exe and this is a button a human presses
+/// once; the same reasoning already puts the pairing dialogs and the ViGEmBus
+/// download on PowerShell. `Compress-Archive` ships with every supported
+/// Windows and deflates, which matters here — a log tail compresses roughly ten
+/// to one, and GitHub has an attachment size limit.
+///
+/// Returns the archive path.
+fn zip_bundle(bundle: &Bundle, configured_dir: &str) -> Result<PathBuf, String> {
+    let dir = output_dir(configured_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
 
-    let header_literal = headers
-        .iter()
-        .map(|(k, v)| format!("'{}' = '{}'", escape_ps(k), escape_ps(v)))
-        .collect::<Vec<_>>()
-        .join("; ");
+    let name = bundle
+        .directory
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "report".into());
+    let archive = dir.join(format!("nova-report-{name}.zip"));
+    // Compress-Archive refuses to overwrite without -Force, and -Force on a
+    // path that already exists is the only way a second report in the same
+    // second does not fail.
+    let _ = std::fs::remove_file(&archive);
 
     let script = format!(
-        "$body = [Console]::In.ReadToEnd(); \
-         $headers = @{{ {header_literal} }}; \
-         try {{ \
-            $r = Invoke-RestMethod -Uri '{}' -Method Post -Body $body \
-                 -ContentType 'application/json' -Headers $headers -TimeoutSec 30; \
-            if ($r.html_url) {{ Write-Output $r.html_url }} else {{ Write-Output 'accepted' }} \
-         }} catch {{ Write-Error $_.Exception.Message; exit 1 }}",
-        escape_ps(url)
+        "$ErrorActionPreference='Stop'; \
+         Compress-Archive -Path '{}\\*' -DestinationPath '{}' -CompressionLevel Optimal -Force",
+        escape_ps(&bundle.directory.to_string_lossy()),
+        escape_ps(&archive.to_string_lossy()),
     );
 
-    let mut child = std::process::Command::new("powershell")
+    let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run the upload: {e}"))?;
+        .output()
+        .map_err(|e| format!("could not run Compress-Archive: {e}"))?;
 
-    child
-        .stdin
-        .as_mut()
-        .ok_or("the upload process refused its input")?
-        .write_all(body.as_bytes())
-        .map_err(|e| format!("could not send the report: {e}"))?;
-
-    let output = child.wait_with_output().map_err(|e| format!("upload failed: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "the report could not be submitted: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // Trust the exit code only as far as the file: a zip that does not exist is
+    // a zip the user cannot attach, whatever PowerShell reported.
+    if !archive.exists() {
+        return Err("Compress-Archive reported success but wrote no file".into());
+    }
+    Ok(archive)
 }
 
+/// Where the finished `.zip` goes.
+///
+/// The Desktop by default, because the next thing that happens is a drag into a
+/// browser and the Desktop is the one folder every user can find during that.
+/// A configured `[bugreport] output_dir` wins.
+///
+/// Falls back to the report directory itself if the Desktop cannot be resolved —
+/// which happens for real here, not just in theory: a Worker respawned under the
+/// SYSTEM fallback has no user profile, so `USERPROFILE` points somewhere with no
+/// Desktop at all.
+fn output_dir(configured: &str) -> PathBuf {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let desktop = PathBuf::from(profile).join("Desktop");
+        if desktop.is_dir() {
+            return desktop;
+        }
+    }
+    debug::log_path().parent().unwrap_or(Path::new(".")).join("bugreports")
+}
+
+/// Open Explorer with `path` selected, so a drag-and-drop is one motion away.
+///
+/// `/select,` needs the argument as ONE token including the comma; splitting it
+/// opens the user's Documents folder instead, which is the sort of failure
+/// nobody reports and everybody works around.
+fn reveal_in_explorer(path: &Path) {
+    let selected = path.is_file();
+    let mut cmd = std::process::Command::new("explorer");
+    if selected {
+        cmd.arg(format!("/select,{}", path.display()));
+    } else {
+        cmd.arg(path);
+    }
+    // Explorer's exit code is meaningless (it returns 1 on success routinely),
+    // so nothing is checked here. A failure to open a window must not fail a
+    // report that has already been written to disk.
+    let _ = cmd.spawn();
+}
 /// Escape for a PowerShell single-quoted string, where `'` is doubled.
 fn escape_ps(text: &str) -> String {
     text.replace('\'', "''")
@@ -679,6 +736,59 @@ mod tests {
     #[test]
     fn powershell_quotes_in_a_url_cannot_break_out_of_their_string() {
         assert_eq!(escape_ps("it's"), "it''s");
+    }
+
+    fn a_bundle(description: &str) -> Bundle {
+        Bundle {
+            directory: PathBuf::from(r"C:\x\bugreports\20260824-101500"),
+            description: description.into(),
+            summary: "### Host\n\n| Nova | 0.1.0 |\n".into(),
+        }
+    }
+
+    /// The template has to tell the user what to do with the file, or the whole
+    /// point of packaging it is lost — an issue with no attachment is the
+    /// unactionable report this feature exists to replace.
+    #[test]
+    fn the_issue_body_names_the_zip_and_asks_for_it() {
+        let zip = PathBuf::from(r"C:\Users\x\Desktop\nova-report-20260824-101500.zip");
+        let body = issue_body(&a_bundle("the picture froze"), Some(&zip));
+        assert!(body.contains("nova-report-20260824-101500.zip"), "{body}");
+        assert!(body.contains("drag"), "the body must ask for the attachment: {body}");
+        assert!(body.contains("the picture froze"), "the user's words must survive");
+        assert!(body.contains("## Steps to reproduce"), "template sections missing");
+    }
+
+    /// A failed zip must not produce a template that points at a file which does
+    /// not exist — that sends the user hunting for something Nova never wrote.
+    #[test]
+    fn without_a_zip_the_body_asks_for_the_folder_instead() {
+        let body = issue_body(&a_bundle("no picture"), None);
+        assert!(body.contains("folder"), "{body}");
+        // Explaining that the zip could not be made is fine and necessary. What
+        // must never appear is a specific FILENAME, which would send the user
+        // hunting for something Nova never wrote.
+        assert!(
+            !body.contains("nova-report-"),
+            "must not name a zip that was never created: {body}"
+        );
+    }
+
+    #[test]
+    fn a_configured_output_directory_wins_over_the_desktop() {
+        assert_eq!(output_dir(r"D:\reports"), PathBuf::from(r"D:\reports"));
+        // Blank falls through to the Desktop, or to the report folder when there
+        // is no profile — either way it must produce SOMEWHERE, never a panic.
+        assert!(output_dir("  ").is_absolute() || output_dir("  ").components().count() > 0);
+    }
+
+    /// The URL is built from this, so an empty owner would produce
+    /// `github.com//issues/new` — a 404 at the exact moment a user is trying to
+    /// help.
+    #[test]
+    fn the_default_repository_is_a_real_owner_and_repo() {
+        let (owner, repo) = DEFAULT_REPOSITORY.split_once('/').expect("owner/repo");
+        assert!(!owner.is_empty() && !repo.is_empty());
     }
 
     #[test]

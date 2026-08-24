@@ -339,6 +339,50 @@ pub fn rtt_stats() -> (u32, u32) {
     (RTT_LAST_MS.load(Ordering::Relaxed), if best == u32::MAX { 0 } else { best })
 }
 
+/// When the host last *answered* a control round trip, as milliseconds since
+/// process start.
+///
+/// This is the signal that separates "the network is gone" from "the host has
+/// stopped producing frames", and the difference decides whether reconnecting
+/// helps or hurts. A Nova host stops sending video for several seconds on every
+/// Worker respawn — a sign-out, a sign-in, a SYSTEM-fallback upgrade — while its
+/// Master, which owns every socket, keeps answering control calls throughout.
+/// Video silence alone therefore cannot mean what it looks like it means.
+///
+/// Zero means "never", which [`control_idle`] reports as `None` for the same
+/// reason [`crate::handover::Liveness`] does: before the first answer there is
+/// nothing to be silent relative to.
+static CONTROL_ALIVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-start reference for [`CONTROL_ALIVE_MS`]. An `Instant` cannot live in
+/// an atomic, and a wall clock would jump when the phone syncs time.
+static CONTROL_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn control_now_ms() -> u64 {
+    CONTROL_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Record that the host answered. Called from the RTT probe.
+fn mark_control_alive() {
+    CONTROL_ALIVE_MS.store(control_now_ms().max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long since the host last answered a control call, or `None` if it never
+/// has on this attempt.
+pub fn control_idle() -> Option<Duration> {
+    let last = CONTROL_ALIVE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(control_now_ms().saturating_sub(last)))
+}
+
+/// Forget the last answer. Called at the start of every handover attempt, so a
+/// previous attempt's healthy control channel cannot vouch for this one.
+pub fn reset_control_liveness() {
+    CONTROL_ALIVE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Ceiling on packets drained into one batch.
 ///
 /// Bounds the work per iteration without bounding the *queue*: a larger burst
@@ -419,6 +463,25 @@ pub struct StreamOptions {
     /// punched tunnel. The host refuses that port from non-private addresses,
     /// so this is not a WAN fallback and must not be presented as one.
     pub control: Option<String>,
+    /// Set to leave the host's session ALIVE when [`stream`] returns.
+    ///
+    /// **This is the difference between a handover and a disconnect, and getting
+    /// it wrong destroys the thing a handover exists to preserve.** The host
+    /// distinguishes "said goodbye" from "went quiet": a client that sends
+    /// `stop_session` gets a full teardown — display released, desktop
+    /// rearranged, session gone — while a client that simply stops talking is
+    /// DETACHED, with its display and everything running on it held for
+    /// `detach_grace_secs` so it can reclaim them.
+    ///
+    /// `stream`'s cleanup says goodbye unconditionally, which is right for a
+    /// user who pressed stop and catastrophic for a path that just died: the
+    /// first thing the reconnect would find is that its session had been torn
+    /// down on its way out. Setting this makes the exit silent, which is exactly
+    /// what the host's detach path is built for.
+    ///
+    /// Shared and atomic because the decision is made mid-stream, by
+    /// [`crate::handover`], after this struct was built.
+    pub detach_on_exit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for StreamOptions {
@@ -430,6 +493,8 @@ impl Default for StreamOptions {
             bitrate_kbps: 20000,
             app_id: 1,
             control: None,
+            // Say goodbye, which is what a one-shot caller means by returning.
+            detach_on_exit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1028,6 +1093,8 @@ async fn stream_inner(
                 let ms = began.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 RTT_LAST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
                 RTT_BEST_MS.fetch_min(ms, std::sync::atomic::Ordering::Relaxed);
+                // A round trip the HOST answered. See `control_idle`.
+                mark_control_alive();
 
                 // Send the client's own view of the session to the host, so it
                 // lands in the host log next to the host's measurements. Both
@@ -1230,9 +1297,28 @@ async fn stream_inner(
         p.disarm();
     }
 
-    // Always tell the host we are done. A session left open would block the
-    // next client — including a Moonlight one, which is exactly the asymmetry
-    // the host's gate exists to prevent.
+    // Tell the host we are done — UNLESS this exit is a handover.
+    //
+    // A session left open would block the next client, including a Moonlight
+    // one, which is the asymmetry the host's gate exists to prevent. But saying
+    // goodbye is a *teardown request*: it releases the display and destroys the
+    // session. On a path that just died that is precisely wrong — the reconnect
+    // has nothing left to reclaim, and the user watches their desktop rearrange
+    // itself for a network blip. See `StreamOptions::detach_on_exit`.
+    //
+    // Going silent instead is not a leak: the host's sweep detaches an unheard-
+    // from session and reaps it at `detach_grace_secs`, so the pipeline is
+    // released either way — just late enough to come back to.
+    if opts.detach_on_exit.load(std::sync::atomic::Ordering::SeqCst) {
+        progress.event(Event::Warning {
+            message: "leaving the host session attached for a handover".into(),
+        });
+        // No `Ended` either. It is the terminal event as far as a platform layer
+        // is concerned, and emitting one per attempt is how a UI tears itself
+        // down in the middle of a recovery that is still going.
+        return Ok(stats);
+    }
+
     if let Err(e) = ctl.lock().await.call("stop_session", serde_json::Map::new()).await {
         // Not fatal: the host also releases the session when the control tunnel
         // closes, precisely so a client that vanishes cannot hold the pipeline.

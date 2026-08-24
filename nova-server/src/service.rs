@@ -574,8 +574,36 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                 None => true,
                 Some(h) if h.has_exited() => {
                     let _ = unsafe { CloseHandle(h.process) };
+                    // A fast exit with NO USER TOKEN in the session is not a
+                    // crash — it is a sign-out.
+                    //
+                    // The damper exists so a host that crashes during startup
+                    // cannot be respawned every reconcile tick (15.3: every start
+                    // cycles the VDD devnode, so the loop was audible). It was
+                    // never meant to police the sign-out path, and on that path
+                    // it is actively harmful: an interactive host CANNOT run in a
+                    // session with no signed-in user, so the exit is both
+                    // expected and instant, and the correct next action is the
+                    // SYSTEM fallback — immediately, not in four seconds.
+                    //
+                    // Measured on the dev box 2026-08-24, and this is the whole
+                    // reason a live stream freezes across a sign-out:
+                    //
+                    //   Host exited 0.6s after spawn (fast exit #1) — backing off 4s
+                    //     ↳ interactive spawn failed (WTSQueryUserToken: token does not exist)
+                    //   Host spawned in session 1 as SYSTEM (pre-login fallback)
+                    //
+                    // Four seconds of no Worker, therefore no capture and no
+                    // encode, bought to protect against a crash that was not
+                    // happening. The client sees a frozen picture for the whole
+                    // window and, if it is Echo, may conclude its path is dead.
+                    //
+                    // The crash case is untouched: a host that dies fast while
+                    // the session DOES have a signed-in user is still a crash and
+                    // still backs off.
+                    let signed_out = !session_has_user_token(session);
                     match last_spawn {
-                        Some(t) if t.elapsed() < HEALTHY_UPTIME => {
+                        Some(t) if t.elapsed() < HEALTHY_UPTIME && !signed_out => {
                             fast_exits += 1;
                             let delay_s = (2u64 << fast_exits.min(5)).min(60);
                             respawn_not_before = Some(
@@ -585,6 +613,20 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
                             println!(
                                 "⚠️  Host exited {:.1}s after spawn (fast exit #{fast_exits}) — \
                                  backing off {delay_s}s before respawn",
+                                t.elapsed().as_secs_f32()
+                            );
+                        }
+                        Some(t) if signed_out => {
+                            // Deliberately does NOT reset `fast_exits`: a genuine
+                            // crash loop that happens to straddle a sign-out
+                            // should keep its history rather than be forgiven by
+                            // it. It only declines to ADD to it, and declines to
+                            // wait.
+                            respawn_not_before = None;
+                            println!(
+                                "🔑 Host exited {:.1}s after spawn with no signed-in user in \
+                                 session {session} — treating as a sign-out, respawning at once \
+                                 (SYSTEM fallback)",
                                 t.elapsed().as_secs_f32()
                             );
                         }

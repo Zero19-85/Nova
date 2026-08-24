@@ -260,15 +260,30 @@ pub struct HandoverPolicy {
     /// for a minute has already decided the app is broken.
     pub resume_window: Duration,
 
-    /// Video silence that counts as an interruption.
-    ///
-    /// This is the number that catches the silent swap, so it is bounded from
-    /// both sides. Too low and a legitimate stall — the host encoding a 4K IDR,
-    /// a decoder hiccup, a moment of congestion — throws away a working path and
-    /// costs a full reconnect. Too high and the user sits in front of a frozen
-    /// picture while the fix is one rebind away. 1.5 s is roughly 90 missed
-    /// frames at 60 fps, which no healthy path produces.
+    /// Video silence that counts as an interruption — but only alongside
+    /// [`Self::control_stall_timeout`]. See that field.
     pub stall_timeout: Duration,
+
+    /// Control-plane silence required before video silence is believed.
+    ///
+    /// **Video going quiet does not mean the network is gone, and acting as
+    /// though it does makes a host-side pause worse.** A Nova host stops
+    /// producing frames for several seconds on every Worker respawn — sign-out,
+    /// sign-in, the SYSTEM-fallback upgrade — while its Master, which owns every
+    /// socket, keeps answering control calls throughout. Measured on the dev box
+    /// 2026-08-24: `Host exited 0.6s after spawn … backing off 4s`, then two
+    /// more pipe cycles before `replaying ConfigureStart`.
+    ///
+    /// A video-only watchdog fires in the middle of that, tears down a perfectly
+    /// good path, and reconnects — which cannot help, because the host was never
+    /// the problem's network end, and which costs the client its place in the
+    /// queue while the host is still coming back. So both signals must agree:
+    /// no frames AND no answers.
+    ///
+    /// Shorter than the video timeout because a control round trip is cheap and
+    /// frequent (`RTT_PROBE_INTERVAL`), so its silence is the more decisive of
+    /// the two once video has already stopped.
+    pub control_stall_timeout: Duration,
 
     /// Gap before the first retry.
     ///
@@ -292,6 +307,7 @@ impl Default for HandoverPolicy {
         Self {
             resume_window: Duration::from_secs(60),
             stall_timeout: Duration::from_millis(1500),
+            control_stall_timeout: Duration::from_millis(1200),
             first_backoff: Duration::from_millis(250),
             max_backoff: Duration::from_secs(3),
         }
@@ -465,13 +481,30 @@ async fn attempt<S: FrameSink, P: Progress>(
     policy: &HandoverPolicy,
     started_epoch: u64,
 ) -> Attempt {
+    // A previous attempt's healthy control channel must not vouch for this one.
+    session::reset_control_liveness();
+
     // Every attempt binds its own socket inside `open_path`. Reusing one across
     // a handover is not an optimisation that costs a little latency — it is a
     // socket holding a mapping on an interface that is gone, and it will
     // "succeed" at sending forever.
-    let path: OpenPath = match session::open_path(identity, connect, progress).await {
-        Ok(path) => path,
-        Err(reason) => return Attempt::Interrupted(classify(reason, started_epoch)),
+    //
+    // Raced against the epoch, because `open_path` is not otherwise
+    // interruptible and its budget is long: the WAN punch alone blasts for 8
+    // seconds. On a phone that is walking between networks the ground can move
+    // twice inside one attempt, and without this the second change waits out the
+    // first attempt's full timeout before anything reacts to it.
+    let path: OpenPath = tokio::select! {
+        opened = session::open_path(identity, connect, progress) => match opened {
+            Ok(path) => path,
+            Err(reason) => return Attempt::Interrupted(classify(reason, started_epoch)),
+        },
+        moved = epoch_changed(started_epoch) => {
+            return Attempt::Interrupted(Interruption::NetworkChanged { epoch: moved });
+        }
+        _ = stopped(stop.clone()) => {
+            return Attempt::Stopped(ReceiveStats::default());
+        }
     };
 
     // The attempt's own stop signal: set by the caller's stop, by a network
@@ -487,6 +520,7 @@ async fn attempt<S: FrameSink, P: Progress>(
         live.clone(),
         policy.clone(),
         started_epoch,
+        stream_opts.detach_on_exit.clone(),
     ));
 
     let mut watched = WatchdogSink { inner: sink, live: live.clone() };
@@ -502,6 +536,12 @@ async fn attempt<S: FrameSink, P: Progress>(
     )
     .await;
     watcher.abort();
+
+    // Put the flag back for the next attempt. The watcher raised it on its way
+    // out; leaving it raised would make a later *deliberate* stop go silent too,
+    // and a session nobody says goodbye to holds the host's pipeline until its
+    // grace period expires — locking out every other paired device meanwhile.
+    stream_opts.detach_on_exit.store(false, Ordering::SeqCst);
 
     // The watcher's reason outranks whatever `stream` said on the way out.
     // `stream` reports the *symptom* of an interruption it was asked to make —
@@ -529,7 +569,18 @@ async fn watch_for_interruption(
     live: Arc<Liveness>,
     policy: HandoverPolicy,
     started_epoch: u64,
+    detach_on_exit: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // Raised BEFORE `attempt_stop` on every interruption path, and never on the
+    // caller's-stop path. Ordering matters: `stream` reads it during the cleanup
+    // that `attempt_stop` triggers, so a flag set afterwards would arrive to
+    // find the goodbye already sent and the host's session already torn down.
+    let interrupt = |what: Interruption| {
+        detach_on_exit.store(true, Ordering::SeqCst);
+        *reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(what);
+        let _ = attempt_stop.send(true);
+    };
+
     // Fast enough that the epoch path costs a fraction of the backoff it saves,
     // slow enough to be free. The stall path is bounded by `stall_timeout`
     // anyway, so this tick is not the resolution of that measurement.
@@ -541,17 +592,29 @@ async fn watch_for_interruption(
             _ = tick.tick() => {
                 let now = epoch();
                 if now != started_epoch {
-                    *reason.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(Interruption::NetworkChanged { epoch: now });
-                    let _ = attempt_stop.send(true);
+                    interrupt(Interruption::NetworkChanged { epoch: now });
                     return;
                 }
+                // BOTH signals, never video alone — see
+                // `HandoverPolicy::control_stall_timeout`. A host that has
+                // stopped encoding but is still answering is a host that is
+                // coming back on its own, and the only thing a reconnect adds
+                // there is a teardown.
                 if let Some(silent) = live.silent_for() {
                     if silent >= policy.stall_timeout {
-                        *reason.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(Interruption::Stalled { silent_for: silent });
-                        let _ = attempt_stop.send(true);
-                        return;
+                        match session::control_idle() {
+                            // The host is still answering: this is a host-side
+                            // pause, not a lost path. Hold the picture and wait.
+                            Some(idle) if idle < policy.control_stall_timeout => {}
+                            // Answered once, and has now stopped: the path is
+                            // gone. `None` means it never answered on this
+                            // attempt, which with video also silent is the same
+                            // conclusion.
+                            _ => {
+                                interrupt(Interruption::Stalled { silent_for: silent });
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -580,6 +643,35 @@ fn classify(reason: String, started_epoch: u64) -> Interruption {
         Interruption::NetworkChanged { epoch: now }
     } else {
         Interruption::Failed { reason }
+    }
+}
+
+/// Resolves with the new epoch once it differs from `known`.
+///
+/// Polled rather than notified: the epoch is raised from a JNI call on Android's
+/// connectivity callback, which has no runtime handle to wake a `Notify` with,
+/// and 100 ms is far below the time any reconnect takes.
+async fn epoch_changed(known: u64) -> u64 {
+    loop {
+        let now = epoch();
+        if now != known {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Resolves when the caller sets `stop`.
+async fn stopped(mut stop: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            // Every sender gone: nothing can ever stop us, so this future must
+            // never resolve — returning here would abort a healthy attempt.
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -654,5 +746,66 @@ mod tests {
     fn the_default_resume_window_fits_inside_the_hosts_detach_grace() {
         const HOST_DEFAULT_DETACH_GRACE: Duration = Duration::from_secs(600);
         assert!(HandoverPolicy::default().resume_window < HOST_DEFAULT_DETACH_GRACE);
+    }
+
+    /// An ordinary caller says goodbye; only the supervisor makes an exit
+    /// silent. A default of `true` would leave every CLI run holding the host's
+    /// pipeline until its grace period expired.
+    #[test]
+    fn a_plain_stream_says_goodbye_on_the_way_out() {
+        let opts = StreamOptions::default();
+        assert!(!opts.detach_on_exit.load(Ordering::SeqCst));
+    }
+
+    /// Video silence alone must not trigger a handover while the host is still
+    /// answering — that is a Worker respawn, and reconnecting through one costs
+    /// the session for a problem the network end never had.
+    #[test]
+    fn a_host_that_still_answers_is_not_a_lost_path() {
+        let policy = HandoverPolicy::default();
+        let video_silent = policy.stall_timeout + Duration::from_millis(500);
+
+        // Host answered 200 ms ago: a pause, not a loss.
+        let control_recent = Duration::from_millis(200);
+        assert!(control_recent < policy.control_stall_timeout);
+        assert!(video_silent >= policy.stall_timeout);
+
+        // Both quiet: a genuinely lost path.
+        let control_gone = policy.control_stall_timeout + Duration::from_millis(500);
+        assert!(control_gone >= policy.control_stall_timeout);
+    }
+
+    /// The control timeout has to be reachable while video silence is still
+    /// being measured, or the second signal could never agree in time.
+    #[test]
+    fn the_control_timeout_is_not_longer_than_the_video_one() {
+        let policy = HandoverPolicy::default();
+        assert!(policy.control_stall_timeout <= policy.stall_timeout);
+    }
+
+    #[tokio::test]
+    async fn an_epoch_that_moves_wakes_the_open_path_race() {
+        let start = epoch();
+        let waiter = tokio::spawn(async move { epoch_changed(start).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let raised = network_changed();
+        let seen = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("epoch_changed must not hang once the epoch moves")
+            .unwrap();
+        assert!(seen >= raised);
+    }
+
+    /// With every sender dropped, nothing can ever stop the attempt — so the
+    /// future must never resolve. Resolving would abort a healthy session the
+    /// moment its stop channel was garbage collected.
+    #[tokio::test]
+    async fn a_stop_channel_with_no_senders_never_fires() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stopped(rx)).await.is_err(),
+            "stopped() resolved on a dead channel"
+        );
     }
 }

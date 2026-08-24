@@ -193,32 +193,29 @@ pub struct HdrConfig {
     pub max_fall_nits: u16,
 }
 
-/// Where the tray's "Report an issue…" sends what it collects.
+/// The tray's "Report an issue…".
 ///
-/// **Every field is empty by default, and that is the secure configuration**,
-/// not an unfinished one. With nothing set, Nova writes the bundle to disk and
-/// opens GitHub's prefilled issue form — the user posts it under their own
-/// account, having read it. Nothing is uploaded and no credential exists to be
-/// extracted from the binary.
+/// **There is no credential here and there is deliberately nowhere to put one.**
+/// Nova zips the evidence, opens GitHub's issue form already written, and the
+/// user attaches the zip and submits under their own account. Nothing is
+/// uploaded by Nova.
 ///
-/// See `bugreport.rs` for why an embedded GitHub token is not an option: an
-/// installer is not a secret store, and a token shipped to everyone is a token
-/// that has to be revoked for everyone.
+/// An earlier draft had an intake-endpoint and a direct-token mode. Both were
+/// removed rather than left switched off: an installer is not a secret store, so
+/// a shipped token is readable by everyone who has a copy and revocable only for
+/// all of them at once — and a config field for one is an invitation to put one
+/// there. See `bugreport.rs`.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct BugReportConfig {
     /// `owner/repo` the report is filed against. Only used to build the issue
-    /// URL — it is not a credential and reveals nothing.
+    /// URL — not a credential, and it reveals nothing.
     pub repository: String,
-    /// An intake service the project runs, which holds the GitHub credential
-    /// server-side. Set this for one-press reporting without shipping a token.
-    pub endpoint: String,
-    /// A GitHub token to post with directly.
+    /// Where the finished `.zip` is written. Empty means the user's Desktop.
     ///
-    /// For an operator running their own fork against their own tracker. **Never
-    /// ship this set.** Anyone with the installed copy can read it, and it
-    /// grants issue-write for as long as it lives.
-    pub github_token: String,
+    /// The Desktop is the default because the next thing that happens is a drag
+    /// into a browser, and it is the one folder every user can find mid-task.
+    pub output_dir: String,
 }
 
 /// Echo side-channel (`echo_rpc.rs`) — the control/telemetry RPC for Nova's
@@ -297,10 +294,12 @@ impl Default for NovaConfig {
 impl Default for BugReportConfig {
     fn default() -> Self {
         Self {
-            repository: "nova-stream/nova".into(),
-            // Both empty: no upload, no credential. See the struct's docs.
-            endpoint: String::new(),
-            github_token: String::new(),
+            repository: crate::bugreport::DEFAULT_REPOSITORY.into(),
+            // Empty = the user's Desktop, resolved at report time. Not resolved
+            // here: a Worker respawned under the SYSTEM fallback has no user
+            // profile, and a path baked in at startup would point at whichever
+            // identity happened to be running then.
+            output_dir: String::new(),
         }
     }
 }
@@ -454,19 +453,14 @@ max_cll_nits       = 1000   # MaxCLL: brightest pixel in the stream (nit)
 max_fall_nits      = 400    # MaxFALL: max frame-average light level (nit)
 
 [bugreport]
-# Where the tray's "Report an issue…" sends what it collects.
+# The tray's "Report an issue…".
 #
-# LEAVE endpoint AND github_token EMPTY unless you know you want otherwise.
-# Empty is not "unconfigured" — it is the mode where Nova uploads nothing: the
-# report is written to a folder beside the exe and GitHub's issue form opens
-# prefilled, so you post it yourself, under your own account, having read it.
-#
-# A token here is readable by anyone with access to this machine and grants
-# issue-write for as long as it exists. It is meant for a maintainer running a
-# fork against their own tracker, not for distribution.
-repository   = "nova-stream/nova"  # owner/repo the issue is filed against
-endpoint     = ""                  # project-run intake service that holds the credential
-github_token = ""                  # direct GitHub token — never ship this set
+# Nova zips the logs, this machine's specifications and a snapshot of the last
+# encoded frame, then opens GitHub's issue form already filled in. You attach
+# the zip and press submit — nothing is uploaded by Nova, and there is no token
+# anywhere in this program.
+repository = "Zero19-85/Nova"  # owner/repo the issue is filed against
+output_dir = ""                # where the .zip goes; empty = your Desktop
 "#;
 
 impl NovaConfig {

@@ -229,7 +229,18 @@ class EchoController private constructor(private val context: android.content.Co
      * keeps its behaviour, and unlike [prefs] it is NOT negotiable: the host
      * either launches that app or it does not.
      */
+    /**
+     * The host this session is talking to, kept so [stop] can release a session
+     * that is between handover attempts.
+     *
+     * Needed because ending a session and streaming one are different jobs: the
+     * engine says goodbye from inside the stream, so a stop that lands while no
+     * stream is running has no channel to say it on. See [stop].
+     */
+    private var lastHost: KnownHost? = null
+
     fun connect(host: KnownHost, prefs: StreamPrefs, appId: Int = LaunchMode.Mirror.appId) {
+        lastHost = host
         val asked = prefs
         val effective = decodableOrDowngraded(prefs)
         if (effective == null) {
@@ -461,8 +472,23 @@ class EchoController private constructor(private val context: android.content.Co
                 "path_resuming" -> post {
                     it.copy(status = "Reconnecting… (${event.optInt("attempt")})")
                 }
+                // NOT terminal, and treating it as terminal is what made a
+                // network change look like an instant drop.
+                //
+                // `ended` is emitted by the engine at the end of a STREAM
+                // ATTEMPT, and a supervised session has as many attempts as it
+                // needs. Returning here killed the event poller on the first
+                // one — so `path_resuming` and the next `granted` were never
+                // read, and a recovery that was still running had no UI left to
+                // report to. The engine no longer emits it for a handover exit
+                // at all; this arm is the belt to that braces, because the cost
+                // of being wrong is the whole feature.
+                //
+                // `closed` remains the one terminal event: the JNI layer emits
+                // it exactly once, after the supervisor has finished for good.
+                "ended" -> post { it.copy(streaming = false) }
                 "error" -> post { it.copy(status = "Failed", error = event.optString("message")) }
-                "closed", "ended" -> {
+                "closed" -> {
                     // `transport` goes with the session. Leaving it set would
                     // leave a card claiming a live LAN path to a host nothing
                     // is connected to.
@@ -771,6 +797,19 @@ class EchoController private constructor(private val context: android.content.Co
         // Before the handle goes: a session that ends mid-keystroke would
         // otherwise leave that key held on the host with nothing left to
         // release it.
+        // Read before anything is torn down: stopping WHILE the engine is
+        // between handover attempts is the one case where nobody has told the
+        // host we are done.
+        //
+        // Normally `stream` sends `stop_session` on its way out, so a stop is a
+        // clean goodbye. During a handover that goodbye is deliberately
+        // suppressed — it would tear down the very session the reconnect exists
+        // to reclaim — which means a stop landing in that window leaves the host
+        // holding the display for its full grace period with no client coming
+        // back for it. Bounded rather than leaked (the host detaches and reaps),
+        // but "I pressed stop and my monitor stayed captured for ten minutes" is
+        // not an acceptable shape for that bound.
+        val strandedSession = state.reconnecting
         releaseAllInput()
         // Before the handle goes: the capture thread calls `nativeSendMic` with
         // it, and a handle freed underneath a running thread is a use-after-free
@@ -802,9 +841,21 @@ class EchoController private constructor(private val context: android.content.Co
                 error = null,
                 pin = null,
                 streaming = false,
+                reconnecting = false,
                 connected = false,
                 transport = null,
             )
+        }
+
+        // Only for the stranded case. `nativeRelease` opens its own path and
+        // makes one RPC — cheap next to a stream, but a whole punch and TLS
+        // handshake, so it is not worth spending on the ordinary stop where the
+        // goodbye has already been sent. Posts its own status when it lands.
+        if (strandedSession) {
+            lastHost?.let { host ->
+                Log.i(TAG, "stopped mid-handover — releasing the host session explicitly")
+                releaseHostSession(host)
+            }
         }
     }
 

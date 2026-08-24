@@ -1039,6 +1039,11 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         // refuses that port from non-private addresses, so offering it in an app
         // would only produce confusing failures.
         control: None,
+        // Owned by the handover supervisor, which raises it before it interrupts
+        // an attempt so the exit is SILENT rather than a goodbye. A goodbye here
+        // tells the host to tear the session down, which is the one thing the
+        // reconnect needs not to have happened.
+        detach_on_exit: Default::default(),
     };
 
     let identity = Identity::load_or_create_rsa2048(

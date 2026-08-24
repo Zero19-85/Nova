@@ -87,19 +87,36 @@ class NetworkMonitor private constructor(private val context: Context) {
         }
 
         /**
-         * Losing the default is reported but does **not** raise the epoch.
+         * The default network is gone. **Unbind, then raise the epoch.**
          *
-         * There is nothing to reconnect *to* yet. Raising here would spend an
-         * attempt on an interfaceless device and then have to spend another one
-         * when the replacement arrives moments later, which is one extra
-         * reconnect during the exact window the user is watching a frozen
-         * picture. The arrival of the replacement is the actionable event.
+         * Both halves were wrong in the first version, and together they are why
+         * disabling Wi-Fi dropped the stream instead of handing it over.
+         *
+         * **Unbinding is not optional.** [bindProcessToNetwork] is sticky: the
+         * process stays bound to a [Network] that no longer exists, and every
+         * socket opened afterwards — including the fresh one each handover
+         * attempt binds — is bound to that dead network too. The reconnect then
+         * fails for a reason that has nothing to do with where it was dialling,
+         * forever, and reads as "the host is unreachable". Passing null restores
+         * ordinary system routing, which is what lets the next attempt reach
+         * cellular at all.
+         *
+         * **Raising the epoch here was originally skipped** on the reasoning
+         * that there is nothing to reconnect *to* yet, so waiting for the
+         * replacement saved an attempt. That traded one cheap attempt for
+         * something far worse: without it, the in-flight attempt keeps running
+         * against a dead interface for its full budget — the WAN punch alone
+         * blasts for 8 seconds — before anything reacts. The supervisor's own
+         * backoff is what handles "no network yet"; it does that well, and it
+         * cannot do it until it has been told.
          */
         override fun onLost(network: Network) {
-            if (network == current) {
-                Log.i(TAG, "default network lost — waiting for its replacement")
-                current = null
-            }
+            if (network != current) return
+            current = null
+            lastTransport = "?"
+            runCatching { cm.bindProcessToNetwork(null) }
+            val epoch = runCatching { EchoNative.nativeNetworkChanged() }.getOrDefault(0L)
+            Log.i(TAG, "default network lost — unbound, epoch $epoch")
         }
     }
 

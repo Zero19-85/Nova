@@ -268,7 +268,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = stop_tx.send(true);
             });
 
-            let opts = StreamOptions { res, fps, codec, bitrate_kbps, app_id, control };
+            // The CLI is one-shot: it always says goodbye, which is what
+            // `..Default::default()` supplies for `detach_on_exit`.
+            let opts =
+                StreamOptions { res, fps, codec, bitrate_kbps, app_id, control, ..Default::default() };
             let mut sink = LoggingSink::default();
             let stats = session::stream(
                 &identity,
