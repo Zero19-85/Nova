@@ -502,6 +502,28 @@ fn submit(bundle: &Bundle) -> Result<String, String> {
         urlencode(&body),
     );
 
+    // A durable, double-clickable way back to this exact prefilled form.
+    //
+    // The browser launch below can succeed and still not be SEEN: while Nova is
+    // streaming headless, the desktop lives on the virtual display, so the window
+    // opens on the screen being sent to the client rather than on the physical
+    // monitor the user is sitting at. That is inherent to how Nova streams — it
+    // is not a launch failure and there is nothing to "fix" about it — but it
+    // does mean a fire-and-forget launch is not good enough on its own.
+    //
+    // So the shortcut sits next to the zip, and the URL goes in the log. Both
+    // survive the window opening somewhere the user is not looking.
+    let shortcut = archive
+        .as_ref()
+        .and_then(|zip| zip.parent())
+        .map(|dir| dir.join("Open Nova bug report.url"));
+    if let Some(shortcut) = &shortcut {
+        // Internet Shortcut format — an INI that Explorer opens with the
+        // default browser, unelevated, via the user's own shell.
+        let _ = std::fs::write(shortcut, format!("[InternetShortcut]\r\nURL={url}\r\n"));
+    }
+    println!("🐞 Bug report: issue URL is {url}");
+
     // Reveal the zip BEFORE the browser, so the file the form asks for is
     // already selected in an Explorer window behind it. Reversing these leaves
     // the user on a page telling them to drag a file they now have to go and
@@ -510,12 +532,25 @@ fn submit(bundle: &Bundle) -> Result<String, String> {
         Some(path) => reveal_in_explorer(path),
         None => reveal_in_explorer(&bundle.directory),
     }
-    open_url(&url)?;
 
-    Ok(match archive {
-        Some(path) => format!("Saved {} — the issue form is open in your browser", path.display()),
-        None => format!(
+    // A failed launch is reported, not swallowed. The report is already on disk
+    // and the shortcut already written, so this is a degraded success rather
+    // than a failure — saying "the form is open" when it is not is the part that
+    // would waste someone's time.
+    let opened = open_url(&url).is_ok();
+
+    let where_ = archive.as_ref().map(|p| p.display().to_string());
+    Ok(match (where_, opened) {
+        (Some(zip), true) => format!("Saved {zip} — the issue form is open in your browser"),
+        (Some(zip), false) => format!(
+            "Saved {zip} — could not open the browser; use \"Open Nova bug report.url\" beside it"
+        ),
+        (None, true) => format!(
             "Saved {} (no .zip — attach the files by hand) — the issue form is open",
+            bundle.directory.display()
+        ),
+        (None, false) => format!(
+            "Saved {} — no .zip and no browser; the issue URL is in nova.log",
             bundle.directory.display()
         ),
     })
@@ -616,22 +651,55 @@ fn zip_bundle(bundle: &Bundle, configured_dir: &str) -> Result<PathBuf, String> 
 /// browser and the Desktop is the one folder every user can find during that.
 /// A configured `[bugreport] output_dir` wins.
 ///
-/// Falls back to the report directory itself if the Desktop cannot be resolved —
-/// which happens for real here, not just in theory: a Worker respawned under the
-/// SYSTEM fallback has no user profile, so `USERPROFILE` points somewhere with no
-/// Desktop at all.
+/// **`%USERPROFILE%\Desktop` is the wrong way to ask.** OneDrive's Known Folder
+/// Move redirects the Desktop, and on a redirected machine that path does not
+/// exist at all — so the first version fell straight through to its fallback and
+/// wrote the zip beside the exe, in Program Files, which is precisely where a
+/// user will not look. Measured on the dev box 2026-08-24: `USERPROFILE` is
+/// `C:\Users\bobby`, `C:\Users\bobby\Desktop` does not exist, and the real
+/// Desktop is `C:\Users\bobby\OneDrive\Desktop`.
+///
+/// [`SHGetKnownFolderPath`] is the API that answers the question actually being
+/// asked — "where does the shell put things on this user's Desktop" — and it
+/// follows the redirection. The environment variable is kept only as a fallback
+/// for the case where the shell API fails.
 fn output_dir(configured: &str) -> PathBuf {
     let configured = configured.trim();
     if !configured.is_empty() {
         return PathBuf::from(configured);
     }
+    if let Some(desktop) = known_desktop() {
+        if desktop.is_dir() {
+            return desktop;
+        }
+    }
+    // Legacy shape, for a shell API that refused. Still checked for existence:
+    // handing back a path that is not there would put us back where we started.
     if let Ok(profile) = std::env::var("USERPROFILE") {
         let desktop = PathBuf::from(profile).join("Desktop");
         if desktop.is_dir() {
             return desktop;
         }
     }
+    // No Desktop at all — a Worker respawned under the SYSTEM fallback has no
+    // user profile. Beside the exe is not a good answer, but it is a real one,
+    // and the log line names it.
     debug::log_path().parent().unwrap_or(Path::new(".")).join("bugreports")
+}
+
+/// The user's Desktop as the shell resolves it, honouring redirection.
+fn known_desktop() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    unsafe {
+        // KF_FLAG_DEFAULT, not KF_FLAG_CREATE: if the folder genuinely is not
+        // there, that is something to fall back from, not to materialise inside
+        // somebody's profile as a side effect of filing a bug report.
+        let raw = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None).ok()?;
+        let path = PathBuf::from(raw.to_string().ok()?);
+        // The returned PWSTR is CoTaskMem and ours to free.
+        windows::Win32::System::Com::CoTaskMemFree(Some(raw.0 as *const _));
+        Some(path)
+    }
 }
 
 /// Open Explorer with `path` selected, so a drag-and-drop is one motion away.

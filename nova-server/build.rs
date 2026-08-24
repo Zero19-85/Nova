@@ -39,6 +39,14 @@ fn main() {
     // ── Rerun triggers ────────────────────────────────────────────────────────
     println!("cargo:rerun-if-changed=shim/shim.cpp");
     println!("cargo:rerun-if-changed=shim/audio_shim.cpp");
+    // Missing these meant an edit to either file did NOT rebuild the DLL —
+    // cargo saw no reason to re-run this script, so the C++ change was silently
+    // left out of nova_shim.dll while `cargo build` reported success. Every
+    // source listed in `srcs` needs a line here.
+    println!("cargo:rerun-if-changed=shim/recorder.cpp");
+    println!("cargo:rerun-if-changed=shim/recorder.h");
+    println!("cargo:rerun-if-changed=shim/snapshot.cpp");
+    println!("cargo:rerun-if-changed=shim/snapshot.h");
     println!("cargo:rerun-if-changed=shim/NvEncoder/NvEncoder.cpp");
     println!("cargo:rerun-if-changed=shim/NvEncoder/NvEncoderD3D11.cpp");
     println!("cargo:rerun-if-changed=shim/NvEncoder/NvEncoder.h");

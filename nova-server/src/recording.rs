@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::encoder::{self, Codec};
+use crate::encoder;
 
 /// Where recordings go, and what the last one was called.
 ///
@@ -84,13 +84,35 @@ pub fn start() -> Result<PathBuf, String> {
         return Err("already recording".into());
     }
 
-    let codec = Codec::from_str(snapshot.codec);
+    // The IDENTIFIER, never the label.
+    //
+    // This was `Codec::from_str(snapshot.codec)` and it is the bug that made
+    // every recording a 0-byte file: `snapshot.codec` is display text
+    // ("HEVC Main10 HDR"), `from_str` matches "hevc", and its catch-all arm
+    // answers H264 rather than failing. The muxer was then told H.264 for an
+    // HEVC stream, searched for NAL types 7/8 in a bitstream carrying 32/33/34,
+    // never found a parameter set, and so never wrote a track.
+    //
+    // `None` is refused rather than guessed at. There is no safe default here —
+    // guessing is exactly what produced a file that looked fine until someone
+    // tried to play it.
+    let Some(codec) = snapshot.codec_kind else {
+        return Err(format!(
+            "the session's codec is not known yet ({}) — nothing to record",
+            snapshot.codec
+        ));
+    };
+    // `codec.as_str()` ("hevc"), not `snapshot.codec` ("HEVC Main10 HDR"). The
+    // label contains spaces, which produced `…-HEVC Main10 HDR.mkv` — awkward to
+    // type, awkward to quote in a shell, and a second place where a display
+    // string had leaked into something structural.
     let path = recordings_dir().join(format!(
-        "nova-{}-{}x{}-{}.mkv",
+        "nova-{}-{}x{}-{}{}.mkv",
         timestamp(),
         snapshot.width,
         snapshot.height,
-        snapshot.codec,
+        codec.as_str(),
+        if snapshot.hdr { "-hdr" } else { "" },
     ));
 
     match encoder::recorder_start(

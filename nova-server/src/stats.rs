@@ -48,6 +48,29 @@ fn codec_code(codec: Codec) -> u32 {
     }
 }
 
+/// The inverse of [`codec_code`] — the codec as an IDENTIFIER, not a label.
+///
+/// This exists because the two were once conflated and it cost a whole feature.
+/// [`Snapshot::codec`] is a *display string* (`"HEVC Main10 HDR"`), and the local
+/// recorder configured itself by feeding that string back through
+/// `Codec::from_str` — which matches `"hevc"`, not `"HEVC Main10 HDR"`, and whose
+/// catch-all arm answers `H264`. So a 4K HEVC stream was recorded as H.264:
+/// the muxer then hunted for H.264 SPS/PPS (NAL types 7/8) in a bitstream that
+/// only carries VPS/SPS/PPS at 32/33/34, never found them, and wrote a 0-byte
+/// file (live 2026-08-24).
+///
+/// **A label is for humans and an identifier is for code.** Round-tripping one
+/// through the other is a silent, lossy parse — and `from_str`'s permissive
+/// default turned the loss into a plausible wrong answer instead of an error.
+pub fn codec_kind(code: u32) -> Option<Codec> {
+    match code {
+        CODEC_H264 => Some(Codec::H264),
+        CODEC_HEVC => Some(Codec::Hevc),
+        CODEC_AV1 => Some(Codec::Av1),
+        _ => None,
+    }
+}
+
 fn codec_label(code: u32, hdr: bool) -> &'static str {
     match (code, hdr) {
         (CODEC_H264, _) => "H.264",
@@ -116,7 +139,17 @@ pub struct Snapshot {
     pub height: u32,
     pub target_fps: u32,
     pub measured_fps_x10: u32,
+    /// The codec as a LABEL, for display only.
+    ///
+    /// Never parse this back into a codec — see [`codec_kind`]. Use
+    /// [`Snapshot::codec_kind`], which carries the identifier alongside it.
     pub codec: &'static str,
+    /// The codec as an IDENTIFIER, or `None` when nothing is configured.
+    ///
+    /// Carried beside the label rather than derived from it, so a caller that
+    /// needs to make a decision has something to decide on that was never a
+    /// string.
+    pub codec_kind: Option<Codec>,
     pub hdr: bool,
     pub ceiling_kbps: u32,
     pub target_kbps: u32,
@@ -276,6 +309,7 @@ pub fn snapshot() -> Snapshot {
         target_fps: STATS.target_fps.load(Ordering::Relaxed),
         measured_fps_x10: STATS.measured_fps_x10.load(Ordering::Relaxed),
         codec: codec_label(STATS.codec.load(Ordering::Relaxed), hdr),
+        codec_kind: codec_kind(STATS.codec.load(Ordering::Relaxed)),
         hdr,
         ceiling_kbps: STATS.ceiling_kbps.load(Ordering::Relaxed),
         target_kbps: STATS.target_kbps.load(Ordering::Relaxed),
@@ -296,6 +330,33 @@ pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression that made every recording a 0-byte file.
+    ///
+    /// `codec` is a LABEL and `codec_kind` is an IDENTIFIER. Deriving the second
+    /// from the first is a lossy parse, and `Codec::from_str`'s permissive
+    /// catch-all turns the loss into a plausible wrong answer instead of an
+    /// error — an HEVC session silently became H.264, and the muxer then looked
+    /// for parameter sets that a HEVC bitstream does not contain.
+    #[test]
+    fn the_codec_identifier_survives_where_the_label_does_not() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        session_started(3840, 2160, 120, Codec::Hevc, true, 90_000);
+        let snap = snapshot();
+
+        assert_eq!(snap.codec_kind, Some(Codec::Hevc), "the identifier must be exact");
+        assert_eq!(snap.codec, "HEVC Main10 HDR", "the label is for humans");
+        // The trap itself, asserted so nobody re-introduces the shortcut: the
+        // label does NOT parse back to the codec it describes.
+        assert_eq!(
+            Codec::from_str(snap.codec),
+            Codec::H264,
+            "parsing the label yields the WRONG codec — this is why codec_kind exists"
+        );
+
+        session_ended();
+        assert_eq!(snapshot().codec_kind, None, "an idle host has no codec to record");
+    }
 
     #[test]
     fn session_lifecycle_publishes_then_clears() {

@@ -244,6 +244,20 @@ std::vector<Nal> SplitAnnexB(const uint8_t* buffer, size_t size, bool hevc) {
     return nals;
 }
 
+// " 32, 33, 34, 21" — for the diagnostic above.
+//
+// Names the types actually present so a mismatch reads as one at a glance:
+// H.264 sets are 7/8, HEVC's are 32/33/34, and seeing the wrong family is the
+// whole answer.
+std::string DescribeNalTypes(const std::vector<Nal>& nals) {
+    std::string out;
+    for (size_t i = 0; i < nals.size() && i < 12; ++i) {
+        out += (i ? ", " : " ");
+        out += std::to_string((unsigned)nals[i].type);
+    }
+    return out.empty() ? std::string(" (none)") : out;
+}
+
 // Rewrite Annex-B as 4-byte-length-prefixed NALs.
 void ToLengthPrefixed(const std::vector<Nal>& nals, Bytes& out) {
     size_t total = 0;
@@ -380,6 +394,7 @@ public:
         bit_depth_ = is_hdr ? 10 : 8;
         dropped_.store(0);
         header_written_ = false;
+        frames_without_params_ = 0;
         cluster_open_ = false;
         base_ms_ = 0;
         have_base_ = false;
@@ -512,7 +527,29 @@ private:
 
         if (!header_written_) {
             CollectParameterSets(nals);
-            if (!WriteHeader()) return;   // still waiting for the parameter sets
+            if (!WriteHeader()) {
+                // Still waiting for the parameter sets — normal for a frame or
+                // two, and a defect after that.
+                //
+                // This used to be a bare `return`, and the silence is what let a
+                // codec mismatch masquerade as a working feature for a whole test
+                // cycle: the recorder was told H.264 for an HEVC stream, so it
+                // searched for NAL types 7/8 in a bitstream carrying 32/33/34,
+                // found nothing on EVERY frame, and wrote a 0-byte file whose
+                // only complaint arrived at Stop. Nova forces an IDR with
+                // OUTPUT_SPSPPS at session start, so the sets are in the first
+                // frame or something is wrong about what we think we are reading.
+                if (++frames_without_params_ == 60) {
+                    NovaShimLogExternal(
+                        "[Rec] 60 frames in and still no %s parameter set — saw NAL types%s. "
+                        "Nothing has been written. This is a codec mismatch, not a slow start: "
+                        "the recorder was told %s.\n",
+                        hevc_ ? "VPS/SPS/PPS (32/33/34)" : "SPS/PPS (7/8)",
+                        DescribeNalTypes(nals).c_str(),
+                        hevc_ ? "HEVC" : "H.264");
+                }
+                return;
+            }
         }
 
         // The caller's keyframe flag is a hint; the bitstream is the authority.
@@ -742,6 +779,8 @@ private:
     uint64_t base_ms_ = 0;
     bool have_base_ = false;
     uint64_t last_ms_ = 0;
+    // Frames seen before a parameter set turned up. See WriteFrame.
+    uint64_t frames_without_params_ = 0;
 };
 
 Recorder g_recorder;
