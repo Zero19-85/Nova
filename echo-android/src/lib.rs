@@ -61,9 +61,9 @@ use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
 use echo_client::audio::PlayoutStep;
-use echo_client::{input, pairing};
+use echo_client::{handover, input, pairing};
 use echo_client::session::{
-    self, ConnectOptions, Event, OpenPath, Progress, StreamOptions, Uplink,
+    self, ConnectOptions, Event, Progress, StreamOptions, Uplink,
 };
 use nova_core::identity::Identity;
 
@@ -923,6 +923,29 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRequestIdr(
     u8::from(asked)
 }
 
+/// Tell the engine the device's network changed.
+///
+/// **Takes no handle, deliberately.** The fact being reported is a property of
+/// the device, not of a session, and `ConnectivityManager`'s callbacks fire at
+/// exactly the moments a handle is most likely to be mid-teardown — the same
+/// reasoning that makes `nativeRelease` handle-free. There is no session state
+/// here to get wrong, so there is no bad-handle case to return.
+///
+/// Safe to call spuriously. Android is generous with these callbacks, and a
+/// false positive costs one reconnect that would have worked anyway, while a
+/// false negative costs the stall watchdog's timeout — seconds of frozen picture
+/// instead of milliseconds.
+///
+/// Returns the new epoch, purely so a log line can prove the call arrived.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeNetworkChanged(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    std::panic::catch_unwind(AssertUnwindSafe(echo_client::handover::network_changed))
+        .unwrap_or(0) as jlong
+}
+
 /// End the session and free the handle.
 ///
 /// Wakes anything blocked in `nativeFillBuffer`/`nativePollEvent` first, so a
@@ -1190,20 +1213,43 @@ async fn run_session(
     stop: tokio::sync::watch::Receiver<bool>,
     uplink: Uplink,
 ) -> Result<(), String> {
-    let path: OpenPath = session::open_path(identity, &connect, progress).await?;
+    // The supervisor, not `open_path`+`stream` directly. On a phone the network
+    // moving underneath a session is ordinary — a walk out of Wi-Fi range is not
+    // an error condition — so the single-attempt pair is the wrong shape here
+    // even though it is exactly right for the CLI.
+    let relay = handover::UplinkRelay::spawn(uplink);
     let mut sink = QueueSink(queue.clone());
-    session::stream(
+    let outcome = handover::supervise(
         identity,
-        &connect.host_fingerprint,
-        path,
+        &connect,
         &stream,
         &mut sink,
         progress,
         stop,
-        uplink,
+        || {
+            // Runs once per attempt, which makes it the hook for "this decoder
+            // is about to be fed a different session". The queue is not closed
+            // and the gate is not closed — the picture on screen stays, and
+            // `request_keyframe` only *flags*, for the same reason the Surface
+            // lifecycle uses it: a chain that survived costs one redundant IDR,
+            // while a chain that did not and was never asked about is a
+            // permanent freeze.
+            queue.request_keyframe();
+            relay.next()
+        },
+        handover::HandoverPolicy::default(),
     )
-    .await?;
-    Ok(())
+    .await;
+
+    match outcome {
+        handover::Outcome::Stopped(_) => Ok(()),
+        // Reported as the *last* reason, not the first. The earlier ones are why
+        // it kept trying; this one is why it stopped, and it is the only one a
+        // user can act on.
+        handover::Outcome::GaveUp { last, attempts } => {
+            Err(format!("could not get back to the host after {attempts} attempts: {last}"))
+        }
+    }
 }
 
 fn str_field(value: &serde_json::Value, key: &str) -> Result<String, String> {

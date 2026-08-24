@@ -94,6 +94,10 @@ windows = { version = "0.58", features = [
     "Win32_System_RemoteDesktop",
     #   CreateEnvironmentBlock — give the spawned host the user's environment
     "Win32_System_Environment",
+    #   GetLocalTime — timestamps for recording filenames and bug-report folders.
+    #   Local, not UTC: the person looking for the file is the one who pressed
+    #   the button. Bindings only — no new library is linked (developer rule #1).
+    "Win32_System_SystemInformation",
 ] }
 # System tray icon + native right-click context menu (handles all Win32 quirks
 # — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).

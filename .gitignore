@@ -54,3 +54,13 @@ android/local.properties
 android/app/src/main/jniLibs/
 echo-data/
 relay-data/
+
+# Local recordings and bug-report bundles.
+#
+# Both are written beside the executable, so in a normal build they land under
+# the already-ignored /target/. Named here anyway because of WHAT they contain:
+# a recording is a capture of somebody's desktop and a report bundle carries a
+# desktop screenshot plus redacted logs. A stray one committed from a manual
+# run is not a build artifact, it is a disclosure.
+recordings/
+bugreports/

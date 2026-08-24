@@ -1,5 +1,6 @@
 mod app_launcher;
 mod audio;
+mod bugreport;
 mod capture;
 mod config;
 mod control;
@@ -26,6 +27,7 @@ mod pairing;
 /// and the closed-loop congestion controller that runs underneath it. Both
 /// capture loops share the controller; both negotiators share the budget.
 mod qos;
+mod recording;
 mod rtp;
 mod rtsp;
 mod session_negotiate;
@@ -679,6 +681,12 @@ pub async fn start_master_network() -> MasterHandles {
              LAN-direct sessions still work"
         );
     }
+    // Taken before `gather` is consumed below. The WAN control loop reads it to
+    // recognise a client that has moved networks: a contender whose address is
+    // the current latch is one Nova's own punch just confirmed, so it takes the
+    // tunnel slot immediately instead of waiting out the contended leash.
+    let latched_path = gather.latched_handle();
+
     // The RPC's view of the gatherer is one method wide: "blast at these".
     let echo_prober: Arc<dyn echo::rpc::PathProber> = Arc::new(gather);
 
@@ -734,7 +742,13 @@ pub async fn start_master_network() -> MasterHandles {
     if let Some(sessions) = echo_sessions.clone() {
         let (echo_tx, echo_rx) = mpsc::unbounded_channel();
         rtp_sender.lock().unwrap().set_echo_inbox(echo_tx);
-        echo::transport::spawn(echo_rx, rtp_sender.clone(), echo_handler, sessions.clone());
+        echo::transport::spawn(
+            echo_rx,
+            rtp_sender.clone(),
+            echo_handler,
+            sessions.clone(),
+            latched_path,
+        );
         spawn_mic_passthrough(&cfg.audio.endpoint_override, rtp_sender.clone(), sessions);
     }
 
@@ -2220,6 +2234,19 @@ fn deactivate_worker(
     // call sites so no future teardown path can leave the tray advertising a
     // session that has already been torn down.
     stats::session_ended();
+
+    // A recording belongs to the session that was being recorded. Finalising it
+    // here means what is on disk is a closed, patched file rather than one whose
+    // writer was still holding a handle when the encoder went away — and the
+    // encoder is about to be destroyed a few lines below.
+    //
+    // Unconditional and cheap: `stop` answers `Ok(None)` when nothing was
+    // recording, which is the common case.
+    let _ = recording::stop();
+    // Likewise the bug reporter's held frame. It is a picture of somebody's
+    // desktop, and it has no business surviving the session it came from just
+    // because nobody pressed the report button.
+    encoder::reset_frame_snapshot();
 
     let was_hdr = enc.config.is_hdr;
     enc.config.is_hdr = false;
@@ -4845,6 +4872,14 @@ pub async fn run() -> Result<()> {
                 // Tray back to idle — mirrors deactivate_worker's identical
                 // call on the split path.
                 stats::session_ended();
+                // Mirrored from `deactivate_worker` for the same reasons — a
+                // recording is finalised with the session that produced it, and
+                // a held desktop frame does not outlive it. **The monolithic
+                // loop must keep pace with the Worker loop**; this project's
+                // recurring bug is a feature landing in one and not the other
+                // (dynamic bitrate, `idle_teardown_secs`, both twice).
+                let _ = recording::stop();
+                encoder::reset_frame_snapshot();
                 frame_interval  = startup_frame_interval;
                 next_frame_time = Instant::now();
                 client_connected    = false;

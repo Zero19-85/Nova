@@ -12,6 +12,8 @@
 
 #include "nvEncodeAPI.h"
 #include "NvEncoderD3D11.h"
+#include "snapshot.h"
+#include "recorder.h"
 
 // ==================== SHIM FILE LOGGER ====================
 // Writes to the same nova.log as the Rust side.
@@ -40,6 +42,26 @@ static void ShimLog(const char* fmt, ...) {
     // Also write to CRT stdout (visible in `cargo run`, no-op in service).
     fwrite(buf, 1, (size_t)n, stdout);
     fflush(stdout);
+}
+
+// Non-static bridge to ShimLog for the shim's other translation units
+// (snapshot.cpp, recorder.cpp).
+//
+// They must log into the SAME handle rather than opening their own: two writers
+// on one log file is precisely the collision that once cost this project every
+// shim log line (InitShimLog opening nova.log FILE_SHARE_READ against Rust's
+// write handle). One owner, one handle, everybody else calls through.
+void NovaShimLogExternal(const char* fmt, ...) {
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(buf, (int)sizeof(buf) - 1, fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+    // "%s" and not `buf`: the text has already been formatted, and any percent
+    // sign surviving in it (a path, a percentage in a message) would be read as
+    // a conversion against arguments that do not exist.
+    ShimLog("%s", buf);
 }
 
 // Called from Rust (encoder.rs::init_shim_log) before any other shim function.
@@ -1832,6 +1854,16 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         DrawCursorOverlay();
     }
 
+    // Bug-reporter frame capture. Costs one relaxed atomic load unless somebody
+    // has armed it — see snapshot.cpp on why nothing here runs continuously.
+    //
+    // Placed AFTER the cursor overlay and BEFORE the colour conversion on
+    // purpose: this is the last point at which the frame is still the picture a
+    // human would recognise. One step later it is NV12/P010 in the encoder's
+    // colour space, which is the right thing to encode and the wrong thing to
+    // attach to a bug report.
+    NovaSnapshotOnFrame(g_device, g_context, g_compositeTex);
+
     // HDR: CS writes BT.2020 NCL PQ YCbCr directly to P010 plane UAVs (D3D11.3
     // per-plane typed views on a single DXGI_FORMAT_P010 intermediate texture).
     // CopyResource (P010→P010, same format) then feeds NVENC — no VP involved.
@@ -2013,7 +2045,12 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // init; otherwise it would overwrite inputTimeStamp with its own counter.
     NV_ENC_PIC_PARAMS picParams = {};
     picParams.inputTimeStamp = frame_index;
-    if (g_force_idr.exchange(false)) {
+    // Held in a local because the recorder wants it too. `exchange` consumes the
+    // flag, so a second read further down would always answer false — and a
+    // recording whose Clusters never start on a keyframe is a recording no
+    // player can seek in.
+    const bool forceIdr = g_force_idr.exchange(false);
+    if (forceIdr) {
         // NV_ENC_PIC_FLAG_FORCEIDR alone generates the IDR slice but does NOT
         // guarantee inline SPS/PPS/VPS headers unless the codec config set
         // repeatSPSPPS=1 for a *periodic* IDR. For on-demand IDRs triggered by
@@ -2048,6 +2085,21 @@ extern "C" __declspec(dllexport) int EncodeFrame(
         memcpy(out_buffer + total_size, packet.frame.data(), chunk);
         total_size += chunk;
     }
+    // Local recording tees off HERE, from the same bytes that are about to be
+    // handed to the caller — so what lands in the file is byte-identical to what
+    // goes on the wire, and no second encode exists to disagree with it.
+    //
+    // After the truncation check below would be wrong (a truncated frame is not
+    // worth recording), and before the copy above would mean re-walking
+    // `vPacket`. This is the one point where the frame is complete, contiguous,
+    // and still Annex-B.
+    //
+    // `RecorderSubmit` is a memcpy into a bounded queue and a notify; it never
+    // touches a disk on this thread. See recorder.cpp.
+    if (!truncated && total_size > 0 && RecorderIsActive()) {
+        RecorderSubmit(out_buffer, total_size, forceIdr ? 1 : 0, frame_index);
+    }
+
     if (truncated) {
         // What leaves here is a STRUCTURALLY INCOMPLETE temporal unit: the
         // client cannot decode it, and every frame that references it inherits

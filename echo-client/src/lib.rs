@@ -38,10 +38,13 @@
 //!   socket.
 //! - [`receiver`] — the one socket reader, reassembly, FEC, and decryption.
 //! - [`gate`] — the keyframe gate that stands between the stream and a decoder.
+//! - [`handover`] — keeping a session alive across a network change, by
+//!   rebuilding the path underneath a decoder that is never told about it.
 
 pub mod audio;
 pub mod control;
 pub mod gate;
+pub mod handover;
 pub mod input;
 pub mod mic;
 pub mod pairing;

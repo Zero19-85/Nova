@@ -1,3 +1,4 @@
+use std::os::windows::ffi::OsStrExt;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -90,6 +91,113 @@ extern "C" {
     /// RFI: whether the most recently encoded frame was a recovery frame (its
     /// reference was re-pointed by an invalidation). 1 = mark it wire type 5.
     fn LastFrameWasRfiRecovery() -> i32;
+
+    // ── Bug-reporter frame capture (shim/snapshot.cpp) ──────────────────────
+    //
+    // Nothing here touches NVENC. The snapshot is taken from the composite
+    // texture the encoder consumes, one step before colour conversion, so it is
+    // a picture of what was streamed rather than a second render of it.
+    fn ArmFrameSnapshot();
+    fn TakeFrameSnapshotPng(path: *const u16) -> i32;
+    fn ResetFrameSnapshot();
+
+    // ── Local recording (shim/recorder.cpp) ─────────────────────────────────
+    //
+    // Also NVENC-free: the recorder receives the bytes NVENC already produced
+    // and writes a container around them. No second encoder session exists, and
+    // adding one is the thing this design is avoiding.
+    fn RecorderStart(
+        path: *const u16,
+        codec: i32,
+        width: i32,
+        height: i32,
+        fps: i32,
+        is_hdr: i32,
+    ) -> i32;
+    fn RecorderStop() -> i32;
+    fn RecorderIsActive() -> i32;
+    fn RecorderDroppedFrames() -> u64;
+}
+
+/// Ask the encode loop to keep its next frame for the bug reporter.
+///
+/// Returns immediately; the frame appears when the encoder next runs. A host
+/// that is not streaming never calls `EncodeFrame`, so this can legitimately
+/// never be satisfied — [`take_frame_snapshot_png`] reports that as "nothing
+/// captured" rather than blocking.
+pub fn arm_frame_snapshot() {
+    unsafe { ArmFrameSnapshot() }
+}
+
+/// Write the armed frame to `path` as a PNG.
+///
+/// `Ok(false)` means nothing had been captured — armed but no frame encoded
+/// since, or never armed. That is a normal outcome for an idle host and is not
+/// an error.
+pub fn take_frame_snapshot_png(path: &std::path::Path) -> Result<bool, i32> {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { TakeFrameSnapshotPng(wide.as_ptr()) } {
+        0 => Ok(true),
+        -1 => Ok(false),
+        code => Err(code),
+    }
+}
+
+/// Drop any held frame and free the readback texture.
+///
+/// Called at session end: a snapshot is a picture of somebody's desktop, and it
+/// has no business outliving the stream it came from just because nobody pressed
+/// the report button.
+pub fn reset_frame_snapshot() {
+    unsafe { ResetFrameSnapshot() }
+}
+
+/// Begin recording the encoded stream to `path`. See `shim/recorder.h` for the
+/// return codes.
+pub fn recorder_start(
+    path: &std::path::Path,
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    is_hdr: bool,
+) -> i32 {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // The shim's own codec numbering, which `Codec` already mirrors — kept as an
+    // explicit match rather than a cast so a new variant is a compile error here
+    // instead of a file that records as the wrong codec.
+    let codec_id = match codec {
+        Codec::H264 => 0,
+        Codec::Hevc => 1,
+        Codec::Av1 => 2,
+    };
+    unsafe {
+        RecorderStart(wide.as_ptr(), codec_id, width as i32, height as i32, fps as i32, is_hdr as i32)
+    }
+}
+
+/// Finish and close the recording. Safe when nothing is recording.
+pub fn recorder_stop() -> i32 {
+    unsafe { RecorderStop() }
+}
+
+/// Whether a recording is open.
+pub fn recorder_is_active() -> bool {
+    unsafe { RecorderIsActive() == 1 }
+}
+
+/// Frames the writer could not keep up with. Nonzero means the recording has
+/// gaps; the live stream is unaffected by construction.
+pub fn recorder_dropped_frames() -> u64 {
+    unsafe { RecorderDroppedFrames() }
 }
 
 /// Master feature flag for reference-frame invalidation. While `false`, Nova

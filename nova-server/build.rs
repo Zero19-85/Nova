@@ -91,6 +91,12 @@ fn build_shim_dll(target: &str, manifest_dir: &str, out_dir: &Path, dll_dest: &P
         "shim/NvEncoder/NvEncoder.cpp",
         "shim/NvEncoder/NvEncoderD3D11.cpp",
         "shim/audio_shim.cpp",
+        // Bug-reporter frame capture and local recording. Both are teed off the
+        // existing encode path rather than duplicating it — see each file's
+        // header. Neither links anything NVENC-related, so they cannot affect
+        // the encoder's link surface (developer rule #1).
+        "shim/snapshot.cpp",
+        "shim/recorder.cpp",
     ];
     let includes = [
         "shim",
@@ -149,7 +155,11 @@ fn build_shim_dll(target: &str, manifest_dir: &str, out_dir: &Path, dll_dest: &P
        .arg("dxgi.lib")
        .arg("d3dcompiler.lib")
        // COM
-       .arg("ole32.lib");
+       .arg("ole32.lib")
+       // WIC, for the bug reporter's PNG encode (shim/snapshot.cpp). Listed
+       // here as well as in that file's #pragma comment so the link surface is
+       // readable from one place — a duplicate /DEFAULTLIB is a no-op.
+       .arg("windowscodecs.lib");
 
     for obj in &objs {
         cmd.arg(obj);

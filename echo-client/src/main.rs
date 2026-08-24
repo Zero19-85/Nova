@@ -417,6 +417,14 @@ impl Progress for ConsoleProgress {
             ),
             Event::Refused { reason } => println!("⛔ The host refused: {reason}"),
             Event::Warning { message } => println!("⚠️  {message}"),
+            Event::PathInterrupted { detail, attempt, frames_this_attempt, .. } => println!(
+                "🔀 Path lost after {frames_this_attempt} frames on attempt {attempt}: {detail} \
+                 — holding the picture, rebuilding the path"
+            ),
+            Event::PathResuming { attempt, window_left_ms } => println!(
+                "♻️  Attempt {attempt} ({}s of the resume window left)",
+                window_left_ms / 1000
+            ),
             // The CLI prints its own richer summary once `stream` returns, so
             // this would only duplicate it.
             Event::Ended { .. } => {}

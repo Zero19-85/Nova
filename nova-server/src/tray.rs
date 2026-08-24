@@ -153,7 +153,7 @@ fn tray_main(
     // appears, then the icon shows up as normal. The menu/icon values are
     // consumed by the builder, so they are rebuilt on every attempt.
     let mut logged_wait = false;
-    let (tray, ids, end_item) = loop {
+    let (tray, ids, end_item, record_item) = loop {
         // Order puts the session actions first (what a user reaches for mid-
         // stream) and the destructive ones behind separators.
         let stats_item = MenuItem::new("Server Stats…", true, None);
@@ -163,6 +163,16 @@ fn tray_main(
         // there is genuinely nothing to do — a greyed item explains that
         // better than an error dialog would.
         let end_item = MenuItem::new(end_item_label(), end_item_enabled(), None);
+        // Enabled only while something is being encoded, because a recorder with
+        // no encoder to tee off has nothing to write — see `recording::start`.
+        // The label carries the state, like `end_item`'s does: one item that
+        // says what it will do beats two that are alternately greyed out.
+        let record_item =
+            MenuItem::new(record_item_label(), crate::stats::is_streaming(), None);
+        // Always enabled. A report about a session that will not START is as
+        // valuable as one about a session that went wrong, and greying this out
+        // when nothing is streaming would remove it in exactly that case.
+        let report_item = MenuItem::new("Report an Issue…", true, None);
         let pair_item = MenuItem::new("Pair Device", true, None);
         let clear_item = MenuItem::new("Clear Paired Devices…", true, None);
         let quit_item = MenuItem::new("Quit Nova", true, None);
@@ -170,6 +180,9 @@ fn tray_main(
         let menu = Menu::new();
         let _ = menu.append(&stats_item);
         let _ = menu.append(&end_item);
+        let _ = menu.append(&record_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&report_item);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&pair_item);
         let _ = menu.append(&clear_item);
@@ -185,6 +198,8 @@ fn tray_main(
             pair: pair_item.id().clone(),
             clear: clear_item.id().clone(),
             quit: quit_item.id().clone(),
+            record: record_item.id().clone(),
+            report: report_item.id().clone(),
         };
 
         match TrayIconBuilder::new()
@@ -193,7 +208,7 @@ fn tray_main(
             .with_icon(idle_icon.clone())
             .build()
         {
-            Ok(tray) => break (tray, ids, end_item),
+            Ok(tray) => break (tray, ids, end_item, record_item),
             Err(e) => {
                 if !logged_wait {
                     println!(
@@ -220,6 +235,8 @@ fn tray_main(
     // menu is only rewritten when the stage actually changes.
     let mut shown_end_label: Option<String> = None;
     let mut shown_end_enabled: Option<bool> = None;
+    let mut shown_record_label: Option<String> = None;
+    let mut shown_record_enabled: Option<bool> = None;
     let mut shown_tooltip = String::new();
     // A pairing status message temporarily owns the tooltip; see STATUS_TOOLTIP_HOLD.
     let mut status_until: Option<Instant> = None;
@@ -280,6 +297,41 @@ fn tray_main(
                         println!("⚠️  Tray: {action:?} could not be delivered (queue full or receiver gone)");
                     }
                 }
+            } else if event.id == ids.record {
+                // No confirmation: both directions are cheap and reversible, and
+                // a dialog in front of "stop recording" is a dialog between a
+                // user and the file they want saved.
+                //
+                // Runs inline on this thread. That is acceptable here and only
+                // here: `toggle` opens or finalises a file and returns — it does
+                // not wait on the encoder, and the writer thread does the I/O.
+                match crate::recording::toggle() {
+                    Ok(message) => {
+                        println!("⏺️  Tray: {message}");
+                        let _ = tray.set_tooltip(Some(format!("Nova — {message}")));
+                        status_until = Some(Instant::now() + STATUS_TOOLTIP_HOLD);
+                    }
+                    Err(message) => {
+                        println!("⚠️  Tray: recording — {message}");
+                        let _ = tray.set_tooltip(Some(format!("Nova — {message}")));
+                        status_until = Some(Instant::now() + STATUS_TOOLTIP_HOLD);
+                    }
+                }
+            } else if event.id == ids.report {
+                // Off-thread, unlike the recording toggle. This path opens two
+                // PowerShell dialogs, waits on a WMI query, and may make an
+                // HTTPS request — seconds, during which this thread's message
+                // pump has to keep running or the tray icon stops responding and
+                // the Server Stats window stops repainting. The pairing dialog
+                // blocks here today and is a known wart; a longer path should
+                // not join it.
+                std::thread::Builder::new()
+                    .name("nova-bugreport".to_string())
+                    .spawn(|| match crate::bugreport::report_issue() {
+                        Ok(message) => println!("🐞 Bug report: {message}"),
+                        Err(message) => println!("⚠️  Bug report failed: {message}"),
+                    })
+                    .ok();
             } else if event.id == ids.pair {
                 match prompt_for_pin_and_name() {
                     Some((pin, name)) => {
@@ -402,6 +454,23 @@ fn tray_main(
                 end_item.set_enabled(enabled);
             }
 
+            // The recording item tracks two independent facts — whether a
+            // recording is open, and whether there is anything to record — and
+            // they move at different moments: a stream ending leaves a recording
+            // open until the teardown path stops it.
+            let record_label = record_item_label();
+            if shown_record_label.as_deref() != Some(record_label) {
+                shown_record_label = Some(record_label.to_string());
+                record_item.set_text(record_label);
+            }
+            // Stopping stays reachable with nothing streaming, so a recording is
+            // never stranded by the stream ending first.
+            let record_enabled = snap.streaming || crate::recording::is_active();
+            if shown_record_enabled != Some(record_enabled) {
+                shown_record_enabled = Some(record_enabled);
+                record_item.set_enabled(record_enabled);
+            }
+
             let status_active = status_until.is_some_and(|t| Instant::now() < t);
             if status_active {
                 // A pairing message owns the tooltip right now — don't clobber it.
@@ -428,6 +497,18 @@ fn tray_main(
 /// the display would yank it out from under the client; with no stream, there
 /// is nothing to end. A second permanently-greyed entry would say less than a
 /// label that changes.
+/// The recording item's label, which is also its state.
+///
+/// Same pattern as [`end_item_label`], and for the same reason: a user reading
+/// a menu wants to know what pressing it does, not what mode the program is in.
+fn record_item_label() -> &'static str {
+    if crate::recording::is_active() {
+        "Stop Recording"
+    } else {
+        "Start Recording"
+    }
+}
+
 fn end_item_label() -> &'static str {
     if crate::stats::is_streaming() {
         "End Stream"
@@ -449,6 +530,8 @@ struct MenuIds {
     pair: tray_icon::menu::MenuId,
     clear: tray_icon::menu::MenuId,
     quit: tray_icon::menu::MenuId,
+    record: tray_icon::menu::MenuId,
+    report: tray_icon::menu::MenuId,
 }
 
 // ── Server Stats window ────────────────────────────────────────────────────

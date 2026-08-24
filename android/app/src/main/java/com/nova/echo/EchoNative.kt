@@ -239,6 +239,21 @@ object EchoNative {
      */
     external fun nativeRequestIdr(handle: Long): Boolean
 
+    /**
+     * Tell the engine the device's network changed, so a live session rebuilds
+     * its path instead of waiting to notice.
+     *
+     * **Takes no handle**, unlike everything else here except [nativeRelease].
+     * The fact is a property of the device, not of a session, and
+     * `ConnectivityManager` fires its callbacks at exactly the moments a handle
+     * is most likely to be mid-teardown — so there is deliberately nothing here
+     * to get wrong.
+     *
+     * Safe to call spuriously; the engine's epoch only ever moves forward.
+     * Returns the new epoch, which is worth nothing except in a log line.
+     */
+    external fun nativeNetworkChanged(): Long
+
     /** Queue and receive statistics as JSON. */
     external fun nativeStats(handle: Long): String
 

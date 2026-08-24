@@ -49,6 +49,18 @@ data class UiState(
      * case wrong, and it is the case that matters most: it is the fast one.
      */
     val transport: String? = null,
+    /**
+     * The path is being rebuilt underneath a session that is still alive.
+     *
+     * **Not an error, and not the end of [streaming].** Both stay as they were,
+     * because the decoder is still holding the last frame and the host is still
+     * holding the session — the only honest thing to draw is an overlay on top
+     * of a picture that is simply not advancing. Clearing `streaming` here would
+     * make every screen that keys off it (the surface, the input path, the stop
+     * button) behave as though the session had ended, which is exactly the
+     * teardown the handover exists to avoid.
+     */
+    val reconnecting: Boolean = false,
     val error: String? = null,
     val log: List<String> = emptyList(),
     /** The user's intent for the microphone; persists across sessions. */
@@ -169,6 +181,10 @@ class EchoController private constructor(private val context: android.content.Co
         // that. Arrival needs no listener: a pad claims its slot on the first
         // event it sends.
         gamepads.start()
+        // Same lifetime, same reasoning, different subject: a session that is
+        // *between* handover attempts is the one that most needs to hear about
+        // the next network change, so this cannot be scoped to a live session.
+        NetworkMonitor.of(context).start()
         // The microphone switch is *intent* and is persisted, so it has to be
         // restored here rather than defaulting off on every process start —
         // otherwise the settings sheet and the controller disagree about a
@@ -433,12 +449,31 @@ class EchoController private constructor(private val context: android.content.Co
                     it.copy(transport = event.optString("transport").ifBlank { null })
                 }
                 "granted" -> onGranted(event, h)
+                // The path died and the engine is rebuilding it. NOTHING is torn
+                // down here — no `player.stop()`, no surface change, no
+                // `streaming = false`. The engine's contract is that the frame
+                // on screen stays valid (`hold_last_frame`), and acting on this
+                // event by releasing the decoder would recreate the black screen
+                // it exists to prevent.
+                "path_interrupted" -> post {
+                    it.copy(status = "Reconnecting…", reconnecting = true)
+                }
+                "path_resuming" -> post {
+                    it.copy(status = "Reconnecting… (${event.optInt("attempt")})")
+                }
                 "error" -> post { it.copy(status = "Failed", error = event.optString("message")) }
                 "closed", "ended" -> {
                     // `transport` goes with the session. Leaving it set would
                     // leave a card claiming a live LAN path to a host nothing
                     // is connected to.
-                    post { it.copy(status = "Ended", streaming = false, transport = null) }
+                    post {
+                        it.copy(
+                            status = "Ended",
+                            streaming = false,
+                            reconnecting = false,
+                            transport = null,
+                        )
+                    }
                     return
                 }
             }
@@ -462,6 +497,38 @@ class EchoController private constructor(private val context: android.content.Co
         // value here misconfigures it rather than merely mislabelling a log.
         val fps = event.optInt("fps", 60)
 
+        // A grant arriving over a decoder that can carry it is a HANDOVER, not a
+        // new stream: the engine rebuilt the path underneath us and the host
+        // handed back the session it was holding. The picture currently on the
+        // Surface is still the right picture, so nothing here is torn down — the
+        // decoder keeps running, and the only thing owed is a keyframe, because
+        // whatever the old path was mid-GOP on did not survive the move.
+        //
+        // Rebuilding instead would black the screen for the rebuild and
+        // manufacture a visible fault out of a successful recovery. This branch
+        // is the difference between "it froze for a second" and "it went black".
+        val carried = player?.takeIf { it.canCarry(h, width, height, fps, codec) }
+        if (carried != null) {
+            EchoNative.nativeRequestIdr(h)
+            post {
+                it.copy(
+                    status = "Streaming ${width}x$height@${fps} $codec",
+                    streaming = true,
+                    reconnecting = false,
+                    error = null,
+                )
+            }
+            // Audio is not re-armed: `gameAudio` and the mic are bound to the
+            // same JNI handle, which the handover did not change, so they have
+            // been draining the whole time.
+            return
+        }
+
+        // Anything the running decoder cannot carry — a renegotiated codec, a
+        // different geometry, or no decoder at all — needs a real one. Releasing
+        // the old one first matters: two codecs writing into one Surface is the
+        // BufferQueue wedge this class exists to avoid.
+        player?.stop()
         player = VideoPlayer(h, target, width, height, fps, codec) { message ->
             post { it.copy(status = "Failed", error = message) }
         }.also { it.start() }

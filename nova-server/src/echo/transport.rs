@@ -163,11 +163,15 @@ impl ActiveTunnel {
 ///
 /// `inbound` receives every control datagram `rtp.rs` demultiplexes off the
 /// media socket; `rtp_sender` is how replies leave.
+/// `latched` is the gatherer's latched-peer cell — the address Nova's own punch
+/// most recently confirmed a path to. It is read here for one purpose: see
+/// `the incumbent is provably stale` in the contention block below.
 pub fn spawn(
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     rtp_sender: Arc<Mutex<crate::rtp::RtpSender>>,
     handler: Arc<rpc::Handler>,
     sessions: Arc<SessionManager>,
+    latched: Arc<Mutex<Option<SocketAddr>>>,
 ) {
     tokio::spawn(async move {
         // True while a tunnel is being served. Not a mutex: the accept loop is
@@ -297,13 +301,50 @@ pub fn spawn(
                     // finding out, so the incumbent gets a much shorter leash
                     // than the unattended timeout.
                     let idle = t.idle_for(&rtp_sender);
-                    if idle > CONTENDED_IDLE_TIMEOUT {
-                        println!(
-                            "🔀 Echo WAN: {from} wants a tunnel and {} has been silent {}s — \
-                             handing the slot over",
-                            t.peer,
-                            idle.as_secs()
-                        );
+                    // The incumbent is provably stale, so waiting out the leash
+                    // buys nothing.
+                    //
+                    // Nova never blasts unsolicited: it punches only when a relay
+                    // offer or a LAN rendezvous tells it to, and it latches only
+                    // the peer that answered. So a contender whose address IS the
+                    // current latch is one Nova itself just confirmed a two-way
+                    // path to, on a punch it was authorised to make. The
+                    // incumbent, meanwhile, is an address the latch has moved off
+                    // — nothing has come back from it since.
+                    //
+                    // This is what makes a client-side network handover feel
+                    // seamless rather than five seconds long: the phone moves
+                    // Wi-Fi → cellular, re-offers through the relay, Nova punches
+                    // and latches its new address, and its first control datagram
+                    // takes the slot immediately instead of waiting out a leash
+                    // sized for a client that might still be alive.
+                    //
+                    // Safe *because* it is the latch and not merely the source
+                    // address: `from` is unauthenticated and trivially spoofable,
+                    // which is exactly why nothing else in this loop trusts it.
+                    // The latch is Nova's own record of a punch that completed,
+                    // so an attacker cannot reach this branch by claiming an
+                    // address — only by actually completing a punch Nova was
+                    // told to make. And taking the slot still proves nothing:
+                    // the TLS handshake below decides everything that matters.
+                    let latched_here =
+                        *latched.lock().unwrap_or_else(|e| e.into_inner()) == Some(from);
+                    if latched_here || idle > CONTENDED_IDLE_TIMEOUT {
+                        if latched_here {
+                            println!(
+                                "🔀 Echo WAN: {from} is the latched path and {} is not — handing \
+                                 the slot over immediately (idle {}s)",
+                                t.peer,
+                                idle.as_secs()
+                            );
+                        } else {
+                            println!(
+                                "🔀 Echo WAN: {from} wants a tunnel and {} has been silent {}s — \
+                                 handing the slot over",
+                                t.peer,
+                                idle.as_secs()
+                            );
+                        }
                         // Falls through to the shared `active = None` below,
                         // which drops the record. That closes the sink, ends the
                         // driver, unblocks the served task's TLS read and lets it

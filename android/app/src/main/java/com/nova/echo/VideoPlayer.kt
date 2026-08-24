@@ -97,11 +97,7 @@ class VideoPlayer(
     /** Guards [codecInstance] against a surface swap racing start/stop. */
     private val lock = Any()
     private var surface: Surface? = surface
-    private val mime = when (codec.lowercase()) {
-        "h264", "avc" -> MediaFormat.MIMETYPE_VIDEO_AVC
-        "av1" -> MediaFormat.MIMETYPE_VIDEO_AV1
-        else -> MediaFormat.MIMETYPE_VIDEO_HEVC
-    }
+    private val mime = mimeFor(codec)
 
     private var codecInstance: MediaCodec? = null
     private var feeder: Thread? = null
@@ -120,6 +116,40 @@ class VideoPlayer(
      * every attempt reports instead of thrashing. Reset by a clean [start].
      */
     private var restarts = 0
+
+    /**
+     * Whether this decoder can carry a newly granted session without being
+     * rebuilt.
+     *
+     * The handover case. When the network moves the engine rebuilds the path and
+     * the host grants a *new* session — but the picture on screen, the Surface
+     * it is on, and the decoder that produced it are all still perfectly valid,
+     * and the whole point of a handover is that the user never learns any of
+     * this happened. Rebuilding here would black the screen for the rebuild, ask
+     * the host for a keyframe it was going to send anyway, and re-run the codec
+     * negotiation that already succeeded — a visible fault manufactured out of a
+     * recovery.
+     *
+     * The comparison is on everything `configure` was given, because those are
+     * exactly the things a running codec cannot be told to change. Anything
+     * different — the returning client renegotiated a codec, the host granted a
+     * different geometry, the cadence moved — genuinely needs a new decoder, and
+     * falling through to one is always safe.
+     *
+     * `handle` is compared too, though in practice it never changes across a
+     * handover: the JNI handle outlives the attempts inside it. It is compared
+     * because a mismatch would mean this decoder is draining a session that no
+     * longer exists, which is a wedge rather than a glitch.
+     */
+    fun canCarry(handle: Long, width: Int, height: Int, fps: Int, codec: String): Boolean {
+        if (failed) return false
+        if (synchronized(lock) { codecInstance } == null) return false
+        return handle == this.handle &&
+            width == this.width &&
+            height == this.height &&
+            fps == this.fps &&
+            mimeFor(codec) == this.mime
+    }
 
     fun start() {
         val target = synchronized(lock) { surface }
@@ -695,6 +725,20 @@ class VideoPlayer(
     data class Mode(val codec: String, val fps: Int)
 
     private companion object {
+        /**
+         * The MIME a codec name configures to.
+         *
+         * Extracted so [canCarry] compares the same value `configure` was given
+         * rather than the string it came from — "hevc" and "h265" are the same
+         * decoder, and a comparison on the raw name would rebuild a perfectly
+         * good codec because the host spelled it differently this time.
+         */
+        fun mimeFor(codec: String): String = when (codec.lowercase()) {
+            "h264", "avc" -> MediaFormat.MIMETYPE_VIDEO_AVC
+            "av1" -> MediaFormat.MIMETYPE_VIDEO_AV1
+            else -> MediaFormat.MIMETYPE_VIDEO_HEVC
+        }
+
         const val TAG = "EchoVideo"
         const val DEQUEUE_TIMEOUT_US = 10_000L
         // Long enough that a healthy 60 fps stream never times out, short enough

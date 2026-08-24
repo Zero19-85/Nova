@@ -135,6 +135,17 @@ pub enum Event {
     /// somebody else is streaming. An expected answer, not a failure.
     Refused { reason: String },
     Warning { message: String },
+    /// The path died and [`crate::handover`] is going to rebuild it.
+    ///
+    /// **`hold_last_frame` is the contract with the platform layer**, and it is
+    /// the whole point of the event: the decoder, its Surface and the picture
+    /// currently on screen are all still valid, so the correct response is an
+    /// overlay *over* the held frame — never a teardown, never a black fill. A
+    /// client that releases its codec here has re-created the very failure the
+    /// handover exists to prevent.
+    PathInterrupted { reason: String, detail: String, attempt: u32, frames_this_attempt: u64 },
+    /// A new attempt is starting, with this much of the resume window left.
+    PathResuming { attempt: u32, window_left_ms: u64 },
     Ended { stats: ReceiveStats },
 }
 
@@ -218,6 +229,21 @@ impl Event {
             }),
             Event::Refused { reason } => json!({"type": "refused", "reason": reason}),
             Event::Warning { message } => json!({"type": "warning", "message": message}),
+            Event::PathInterrupted { reason, detail, attempt, frames_this_attempt } => json!({
+                "type": "path_interrupted",
+                "reason": reason,
+                "detail": detail,
+                "attempt": attempt,
+                "frames_this_attempt": frames_this_attempt,
+                // Constant rather than computed, so the flag cannot drift out of
+                // agreement with the doc comment on the variant.
+                "hold_last_frame": true,
+            }),
+            Event::PathResuming { attempt, window_left_ms } => json!({
+                "type": "path_resuming",
+                "attempt": attempt,
+                "window_left_ms": window_left_ms,
+            }),
             Event::Ended { stats } => json!({
                 "type": "ended",
                 "frames_completed": stats.frames_completed,
