@@ -37,6 +37,12 @@ const MOUSE_BUTTON_DOWN: u32 = 0x0000_0008;
 const MOUSE_BUTTON_UP: u32 = 0x0000_0009;
 const SCROLL: u32 = 0x0000_000A;
 
+/// Absolute touch — **Nova-private, not a GameStream magic.** Deliberately far
+/// outside the protocol's contiguous small numbering so a future GEN5 packet
+/// cannot collide with it; reads as ASCII `NTCH` big-endian. Mirrors
+/// `nova-server/src/input.rs::TOUCH_MAGIC`.
+const TOUCH: u32 = 0x4E54_4348;
+
 /// `NV_MULTI_CONTROLLER_PACKET`, magic `MULTI_CONTROLLER_MAGIC_GEN5`. Unlike
 /// every other packet in this file, its body is little-endian throughout —
 /// see [`gamepad`].
@@ -131,6 +137,72 @@ pub fn mouse_button(button: MouseButton, down: bool) -> Vec<u8> {
     p
 }
 
+
+// ── Absolute touch ──────────────────────────────────────────────────────────
+
+/// The reference space touch coordinates are expressed in, on both axes.
+///
+/// A fixed normalised range rather than the client's own pixel dimensions,
+/// because by the time a coordinate reaches here the platform layer has already
+/// applied its rounded-corner transform — the numbers no longer describe any
+/// real surface. Sending a phone's pixel size beside transformed coordinates
+/// would invite someone to un-transform them on the host, and the host would be
+/// wrong in a way that looks like a slightly miscalibrated screen.
+///
+/// 32767 is `i16::MAX`, so a fraction survives the wire at ~0.003% — far finer
+/// than any panel, and the packing is exact rather than nearly-exact.
+/// Mirrored in `nova-server/src/input.rs::inject_touch`.
+pub const TOUCH_REF: i16 = i16::MAX;
+
+/// What happened to one contact. Values match `nova-server/src/touch.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TouchEvent {
+    Down = 0,
+    Update = 1,
+    Up = 2,
+    /// The gesture was taken over by something else — Android's own
+    /// `ACTION_CANCEL`, or the app deciding a gesture belongs to it after all.
+    /// The host lifts the contact: there is no cancelled state on Windows, and
+    /// a contact left down is a finger pressed on someone's desktop.
+    Cancel = 3,
+}
+
+impl TouchEvent {
+    /// Map a small integer from the JNI boundary. `None` rather than a default,
+    /// for the same reason [`MouseButton::from_code`] refuses: a bad value
+    /// should be a refused call, not a guessed gesture.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Down),
+            1 => Some(Self::Update),
+            2 => Some(Self::Up),
+            3 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// One contact transition.
+///
+/// Per-contact rather than per-frame, because that is the shape Android
+/// delivers and the host reassembles frames anyway (it has to — a lost packet
+/// would otherwise silently lift every other finger). `x`/`y` are in
+/// [`TOUCH_REF`] units, already corner-corrected by the caller.
+///
+/// `id` is the platform's pointer id, stable for the life of one finger. It is
+/// what lets the host distinguish a drag from a series of taps, so it must not
+/// be re-derived per event.
+pub fn touch(id: u8, event: TouchEvent, x: i16, y: i16) -> Vec<u8> {
+    let mut p = header(TOUCH, 10);
+    p.push(event as u8);
+    p.push(id);
+    p.extend_from_slice(&x.clamp(0, TOUCH_REF).to_be_bytes()); // big-endian, like every other position
+    p.extend_from_slice(&y.clamp(0, TOUCH_REF).to_be_bytes());
+    p.extend_from_slice(&TOUCH_REF.to_be_bytes()); // at len-4
+    p.extend_from_slice(&TOUCH_REF.to_be_bytes()); // at len-2
+    p
+}
 /// Vertical scroll, in WHEEL_DELTA units (120 per notch) — the host passes the
 /// amount to `SendInput` unchanged.
 pub fn scroll(amount: i16) -> Option<Vec<u8>> {
@@ -357,6 +429,22 @@ pub fn coalesce(packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
                 // newer one exists.
                 *out.last_mut().expect("previous exists") = packet;
             }
+            (Some(TOUCH), Some(Some(TOUCH)))
+                if touch_update_of(&packet).is_some()
+                    && touch_update_of(&packet) == out.last().and_then(|p| touch_update_of(p)) =>
+            {
+                // Superseded, and ONLY for an `update` of the SAME contact —
+                // exactly the absolute-position case, one finger at a time.
+                //
+                // The guard is the whole point. A `down`, an `up` or a `cancel`
+                // is a transition the host reassembles into a frame, so dropping
+                // one does not lose a position, it loses a press or a lift: a
+                // superseded `down` is a tap that never happened, and a
+                // superseded `up` is a finger left pressed on the desktop. Two
+                // fingers dragging at once must not collapse into one either,
+                // which is why the id is compared and not just the event.
+                *out.last_mut().expect("previous exists") = packet;
+            }
             _ => out.push(packet),
         }
     }
@@ -451,6 +539,23 @@ fn controller_number_of(packet: &[u8]) -> Option<u8> {
     packet
         .get(10..12)
         .map(|b| i16::from_le_bytes(b.try_into().expect("2 bytes")) as u8)
+}
+
+/// The contact id of a touch packet **that is an `update`**, or `None` for any
+/// other packet — including a touch `down`, `up` or `cancel`.
+///
+/// The narrowness is deliberate and is what makes the supersede in [`coalesce`]
+/// safe: returning an id for a transition would let one be dropped, and a
+/// dropped transition is a lost press or a finger left down on the host. Two
+/// `None`s must never compare equal, so callers test `is_some()` first.
+fn touch_update_of(packet: &[u8]) -> Option<u8> {
+    if magic_of(packet) != Some(TOUCH) {
+        return None;
+    }
+    match (packet.get(8), packet.get(9)) {
+        (Some(&e), Some(&id)) if e == TouchEvent::Update as u8 => Some(id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +741,89 @@ mod tests {
             keyboard(0x42, 0, false),
         ]);
         assert_eq!(out.len(), 4, "every key event is meaningful on its own");
+    }
+
+    /// The exact bytes the host reads, locked down. `inject_touch` takes the
+    /// event and id from fixed offsets and the reference size from the packet's
+    /// *end*, so a field inserted in the middle must not shift those two.
+    #[test]
+    fn a_touch_packet_lays_out_where_the_host_reads() {
+        let p = touch(3, TouchEvent::Down, 1000, 2000);
+        assert_eq!(p.len(), 18, "8-byte header + 10-byte body");
+        assert_eq!(magic_of(&p), TOUCH);
+        assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 14, "size = body + magic");
+        assert_eq!(p[8], 0, "event: down");
+        assert_eq!(p[9], 3, "pointer id");
+        assert_eq!(i16::from_be_bytes([p[10], p[11]]), 1000);
+        assert_eq!(i16::from_be_bytes([p[12], p[13]]), 2000);
+        let len = p.len();
+        assert_eq!(i16::from_be_bytes([p[len - 4], p[len - 3]]), TOUCH_REF);
+        assert_eq!(i16::from_be_bytes([p[len - 2], p[len - 1]]), TOUCH_REF);
+    }
+
+    /// A coordinate outside the reference space pins at the rail rather than
+    /// wrapping to the opposite edge — the same reason the JNI layer saturates
+    /// its deltas. A negative x that wrapped would put a finger on the far side
+    /// of the desktop from where the user touched.
+    #[test]
+    fn touch_coordinates_pin_rather_than_wrap() {
+        let p = touch(0, TouchEvent::Update, -50, i16::MAX);
+        assert_eq!(i16::from_be_bytes([p[10], p[11]]), 0);
+        assert_eq!(i16::from_be_bytes([p[12], p[13]]), TOUCH_REF);
+    }
+
+    /// One finger dragging: only the newest position matters, exactly as for an
+    /// absolute mouse position.
+    #[test]
+    fn touch_updates_for_one_contact_keep_only_the_newest() {
+        let out = coalesce(vec![
+            touch(1, TouchEvent::Update, 10, 10),
+            touch(1, TouchEvent::Update, 20, 20),
+            touch(1, TouchEvent::Update, 30, 40),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(i16::from_be_bytes([out[0][10], out[0][11]]), 30);
+        assert_eq!(i16::from_be_bytes([out[0][12], out[0][13]]), 40);
+    }
+
+    /// Two fingers dragging at once must not collapse into one. Superseding
+    /// across ids would drop a whole contact's motion for the length of the
+    /// gesture — a pinch that only one finger takes part in.
+    #[test]
+    fn touch_updates_for_different_contacts_never_supersede() {
+        let out = coalesce(vec![
+            touch(1, TouchEvent::Update, 10, 10),
+            touch(2, TouchEvent::Update, 20, 20),
+            touch(1, TouchEvent::Update, 11, 11),
+            touch(2, TouchEvent::Update, 21, 21),
+        ]);
+        assert_eq!(out.len(), 4, "interleaved contacts are independent");
+    }
+
+    /// The transitions are not idempotent and must survive a burst intact.
+    ///
+    /// This is the test that would have caught treating touch like an absolute
+    /// position wholesale: a dropped `down` is a tap that never happened, and a
+    /// dropped `up` is a finger left pressed on someone's desktop until the
+    /// session ends.
+    #[test]
+    fn touch_transitions_are_never_merged() {
+        let out = coalesce(vec![
+            touch(1, TouchEvent::Down, 10, 10),
+            touch(1, TouchEvent::Up, 10, 10),
+            touch(1, TouchEvent::Down, 10, 10),
+            touch(1, TouchEvent::Up, 10, 10),
+        ]);
+        assert_eq!(out.len(), 4, "a double tap is two taps");
+
+        // And a run of updates must not swallow the lift that follows it.
+        let out = coalesce(vec![
+            touch(1, TouchEvent::Update, 10, 10),
+            touch(1, TouchEvent::Update, 20, 20),
+            touch(1, TouchEvent::Up, 20, 20),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1][8], TouchEvent::Up as u8, "the lift is the last word");
     }
 
     /// Every modifier and button must be released, and every packet must be an

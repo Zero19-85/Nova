@@ -98,6 +98,48 @@ object EchoNative {
      */
     const val INPUT_RELEASE_ALL = 6
 
+    /**
+     * One absolute touch contact. [a]=event ([TOUCH_DOWN]…[TOUCH_CANCEL]),
+     * [b]=pointer id, [c]=x, [d]=y in [TOUCH_REF] units.
+     *
+     * Native contacts, not a synthesised mouse: the host injects
+     * `POINTER_TOUCH_INFO` through a synthetic touchscreen, so Windows gives the
+     * stream touch-sized hit targets, edge swipes, press-and-hold as a
+     * right-click, and real multi-touch. That is unreachable by moving the
+     * cursor and clicking it, which is what [INPUT_MOUSE_ABS] does.
+     *
+     * The host reassembles these per-contact transitions into the whole-frame
+     * form its injection API demands, so **a transition may never be dropped or
+     * reordered**: a lost `down` is a tap that never happened and a lost `up` is
+     * a finger left pressed on the desktop until the session ends.
+     */
+    const val INPUT_TOUCH = 7
+
+    /** A contact landed. Its [id] is live from here until [TOUCH_UP]. */
+    const val TOUCH_DOWN = 0
+    /** A live contact moved. Ignored by the host for an id that is not down. */
+    const val TOUCH_UPDATE = 1
+    /** A contact lifted. */
+    const val TOUCH_UP = 2
+    /**
+     * The gesture was taken over — Android's `ACTION_CANCEL`, or the app
+     * claiming it for its own keyboard gesture. The host lifts the contact:
+     * Windows has no cancelled state, and a contact left down is a finger
+     * pressed on someone's desktop.
+     */
+    const val TOUCH_CANCEL = 3
+
+    /**
+     * The reference space touch coordinates are sent in, on both axes.
+     *
+     * A fixed normalised range rather than the view's pixel size, because the
+     * coordinates have already been through the rounded-corner transform by then
+     * and no longer describe any real surface. Sending the panel's dimensions
+     * beside transformed coordinates would invite un-transforming them on the
+     * host. `Short.MAX_VALUE`; mirrored as `TOUCH_REF` in `echo-client`.
+     */
+    const val TOUCH_REF = 32767
+
     external fun nativeSendInput(handle: Long, kind: Int, a: Int, b: Int, c: Int, d: Int): Boolean
 
     // ── Gamepad ─────────────────────────────────────────────────────────────

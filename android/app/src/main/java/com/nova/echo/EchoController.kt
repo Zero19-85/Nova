@@ -466,8 +466,27 @@ class EchoController private constructor(private val context: android.content.Co
                 // on screen stays valid (`hold_last_frame`), and acting on this
                 // event by releasing the decoder would recreate the black screen
                 // it exists to prevent.
+                // A refusal is not a broken path, so it must not read as one.
+                //
+                // The host answers a declined session immediately and in plain
+                // English — "a Moonlight client is streaming right now…" — and
+                // this arm used to overwrite that with "Reconnecting…" while the
+                // engine retried behind it. The user got a spinner for the whole
+                // resume window and never learned that their PC had already
+                // told them exactly what was wrong (live 2026-08-24).
+                //
+                // `reconnecting` stays false: nothing is being reconnected, and
+                // setting it would put a "reconnecting" overlay over a held
+                // frame that does not exist yet on a first attempt.
                 "path_interrupted" -> post {
-                    it.copy(status = "Reconnecting…", reconnecting = true)
+                    if (event.optString("reason") == "refused") {
+                        it.copy(
+                            status = "The PC is busy",
+                            error = event.optString("detail").ifBlank { "the host declined the session" },
+                        )
+                    } else {
+                        it.copy(status = "Reconnecting…", reconnecting = true)
+                    }
                 }
                 "path_resuming" -> post {
                     it.copy(status = "Reconnecting… (${event.optInt("attempt")})")
@@ -732,6 +751,18 @@ class EchoController private constructor(private val context: android.content.Co
         send(EchoNative.INPUT_MOUSE_BUTTON, button, if (down) 1 else 0)
 
     fun scroll(amount: Int) = send(EchoNative.INPUT_SCROLL, amount)
+
+    /**
+     * One touch contact transition, for absolute-touch mode.
+     *
+     * [id] is the platform's pointer id and must stay with one finger for the
+     * whole gesture — it is what lets Windows tell a drag from a run of taps.
+     * [x] and [y] are in [EchoNative.TOUCH_REF] units, already corner-corrected
+     * by the view: the transform depends on the panel's geometry, which nothing
+     * below this layer can see.
+     */
+    fun touch(id: Int, event: Int, x: Int, y: Int) =
+        send(EchoNative.INPUT_TOUCH, event, id, x, y)
 
     /**
      * Post one controller state snapshot.

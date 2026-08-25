@@ -323,6 +323,14 @@ pub enum Interruption {
     Stalled { silent_for: Duration },
     /// A layer below returned an error.
     Failed { reason: String },
+    /// The host understood the request and said no.
+    ///
+    /// Kept apart from [`Interruption::Failed`] because the two want opposite
+    /// treatment. A failure is retried, because it is usually the network and
+    /// the network usually comes back. A refusal is a decision — the seat is
+    /// taken, a Moonlight client is streaming — and nothing this side does will
+    /// change it. See [`crate::session::REFUSED_PREFIX`].
+    Refused { reason: String },
 }
 
 impl Interruption {
@@ -332,6 +340,7 @@ impl Interruption {
             Self::NetworkChanged { .. } => "network_changed",
             Self::Stalled { .. } => "stalled",
             Self::Failed { .. } => "failed",
+            Self::Refused { .. } => "refused",
         }
     }
 }
@@ -344,6 +353,7 @@ impl std::fmt::Display for Interruption {
                 write!(f, "no video for {} ms", silent_for.as_millis())
             }
             Self::Failed { reason } => write!(f, "{reason}"),
+            Self::Refused { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -435,6 +445,33 @@ where
             attempt: attempts,
             frames_this_attempt: live.frames(),
         });
+
+        // A refusal ends it now, without waiting out the resume window.
+        //
+        // Everything else in this loop is retried because the thing that broke
+        // is expected to come back on its own — an interface settles, a punch
+        // finds a route, a stall clears. A refusal is not that. The host
+        // understood the request and declined it for a reason that will still be
+        // true on the next attempt and the twenty after it, and the only thing
+        // that clears it is a person doing something: stopping the Moonlight
+        // client, releasing the seat from the other device.
+        //
+        // Retrying anyway is not merely useless, it actively hides the answer.
+        // Each attempt is a full rendezvous, punch and TLS handshake against a
+        // host that already said no, and while they run the UI shows
+        // "Reconnecting…" — so the one message the user needed, which the host
+        // wrote in plain English and sent immediately, was buried under a minute
+        // of retry chatter (live 2026-08-24).
+        //
+        // The trade, stated: a refusal that WOULD have cleared within the window
+        // — the other client quitting a few seconds later — now needs the user
+        // to tap again instead of recovering by itself. That is the right way
+        // round. Being told "your PC is busy, a Moonlight client is streaming"
+        // in under a second is worth more than an automatic recovery that only
+        // sometimes happens and never explains itself.
+        if let Interruption::Refused { .. } = interruption {
+            return Outcome::GaveUp { last: interruption, attempts };
+        }
 
         let since = *resuming_since.get_or_insert_with(Instant::now);
         if since.elapsed() >= policy.resume_window {
@@ -640,9 +677,15 @@ async fn watch_for_interruption(
 fn classify(reason: String, started_epoch: u64) -> Interruption {
     let now = epoch();
     if now != started_epoch {
-        Interruption::NetworkChanged { epoch: now }
-    } else {
-        Interruption::Failed { reason }
+        // The epoch is tested FIRST, and it outranks a refusal deliberately. If
+        // the ground moved mid-attempt then whatever came back describes a path
+        // that no longer exists — including a refusal, which the host may well
+        // not repeat once we ask again from the interface we actually have.
+        return Interruption::NetworkChanged { epoch: now };
+    }
+    match reason.strip_prefix(session::REFUSED_PREFIX) {
+        Some(refusal) => Interruption::Refused { reason: refusal.to_string() },
+        None => Interruption::Failed { reason },
     }
 }
 
@@ -738,6 +781,55 @@ mod tests {
         let b = network_changed();
         assert!(b > a);
         assert_eq!(epoch(), b);
+    }
+
+    #[test]
+    fn a_host_refusal_is_classified_apart_from_a_failure() {
+        // The distinction the whole fix rests on. Both arrive as an `Err(String)`
+        // from the same call; only the tag tells them apart, and getting this
+        // wrong in either direction is bad — a misread failure gives up on a
+        // recoverable network blip, a misread refusal spins for a minute.
+        let start = epoch();
+        let refusal = format!(
+            "{}a Moonlight client is streaming right now (moonlight_active)",
+            session::REFUSED_PREFIX
+        );
+        match classify(refusal, start) {
+            Interruption::Refused { reason } => {
+                assert_eq!(reason, "a Moonlight client is streaming right now (moonlight_active)");
+                // And the tag must not survive into anything a person reads.
+                assert!(!reason.contains(session::REFUSED_PREFIX));
+            }
+            other => panic!("a tagged refusal must classify as Refused, got {other:?}"),
+        }
+        assert!(
+            matches!(classify("connection reset".into(), start), Interruption::Failed { .. }),
+            "an untagged error is still an ordinary failure"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_itself_on_the_wire_and_reads_as_the_hosts_own_words() {
+        // `as_str` is what Kotlin branches on to decide between "the PC is busy"
+        // and "Reconnecting…", and Display is what it puts on screen. Both are
+        // API; a rename here is a silent UI regression.
+        let r = Interruption::Refused { reason: "the seat is taken".into() };
+        assert_eq!(r.as_str(), "refused");
+        assert_eq!(r.to_string(), "the seat is taken");
+    }
+
+    #[test]
+    fn a_network_change_outranks_a_refusal() {
+        // A refusal collected from an interface that has since gone away says
+        // nothing about the one we now have, so it must be retried rather than
+        // reported as the host's final word. Ordering inside `classify`.
+        let start = epoch();
+        let refusal = format!("{}the seat is taken", session::REFUSED_PREFIX);
+        network_changed();
+        assert!(
+            matches!(classify(refusal, start), Interruption::NetworkChanged { .. }),
+            "the ground moving outranks whatever the old path came back with"
+        );
     }
 
     /// The resume window has to stay inside the host's grace period, or the

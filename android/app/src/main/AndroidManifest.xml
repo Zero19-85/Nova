@@ -39,13 +39,25 @@
              mode and secondary displays at all; several OEM implementations
              refuse to place a non-resizeable activity on an external display,
              which is why the app would not appear on the glasses. -->
+
+        <!-- windowSoftInputMode=adjustNothing is load-bearing, not cosmetic.
+             The three-finger tap opens the phone's own keyboard OVER a live
+             stream; the default (adjustResize / adjustPan) would shrink or
+             slide the window to make room, which resizes the SurfaceView and
+             hands MediaCodec a different Surface mid-session. That is the exact
+             shape of the decoder wedge fixed on 2026-08-19 — a codec whose
+             output BufferQueue is abandoned underneath it never throws, it
+             simply stops consuming. The keyboard covering part of the picture
+             is the wanted behaviour anyway: it is an overlay on a game, not a
+             form to be scrolled. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:resizeableActivity="true"
             android:preferMinimalPostProcessing="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden|navigation|touchscreen|layoutDirection|fontScale"
-            android:screenOrientation="landscape">
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustNothing">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

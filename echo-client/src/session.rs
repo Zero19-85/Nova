@@ -40,6 +40,24 @@ use serde_json::{json, Value};
 use crate::control::{self, ControlChannel};
 use crate::receiver::{self, FrameSink, ReceiveStats};
 
+/// Marks an error as **the host's considered answer**, not a fault on the way to
+/// asking it.
+///
+/// [`crate::handover`] retries a failure, because a failure is usually the
+/// network and the network usually comes back. A refusal is the opposite kind of
+/// fact: the host understood the request perfectly and said no, for a reason
+/// only a person can clear — stop the other client, release the seat. Retrying
+/// it changes nothing, and retrying it *silently* is what turned "your PC is
+/// busy" into a loading screen that sat there for the full resume window (live
+/// 2026-08-24: seven full rendezvous-punch-TLS attempts in twelve seconds, with
+/// the host's plain-English explanation discarded every time).
+///
+/// A tag rather than a match on the host's wording, because the wording is the
+/// host's to change and is written for a human to read. One constant, produced
+/// in exactly one place below and consumed in exactly one place in
+/// `handover::classify`.
+pub const REFUSED_PREFIX: &str = "\u{1}refused\u{1}";
+
 /// Which route the media path actually took.
 ///
 /// **Determined from the peer that was latched, never from which branch of the
@@ -133,6 +151,11 @@ pub enum Event {
     Granted { session_id: u64, width: u64, height: u64, fps: u64, codec: String },
     /// The host declined — most often the anti-hijack gate doing its job while
     /// somebody else is streaming. An expected answer, not a failure.
+    ///
+    /// The same fact also travels back through the error channel, tagged with
+    /// [`REFUSED_PREFIX`], because the supervisor above has to *act* on it and
+    /// only sees the error. See that constant for why it is a tag and not a
+    /// substring match on the host's prose.
     Refused { reason: String },
     Warning { message: String },
     /// The path died and [`crate::handover`] is going to rebuild it.
@@ -993,7 +1016,7 @@ async fn stream_inner(
             // The anti-hijack refusal is the expected, correct answer while
             // someone else is streaming — report it as an answer, not a fault.
             progress.event(Event::Refused { reason: e.clone() });
-            return Err(format!("no session was granted: {e}"));
+            return Err(format!("{REFUSED_PREFIX}{e}"));
         }
     };
 

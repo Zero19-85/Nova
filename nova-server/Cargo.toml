@@ -56,6 +56,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Absolute touch injection (touch.rs). POINTER_INFO / POINTER_TOUCH_INFO
+    # live in Win32_UI_Input_Pointer; CreateSyntheticPointerDevice,
+    # InjectSyntheticPointerInput, HSYNTHETICPOINTERDEVICE and the
+    # POINTER_TYPE_INFO union that wraps them live in Win32_UI_Controls. Both
+    # are required together — the union's fields are cfg-gated on the *other*
+    # feature, so either alone fails to compile. Bindings only, nothing linked.
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Controls",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_Devices_Display",

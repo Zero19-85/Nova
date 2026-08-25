@@ -97,6 +97,15 @@ const MOUSE_BUTTON_DOWN_MAGIC_GEN5: u32 = 0x0000_0008;
 const MOUSE_BUTTON_UP_MAGIC_GEN5: u32 = 0x0000_0009;
 const SCROLL_MAGIC_GEN5: u32 = 0x0000_000A;
 
+/// Absolute touch, Nova-private (`touch.rs`).
+///
+/// **Not a GameStream magic.** Echo's touch mode has no NVIDIA counterpart, so
+/// the value deliberately sits far outside the protocol's contiguous small
+/// numbering (0x03..0x0C) where a future GEN5 packet cannot collide with it —
+/// it reads as ASCII `NTCH` big-endian. A Moonlight client will never send it,
+/// and Echo only sends it when the user turns absolute touch on.
+const TOUCH_MAGIC: u32 = 0x4E54_4348;
+
 // NV_MOUSE_BUTTON_PACKET button values (moonlight-android MouseButtonPacket.java).
 const BUTTON_LEFT: u8 = 1;
 const BUTTON_MIDDLE: u8 = 2;
@@ -364,6 +373,12 @@ pub fn stop_session() {
     // The host's own pointer settings come back first, before anything here
     // can fail: they belong to the local user, not to the stream.
     restore_pointer_ballistics();
+    // Lift any touch contact still on the glass, for the same reason the held
+    // modifiers below are released: a client that vanished mid-gesture leaves
+    // the host holding input it can never take back itself. A stranded contact
+    // is worse than a stuck modifier — it is a finger pressed on the desktop,
+    // and the ids belong to a client that no longer exists.
+    crate::touch::release_all();
     let held = HELD_MODIFIERS.swap(0, Ordering::SeqCst);
     if held & MODIFIER_SHIFT != 0 {
         send_key_event(VK_SHIFT, true);
@@ -769,6 +784,7 @@ pub fn handle_input_packet(payload: &[u8]) {
         MOUSE_BUTTON_DOWN_MAGIC_GEN5 => inject_mouse_button(payload, true),
         MOUSE_BUTTON_UP_MAGIC_GEN5 => inject_mouse_button(payload, false),
         SCROLL_MAGIC_GEN5 => inject_scroll(payload),
+        TOUCH_MAGIC => inject_touch(payload),
         KEY_DOWN_EVENT_MAGIC => inject_keyboard(payload, false),
         KEY_UP_EVENT_MAGIC => inject_keyboard(payload, true),
         // 10-byte controller capability/status packets (8-byte
@@ -1053,6 +1069,71 @@ fn inject_mouse_move_abs(payload: &[u8]) {
         time: 0,
         dwExtraInfo: 0,
     });
+}
+
+/// NV-style absolute-touch packet, Nova-private (magic [`TOUCH_MAGIC`]).
+/// Body after the 8-byte NV_INPUT_HEADER, 10 bytes:
+///   event      : u8      @8      0=down 1=update 2=up 3=cancel
+///   pointer id : u8      @9      stable for the life of one finger
+///   x          : i16 BE  @10     position in the client's reference space
+///   y          : i16 BE  @12
+///   width      : i16 BE  @len-4  the client's reference width for `x`
+///   height     : i16 BE  @len-2  the client's reference height for `y`
+///
+/// Width and height are read from the **end** of the packet, matching
+/// [`inject_mouse_move_abs`], so a future revision can insert a field without
+/// moving them.
+///
+/// The client sends a normalised reference space (0..32767 on both axes) rather
+/// than its own pixel dimensions, because it has already applied the rounded-
+/// corner transform by this point — the numbers no longer describe any real
+/// surface, and passing a phone's pixel size alongside transformed coordinates
+/// would invite exactly the mistake of un-transforming them here.
+///
+/// The fraction is applied to the active capture rect, the same one the mouse
+/// path uses, so touch and pointer modes address identical desktop geometry.
+/// Unlike the mouse path there is no conversion to SendInput's 0–65535 space:
+/// `POINTER_INFO.ptPixelLocation` wants desktop pixels. See `touch.rs`.
+fn inject_touch(payload: &[u8]) {
+    if payload.len() < 18 {
+        return;
+    }
+    let len = payload.len();
+    let Some(event) = crate::touch::TouchEvent::from_code(payload[8]) else {
+        return;
+    };
+    let id = payload[9] as u32;
+    if id as usize >= crate::touch::MAX_CONTACTS {
+        // Beyond what the synthetic device was created for. Refused here rather
+        // than clamped: clamping would alias two fingers onto one contact id,
+        // and a drag that silently teleports between two fingers is worse than
+        // an eleventh finger that does nothing.
+        return;
+    }
+
+    let x = i16::from_be_bytes([payload[10], payload[11]]) as f64;
+    let y = i16::from_be_bytes([payload[12], payload[13]]) as f64;
+    let ref_w = i16::from_be_bytes([payload[len - 4], payload[len - 3]]) as f64;
+    let ref_h = i16::from_be_bytes([payload[len - 2], payload[len - 1]]) as f64;
+    if ref_w <= 0.0 || ref_h <= 0.0 {
+        return;
+    }
+
+    let (origin_x, origin_y, capture_w, capture_h) = active_capture_rect();
+    if capture_w <= 0 || capture_h <= 0 {
+        return;
+    }
+
+    let frac_x = (x / ref_w).clamp(0.0, 1.0);
+    let frac_y = (y / ref_h).clamp(0.0, 1.0);
+    // `capture_w - 1` because the rect's last addressable pixel is one short of
+    // its width: at a fraction of exactly 1.0 the mouse path's 0–65535 mapping
+    // absorbs the difference, but a raw pixel coordinate here would name a
+    // column one past the right edge and hit-test to nothing.
+    let target_x = origin_x + (frac_x * (capture_w - 1) as f64).round() as i32;
+    let target_y = origin_y + (frac_y * (capture_h - 1) as f64).round() as i32;
+
+    crate::touch::apply(id, event, target_x, target_y);
 }
 
 /// NV_REL_MOUSE_MOVE_PACKET body:

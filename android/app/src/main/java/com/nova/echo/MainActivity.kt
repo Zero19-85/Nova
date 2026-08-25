@@ -149,6 +149,11 @@ private fun EchoScreen(controller: EchoController) {
     var controlsVisible by rememberSaveable { mutableStateOf(false) }
     var inputEnabled by rememberSaveable { mutableStateOf(true) }
     var touchAsPointer by rememberSaveable { mutableStateOf(false) }
+    // Native Windows touch rather than a synthesised mouse. A second flag and
+    // not a mode enum because that is what the two questions actually are —
+    // "should touch reach the PC at all" and "as what" — and because the view
+    // resolves the overlap itself: absolute wins when both are set.
+    var absoluteTouch by rememberSaveable { mutableStateOf(false) }
     // Pointer capture is now opt-in. Grabbing it automatically hid the cursor
     // and swallowed the touchscreen, which left no way to reach the controls.
     var captureMouse by rememberSaveable { mutableStateOf(false) }
@@ -157,12 +162,19 @@ private fun EchoScreen(controller: EchoController) {
     var captureHeld by remember { mutableStateOf(false) }
     var captureWhy by remember { mutableStateOf("") }
     var captureEverHeld by remember { mutableStateOf(false) }
+    // Whether the phone's own keyboard is over the stream, so the mouse can be
+    // handed back while it is — a captured pointer cannot tap a key.
+    var keyboardVisible by remember { mutableStateOf(false) }
 
     // Requested on first use rather than at launch: a microphone prompt before
     // the user has asked for a microphone is the kind of thing people decline
     // reflexively, and a declined permission is much harder to recover from
     // than an un-asked one.
     val context = LocalContext.current
+    // Read live rather than snapshotted: the Clean UI switch is in the same
+    // settings sheet the dashboard opens, and `prefsState` is Compose state, so
+    // flipping it recomposes the overlay while a stream is running.
+    val settings = remember { EchoSettings.of(context) }
     val micPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> controller.onMicPermissionResult(granted) }
@@ -183,6 +195,7 @@ private fun EchoScreen(controller: EchoController) {
                         if (it) captureEverHeld = true
                     }
                     onCaptureDiagnosis = { captureWhy = it }
+                    onKeyboardVisibility = { keyboardVisible = it }
                     view = this
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(h: SurfaceHolder) {
@@ -209,10 +222,15 @@ private fun EchoScreen(controller: EchoController) {
 
         // Push the toggles down whenever they change. The controller carries
         // the master switch because the Activity's key dispatch reads it too.
-        LaunchedEffect(view, inputEnabled, touchAsPointer) {
+        LaunchedEffect(view, inputEnabled, touchAsPointer, absoluteTouch) {
             controller.inputEnabled = inputEnabled
             view?.inputEnabled = inputEnabled
             view?.touchAsPointer = touchAsPointer
+            view?.absoluteTouch = absoluteTouch
+            // Whatever the host is holding belongs to the mode that was on when it
+            // was pressed. Switching modes with a finger down would otherwise
+            // strand it — the new mode has no idea it exists to release it.
+            view?.releaseAllTouchInput()
         }
 
         // Turn capture on by itself when a mouse is actually attached. Leaving
@@ -235,11 +253,11 @@ private fun EchoScreen(controller: EchoController) {
             }
         }
 
-        // Capture only when asked, and never while the controls are open — a
-        // captured pointer cannot click them.
-        LaunchedEffect(state.streaming, view, controlsVisible, captureMouse) {
+        // Capture only when asked, and never while the controls or the phone's
+        // own keyboard are open — a captured pointer can click neither.
+        LaunchedEffect(state.streaming, view, controlsVisible, captureMouse, keyboardVisible) {
             val v = view ?: return@LaunchedEffect
-            if (state.streaming && captureMouse && !controlsVisible) v.captureMouse()
+            if (state.streaming && captureMouse && !controlsVisible && !keyboardVisible) v.captureMouse()
             else v.releaseMouse()
         }
 
@@ -265,6 +283,7 @@ private fun EchoScreen(controller: EchoController) {
                 captureEverHeld = captureEverHeld,
                 inputEnabled = inputEnabled,
                 touchAsPointer = touchAsPointer,
+                absoluteTouch = absoluteTouch,
                 captureMouse = captureMouse,
                 micEnabled = state.micEnabled,
                 syncEnabled = state.syncEnabled,
@@ -289,7 +308,11 @@ private fun EchoScreen(controller: EchoController) {
                 },
                 onInputEnabled = { inputEnabled = it },
                 onTouchAsPointer = { touchAsPointer = it },
+                onAbsoluteTouch = { absoluteTouch = it },
                 onCaptureMouse = { captureMouse = it },
+                cleanUi = settings.prefsState.cleanUi,
+                onCleanUi = { on -> settings.edit { it.copy(cleanUi = on) } },
+                onKeyboard = { view?.toggleSoftKeyboard() },
                 onToggle = { controlsVisible = !controlsVisible },
                 onStop = { controlsVisible = false; controller.stop() },
                 stats = { controller.stats() },
@@ -322,6 +345,7 @@ private fun BoxScope.StreamOverlay(
     captureEverHeld: Boolean,
     inputEnabled: Boolean,
     touchAsPointer: Boolean,
+    absoluteTouch: Boolean,
     captureMouse: Boolean,
     micEnabled: Boolean,
     syncEnabled: Boolean,
@@ -332,12 +356,28 @@ private fun BoxScope.StreamOverlay(
     onMicEnabled: (Boolean) -> Unit,
     onInputEnabled: (Boolean) -> Unit,
     onTouchAsPointer: (Boolean) -> Unit,
+    onAbsoluteTouch: (Boolean) -> Unit,
     onCaptureMouse: (Boolean) -> Unit,
+    cleanUi: Boolean,
+    onCleanUi: (Boolean) -> Unit,
+    onKeyboard: () -> Unit,
     onToggle: () -> Unit,
     onStop: () -> Unit,
     stats: () -> String,
 ) {
     if (!visible) {
+        // Clean UI: the button is not drawn at all.
+        //
+        // Compose has no `View.GONE` — there is no view to set a flag on. Not
+        // emitting the node is the same thing and slightly more: GONE leaves a
+        // view in the hierarchy taking hit tests from nothing, while an
+        // un-emitted composable does not exist, so nothing over the video can
+        // swallow a touch meant for the stream.
+        //
+        // The panel stays reachable: the system back gesture opens it (see the
+        // BackHandler above), which is what makes hiding the button safe rather
+        // than a trap.
+        if (cleanUi) return
         TextButton(onClick = onToggle, modifier = Modifier.align(Alignment.TopEnd)) {
             Text("☰", color = Ion.copy(alpha = 0.75f), fontSize = 22.sp)
         }
@@ -373,13 +413,34 @@ private fun BoxScope.StreamOverlay(
                 TextButton(onClick = onToggle) {
                     Text("RESUME", style = TelemetryStrong.copy(color = Ion))
                 }
+                // The gesture has a button too. A three-finger tap is not
+                // discoverable on its own, and it is unavailable to anyone
+                // driving the session with a mouse rather than the touchscreen.
+                // Closing the panel on the way is deliberate: the keyboard is
+                // wanted over the *stream*, not over the controls.
+                TextButton(onClick = { onToggle(); onKeyboard() }) {
+                    Text("KEYBOARD", style = TelemetryStrong.copy(color = Ion))
+                }
             }
 
             OverlayToggle("Send input to PC", inputEnabled, onInputEnabled)
             OverlayToggle("Capture mouse (games)", captureMouse, onCaptureMouse)
             OverlayToggle("Touch moves PC pointer", touchAsPointer, onTouchAsPointer)
+            OverlayToggle("Touchscreen mode (1:1 Windows touch)", absoluteTouch, onAbsoluteTouch)
             OverlayToggle("Microphone → PC", micEnabled, onMicEnabled)
             OverlayToggle("A/V sync (adds input lag)", syncEnabled, onSyncEnabled)
+            OverlayToggle("Clean UI (hide the ☰ button)", cleanUi, onCleanUi)
+
+            // Said on screen because a gesture nobody knows about is a gesture
+            // nobody has. Also names the way back in, which is the one question
+            // Clean UI raises: with the button gone, Back is the only route to
+            // this panel.
+            Text(
+                "Three-finger tap opens the phone keyboard over the stream.\n" +
+                    "Swipe back to reach these controls" +
+                    (if (cleanUi) " — the ☰ button is hidden." else "."),
+                style = Telemetry,
+            )
 
             // The trade, said on screen rather than buried in a doc. Audio sits
             // at a device-imposed floor that cannot be lowered, so sync is

@@ -310,6 +310,17 @@ fun SettingsSheet(
 
             HorizontalDivider(color = Edge)
 
+            // ── While streaming ─────────────────────────────────────────────
+            SheetTitle("ON SCREEN")
+            IonSwitch(
+                label = "Clean UI",
+                sub = "Hides the ☰ button over the stream. Swipe back to open " +
+                    "the controls — the gesture works either way.",
+                checked = prefs.cleanUi,
+            ) { on -> settings.edit { it.copy(cleanUi = on) } }
+
+            HorizontalDivider(color = Edge)
+
             SheetTitle("DIAGNOSTICS")
             IonSwitch(
                 label = "Show raw fingerprints & hashes",

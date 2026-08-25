@@ -44,6 +44,8 @@ mod shutdown;
 /// whichever capture loop is running and read by the tray's Server Stats
 /// window. Lock-free atomics — see the module docs for why it is not a channel.
 mod stats;
+/// Absolute touch injection (synthetic POINTER_TOUCH_INFO contacts) for Echo.
+mod touch;
 mod upnp;
 pub mod tray;
 mod virtual_display;

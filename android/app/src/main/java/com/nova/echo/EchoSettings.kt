@@ -42,6 +42,17 @@ data class StreamPrefs(
      * who will find this switch.
      */
     val showTelemetry: Boolean = false,
+    /**
+     * Hide the on-screen ☰ button while streaming.
+     *
+     * For people who want the picture and nothing else. The controls are not
+     * lost with it: the system back gesture opens the same panel, which is how
+     * the button gets to be optional at all — a toggle that made the panel
+     * genuinely unreachable would be a way to strand yourself in a stream.
+     *
+     * Off by default. The button is how a first-time user finds Stop.
+     */
+    val cleanUi: Boolean = false,
     /** What this phone calls itself when pairing. */
     val deviceName: String = "Echo Android",
 ) {
@@ -81,6 +92,7 @@ class EchoSettings private constructor(context: Context) {
             fps = prefs.getInt(KEY_FPS, d.fps),
             micEnabled = prefs.getBoolean(KEY_MIC, d.micEnabled),
             showTelemetry = prefs.getBoolean(KEY_TELEMETRY, d.showTelemetry),
+            cleanUi = prefs.getBoolean(KEY_CLEAN_UI, d.cleanUi),
             deviceName = prefs.getString(KEY_DEVICE, d.deviceName) ?: d.deviceName,
         )
         return migrate(stored)
@@ -150,6 +162,7 @@ class EchoSettings private constructor(context: Context) {
             .putInt(KEY_FPS, next.fps)
             .putBoolean(KEY_MIC, next.micEnabled)
             .putBoolean(KEY_TELEMETRY, next.showTelemetry)
+            .putBoolean(KEY_CLEAN_UI, next.cleanUi)
             .putString(KEY_DEVICE, next.deviceName)
             .apply()
         prefsState = next
@@ -172,6 +185,7 @@ class EchoSettings private constructor(context: Context) {
         private const val KEY_FPS = "pref_fps"
         private const val KEY_MIC = "pref_mic"
         private const val KEY_TELEMETRY = "pref_telemetry"
+        private const val KEY_CLEAN_UI = "pref_clean_ui"
         private const val KEY_DEVICE = "device_name"
 
         /** Bitrate slider range, in Mbps. */

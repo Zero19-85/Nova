@@ -1,4 +1,4 @@
-# Echo — Input, Latency, and What Comes Next (2026-08-16)
+# Echo — Input, Latency, and What Comes Next (2026-08-16, touch 2026-08-24)
 
 Read this before touching Echo's input path, and before starting the microphone
 work. It supersedes nothing in `HANDOFF_ECHO_P2P.md` or
@@ -578,3 +578,176 @@ endpoint_override`. Both of the first two are present on the dev box; the
 built-in list in `audio_shim.cpp` (`kVirtualSinkNames`) already carries Steam's
 and would need `CABLE Input` **removed** or the resolver taught to exclude the
 mic's endpoint, or the ghost sink will pick the cable by itself.
+
+---
+
+## 11. Dual-mode touch input (2026-08-24) — **LIVE**
+
+Touch on the phone now drives the PC two different ways, and the mode is a
+deliberate choice rather than a guess about what the user meant:
+
+| Mode | Toggle (stream overlay) | What the host receives |
+|---|---|---|
+| **Pointer** | "Touch moves PC pointer" | An absolute mouse position plus a left-click — `SendInput`, exactly as before |
+| **Touchscreen** | "Touchscreen mode (1:1 Windows touch)" | Real `POINTER_TOUCH_INFO` contacts through a synthetic touchscreen |
+
+Absolute touch **outranks** pointer mode when both are on: it is the more
+specific answer to the same question, and running both would put a mouse click
+and a touch contact on the host for one finger.
+
+### 11.1 The state trap — why input is withheld, not undone
+
+Both modes buffer the host-bound payload for `PRESS_HOLD_MS` (60 ms) on the
+first `ACTION_DOWN`, because the first finger of the three-finger keyboard
+gesture is indistinguishable from a tap meant for the PC. One of three things
+ends the wait:
+
+- **A third finger** → the payload is dropped and the IME opens. The host never
+  learns the screen was touched.
+- **The timer** → an ordinary press, flushed.
+- **Travel past `scaledTouchSlop`** (pointer mode) or **the last finger lifting**
+  (either mode) → flushed at once, so a drag, a pan or a quick tap pays nothing
+  for the window.
+
+**Retraction is not a substitute for withholding, and this is the lesson worth
+keeping.** The first version of absolute touch forwarded contacts immediately
+and cancelled them once a third finger arrived, reasoning that a contact is not
+a button — nothing irreversible had happened. That was wrong about Windows. A
+contact that goes down and is then cancelled is not a no-op: the desktop has
+already had a finger put on it and it reacts — focus moves, a press-and-hold
+timer starts, a control under the contact lights up. **The cancel undoes the
+contact, not what the contact caused.** Reported live as the taskbar responding
+to a keyboard gesture.
+
+The retraction path still exists, for a third finger arriving *after* the window
+closed. By then the contacts really have gone out and cancelling them is the
+best available. **The window is the fix; the retraction is the fallback.**
+
+Consequences that are deliberate:
+
+- With both touch modes **off**, no trap is ever armed and the three-finger
+  gesture keeps its original tap-on-release behaviour. There is nothing to
+  prevent leaking when nothing is being sent, and that path has live hours
+  behind it.
+- **Three simultaneous fingers are reserved by the client** in touchscreen mode
+  and never reach Windows. Two are not, so pinch-zoom and two-finger scroll
+  behave as on a real touchscreen.
+- `gestureConsumed` is the interlock between the in-window intercept and the
+  older `ACTION_UP` tap judgment. They must never both fire.
+- Pointer mode still moves the host **cursor** on `ACTION_DOWN`, before the
+  trap resolves. Same shape of leak, far milder — Windows answers a cursor move
+  with hover and tooltips, and a cursor that travelled is not an action.
+  Withholding it would put the 60 ms back into every drag. Open, on purpose.
+
+### 11.2 `nova-server/src/touch.rs` — the injector
+
+`CreateSyntheticPointerDevice(PT_TOUCH, 10)` + `InjectSyntheticPointerInput`.
+Three rules the API enforces silently, each of which produces plausible-but-wrong
+input:
+
+1. **The API is frame-based, not event-based.** Every call must describe *every*
+   contact on the glass; absence from a frame is how a lift is expressed. The
+   wire carries per-contact transitions (that is what a `MotionEvent` cheaply
+   yields) and this module reassembles frames. That reassembly buffer is the
+   reason it is a module and not six lines in `input.rs`.
+2. **Flags describe a transition, not a state.** `DOWN` on the frame it lands,
+   `UPDATE` after, `UP` on the frame it lifts. `UP` carries neither `INRANGE`
+   nor `INCONTACT`.
+3. **A lifted contact is forgotten only after the frame reporting its `UP`.**
+   Dropping it when the packet arrives means the lift never goes out.
+
+`input::stop_session` calls `touch::release_all()` unconditionally: a client that
+vanishes mid-gesture otherwise leaves Windows with a finger pressed on the
+desktop, and the contact ids belong to a client that no longer exists.
+
+**Coordinates are virtual-desktop pixels**, the space `current_capture_rect`
+describes — *not* `SendInput`'s 0–65535 `MOUSEEVENTF_ABSOLUTE` space. Applying
+the mouse path's `virtual_desktop_to_absolute` here lands every touch in the
+desktop's top-left corner.
+
+Injection is UIPI-gated exactly like `SendInput`: it will not reach the lock
+screen or an elevated window. The failure is logged (`👆 Touch:
+InjectSyntheticPointerInput failed`), never silent.
+
+### 11.3 The wire
+
+Magic `0x4E544348` (`NTCH`), **Nova-private, not a GameStream magic** —
+deliberately far outside the protocol's contiguous small numbering (0x03–0x0C)
+so a future GEN5 packet cannot collide. 18 bytes: the 8-byte `NV_INPUT_HEADER`,
+then `event: u8`, `pointer id: u8`, `x/y: i16 BE`, and the reference size read
+from the packet's **end**, matching `inject_mouse_move_abs`.
+
+Coordinates travel in a fixed normalised space (`TOUCH_REF = 32767`), not the
+phone's pixels, because the corner transform has already been applied by then —
+the numbers no longer describe any real surface, and sending the panel's
+dimensions beside transformed coordinates invites someone to un-transform them
+on the host.
+
+`coalesce` supersedes touch **updates for the same contact only**. A `down`, an
+`up` or a `cancel` is a transition the host reassembles into a frame: a
+superseded `down` is a tap that never happened, and a superseded `up` is a finger
+left pressed on the desktop. Two fingers dragging must not collapse into one
+either — hence the id comparison, not just the event.
+
+### 11.4 Corner compensation — the ~98% box
+
+On a curved-edge panel the outermost band cannot be touched accurately, so a 1:1
+mapping puts the host's screen corners somewhere the user physically cannot
+reach — which is where Windows keeps the clock, the show-desktop strip and every
+close button.
+
+    f = ((v / size) - inset) / (1 - 2 * inset)     clamped to 0..1
+
+**Clamp after the stretch, never before.** Clamping the raw fraction first maps
+the panel's true edge to 1.0 and leaves the correction with nothing to do.
+
+The inset self-calibrates from `RoundedCorner.getRadius() × 0.293` — the arc's
+closest approach to the corner it replaces, `1 − 1/√2` — bounded to 4%, and
+recalibrates on every `onSizeChanged` because the radius is a fixed pixel count
+while the axis is not. On a Pixel-class panel it lands at ~1%, which is where the
+0.01 fallback constant came from: the derivation and the guess agree, and the
+derivation adapts.
+
+**Applied to fingers only.** A mouse pointer is drawn on screen and can be walked
+into any pixel, so stretching its coordinates would trade a problem it does not
+have for imprecision it would feel everywhere.
+
+### 11.5 A host refusal is an answer, not a fault
+
+Unrelated to touch, found while testing it, and worth its own note.
+
+`handover` retried a declined session for the full 60 s resume window while the
+UI showed "Reconnecting…", so a host that had already explained itself in plain
+English — *"a Moonlight client is streaming right now; Echo will not take the
+pipeline out from under it"* — presented as a frozen loading screen. Seven
+complete rendezvous-punch-TLS attempts in twelve seconds, the answer discarded
+every time.
+
+`Interruption::Refused` now sits beside `Failed`, tagged at the single site that
+produces it via `session::REFUSED_PREFIX` — a tag, not a match on the host's
+prose, because the wording belongs to the host and is written for a human. A
+refusal **gives up immediately** rather than burning the window, and Kotlin's
+`path_interrupted` arm branches on `reason == "refused"` to show *"The PC is
+busy"* plus the host's own sentence.
+
+A network change still outranks a refusal in `classify`: one collected from an
+interface that has since gone away says nothing about the one you now have.
+
+Stated trade: a refusal that would have cleared on its own now needs another tap.
+Being told why in under a second beats an automatic recovery that only sometimes
+happens and never explains itself.
+
+### 11.6 Not verified
+
+- **The three-finger drop itself.** `adb shell input` cannot synthesise
+  multi-touch — that needs raw `sendevent` against the digitiser — so the one
+  gesture the trap exists for could not be driven from the host. The tell that it
+  works: no `👆 Touch:` activity in `nova.log` during a three-finger tap, and no
+  reaction on the desktop.
+- **The refusal string on screen.** Its classification is unit-tested and the
+  event field names are confirmed against captured JSON, but showing it needs a
+  genuinely busy host.
+- **There is no Kotlin test source set** in the Android project — no JUnit, no
+  Robolectric — so unlike the Rust half, none of this state machine has a
+  regression test behind it. `StreamSurfaceView` is a `View`, so a harness means
+  Robolectric or an instrumented test.

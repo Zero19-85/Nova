@@ -548,6 +548,7 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
 /// | 4    | scroll      | amount     | —          | —      | —       |
 /// | 5    | key         | VK code    | 1=down     | mods   | —       |
 /// | 6    | release all | —          | —          | —      | —       |
+/// | 7    | touch       | event 0-3  | pointer id | x      | y       |
 ///
 /// Returns `true` if the event was queued. `false` means the handle was invalid
 /// or the packet was a no-op (a zero delta), never that the host rejected it —
@@ -601,6 +602,15 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeSendInput(
             3 => input::MouseButton::from_code(a as u8).map(|btn| input::mouse_button(btn, b == 1)),
             4 => input::scroll(clamp(a)),
             5 => Some(input::keyboard(a as u16, c as u8, b == 1)),
+            // Absolute touch. `a` is the event (0=down 1=update 2=up 3=cancel),
+            // `b` the platform pointer id, `c`/`d` the position in
+            // `input::TOUCH_REF` units — already corner-corrected by the view,
+            // because the transform depends on the panel's geometry and this
+            // layer has no way to know it.
+            7 => match input::TouchEvent::from_code(a as u8) {
+                Some(event) => Some(input::touch(b as u8, event, clamp(c), clamp(d))),
+                None => None,
+            },
             // Release everything held. Queued like any other input so it cannot
             // overtake a key-down already in flight — arriving out of order
             // would release a key before it was pressed and leave it stuck,
@@ -1251,6 +1261,13 @@ async fn run_session(
         // Reported as the *last* reason, not the first. The earlier ones are why
         // it kept trying; this one is why it stopped, and it is the only one a
         // user can act on.
+        // A refusal is not a failure to reach the host — it is the host, reached
+        // and answering. Reporting it as "could not get back to the host after N
+        // attempts" describes the wrong problem and sends the user to look at
+        // their network, which is the one thing that is working.
+        handover::Outcome::GaveUp { last: last @ handover::Interruption::Refused { .. }, .. } => {
+            Err(last.to_string())
+        }
         handover::Outcome::GaveUp { last, attempts } => {
             Err(format!("could not get back to the host after {attempts} attempts: {last}"))
         }

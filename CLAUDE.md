@@ -33,6 +33,19 @@ handoffs, and they are the authority for anything client-side:
 - **Echo sessions negotiate 20 ms audio frames** where Moonlight negotiates 5.
   This is per-Worker-session, so a Moonlight client sharing the pipeline gets
   20 ms too — accepted deliberately over transcoding the same audio twice.
+- **`src/touch.rs` — native touch injection** (2026-08-24), for Echo's
+  touchscreen mode. `CreateSyntheticPointerDevice(PT_TOUCH, 10)` +
+  `InjectSyntheticPointerInput`, dispatched from `input.rs` on the Nova-private
+  magic `0x4E544348` (`NTCH`) and released by `input::stop_session`. Two things
+  to know before touching it: **the injection API is frame-based** — every call
+  must carry every contact on the glass, because absence from a frame is how a
+  lift is expressed, which is why the module holds a reassembly buffer — and
+  **`ptPixelLocation` is virtual-desktop pixels**, not `SendInput`'s 0–65535
+  space, so the mouse path's `virtual_desktop_to_absolute` must *not* be applied
+  (it lands every touch in the desktop's top-left corner). Needs the
+  `Win32_UI_Input_Pointer` **and** `Win32_UI_Controls` features together — the
+  `POINTER_TYPE_INFO` union's fields are cfg-gated on the other one. Full record:
+  `HANDOFF_ECHO_INPUT.md` §11.
 
 ## Project Scope
 Nova is an ultra-low footprint, native Rust game-streaming host.
@@ -105,6 +118,17 @@ missing IDR after the path swaps, not the transport: the cascade re-establishes
 correctly and the host log shows the new path opening. Start by checking whether
 the host sees a keyframe request after the swap and whether `Configure` is
 replayed to the returning client.
+
+**Operational note that will bite every deploy (2026-08-24):** stopping the
+service drops any live GameStream session, and the Moonlight client reconnects
+on its own — a full RTSP handshake and PLAY within seconds of the Master coming
+back. The anti-hijack gate then correctly refuses every Echo session
+(`⛔ Echo: … asked to start a session while a Moonlight client is streaming —
+denied`) and Echo, until this batch, retried in silence for a minute. **After a
+deploy, check `nova-service.log` for `⛔ Echo:` beside healthy `📊 RTP/s` before
+concluding the client is broken.** There is no end-stream CLI; the tray's "End
+Stream" is the only gesture and its menu renders on the *streamed* display, so a
+second service restart is the practical lever.
 
 ## Echo E9 — **two-way audio + A/V sync** (2026-08-16), live-confirmed
 
