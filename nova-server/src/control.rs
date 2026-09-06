@@ -432,6 +432,7 @@ fn handle_control_message(
             if idr_request_is_congestion(client_info) {
                 println!("🎮 Control: IDR repair request mid-stream — signalling bitrate reduction");
                 signal_congestion(worker_link);
+                arm_idr_repair_retry(client_info);
             }
         }
         // Reference-frame invalidation. Payload (Sunshine stream.cpp): two
@@ -594,5 +595,228 @@ fn handle_event(
             handle_control_message(channel_id, packet.data(), client_info, peer, worker_link);
             None
         }
+    }
+}
+
+// ─── Repair-IDR insurance ────────────────────────────────────────────────────
+//
+// **The failure this exists to stop** (live 2026-08-31, Moonlight/Xbox at
+// 4K120 HEVC/HDR10): the picture freezes mid-session and never comes back,
+// while `📊 RTP/s` keeps reporting a flat 120 frames a second and the host
+// shows no fault at all. The only way out is killing the stream.
+//
+// The cause is that this stream has exactly ONE mid-session recovery
+// mechanism and no redundancy anywhere in it:
+//
+//   * the GOP is infinite (`idrPeriod = NVENC_INFINITE_GOPLENGTH`), so no
+//     keyframe is ever emitted on a schedule;
+//   * intra refresh is off (`[IR] ... requested=OFF`);
+//   * RFI is advertised but this client never uses it — **0 invalidation
+//     requests against 127 IDR requests** across the whole service log.
+//
+// So the entire repair path is: the client sends one `PT_REQUEST_IDR_FRAME`,
+// and the host answers with one IDR — 50 data packets plus 10 parity at 4K.
+// Lose the request, or lose more of that keyframe than FEC can rebuild, and
+// the client can never decode another frame: every P-frame after it
+// references a picture the client does not have. It is not even an unlikely
+// loss, because it happens at the one moment the link has just demonstrated
+// it is dropping packets — that loss is *why* the repair was requested.
+//
+// A wedged client is silent (it has already spent its one request), so the
+// host cannot wait to be asked again. It re-sends on a timer instead, twice,
+// both well inside the client's own 7 s stream watchdog
+// (`x-nv-video[0].timeoutLengthMs:7000` in its ANNOUNCE) so recovery beats
+// the teardown. A client that recovered on the first keyframe just decodes
+// two more; the cost is bounded at two extra keyframes per repair event, and
+// at the observed rate (127 repair requests over several days) that is noise.
+//
+// Deliberately armed ONLY for requests `idr_request_is_congestion` accepts —
+// i.e. genuine mid-stream repair. A warmup burst is already self-healing: the
+// client keeps asking until it syncs, so it needs no insurance, and arming
+// there would add keyframes to the most bitrate-sensitive moment of a session.
+//
+// This lives in the MASTER for the same reason the detach grace clock does:
+// the Worker dies on sign-out and a Worker-side timer would die with it,
+// while the session — and a frozen client waiting on a keyframe — does not.
+const IDR_REPAIR_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(1500), Duration::from_millis(2500)];
+
+/// A repair IDR that has been sent but not yet confirmed to have landed.
+struct RepairRetry {
+    /// The session that asked. A newer generation owes this one nothing — it
+    /// opens with its own keyframe.
+    generation: u64,
+    due: Instant,
+    /// How many re-sends have already gone out; indexes the delay table.
+    sent: usize,
+}
+
+static IDR_REPAIR_RETRY: Mutex<Option<RepairRetry>> = Mutex::new(None);
+
+/// A mid-stream repair IDR just went out. Schedule the re-sends that make it
+/// survive being lost.
+fn arm_idr_repair_retry(client_info: &Arc<Mutex<Option<ClientInfo>>>) {
+    let Some(generation) = client_info
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|i| i.session_generation))
+    else {
+        return;
+    };
+    if let Ok(mut slot) = IDR_REPAIR_RETRY.lock() {
+        // A fresh request re-arms from scratch: the client is still asking,
+        // so the clock restarts against the keyframe it just triggered.
+        *slot = Some(RepairRetry {
+            generation,
+            due: Instant::now() + IDR_REPAIR_RETRY_DELAYS[0],
+            sent: 0,
+        });
+    }
+}
+
+/// Drive the schedule armed by [`arm_idr_repair_retry`]. Called from the
+/// Master's `session_watcher` poll, which already ticks at 50 ms.
+///
+/// Re-sends the keyframe ONLY — never `signal_congestion` a second time. The
+/// original request already cut the bitrate once; charging the same loss event
+/// again for every re-send would walk the rate down a step at a time for a
+/// link that reported one problem.
+pub fn tick_idr_repair_retry(
+    client_info: &Arc<Mutex<Option<ClientInfo>>>,
+    worker_link: &Option<WorkerLink>,
+) {
+    let Ok(mut slot) = IDR_REPAIR_RETRY.lock() else {
+        return; // poisoned — never re-send on a broken lock
+    };
+    // Copy the fields out so the slot can be rewritten below without holding
+    // a borrow of it across the send.
+    let Some((generation, due, sent)) = slot.as_ref().map(|r| (r.generation, r.due, r.sent)) else {
+        return;
+    };
+
+    let (live_generation, streaming) = client_info
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|i| (i.session_generation, i.streaming_active)))
+        .unwrap_or((0, false));
+
+    // The session that asked is over, or has been replaced by a new /launch.
+    if !streaming || live_generation != generation {
+        *slot = None;
+        return;
+    }
+    if Instant::now() < due {
+        return;
+    }
+
+    match worker_link {
+        Some(link) => link.send(ControlMsg::RequestIdr),
+        None => crate::encoder::request_idr_global(),
+    }
+    let sent = sent + 1;
+    println!(
+        "🎮 Control: repair IDR unconfirmed — re-sending keyframe ({}/{})",
+        sent,
+        IDR_REPAIR_RETRY_DELAYS.len(),
+    );
+    *slot = IDR_REPAIR_RETRY_DELAYS
+        .get(sent)
+        .map(|d| RepairRetry { generation, due: Instant::now() + *d, sent });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `IDR_REPAIR_RETRY` is process-global, so these tests must not run
+    /// concurrently with each other.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn streaming_client(generation: u64) -> Arc<Mutex<Option<ClientInfo>>> {
+        Arc::new(Mutex::new(Some(ClientInfo {
+            session_generation: generation,
+            streaming_active: true,
+            ..Default::default()
+        })))
+    }
+
+    /// Bring the pending re-send forward so the schedule can be exercised
+    /// without sleeping through its real seconds. `checked_sub` because
+    /// `Instant` is QPC-since-boot on Windows and plain subtraction panics on a
+    /// machine that booted moments ago — the 15.3 pre-login crash, in a test.
+    fn expire_due() {
+        if let Some(r) = IDR_REPAIR_RETRY.lock().unwrap().as_mut() {
+            r.due = r
+                .due
+                .checked_sub(Duration::from_secs(30))
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// The freeze this mechanism exists for (live 2026-08-31): the client asks
+    /// once for a repair keyframe, that keyframe is lost, and the client — out
+    /// of requests — goes silent forever while the host streams undecodable
+    /// P-frames at it. The host has to re-send unprompted, and then stop.
+    #[test]
+    fn an_unconfirmed_repair_idr_is_resent_a_bounded_number_of_times() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (link, mut rx) = WorkerLink::new();
+        let link = Some(link);
+        let client = streaming_client(7);
+
+        arm_idr_repair_retry(&client);
+
+        // Before the delay elapses there is nothing to do: the client may well
+        // be decoding the keyframe it just asked for.
+        tick_idr_repair_retry(&client, &link);
+        assert!(rx.try_recv().is_err(), "re-sent before the first delay elapsed");
+
+        for n in 1..=IDR_REPAIR_RETRY_DELAYS.len() {
+            expire_due();
+            tick_idr_repair_retry(&client, &link);
+            assert!(
+                matches!(rx.try_recv(), Ok(ControlMsg::RequestIdr)),
+                "re-send {n} never went out",
+            );
+        }
+
+        // Bounded: a client that is never coming back must not cost a keyframe
+        // every 2.5 s for the rest of the session.
+        expire_due();
+        tick_idr_repair_retry(&client, &link);
+        assert!(rx.try_recv().is_err(), "kept re-sending past the retry budget");
+        assert!(
+            IDR_REPAIR_RETRY.lock().unwrap().is_none(),
+            "an exhausted schedule must clear itself",
+        );
+    }
+
+    /// A repair is owed to the session that asked for it and to no other. Both
+    /// ways a session can end have to drop it: a new /launch (a fresh
+    /// generation, which opens with its own keyframe) and a stream that simply
+    /// stopped — otherwise a keyframe request outlives its session and lands on
+    /// whatever is streaming next.
+    #[test]
+    fn a_pending_repair_never_outlives_the_session_that_asked_for_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (link, mut rx) = WorkerLink::new();
+        let link = Some(link);
+
+        let client = streaming_client(11);
+        arm_idr_repair_retry(&client);
+        // A new /launch bumps the generation before the re-send comes due.
+        client.lock().unwrap().as_mut().unwrap().session_generation = 12;
+        expire_due();
+        tick_idr_repair_retry(&client, &link);
+        assert!(rx.try_recv().is_err(), "repair leaked into the next session");
+        assert!(IDR_REPAIR_RETRY.lock().unwrap().is_none());
+
+        let client = streaming_client(12);
+        arm_idr_repair_retry(&client);
+        client.lock().unwrap().as_mut().unwrap().streaming_active = false;
+        expire_due();
+        tick_idr_repair_retry(&client, &link);
+        assert!(rx.try_recv().is_err(), "repair fired at a stopped stream");
+        assert!(IDR_REPAIR_RETRY.lock().unwrap().is_none());
     }
 }

@@ -253,6 +253,55 @@ static const bool     kEnableIntraRefresh  = false;
 static const uint32_t kIntraRefreshPeriod  = 300;
 static const uint32_t kIntraRefreshCnt     = 299;
 
+// How many frames' worth of bits the CBR rate controller may hold in its VBV.
+//
+// This was 1 -- the tightest possible setting, chosen for latency: a frame can
+// never draw on more than its own budget, so it can never take longer than one
+// frame-time to transmit. The cost was invisible until it was measured. At
+// 4K120 on a 47.5 Mbps session, one frame's budget is 49,466 bytes, and an IDR
+// gets exactly that -- 0.048 bits per pixel for a 3840x2160 intra frame, where
+// a clean 4K keyframe wants roughly ten times more. Every repair keyframe was
+// therefore emitted visibly blocky, and the P-frames after it spent the next
+// second refining it back. On a still picture that pulse is the only thing
+// moving on screen, which is exactly the "flashing" reported live 2026-08-31.
+//
+// 4 frames lets a keyframe overshoot and repay it over the frames that follow.
+// The worst case is bounded and small: at 120 fps this is 33 ms of VBV, and
+// only a keyframe ever draws the full allowance -- steady-state P-frames are
+// nowhere near it, so ordinary latency is unchanged.
+//
+// This is a stopgap and should be re-read once LTR recovery lands. The real
+// answer is to stop sending keyframes to repair loss at all, at which point the
+// keyframe budget stops being on the hot path for anything a user can see.
+static const uint32_t kVbvFrames = 4;
+
+
+// Should CBR pad frames it did not need, so every frame costs the full budget?
+//
+// This was on, added in Phase 10 to stop QP oscillation on static frames -- CBR
+// under-spending on an easy frame and then over-correcting, which shows up as
+// "pulsing" text. That reasoning was sound at the time, but it was paired with a
+// single-frame VBV (kVbvFrames was 1), which is the configuration that makes the
+// oscillation worst: with no buffer to smooth across, the controller has to
+// correct within every single frame.
+//
+// The cost, measured live 2026-08-31 at 4K120: a desktop whose content genuinely
+// changed only a couple of times a second still cost **54 Mbps on the wire**,
+// because every frame -- real or duplicate -- was padded back up to 49,466 bytes.
+// Median gap between real captured frames was 56 slots; the p90 was 2,934. Nearly
+// all of that bandwidth was zero-information padding, and it loaded the link
+// continuously, which is what produced the packet loss behind the repair-keyframe
+// flashing.
+//
+// Turning it off is only safe because kVbvFrames is now 4: the VBV itself absorbs
+// the frame-to-frame variation filler was inserted to hide, which is how ordinary
+// adaptive streaming is configured. A static screen now costs what a static screen
+// should cost, and the saved headroom goes to the frames that actually need it.
+//
+// If "pulsing" text ever comes back on a still image, this is the one-line flip --
+// but raise kVbvFrames first, because a bigger VBV addresses the same problem
+// without paying for it in bandwidth.
+static const bool kEnableFillerData = false;
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
 // with (only rate-control fields changed).
@@ -1522,7 +1571,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
 
         encodeConfig.rcParams.rateControlMode       = NV_ENC_PARAMS_RC_CBR;
         encodeConfig.rcParams.averageBitRate        = (uint32_t)bitrate_kbps * 1000;
-        encodeConfig.rcParams.vbvBufferSize         = encodeConfig.rcParams.averageBitRate / (uint32_t)fps;
+        encodeConfig.rcParams.vbvBufferSize         = encodeConfig.rcParams.averageBitRate / (uint32_t)fps * kVbvFrames;
         encodeConfig.rcParams.zeroReorderDelay      = 1;
         encodeConfig.rcParams.enableLookahead       = 0;
         // Keep on-demand IDR frames the same size as P frames so they fit
@@ -1572,7 +1621,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             // easy (low-motion) frames to the full bit budget rather than
             // under-spending and then over-correcting — eliminating the QP
             // oscillation that manifests as "pulsing" text.
-            h264.enableFillerDataInsertion = 1;
+            h264.enableFillerDataInsertion = kEnableFillerData ? 1 : 0;
             h264.h264VUIParameters = vuiParams;
             if (kEnableIntraRefresh) {
                 h264.enableIntraRefresh      = 1;
@@ -1597,7 +1646,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.maxNumRefFramesInDPB = g_refFramesInDpb;
             hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
             // Same filler-data rationale as H264: prevents CBR QP oscillation on static frames.
-            hevc.enableFillerDataInsertion = 1;
+            hevc.enableFillerDataInsertion = kEnableFillerData ? 1 : 0;
             hevc.hevcVUIParameters    = vuiParams;
             if (is_hdr) {
                 // Belt-and-suspenders: explicitly stamp HDR10 VUI as raw integer
@@ -1681,9 +1730,9 @@ extern "C" __declspec(dllexport) int InitEncoder(
             }
         }
 
-        ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (1 frame) gop=infinite preset=P1/ULL\n",
+        ShimLog("📊 NVENC RC config: CBR bitrate=%u vbvBufferSize=%u (%u frame VBV) gop=infinite preset=P1/ULL\n",
                encodeConfig.rcParams.averageBitRate,
-               encodeConfig.rcParams.vbvBufferSize);
+               encodeConfig.rcParams.vbvBufferSize, kVbvFrames);
 
         g_nvEncoder->CreateEncoder(&initializeParams);
 
@@ -2142,7 +2191,7 @@ extern "C" __declspec(dllexport) int ReconfigureBitrate(int bitrate_kbps, int fp
     if (!rateChanged && !fpsChanged) return 0;
 
     g_encConfig.rcParams.averageBitRate = newRate;
-    g_encConfig.rcParams.vbvBufferSize  = newRate / (uint32_t)fps; // single-frame VBV at new fps
+    g_encConfig.rcParams.vbvBufferSize  = newRate / (uint32_t)fps * kVbvFrames;
 
     if (fpsChanged) {
         g_initParams.frameRateNum = (uint32_t)fps;

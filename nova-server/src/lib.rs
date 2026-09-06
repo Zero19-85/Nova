@@ -968,8 +968,19 @@ async fn session_watcher(
     // waiting behind an Echo session produces one line rather than twenty a
     // second.
     let mut echo_blocked_generation: Option<u64> = None;
+    // `tick_idr_repair_retry` takes the same `Option<WorkerLink>` shape the
+    // control handlers use (`None` = monolithic deployment, encoder in-process).
+    // Built once: cloning a sender twenty times a second to pass it by reference
+    // would be pure churn.
+    let repair_link = Some(worker_link.clone());
     loop {
         poll.tick().await;
+
+        // Re-send an unconfirmed mid-stream repair keyframe. Cheap (an
+        // `Instant` compare against an empty slot in the common case) and
+        // placed at the top of the poll so a frozen client is served before
+        // anything below can return early. See `control::tick_idr_repair_retry`.
+        control::tick_idr_repair_retry(&client_info, &repair_link);
 
         // ── Encode suspension (gated OFF — see ENCODE_SUPPRESSION_ENABLED) ──
         //
@@ -2356,6 +2367,58 @@ fn log_static_desktop(
     }
 }
 
+/// Should this static-desktop slot re-send the cached frame, or has the picture
+/// already converged and further duplicates become pure padding?
+///
+/// **Why this exists** (measured live 2026-08-31, 4K120 HEVC): a *motionless*
+/// desktop was costing **54 Mbps on the wire** — 6,759 KB/s sustained. NVENC
+/// encodes a duplicate of an unchanged frame as very nearly nothing, but CBR
+/// with `enableFillerDataInsertion` then pads it back up to the full per-frame
+/// budget, so ~99% of that rate was zero-information filler. It loaded the link
+/// continuously, which produced loss, which had the client asking for a repair
+/// keyframe every 33 s, each one emitted starved of bits and visible as a flash
+/// on an otherwise still image. The padding was the first link in that chain.
+///
+/// **What it does NOT do, deliberately.** Phase 11 gated static frames off
+/// entirely (encode nothing until a 5 s keep-alive) and Phase 16.2 had to undo
+/// it: a static screen starved the decoder and CBR degraded the image until
+/// something moved. The duplicates are load-bearing — they are what lets rate
+/// control spend idle bitrate refining a still picture to full sharpness.
+///
+/// So this throttles **cadence, never quality, and never before the picture is
+/// sharp**. The first `STATIC_CONVERGE_FRAMES` duplicates of every static
+/// episode run at the full frame rate, which is what performs the refinement;
+/// only once the image has converged — and every duplicate after that is
+/// re-encoding an already-perfect frame — does it fall back to a keep-alive
+/// cadence. The client still receives a continuous bitstream, just not 120
+/// identical frames a second.
+fn static_duplicate_is_due(streak: u32, last_sent: &mut Option<Instant>) -> bool {
+    /// Measured on the live install: the median gap between real captured frames
+    /// is 56 slots and the p90 is 2,934, so a 120-frame window never engaged on
+    /// half the episodes at all. 20 slots is ~0.17 s at 120 fps — still far more
+    /// refinement than CBR needs on a frame it has already encoded (roughly 1 MB
+    /// of bits spent on one still image at 47 Mbps), while actually engaging on
+    /// the short episodes that make up most of a working desktop.
+    const STATIC_CONVERGE_FRAMES: u32 = 20;
+    /// 5 duplicates a second once converged. Far inside any client's stream
+    /// watchdog (Moonlight announces 7 s), and ~24x less traffic at 120 fps.
+    const STATIC_KEEPALIVE: Duration = Duration::from_millis(200);
+
+    // Still refining: every slot counts.
+    if streak <= STATIC_CONVERGE_FRAMES {
+        *last_sent = Some(Instant::now());
+        return true;
+    }
+    let due = match last_sent {
+        Some(t) => t.elapsed() >= STATIC_KEEPALIVE,
+        None => true,
+    };
+    if due {
+        *last_sent = Some(Instant::now());
+    }
+    due
+}
+
 /// Commands the dedicated `nova-worker-control` thread (see `run_worker`)
 /// hands to the main capture/encode loop. Everything else the control pipe
 /// can carry (`InjectInput`/`RequestIdr`/`CongestionReduce`) is applied
@@ -3172,6 +3235,8 @@ pub async fn run_worker() -> Result<()> {
     let mut jiggle_toggle = false;
     // Throttle for the static-desktop diagnostic (see log_static_desktop).
     let mut last_static_log: Option<Instant> = None;
+    // When the last static-scene duplicate went out — see static_duplicate_is_due.
+    let mut last_static_dup: Option<Instant> = None;
     // Dynamic-bitrate controller (see QosController): remembers the rate that
     // failed and holds recovery at 90% of it instead of climbing back to the
     // ceiling, which is what produced the 12-second freeze sawtooth.
@@ -3555,13 +3620,26 @@ pub async fn run_worker() -> Result<()> {
                 // the duplicates also let rate control spend the idle bitrate
                 // refining the static picture to full sharpness. Gated on an
                 // active session — idle with no client keeps NVENC at 0%.
-                if client_connected {
+                // Cadence throttle only, and only once the picture is already
+                // sharp — see static_duplicate_is_due.
+                if client_connected
+                    && static_duplicate_is_due(timeout_streak, &mut last_static_dup)
+                {
                     texture_to_encode = capturer.cached_texture().cloned();
                 }
             }
         }
 
         if let Some(texture) = texture_to_encode {
+            // Both freezes on 2026-08-31 have a second in them where the encoder
+            // produced ~1-6 frames instead of 120 (`🎞  Encoder output: 395 Kbps`
+            // and `2374 Kbps` in nova.log; `📊 RTP/s: 9 frames` in the Master's).
+            // Which call ate that second is not recoverable from the logs as they
+            // stand, because nothing here is timed. This makes it falsifiable
+            // without adding a per-frame cost: one `Instant::now()` pair per slot,
+            // and a line only when a slot blows through its budget by an order of
+            // magnitude.
+            let slot_began = Instant::now();
             // The index this frame is encoded AND sent under (== NVENC
             // inputTimeStamp, see encode_frame). Advances once per encoded frame
             // so NVENC's reference timeline and the client's wire indices stay
@@ -3616,6 +3694,18 @@ pub async fn run_worker() -> Result<()> {
                         }
                     }
                 }
+            }
+            // ~8 ms is the whole slot at 120 fps. 100 ms means over ten frames
+            // were never encoded, which the client sees as a visible hitch — and
+            // near a full second it is the stall signature above.
+            let slot_cost = slot_began.elapsed();
+            if slot_cost >= Duration::from_millis(100) {
+                println!(
+                    "⏱️  Capture slot stalled {} ms (encode+send of frame {this_index}) — \
+                     roughly {} frame(s) never went out",
+                    slot_cost.as_millis(),
+                    slot_cost.as_millis() as u64 / frame_interval.as_millis().max(1) as u64,
+                );
             }
         }
 
@@ -4153,6 +4243,8 @@ pub async fn run() -> Result<()> {
     let mut timeout_streak = 0u32;
     // Throttle for the static-desktop diagnostic (see log_static_desktop).
     let mut last_static_log: Option<Instant> = None;
+    // When the last static-scene duplicate went out — see static_duplicate_is_due.
+    let mut last_static_dup: Option<Instant> = None;
     // Stateful tick-tock for the damage-generator jiggle — alternates the
     // cursor between +1 and -1 each fire so it actually rests at a new
     // position for ~50 ms, guaranteeing DWM composites a fresh frame.
@@ -5117,7 +5209,12 @@ pub async fn run() -> Result<()> {
                 // picture to full sharpness. Gated on an active session — idle
                 // with no client keeps NVENC hardware-idle (0% Video Encode,
                 // the Phase 11 signature).
-                if client_connected && video_learned {
+                // Cadence throttle only, and only once the picture is already
+                // sharp — see static_duplicate_is_due. Mirrors the Worker loop.
+                if client_connected
+                    && video_learned
+                    && static_duplicate_is_due(timeout_streak, &mut last_static_dup)
+                {
                     texture_to_encode = capturer.cached_texture().cloned();
                 }
             }
@@ -5227,6 +5324,56 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The static-scene throttle must refine first and economise second. Getting
+    /// this backwards is Phase 11's static blur, which Phase 16.2 had to undo.
+    #[test]
+    fn a_static_scene_is_refined_at_full_rate_before_it_is_throttled() {
+        let mut last = None;
+
+        // Every slot of the convergence window submits, so CBR can spend the
+        // idle bitrate sharpening the still picture.
+        for streak in 1..=20u32 {
+            assert!(
+                static_duplicate_is_due(streak, &mut last),
+                "slot {streak} was throttled while the picture was still converging",
+            );
+        }
+
+        // Past it, the very next slot is throttled — the image is already sharp
+        // and everything further is filler.
+        assert!(
+            !static_duplicate_is_due(21, &mut last),
+            "kept paying full rate after the picture had converged",
+        );
+        assert!(!static_duplicate_is_due(5_000, &mut last));
+
+        // ...but the stream is never silent: the keep-alive still comes due, so
+        // the client keeps receiving a continuous bitstream.
+        last = last.map(|t: Instant| t.checked_sub(Duration::from_secs(1)).unwrap_or(t));
+        assert!(
+            static_duplicate_is_due(5_001, &mut last),
+            "keep-alive never fired — a long static scene would starve the decoder",
+        );
+    }
+
+    /// A fresh static episode gets its own full convergence window: motion
+    /// resets `timeout_streak`, and the throttle has to reset with it.
+    #[test]
+    fn motion_restores_full_rate_for_the_next_static_episode() {
+        let mut last = None;
+        for streak in 1..=200u32 {
+            static_duplicate_is_due(streak, &mut last);
+        }
+        assert!(!static_duplicate_is_due(201, &mut last), "precondition: throttled");
+
+        // A real frame arrived; the caller resets the streak to 0 and the next
+        // static slot starts counting again from 1.
+        assert!(
+            static_duplicate_is_due(1, &mut last),
+            "a new static episode must refine at full rate, not inherit the throttle",
+        );
+    }
     use super::*;
 
     /// Locks the frame-pacing contract that regressed live on 2026-08-06: a
