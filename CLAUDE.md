@@ -46,6 +46,16 @@ handoffs, and they are the authority for anything client-side:
   `Win32_UI_Input_Pointer` **and** `Win32_UI_Controls` features together — the
   `POINTER_TYPE_INFO` union's fields are cfg-gated on the other one. Full record:
   `HANDOFF_ECHO_INPUT.md` §11.
+- **`src/gamepad_mouse.rs` — controller mouse mode** (2026-09-06). **Start +
+  Select** toggles a cursor-driving mode: right stick moves the pointer, right
+  trigger left-clicks, left trigger right-clicks, and gamepad forwarding to the
+  game stops while it is on. Deliberately **host-side rather than in a client**,
+  because every client sends the same `NV_MULTI_CONTROLLER_PACKET` — so Moonlight
+  on any platform, Echo, and the not-yet-written Xbox frontend all get it without
+  implementing anything. Hooked from `input::handle_input_packet`'s gamepad arm,
+  which hands it first refusal on every pad frame. See the Current Phase section
+  for the three rules that are load-bearing (pad neutralisation on the toggle
+  edges, the driver thread, sub-pixel accumulation).
 
 ## Project Scope
 Nova is an ultra-low footprint, native Rust game-streaming host.
@@ -79,7 +89,129 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-08-20): **ZERO-CONFIG WAN IS LIVE** — streamed to a phone
+## Current Phase (2026-09-06): **STREAM INTEGRITY** — the picture stopped
+flashing, and loss recovery stopped costing a keyframe
+
+Four commits, all on `main`, all deployed to the live install. Tier 0 is
+live-validated; Tier 1 and controller mouse mode are code-complete and deployed
+but **not yet exercised** — the Xbox port is where they get tested.
+
+### The diagnosis everything else came from
+
+A motionless 4K desktop was costing **54 Mbps on the wire**. `enableFillerData`
+padded every frame to the full per-frame budget, and Nova re-submits the cached
+texture as a duplicate on every slot with no new capture, so a screen that
+changed twice a second still paid for full-motion 4K in almost pure padding.
+That loaded the link continuously → packet loss → a repair keyframe request
+every 33 s → each one emitted under a single-frame VBV (49,466 bytes for 8.3M
+pixels, 0.048 bpp) and visibly blocky. **The flash the operator was reporting
+was the repair.**
+
+Measured live, same box and session, before → after:
+
+| | before | after |
+|---|---|---|
+| wire rate, static | 6,759 KB/s (54 Mbps) | **15.2 KB/s** |
+| encoder output | 47,883 Kbps flat | 141 Kbps median, 13.9 Mbps peak on motion |
+| IDR repair requests | 1 every 33 s | **0 in 68 minutes** |
+
+### Tier 0 — `2bd1b0c` (LIVE-VALIDATED)
+
+- **`kEnableFillerData = false`** (shim.cpp). The dominant fix.
+- **`kVbvFrames = 4`** (was an implicit 1). This is what makes the above *safe*:
+  filler existed to hide QP oscillation, and a single-frame VBV is the
+  configuration that makes that oscillation worst. It also stops keyframes being
+  crushed into one frame's budget. **If "pulsing" text ever returns on a still
+  image, raise `kVbvFrames` before re-enabling filler.**
+- **`static_duplicate_is_due()`** (lib.rs, shared by BOTH capture loops): after
+  20 duplicates at full rate, fall back to a 200 ms keep-alive. It throttles
+  **cadence, never quality, and never before the picture has converged** — that
+  ordering is what keeps Phase 11's static blur from coming back.
+- **Repair-IDR insurance** (control.rs): a genuine mid-stream repair arms a
+  bounded re-send (+1.5 s, +2.5 s, inside the client's 7 s watchdog), driven from
+  `session_watcher`'s 50 ms poll. This fixed a **permanent freeze**: with an
+  infinite GOP, intra refresh off and RFI inert, the entire repair path was one
+  request answered by one IDR, and losing either froze the stream forever.
+
+### Tier 1 — `7b8d25a` (deployed, NOT yet exercised)
+
+**Long-term references.** "LTR Per Picture" mode, 2 slots inside the *existing*
+DPB, marked every `fps/2` frames. Confirmed active on the live GPU:
+`[LTR] hevc: cap=7 slot(s), active=YES (2 LTR of 5 DPB slots)`.
+`ArmLtrRecovery()` returns 0 when nothing usable is held, so every caller falls
+back to exactly the IDR path it had before.
+
+**Both repair sites now read RFI → LTR → IDR.** Each rung costs more than the one
+above and each is strictly better than the one below.
+
+**`numRefL0` 1 → 2** on both codecs. `maxNumRefFrames`/`maxNumRefFramesInDPB` are
+**untouched** — `numRefL0` sets `num_ref_idx_l0_active` in the slice header, not
+`max_dec_frame_buffering` — so the level a stream conforms to is unchanged and
+LTR slots come out of the existing budget.
+
+**Echo acknowledgements** — new `nova-core/src/feedback_channel.rs`, tag `0xE6`,
+`STREAM_FEEDBACK = 5`, relayed to the Worker as `ControlMsg::LtrAck` (tag 23).
+The client watermark is deliberately **stricter than `last_delivered`**: a frame
+arriving after a gap reaches the decoder but cannot be decoded, so it is not in
+the DPB and not safe to repair against.
+
+**Scope, honestly: this delivers on Echo, not on Moonlight/Xbox.** Moonlight only
+accepts a non-IDR resync when it asked for one via `PT_INVALIDATE_REF_FRAMES`,
+and the Xbox client sends **zero** of those against 127 IDR requests. Its plain
+keyframe requests still get keyframes.
+
+### Controller mouse mode — `bbf5b6c` (deployed, NOT yet tested on a pad)
+
+`src/gamepad_mouse.rs`, beside `touch.rs`. **Start + Select** toggles; right stick
+moves the cursor; right trigger = left-click, left trigger = right-click.
+
+Built **host-side deliberately** — every client sends the same
+`NV_MULTI_CONTROLLER_PACKET`, so one implementation serves Moonlight anywhere,
+Echo, and the Xbox frontend. **The Xbox client will not need to implement it.**
+
+Three rules that are load-bearing, not style:
+
+1. **The pad is NEUTRALISED on both toggle edges, and the chord is swallowed
+   until both buttons are released.** Not "ignored" — if forwarding merely
+   stopped, the game keeps the last state it was handed, and that state has Start
+   held. Games read Start as pause, so mouse mode would open the pause menu going
+   in and again coming out.
+2. **Cursor motion runs on its own 8 ms thread, never on the packet path.** A
+   stick is a velocity, not a position. Moving per packet ties cursor speed to
+   the client's packet rate and stalls entirely on a client that only transmits on
+   change — which is exactly what a *held* stick looks like.
+3. **Sub-pixel remainder is carried between ticks.** `SendInput` moves whole
+   pixels, so at 125 Hz anything under 125 px/s rounds to zero and the cursor does
+   not move at all — removing precisely the slow, careful movement a stick is
+   worst at.
+
+Tunables at the top of the module: `MAX_SPEED_PX_S`, `DEADZONE`,
+`RESPONSE_CURVE`, `TRIGGER_THRESHOLD`.
+
+### Open, and what the Xbox port should watch
+
+- **The capture-slot stall.** `⏱️ Capture slot stalled N ms` (worst seen: 405 ms
+  = ~50 frames that never went out). `b778d29` splits the report into
+  `encode N ms, send N ms` so the next occurrence names the culprit. Every stall
+  so far lands while encoder output is LOW (8–603 Kbps), on the throttled
+  keep-alive rather than under load — including both pre-Tier-0 stalls. "Slowest
+  when it has least to do" points at NVENC waking from a downclock rather than at
+  the media pipe, but the split is what will settle it. **Read this before
+  touching rate control.**
+- **Tier 1 has never repaired anything**, because nothing has needed repairing
+  since Tier 0. It stays unexercised until real loss occurs.
+- **Mouse mode has never seen a physical controller.** The tests cover the toggle
+  state machine and the response curve; the *feel* wants a hand on a stick.
+- **Tiers 2–3 are planned but not started**: Echo receiver reports, adaptive FEC
+  (today it is fixed 10%, and `min_parity_shards = 2` gives a 1-packet frame 200%
+  overhead), QoS with longer memory, and multi-slice frames.
+- **`cargo test --workspace` fails in `echo-android`** with
+  `STATUS_ILLEGAL_INSTRUCTION` — the deliberate panic-across-FFI test aborts the
+  process under parallel execution. **Pre-existing**, verified on the parent
+  commit. Test per-crate (`-p nova-core`, `-p nova-server`, `-p echo-client`)
+  until it is fixed.
+
+## Previous Phase (2026-08-20): **ZERO-CONFIG WAN IS LIVE** — streamed to a phone
 on 5G with nothing forwarded by hand
 
 The transport story is complete and live-confirmed end to end. `open_path` is a
