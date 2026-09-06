@@ -11,6 +11,7 @@ pub mod debug; // pub so nova-server binary can call init_debug_logger() during 
 /// future CLI/diagnostic mode can drive the same surfaces in-process.
 pub mod echo;
 mod encoder;
+mod gamepad_mouse;
 mod input;
 // Microphone passthrough: the client's Opus → VB-CABLE, rendered in the Master.
 mod mic;

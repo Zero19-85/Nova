@@ -119,17 +119,19 @@ const MODIFIER_CTRL: u8 = 0x02;
 const MODIFIER_ALT: u8 = 0x04;
 const MODIFIER_META: u8 = 0x08;
 
+/// Public so `gamepad_mouse` can inspect a pad frame before it reaches the
+/// virtual controller, and synthesise a neutral one to replace it.
 #[derive(Debug, Clone, Copy)]
-struct ControllerInput {
-    controller_number: u8,
-    active_gamepad_mask: u16,
-    button_flags: u16,
-    left_trigger: u8,
-    right_trigger: u8,
-    left_stick_x: i16,
-    left_stick_y: i16,
-    right_stick_x: i16,
-    right_stick_y: i16,
+pub struct ControllerInput {
+    pub controller_number: u8,
+    pub active_gamepad_mask: u16,
+    pub button_flags: u16,
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
 }
 
 /// Parse the payload of a 0x0206 INPUT_DATA message (i.e. everything after
@@ -379,6 +381,9 @@ pub fn stop_session() {
     // is worse than a stuck modifier — it is a finger pressed on the desktop,
     // and the ids belong to a client that no longer exists.
     crate::touch::release_all();
+    // And hand the pad back: a session that ended mid-mouse-mode would
+    // otherwise leave the next one with its gamepad silently swallowed.
+    crate::gamepad_mouse::stop_session();
     let held = HELD_MODIFIERS.swap(0, Ordering::SeqCst);
     if held & MODIFIER_SHIFT != 0 {
         send_key_event(VK_SHIFT, true);
@@ -643,7 +648,7 @@ pub fn attach_to_input_desktop() {
 ///
 /// Returns `true` when the attachment state actually changed, so a caller
 /// retrying a failed injection knows whether a retry is worthwhile.
-fn sync_desktop_for_input(force: bool) -> bool {
+pub(crate) fn sync_desktop_for_input(force: bool) -> bool {
     if !SECURE_DESKTOP_INPUT_ENABLED {
         return false;
     }
@@ -773,9 +778,18 @@ pub fn handle_input_packet(payload: &[u8]) {
     match magic {
         MULTI_CONTROLLER_MAGIC_GEN5 => {
             if let Some(input) = parse_multi_controller(payload) {
-                let mut guard = manager().lock().unwrap();
-                if let Some(m) = guard.as_mut() {
-                    m.apply(input);
+                // Mouse mode gets first refusal on every pad frame: it is what
+                // decides whether the game sees this one at all.
+                let forward = match crate::gamepad_mouse::intercept(input) {
+                    crate::gamepad_mouse::Verdict::Forward(i) => Some(i),
+                    crate::gamepad_mouse::Verdict::Release(i) => Some(i),
+                    crate::gamepad_mouse::Verdict::Swallow => None,
+                };
+                if let Some(input) = forward {
+                    let mut guard = manager().lock().unwrap();
+                    if let Some(m) = guard.as_mut() {
+                        m.apply(input);
+                    }
                 }
             }
         }
@@ -1473,4 +1487,59 @@ mod tests {
         assert!(!is_gamepad_packet(&[0u8; 4]));
         assert!(!is_gamepad_packet(&[]));
     }
+}
+
+// ── Controller mouse mode support ────────────────────────────────────────────
+//
+// The small surface `gamepad_mouse` needs from here. Kept in this module rather
+// than duplicated there because every one of these has an invariant attached to
+// it — the desktop resync in `send_mouse_input`, the relative-motion rule below
+// — and a second copy is a second place for those to drift.
+
+/// Which mouse button a controller trigger stands in for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+}
+
+/// Press or release a mouse button, addressed by name rather than by an
+/// NV_MOUSE_BUTTON_PACKET. Same injection path as a real client click,
+/// including the desktop resync.
+pub fn inject_mouse_button_direct(button: MouseButton, down: bool) {
+    let flag = match (button, down) {
+        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+    };
+    send_mouse_input(MOUSEINPUT {
+        dx: 0,
+        dy: 0,
+        mouseData: 0,
+        dwFlags: flag,
+        time: 0,
+        dwExtraInfo: 0,
+    });
+}
+
+/// Move the cursor by a delta in pixels.
+///
+/// Relative (`MOUSEEVENTF_MOVE` with no `ABSOLUTE`), for the reason
+/// `inject_mouse_move_rel` is: games read motion through `WM_INPUT`, and an
+/// absolute path would also have to know the capture rect — which is the wrong
+/// question here, because a stick is steering the host's own cursor rather than
+/// mirroring a client's.
+pub fn inject_mouse_move_relative(dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    send_mouse_input(MOUSEINPUT {
+        dx,
+        dy,
+        mouseData: 0,
+        dwFlags: MOUSEEVENTF_MOVE,
+        time: 0,
+        dwExtraInfo: 0,
+    });
 }
