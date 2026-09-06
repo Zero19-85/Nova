@@ -3111,6 +3111,9 @@ pub async fn run_worker() -> Result<()> {
                                     }
                                 }
                                 Some(Ok(ipc::ControlMsg::RequestIdr)) => encoder::request_idr_global(),
+                                Some(Ok(ipc::ControlMsg::LtrAck { frame_index })) => {
+                                    encoder::notify_ltr_acked(frame_index as u64)
+                                }
                                 Some(Ok(ipc::ControlMsg::CongestionReduce)) => encoder::signal_congestion_reduction(),
                                 Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last })) => {
                                     // RFI recovery: invalidate the lost range so the
@@ -3134,7 +3137,11 @@ pub async fn run_worker() -> Result<()> {
                                     // lived on a path Echo does not use and dynamic
                                     // bitrate was inert for it. Both client kinds reach
                                     // this handler, so both are covered by one rule.
-                                    if !encoder::invalidate_ref_frames(first as u64, last as u64) {
+                                    // Repair ladder: RFI, then LTR, then an IDR
+                                    // — see the control.rs twin.
+                                    if !encoder::invalidate_ref_frames(first as u64, last as u64)
+                                        && !encoder::arm_ltr_recovery()
+                                    {
                                         encoder::request_idr_global();
                                         encoder::signal_congestion_reduction();
                                     }
@@ -3666,11 +3673,14 @@ pub async fn run_worker() -> Result<()> {
                     if !first_idr_sent && !is_idr {
                         enc.request_idr();
                     } else {
-                        // 2 = IDR, 5 = RFI recovery (reference re-pointed after an
-                        // invalidation — client needs this to decode it), 1 = P.
+                        // 2 = IDR, 5 = recovery (this frame's reference is not the frame
+                        // before it — re-pointed by an invalidation, or a long-term
+                        // reference — and the client needs telling), 1 = P.
                         let frame_type = if is_idr {
                             2u8
-                        } else if encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery() {
+                        } else if (encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery())
+                            || encoder::last_frame_was_ltr_recovery()
+                        {
                             5u8
                         } else {
                             1u8
@@ -5254,10 +5264,13 @@ pub async fn run() -> Result<()> {
                     let is_hevc_enc = enc.config.codec == encoder::Codec::Hevc;
                     let is_av1_enc = enc.config.codec == encoder::Codec::Av1;
                     let is_idr = rtp::detect_frame_type(data, is_hevc_enc, is_av1_enc) == 2;
-                    // 2 = IDR, 5 = RFI recovery, 1 = P (see the Worker path).
+                    // 2 = IDR, 5 = recovery via a re-pointed reference (RFI or LTR),
+                    // 1 = P. See the Worker path for the full reasoning.
                     let frame_type = if is_idr {
                         2u8
-                    } else if encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery() {
+                    } else if (encoder::RFI_ENABLED && encoder::last_frame_was_rfi_recovery())
+                        || encoder::last_frame_was_ltr_recovery()
+                    {
                         5u8
                     } else {
                         1u8

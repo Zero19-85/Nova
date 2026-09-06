@@ -379,6 +379,12 @@ pub struct EchoSession {
     /// into this one. Its window is separate from the input receiver's because
     /// the two streams have independent sequence spaces.
     mic: nova_core::mic_channel::MicReceiver,
+    /// Opener and watermark for this session's video-feedback datagrams.
+    ///
+    /// Per session, like every other channel state here: keys are minted fresh
+    /// at `start`, so a watermark can never survive into a session whose frame
+    /// indices restart at 1.
+    feedback: nova_core::feedback_channel::FeedbackReceiver,
     /// Sealer for this session's downstream game audio.
     ///
     /// Per-session like the two receivers above, and for one extra reason of its
@@ -511,6 +517,13 @@ pub trait MediaPlane: Send + Sync + 'static {
     /// NVENC cannot honour the range (gap >= DPB depth), so a caller never
     /// has to decide that for itself.
     fn invalidate_ref_frames(&self, first: u32, last: u32);
+
+    /// Report the newest wire frame index the client's decoder accepted.
+    ///
+    /// Feeds `encoder::notify_ltr_acked` in the Worker, which is what lets a
+    /// long-term-reference repair point at a picture the client provably holds
+    /// rather than the oldest one the host happens to be keeping.
+    fn ltr_acked(&self, frame_index: u32);
 }
 
 /// Production plane: retargets `RtpSender` and configures the live Worker.
@@ -645,6 +658,12 @@ impl MediaPlane for WorkerMediaPlane {
         // same place Moonlight's does -- including the IDR fallback the
         // Worker applies when NVENC refuses the range.
         self.worker_link.send(ControlMsg::InvalidateRefFrames { first, last });
+    }
+
+    fn ltr_acked(&self, frame_index: u32) {
+        // Same crossing as every other encoder-facing signal: the encoder lives
+        // in the Worker, this arrives at the Master.
+        self.worker_link.send(ControlMsg::LtrAck { frame_index });
     }
 
     fn end(&self, mode: EndMode) {
@@ -950,6 +969,7 @@ impl SessionManager {
             detached_since: None,
             input: nova_core::input_channel::InputReceiver::new(keys.clone()),
             mic: nova_core::mic_channel::MicReceiver::new(keys.clone()),
+            feedback: nova_core::feedback_channel::FeedbackReceiver::new(keys.clone()),
             audio: nova_core::audio_channel::AudioSender::new(keys.clone()),
             keys,
             rikey,
@@ -1084,6 +1104,42 @@ impl SessionManager {
             self.plane.inject_input(packet);
         }
         Ok(count)
+    }
+
+    /// Open a sealed video-feedback datagram that arrived on the media socket.
+    ///
+    /// Authorization works exactly as it does for
+    /// [`inject_sealed_input`](Self::inject_sealed_input): there is no TLS
+    /// connection here, so possession of the session key is what proves the
+    /// sender. On top of that the watermark is monotonic inside
+    /// `FeedbackReceiver`, so a replayed old report cannot retire a reference
+    /// the client still holds.
+    ///
+    /// Returns the new watermark when this report advanced it, `None` when it
+    /// was a repeat or arrived out of order.
+    pub fn apply_sealed_feedback(&self, datagram: &[u8]) -> Result<Option<u32>, InputRejection> {
+        // Same lock discipline as `inject_sealed_input`, and for the same
+        // reason: `seal_video` takes this mutex for every video frame, so the
+        // Worker-link send must happen outside it.
+        let advanced = {
+            let mut guard = self.active.lock().unwrap();
+            let Some(session) = guard.as_mut() else {
+                return Err(InputRejection::NoSession);
+            };
+            let advanced = session
+                .feedback
+                .open(datagram)
+                .map_err(|e| InputRejection::Unopenable(e.to_string()))?;
+            // Proof of life on the same terms as input: this opened under the
+            // session's own key, so only the granted device sent it.
+            session.last_seen = Instant::now();
+            advanced
+        };
+
+        if let Some(frame_index) = advanced {
+            self.plane.ltr_acked(frame_index);
+        }
+        Ok(advanced)
     }
 
     /// Open a sealed microphone datagram that arrived on the media socket.
@@ -1442,6 +1498,7 @@ mod tests {
         fn invalidate_ref_frames(&self, first: u32, last: u32) {
             self.invalidations.lock().unwrap().push((first, last));
         }
+        fn ltr_acked(&self, _frame_index: u32) {}
         fn inject_input(&self, packet: Vec<u8>) {
             self.injected.lock().unwrap().push(packet);
         }

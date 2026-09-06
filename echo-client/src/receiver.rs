@@ -185,6 +185,15 @@ pub struct VideoDepacketizer {
     /// were seen but abandoned. This one only moves when a frame really
     /// reached the caller, which is exactly the set the decoder saw.
     last_delivered: u32,
+    /// Highest frame index the client can PROVE its decoder holds, reported to
+    /// the host so a long-term-reference repair references a real picture.
+    ///
+    /// Deliberately stricter than `last_delivered`. A frame that arrived after
+    /// a gap was handed to the decoder, but the decoder could not decode it —
+    /// its reference was in the missing range — so it is NOT in the DPB and is
+    /// not safe to point a repair at. This only advances across an unbroken
+    /// chain, and resets to a frame that needs no predecessor.
+    decodable_watermark: u32,
     /// Inclusive range of indices that never completed, widened as further
     /// gaps appear and cleared by `take_transit_loss`.
     transit_loss: Option<(u32, u32)>,
@@ -198,9 +207,16 @@ impl VideoDepacketizer {
             pending: HashMap::new(),
             last_completed: 0,
             last_delivered: 0,
+            decodable_watermark: 0,
             transit_loss: None,
             stats: ReceiveStats::default(),
         }
+    }
+
+    /// The newest frame index this client can prove its decoder holds. Zero
+    /// until the first frame is delivered.
+    pub fn decodable_watermark(&self) -> u32 {
+        self.decodable_watermark
     }
 
     /// Feed one datagram. Returns a frame when this datagram completed one —
@@ -399,6 +415,24 @@ impl VideoDepacketizer {
             });
         }
         self.last_delivered = index;
+
+        // Advance the watermark the host repairs against.
+        //
+        //   * A keyframe needs no predecessor, so it restarts the chain
+        //     unconditionally.
+        //   * A recovery frame (type 5) references a re-pointed reference
+        //     rather than the frame before it. It is decodable by construction:
+        //     the host only ever points a repair at a frame at or below the
+        //     watermark this very field reported, so the reference is one the
+        //     decoder has already been proven to hold.
+        //   * An ordinary P-frame only extends the chain when it is contiguous.
+        //     After a gap the watermark deliberately freezes: those frames
+        //     reached the decoder but could not be decoded, and reporting them
+        //     would invite the host to repair against a picture that does not
+        //     exist — which is worse than sending a keyframe.
+        if frame_type == 2 || frame_type == 5 || index == self.decodable_watermark + 1 {
+            self.decodable_watermark = index;
+        }
 
         Some(DecodedFrame { index, frame_type, data, first_shard_at: partial.first_shard_at })
     }
@@ -624,6 +658,10 @@ pub async fn run_receiver(
     stop: tokio::sync::watch::Receiver<bool>,
     repair_tx: Option<tokio::sync::mpsc::UnboundedSender<RepairRequest>>,
 ) -> std::io::Result<ReceiveStats> {
+    // Cloned before `keys` moves into the depacketizer: the same session key
+    // seals the feedback reports, under its own stream id.
+    let mut feedback = keys.clone().map(nova_core::feedback_channel::FeedbackSender::new);
+    let mut feedback_reported: u32 = 0;
     let mut depack = VideoDepacketizer::new(keys);
     let mut gate = crate::gate::KeyframeGate::new();
     let mut outbox = RepairOutbox::default();
@@ -644,6 +682,29 @@ pub async fn run_receiver(
                 // stream to this client. Once a session exists the host has
                 // pinned its target and ignores these entirely.
                 let _ = socket.send_to(b"PING", peer).await;
+
+                // Tell the host how far the decoder has actually got, so a
+                // long-term-reference repair points at a picture this client
+                // provably holds instead of the host's best guess.
+                //
+                // Sent on the keepalive tick rather than per frame: the host
+                // marks a reference about twice a second, so a report at the
+                // same cadence is as fresh as the decision it feeds, and one
+                // datagram per frame at 120 fps would be pure overhead. Skipped
+                // entirely when the watermark has not moved -- a repeat carries
+                // no information the host does not already have.
+                if let Some(sender) = feedback.as_mut() {
+                    let watermark = depack.decodable_watermark();
+                    if watermark > feedback_reported {
+                        if let Ok(datagram) = sender.seal(watermark) {
+                            // Best-effort, exactly like the ping above: each
+                            // report is an absolute watermark, so a lost one
+                            // costs freshness and the next tick recovers it.
+                            let _ = socket.send_to(&datagram, peer).await;
+                            feedback_reported = watermark;
+                        }
+                    }
+                }
 
                 // The tick is now only a backstop. Repairs are raised on the
                 // frame path the moment loss is observed, because the encoder
@@ -748,12 +809,12 @@ pub async fn demultiplex(
                                     return Ok(());
                                 }
                             }
-                            // Input and microphone audio only ever travel
-                            // client → host, so one arriving here is our own
-                            // datagram reflected by a middlebox or someone
-                            // probing. Either way there is no receiver for it
-                            // on this side.
-                            Class::EchoInput | Class::EchoMic => {}
+                            // Input, microphone audio and video feedback only
+                            // ever travel client → host, so one arriving here
+                            // is our own datagram reflected by a middlebox or
+                            // someone probing. Either way there is no receiver
+                            // for it on this side.
+                            Class::EchoInput | Class::EchoMic | Class::EchoFeedback => {}
                             // Downstream game audio goes to its OWN channel,
                             // never the media one. Audio would otherwise be
                             // depacketized, FEC-reconstructed and keyframe-gated
@@ -794,6 +855,68 @@ pub async fn demultiplex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The watermark is what the host repairs against, so it must never claim a
+    /// frame the decoder could not actually decode. Anything else invites a
+    /// repair pointed at a picture that is not there — strictly worse than
+    /// having sent a keyframe.
+    #[test]
+    fn the_decodable_watermark_only_counts_an_unbroken_chain() {
+        let body = vec![3u8; 300];
+        let mut d = VideoDepacketizer::new(None);
+        let mut feed = |d: &mut VideoDepacketizer, idx: u32, ty: u8| {
+            for p in packetize(idx, ty, &body, 200, TEST_FEC_PCT) {
+                d.push(&p);
+            }
+        };
+
+        feed(&mut d, 1, 2); // opening keyframe
+        assert_eq!(d.decodable_watermark(), 1);
+        feed(&mut d, 2, 1);
+        feed(&mut d, 3, 1);
+        assert_eq!(d.decodable_watermark(), 3, "a contiguous chain advances it");
+
+        // Frames 4 and 5 never arrive. Frame 6 reaches the decoder but cannot be
+        // decoded — its reference is in the hole — so it must not be claimed.
+        feed(&mut d, 6, 1);
+        assert_eq!(d.decodable_watermark(), 3, "a frame after a gap is not held");
+        feed(&mut d, 7, 1);
+        assert_eq!(d.decodable_watermark(), 3, "and neither is anything after it");
+
+        // A keyframe needs no predecessor, so it restarts the chain outright.
+        feed(&mut d, 8, 2);
+        assert_eq!(d.decodable_watermark(), 8);
+        feed(&mut d, 9, 1);
+        assert_eq!(d.decodable_watermark(), 9);
+    }
+
+    /// A recovery frame (wire type 5) is decodable by construction: the host
+    /// only points a repair at a frame at or below the watermark this client
+    /// reported, so the reference is one it has already proven it holds.
+    /// Treating it as an ordinary P-frame would strand the watermark behind
+    /// every repair and force the next one to be a keyframe.
+    #[test]
+    fn a_recovery_frame_restores_the_watermark_after_a_gap() {
+        let body = vec![5u8; 300];
+        let mut d = VideoDepacketizer::new(None);
+        let mut feed = |d: &mut VideoDepacketizer, idx: u32, ty: u8| {
+            for p in packetize(idx, ty, &body, 200, TEST_FEC_PCT) {
+                d.push(&p);
+            }
+        };
+
+        feed(&mut d, 1, 2);
+        feed(&mut d, 2, 1);
+        assert_eq!(d.decodable_watermark(), 2);
+
+        feed(&mut d, 5, 1); // arrives after a gap — not decodable
+        assert_eq!(d.decodable_watermark(), 2);
+
+        feed(&mut d, 6, 5); // the host's keyframeless repair
+        assert_eq!(d.decodable_watermark(), 6, "a repair re-establishes the chain");
+        feed(&mut d, 7, 1);
+        assert_eq!(d.decodable_watermark(), 7);
+    }
 
     /// Percentage the test host encodes with. Higher than the 5% Nova ships so
     /// small test frames still get parity worth exercising.

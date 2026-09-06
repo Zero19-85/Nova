@@ -80,6 +80,9 @@ mod tag {
     pub const SET_DISPLAY_MODE: u8 = 20;
     pub const DISPLAY_INVENTORY: u8 = 21;
     pub const PAUSE_ENCODE: u8 = 22;
+    /// Master -> Worker: the Echo client confirmed decoding up to this wire
+    /// frame index, so the encoder may safely reference it (see encoder::notify_ltr_acked).
+    pub const LTR_ACK: u8 = 23;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -287,6 +290,15 @@ pub enum ControlMsg {
     /// references so the next P-frame recovers without an IDR; on failure it
     /// falls back to forcing an IDR. See encoder::invalidate_ref_frames.
     InvalidateRefFrames { first: u32, last: u32 },
+    /// Master -> Worker: the Echo client reported the newest wire frame index
+    /// its decoder accepted.
+    ///
+    /// This is what turns a long-term-reference repair from a guess into a
+    /// proof. The encoder lives in the Worker and the feedback datagram arrives
+    /// at the Master, so it has to cross the pipe like every other control
+    /// signal. Lossy by design: each report is an absolute watermark, so a
+    /// dropped one costs freshness and nothing else.
+    LtrAck { frame_index: u32 },
     /// Worker -> Master: PIN + device name entered on the Worker's tray
     /// dialog, forwarded into Master-side pairing's `global_pin` slot (the
     /// same handshake point the monolithic host's tray uses in-process).
@@ -533,6 +545,11 @@ impl ControlMsg {
                 write_u32(&mut out, *last);
                 out
             }
+            ControlMsg::LtrAck { frame_index } => {
+                let mut out = vec![tag::LTR_ACK];
+                write_u32(&mut out, *frame_index);
+                out
+            }
             ControlMsg::PinRelay { pin, device } => {
                 let mut out = vec![tag::PIN_RELAY];
                 write_string(&mut out, pin);
@@ -599,6 +616,10 @@ impl ControlMsg {
                 let first = read_u32(rest, at)?;
                 let last = read_u32(rest, at)?;
                 Ok(ControlMsg::InvalidateRefFrames { first, last })
+            }
+            tag::LTR_ACK => {
+                let at = &mut 0usize;
+                Ok(ControlMsg::LtrAck { frame_index: read_u32(rest, at)? })
             }
             tag::PIN_RELAY => {
                 let at = &mut 0usize;

@@ -69,6 +69,16 @@ pub const ECHO_MIC: u8 = 0xE4;
 /// replayed upstream as microphone input.
 pub const ECHO_AUDIO: u8 = 0xE5;
 
+/// Echo video feedback: sealed client-to-host reports of which frames the
+/// client's decoder accepted (see [`crate::feedback_channel`]).
+///
+/// Separate from [`ECHO_INPUT`] and [`ECHO_MIC`] for the reasons those two are
+/// separate from each other: a distinct tag spares every dispatcher from
+/// re-inspecting a datagram to find its subsystem, and a distinct stream id
+/// stops a captured feedback report being replayed as input or microphone
+/// audio.
+pub const ECHO_FEEDBACK: u8 = 0xE6;
+
 /// What a datagram arriving on the shared socket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -86,6 +96,8 @@ pub enum Class {
     EchoMic,
     /// Sealed game audio travelling host → client.
     EchoAudio,
+    /// Echo client-to-host video feedback.
+    EchoFeedback,
     /// Anything else: Moonlight RTP, a client ping, or noise. Deliberately one
     /// bucket — Nova's existing paths already know how to tell those apart,
     /// and this classifier must not start second-guessing them.
@@ -107,6 +119,7 @@ pub fn classify(buf: &[u8]) -> Class {
         Some(&ECHO_INPUT) => Class::EchoInput,
         Some(&ECHO_MIC) => Class::EchoMic,
         Some(&ECHO_AUDIO) => Class::EchoAudio,
+        Some(&ECHO_FEEDBACK) => Class::EchoFeedback,
         Some(&b) if b & 0xC0 == 0 => {
             // Leading bits say "could be STUN"; only the cookie settles it.
             // Without this check a stray datagram starting with a low byte
@@ -135,6 +148,7 @@ pub fn is_echo(buf: &[u8]) -> bool {
             | Class::EchoInput
             | Class::EchoMic
             | Class::EchoAudio
+            | Class::EchoFeedback
     )
 }
 

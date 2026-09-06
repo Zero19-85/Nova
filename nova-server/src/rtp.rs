@@ -461,13 +461,15 @@ impl RtpSender {
                     // server's address would send the whole video stream to it.
                     continue;
                 }
-                // Input rides the same inbox as control. It is neither
-                // acknowledged nor ordered (see `nova_core::input_channel`), so
-                // it does not belong to the RUDP tunnel — `echo::transport`
-                // splits the two by class on arrival.
+                // Input and video feedback ride the same inbox as control.
+                // Neither is acknowledged or ordered (see
+                // `nova_core::input_channel` and `nova_core::feedback_channel`),
+                // so neither belongs to the RUDP tunnel — `echo::transport`
+                // splits them out by class on arrival.
                 nova_core::demux::Class::EchoControl
                 | nova_core::demux::Class::EchoControlAck
-                | nova_core::demux::Class::EchoInput => {
+                | nova_core::demux::Class::EchoInput
+                | nova_core::demux::Class::EchoFeedback => {
                     if let Some(inbox) = &self.echo_inbox {
                         let _ = inbox.send((buf[..n].to_vec(), addr));
                     }

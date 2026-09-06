@@ -458,7 +458,14 @@ fn handle_control_message(
                         None => {
                             // Same outcome-based rule as the Worker loop above --
                             // mirror any change to both.
-                            if !crate::encoder::invalidate_ref_frames(first as u64, last as u64) {
+                            // Repair ladder: RFI, then LTR, then an IDR. Each
+                            // rung costs more than the one above and each is
+                            // strictly better than the one below, so the IDR is
+                            // only ever reached when neither cheap repair has a
+                            // reference left to work with.
+                            if !crate::encoder::invalidate_ref_frames(first as u64, last as u64)
+                                && !crate::encoder::arm_ltr_recovery()
+                            {
                                 crate::encoder::request_idr_global();
                                 crate::encoder::signal_congestion_reduction();
                             }

@@ -210,6 +210,65 @@ static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
 static std::atomic<bool>    g_rfiConfirm{false};
 static std::atomic<bool>    g_lastFrameRecovery{false};
 
+// ── Long-term reference (LTR) frames ─────────────────────────────────────────
+//
+// Tier 1 of the stream-integrity plan: recover from packet loss WITHOUT
+// spending a keyframe.
+//
+// Nova's only mid-session repair today is a full IDR, and at 4K120 that is the
+// single most expensive and worst-looking frame in the stream. LTR gives the
+// encoder a second option: mark a frame as a long-term reference, keep it in
+// the DPB, and when the client loses sync encode the next P-frame against that
+// known-good picture instead. The repair then costs an ordinary P-frame.
+//
+// **"LTR Per Picture" mode** (`ltrTrustMode = 0`), which the SDK header
+// explicitly prefers -- Trust mode is documented as discouraged and may be
+// deprecated. The host marks explicitly (`ltrMarkFrame` + `ltrMarkFrameIdx`)
+// and references explicitly (`ltrUseFrames` + `ltrUseFrameBitmap`).
+//
+// **DPB budget, and why this cannot break level compliance.** LTR frames live
+// INSIDE the existing DPB -- `maxNumRefFrames`/`maxNumRefFramesInDPB` is still
+// `g_refFramesInDpb` and is not raised by a single slot. At 4K that is 5 total:
+// kLtrNumFrames of them long-term, the rest short-term. Nothing here changes
+// `max_dec_frame_buffering`, so the level a stream conforms to is exactly what
+// it was before. Two slots is deliberately conservative for the 4K case, where
+// the whole DPB is only 5 deep.
+//
+// **Whose picture is it anyway.** A long-term reference is only useful if the
+// CLIENT still holds that frame. The host cannot know that on its own, which is
+// what `NotifyLtrAcked` is for -- Echo reports the newest frame index it
+// decoded, and recovery then references a frame the client has provably seen.
+// Without an ack (Moonlight) the host falls back to the OLDEST live slot, which
+// is the one most likely to have arrived, and the caller is responsible for
+// escalating to an IDR if that guess turns out to be wrong. Guessing wrong
+// costs one cheap P-frame; the escalation policy lives in Rust beside the
+// repair-request handling.
+static const uint32_t kLtrNumFrames = 2;
+
+// How often a frame is marked as a long-term reference, as a fraction of the
+// frame rate -- so ~0.5 s at any cadence. Two slots then hold roughly 0.5-1.0 s
+// of history. Marking faster narrows what a fallback can repair (the newest LTR
+// may be inside the same loss burst); marking slower makes the recovery P-frame
+// expensive, because it carries everything that changed since.
+static const uint32_t kLtrMarkDivisor = 2;
+
+static bool                  g_ltrSupported = false;
+static bool                  g_ltrActive    = false;
+static uint32_t              g_ltrMarkInterval  = 60;
+static uint32_t              g_ltrMarkCountdown = 0;
+static uint32_t              g_ltrNextMarkIdx   = 0;
+// Wire frame index currently held in each LTR slot; 0 = slot empty. Written and
+// read only on the encode thread, so no atomic is needed.
+static uint64_t              g_ltrSlotFrame[kLtrNumFrames] = { 0 };
+// Newest wire frame index the client has confirmed decoding (Echo only).
+// 0 = no acknowledgement channel, fall back to oldest-slot.
+static std::atomic<uint64_t> g_ltrAckedFrame{0};
+// LTR bitmap the NEXT encoded frame must reference; 0 = none pending.
+static std::atomic<uint32_t> g_ltrUsePending{0};
+// Whether the frame just encoded was an LTR recovery frame, so Rust can mark it
+// on the wire for a client that needs telling.
+static std::atomic<bool>     g_lastFrameLtrRecovery{false};
+
 // ── Intra refresh ─────────────────────────────────────────────────────────────
 //
 // ON, but at the reference cadence — NOT the old `period = cnt = fps`.
@@ -302,6 +361,12 @@ static const uint32_t kVbvFrames = 4;
 // but raise kVbvFrames first, because a bigger VBV addresses the same problem
 // without paying for it in bandwidth.
 static const bool kEnableFillerData = false;
+
+// Master switch for long-term-reference recovery (Tier 1). Off makes the shim
+// behave exactly as it did before: no marking, no LTR references, and
+// ArmLtrRecovery() always answers "no reference available" so every caller
+// falls back to the IDR path it used before.
+static const bool kEnableLtr = true;
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
 // with (only rate-control fields changed).
@@ -1605,6 +1670,31 @@ extern "C" __declspec(dllexport) int InitEncoder(
             vuiParams.colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_BT709;
         }
 
+        // LTR is only wired for H.264 and HEVC. AV1's config carries enableLTR
+        // too, but AV1 is parked on this project pending a hardware decoder
+        // that can keep up, and turning it on there would be untestable.
+        const bool ltrCodec = (codecGuid == NV_ENC_CODEC_H264_GUID)
+                           || (codecGuid == NV_ENC_CODEC_HEVC_GUID);
+        const uint32_t maxLtr = (uint32_t)g_nvEncoder->GetCapabilityValue(
+                                    codecGuid, NV_ENC_CAPS_NUM_MAX_LTR_FRAMES);
+        g_ltrSupported = ltrCodec && maxLtr >= kLtrNumFrames
+                      && g_refFramesInDpb > kLtrNumFrames;
+        g_ltrActive    = kEnableLtr && g_ltrSupported;
+        // Reset per session: a new encoder has an empty DPB, so every slot is
+        // empty and the first mark should happen promptly rather than a full
+        // interval away.
+        g_ltrMarkInterval  = (uint32_t)(fps > 0 ? fps : 60) / kLtrMarkDivisor;
+        if (g_ltrMarkInterval == 0) g_ltrMarkInterval = 1;
+        g_ltrMarkCountdown = 1;
+        g_ltrNextMarkIdx   = 0;
+        for (uint32_t i = 0; i < kLtrNumFrames; ++i) g_ltrSlotFrame[i] = 0;
+        g_ltrAckedFrame.store(0);
+        g_ltrUsePending.store(0);
+        g_lastFrameLtrRecovery.store(false);
+        ShimLog("[LTR] Long-term references for %s: cap=%u slot(s), requested=%s, active=%s "
+               "(%u LTR of %u DPB slots, mark every %u frames)\n",
+               codec, maxLtr, kEnableLtr ? "ON" : "OFF", g_ltrActive ? "YES" : "no",
+               kLtrNumFrames, g_refFramesInDpb, g_ltrMarkInterval);
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
             encodeConfig.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
             auto& h264 = encodeConfig.encodeCodecConfig.h264Config;
@@ -1613,10 +1703,22 @@ extern "C" __declspec(dllexport) int InitEncoder(
             h264.sliceMode         = 3;
             h264.sliceModeData     = 1; // single slice per frame
             h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-            // Deep DPB for future reference-frame invalidation; any single
-            // frame still only references one frame back (numRefL0).
+            // Deep DPB for reference-frame invalidation and for the long-term
+            // references below, which are held inside this same budget.
             h264.maxNumRefFrames   = g_refFramesInDpb;
-            h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_1;
+            // Two references, not one. Every P-frame used to key off exactly the
+            // frame before it, which is the most fragile arrangement possible:
+            // lose that one frame and nothing else in the DPB can stand in --
+            // which is also why reference invalidation kept collapsing into an
+            // IDR. This does NOT change the DPB (maxNumRefFrames is untouched),
+            // so the level the stream conforms to is unchanged; it only widens
+            // what a single frame is allowed to reference.
+            h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_2;
+            if (g_ltrActive) {
+                h264.enableLTR    = 1;
+                h264.ltrNumFrames = kLtrNumFrames;
+                h264.ltrTrustMode = 0; // per-picture mode; see the LTR block above
+            }
             // Filler data keeps CBR byte-accurate on static frames: NVENC pads
             // easy (low-motion) frames to the full bit budget rather than
             // under-spending and then over-correcting — eliminating the QP
@@ -1644,7 +1746,13 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.sliceMode            = 3;
             hevc.sliceModeData        = 1;
             hevc.maxNumRefFramesInDPB = g_refFramesInDpb;
-            hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_1;
+            // See the H.264 arm: two references instead of one, DPB unchanged.
+            hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_2;
+            if (g_ltrActive) {
+                hevc.enableLTR    = 1;
+                hevc.ltrNumFrames = kLtrNumFrames;
+                hevc.ltrTrustMode = 0;
+            }
             // Same filler-data rationale as H264: prevents CBR QP oscillation on static frames.
             hevc.enableFillerDataInsertion = kEnableFillerData ? 1 : 0;
             hevc.hevcVUIParameters    = vuiParams;
@@ -2117,12 +2225,62 @@ extern "C" __declspec(dllexport) int EncodeFrame(
             picParams.codecPicParams.hevcPicParams.seiPayloadArray    = g_hdrSeiPayloads;
         }
     }
+
+    // ── Long-term reference bookkeeping ──────────────────────────────────────
+    //
+    // Three mutually exclusive things can happen to a frame, in this order of
+    // precedence:
+    //
+    //   IDR      -- an IDR empties the DPB, so every LTR slot it held is gone.
+    //               Clearing them here is what stops a later recovery pointing
+    //               at a picture the decoder has already discarded.
+    //   recover  -- an LTR bitmap was armed by ArmLtrRecovery(); this frame
+    //               references it instead of the frame before it. It does not
+    //               also mark, so a repair never becomes the thing future
+    //               repairs depend on.
+    //   mark     -- the periodic case: hand this frame to a slot and move on.
+    //
+    // All of this runs on the encode thread, which is the only writer of the
+    // slot table; the atomics are the ones Rust can touch from elsewhere.
+    bool ltrRecoveryFrame = false;
+    if (g_ltrActive) {
+        if (forceIdr) {
+            for (uint32_t i = 0; i < kLtrNumFrames; ++i) g_ltrSlotFrame[i] = 0;
+            g_ltrUsePending.store(0);
+            g_ltrNextMarkIdx   = 0;
+            g_ltrMarkCountdown = g_ltrMarkInterval;
+        } else if (uint32_t useBitmap = g_ltrUsePending.exchange(0)) {
+            ltrRecoveryFrame = true;
+            if (g_encoderCodec == 1) {
+                picParams.codecPicParams.hevcPicParams.ltrUseFrames     = 1;
+                picParams.codecPicParams.hevcPicParams.ltrUseFrameBitmap = useBitmap;
+            } else {
+                picParams.codecPicParams.h264PicParams.ltrUseFrames     = 1;
+                picParams.codecPicParams.h264PicParams.ltrUseFrameBitmap = useBitmap;
+            }
+            ShimLog("[LTR] frame %llu encoded against LTR bitmap 0x%x — repaired without a keyframe\n",
+                   (unsigned long long)frame_index, useBitmap);
+        } else if (g_ltrMarkCountdown > 0 && --g_ltrMarkCountdown == 0) {
+            const uint32_t idx = g_ltrNextMarkIdx;
+            if (g_encoderCodec == 1) {
+                picParams.codecPicParams.hevcPicParams.ltrMarkFrame    = 1;
+                picParams.codecPicParams.hevcPicParams.ltrMarkFrameIdx = idx;
+            } else {
+                picParams.codecPicParams.h264PicParams.ltrMarkFrame    = 1;
+                picParams.codecPicParams.h264PicParams.ltrMarkFrameIdx = idx;
+            }
+            g_ltrSlotFrame[idx] = frame_index;
+            g_ltrNextMarkIdx    = (idx + 1) % kLtrNumFrames;
+            g_ltrMarkCountdown  = g_ltrMarkInterval;
+        }
+    }
     g_nvEncoder->EncodeFrame(vPacket, &picParams);
     g_lastEncodedFrameIndex.store(frame_index);
     // Tie the RFI recovery marker to the frame just encoded: if an invalidation
     // landed since the last encode, THIS frame is the one that references the
     // re-pointed (older, good) frame, so the wire must mark it type 5.
     g_lastFrameRecovery.store(g_rfiConfirm.exchange(false));
+    g_lastFrameLtrRecovery.store(ltrRecoveryFrame);
 
     int  total_size  = 0;
     int  wanted_size = 0;
@@ -2384,4 +2542,70 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
     g_dstX = g_dstY = g_dstW = g_dstH = 0;
     g_letterboxed      = false;
     return 0;
+}
+
+// ==================== LONG-TERM REFERENCE RECOVERY ====================
+//
+// Non-zero return = the NEXT encoded frame will reference a long-term reference
+// instead of the frame before it, repairing the client without a keyframe.
+// Zero = no usable long-term reference exists and the caller must force an IDR,
+// which is exactly the behaviour that existed before LTR.
+//
+// Slot choice is the whole correctness question, because referencing a picture
+// the client does not hold produces a frame it cannot decode:
+//
+//   * With an acknowledgement (Echo reports decoded frame indices through
+//     NotifyLtrAcked), pick the NEWEST slot at or below the acknowledged index.
+//     Newest is right here because it is provably held, and the closer the
+//     reference the cheaper the repair frame.
+//   * Without one (Moonlight has no such message), pick the OLDEST live slot.
+//     It is the one most likely to have arrived, and it is deliberately the
+//     opposite choice: with no proof, age is the only evidence available.
+extern "C" __declspec(dllexport) int ArmLtrRecovery() {
+    if (!g_nvEncoder || !g_ltrActive) return 0;
+
+    const uint64_t acked = g_ltrAckedFrame.load();
+    uint32_t chosen      = 0;
+    uint64_t chosenFrame = 0;
+
+    for (uint32_t i = 0; i < kLtrNumFrames; ++i) {
+        const uint64_t f = g_ltrSlotFrame[i];
+        if (f == 0) continue;                 // slot never marked, or cleared by an IDR
+        if (acked != 0) {
+            if (f > acked) continue;          // client has not confirmed this one
+            if (chosenFrame == 0 || f > chosenFrame) { chosen = 1u << i; chosenFrame = f; }
+        } else {
+            if (chosenFrame == 0 || f < chosenFrame) { chosen = 1u << i; chosenFrame = f; }
+        }
+    }
+    if (chosen == 0) {
+        ShimLog("[LTR] no usable long-term reference (acked=%llu) — caller must send an IDR\n",
+               (unsigned long long)acked);
+        return 0;
+    }
+    g_ltrUsePending.store(chosen);
+    ShimLog("[LTR] armed recovery against frame %llu (slot bitmap 0x%x, acked=%llu)\n",
+           (unsigned long long)chosenFrame, chosen, (unsigned long long)acked);
+    return 1;
+}
+
+// Echo only: the client decoded everything up to and including this wire frame
+// index. Monotonic -- a late or reordered report must never walk the watermark
+// backwards, because that would retire a reference the client demonstrably has.
+extern "C" __declspec(dllexport) void NotifyLtrAcked(uint64_t frame_index) {
+    uint64_t prev = g_ltrAckedFrame.load();
+    while (frame_index > prev &&
+           !g_ltrAckedFrame.compare_exchange_weak(prev, frame_index)) {
+    }
+}
+
+// Whether long-term references are live for this session, so Rust can decide
+// between the LTR repair path and the IDR one without guessing.
+extern "C" __declspec(dllexport) int LtrActive() {
+    return g_ltrActive ? 1 : 0;
+}
+
+// Whether the frame just encoded was an LTR recovery frame.
+extern "C" __declspec(dllexport) int LastFrameWasLtrRecovery() {
+    return g_lastFrameLtrRecovery.load() ? 1 : 0;
 }

@@ -52,6 +52,7 @@
 pub mod audio_channel;
 pub mod demux;
 pub mod envelope;
+pub mod feedback_channel;
 pub mod identity;
 pub mod input_channel;
 pub mod media_crypto;

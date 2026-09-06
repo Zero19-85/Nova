@@ -92,6 +92,18 @@ extern "C" {
     /// reference was re-pointed by an invalidation). 1 = mark it wire type 5.
     fn LastFrameWasRfiRecovery() -> i32;
 
+    /// LTR: arm the next encoded frame to reference a long-term reference
+    /// instead of the frame before it. Returns 1 when one was armed, 0 when no
+    /// usable long-term reference exists (caller must force an IDR).
+    fn ArmLtrRecovery() -> i32;
+    /// LTR: report the newest wire frame index the client confirmed decoding,
+    /// so recovery only ever references a picture it provably holds.
+    fn NotifyLtrAcked(frame_index: u64);
+    /// LTR: whether long-term references are live for this session.
+    fn LtrActive() -> i32;
+    /// LTR: whether the frame just encoded was an LTR recovery frame.
+    fn LastFrameWasLtrRecovery() -> i32;
+
     // ── Bug-reporter frame capture (shim/snapshot.cpp) ──────────────────────
     //
     // Nothing here touches NVENC. The snapshot is taken from the composite
@@ -227,6 +239,45 @@ pub fn rfi_supported() -> bool {
 /// re-pointed reference correctly. Call immediately after `encode_frame`.
 pub fn last_frame_was_rfi_recovery() -> bool {
     unsafe { LastFrameWasRfiRecovery() == 1 }
+}
+
+/// Attempt a keyframeless repair: point the next P-frame at a long-term
+/// reference the client still holds. `true` = armed, `false` = no usable
+/// long-term reference and the caller must force an IDR.
+///
+/// **Ordering matters at the call sites.** This is the second choice, not the
+/// first: reference-frame invalidation is cheaper still (it re-points within
+/// the short-term window and needs no marked frame), so the repair ladder is
+/// RFI, then LTR, then an IDR. Each rung costs more than the one above it and
+/// each is strictly better than the rung below.
+pub fn arm_ltr_recovery() -> bool {
+    unsafe { ArmLtrRecovery() == 1 }
+}
+
+/// Tell the encoder the client has decoded everything up to `frame_index`.
+///
+/// Only Echo can supply this -- GameStream has no message for it -- and it is
+/// what turns LTR recovery from a conservative guess into a provable one: with
+/// an acknowledgement the shim references the NEWEST confirmed frame (cheapest
+/// repair), without one it falls back to the OLDEST it holds (most likely to
+/// have survived). Monotonic in the shim, so a reordered report cannot retire a
+/// reference the client demonstrably has.
+pub fn notify_ltr_acked(frame_index: u64) {
+    unsafe { NotifyLtrAcked(frame_index) }
+}
+
+/// Whether long-term references are live for this session. False on AV1, on a
+/// GPU that reports too few LTR slots, or when `kEnableLtr` is off in the shim.
+pub fn ltr_active() -> bool {
+    unsafe { LtrActive() == 1 }
+}
+
+/// Whether the frame just returned by `encode_frame` repaired the stream by
+/// referencing a long-term reference. Like its RFI twin, it must go on the wire
+/// as frame type 5: the client is being handed a P-frame whose reference is not
+/// the frame before it, and type 5 is how that is signalled.
+pub fn last_frame_was_ltr_recovery() -> bool {
+    unsafe { LastFrameWasLtrRecovery() == 1 }
 }
 
 /// Pass the log file path (UTF-16, null-terminated) to the C++ shim so that

@@ -184,6 +184,7 @@ pub fn spawn(
         let mut last_busy_notice: Option<Instant> = None;
         // Same, for input that could not be injected.
         let mut last_input_notice: Option<Instant> = None;
+    let mut last_feedback_notice: Option<Instant> = None;
         // Input arrival accounting — see INPUT_REPORT_INTERVAL.
         let mut input_window = Instant::now();
         let (mut datagrams, mut applied, mut duplicates, mut refused) = (0u32, 0u32, 0u32, 0u32);
@@ -233,6 +234,29 @@ pub fn spawn(
             };
 
             // Input is split off before anything else looks at this datagram.
+
+            // Video feedback is split off on the same terms as input: it
+            // carries its own authentication, so it must not open a tunnel,
+            // evict one, or count toward the busy slot. It deliberately does
+            // NOT refresh `last_seen` on the tunnel either — the idle sweep is
+            // asking whether the *tunnel* is alive, and a client that only kept
+            // reporting decoded frames would otherwise hold the slot forever.
+            if nova_core::demux::classify(&datagram) == nova_core::demux::Class::EchoFeedback {
+                match sessions.apply_sealed_feedback(&datagram) {
+                    Ok(_) => {}
+                    Err(why) => {
+                        // Rate-limited for the same reason input is: a spray of
+                        // forged datagrams must not become a log amplifier.
+                        if last_feedback_notice
+                            .map_or(true, |t: Instant| t.elapsed() > Duration::from_secs(10))
+                        {
+                            println!("🚫 Echo feedback from {from} refused: {why}");
+                            last_feedback_notice = Some(Instant::now());
+                        }
+                    }
+                }
+                continue;
+            }
             //
             // It shares the inbox with control but has nothing to do with the
             // tunnel: it carries its own authentication, so it must not open
@@ -541,6 +565,7 @@ mod tests {
         fn end(&self, _mode: crate::echo::session::EndMode) {}
         fn request_idr(&self) {}
         fn invalidate_ref_frames(&self, _first: u32, _last: u32) {}
+        fn ltr_acked(&self, _frame_index: u32) {}
         fn inject_input(&self, _packet: Vec<u8>) {}
     }
 
