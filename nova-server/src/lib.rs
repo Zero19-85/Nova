@@ -3654,6 +3654,12 @@ pub async fn run_worker() -> Result<()> {
             // in bijection; a frame dropped after encode simply leaves a gap.
             let this_index = wire_index;
             let packet_size = enc.encode_frame(&texture, &mut out_buffer, this_index as u64);
+            // Split from the slot total below so a stall names its own culprit.
+            // "encode+send" localised it to this block but not to which half,
+            // and the two want completely different fixes: NVENC waking from a
+            // downclock is a rate-control problem, a slow pipe is a Master-side
+            // one.
+            let encode_cost = slot_began.elapsed();
             if packet_size > 0 {
                 wire_index = wire_index.wrapping_add(1);
                 if wire_index == 0 { wire_index = 1; } // Moonlight discards frame 0
@@ -3707,14 +3713,15 @@ pub async fn run_worker() -> Result<()> {
                 }
             }
             // ~8 ms is the whole slot at 120 fps. 100 ms means over ten frames
-            // were never encoded, which the client sees as a visible hitch — and
-            // near a full second it is the stall signature above.
+            // were never encoded, which the client sees as a visible hitch.
             let slot_cost = slot_began.elapsed();
             if slot_cost >= Duration::from_millis(100) {
                 println!(
-                    "⏱️  Capture slot stalled {} ms (encode+send of frame {this_index}) — \
-                     roughly {} frame(s) never went out",
+                    "⏱️  Capture slot stalled {} ms (frame {this_index}: encode {} ms, \
+                     send {} ms) — roughly {} frame(s) never went out",
                     slot_cost.as_millis(),
+                    encode_cost.as_millis(),
+                    slot_cost.saturating_sub(encode_cost).as_millis(),
                     slot_cost.as_millis() as u64 / frame_interval.as_millis().max(1) as u64,
                 );
             }
