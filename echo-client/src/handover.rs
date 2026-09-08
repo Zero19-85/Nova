@@ -189,6 +189,7 @@ pub struct UplinkRelay {
     input: Option<Slot>,
     mic: Option<Slot>,
     audio: Option<Arc<crate::audio::AudioPlayout>>,
+    control: Option<Slot>,
 }
 
 type Slot = Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
@@ -200,8 +201,13 @@ impl UplinkRelay {
     /// channel present. The tasks end when the platform's senders are dropped,
     /// which happens when the JNI handle is closed.
     pub fn spawn(source: Uplink) -> Self {
-        let Uplink { input, mic, audio } = source;
-        Self { input: input.map(pump), mic: mic.map(pump), audio }
+        let Uplink { input, mic, audio, control } = source;
+        Self {
+            input: input.map(pump),
+            mic: mic.map(pump),
+            audio,
+            control: control.map(pump),
+        }
     }
 
     /// A fresh [`Uplink`] for one attempt.
@@ -217,6 +223,7 @@ impl UplinkRelay {
             // polls this same handle for the life of the app, so it is shared
             // across attempts rather than rebuilt for each one.
             audio: self.audio.clone(),
+            control: self.control.as_ref().map(install),
         }
     }
 }

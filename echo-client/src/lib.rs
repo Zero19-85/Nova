@@ -43,6 +43,10 @@
 
 pub mod audio;
 pub mod control;
+// The bounded queue that stands between the receive loop and a platform
+// decoder. Lives here rather than in a bridge because its drop policy is a
+// streaming decision, and every bridge must make the same one.
+pub mod frames;
 pub mod gate;
 pub mod handover;
 pub mod input;

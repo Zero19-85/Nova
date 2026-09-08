@@ -2392,6 +2392,82 @@ impl VirtualDisplay {
         Resume::Reused
     }
 
+
+    /// Re-mode the live virtual display in place, without rebuilding it.
+    ///
+    /// `activate_for_stream`'s small sibling, for exactly one caller: an Echo
+    /// client changing resolution mid-session. The full activation path saves
+    /// topology, may cycle the devnode, waits for GDI enumeration and commits a
+    /// topology change — seconds of visibly rearranging desktop to arrive at the
+    /// arrangement it already had, in a different size. All of that is about
+    /// bringing a display *into existence*; here the display exists and only its
+    /// mode is wrong.
+    ///
+    /// **The driver's mode table is the constraint, not the CCD call.** MttVDD
+    /// is an IddCx driver: it reads `vdd_settings.xml` when the devnode starts
+    /// and never again, so `SetDisplayConfig` can only reach a mode the driver
+    /// was already advertising at that moment. `configure_mode` still runs —
+    /// it is what makes the mode reachable after the NEXT devnode start — but
+    /// it cannot help this commit, and the read-back below is what turns
+    /// "advertised nowhere" into an honest error instead of a success that
+    /// changed nothing.
+    pub fn reconfigure_active(
+        &mut self,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> Result<(), String> {
+        if !self.active {
+            return Err("no virtual display is up".to_string());
+        }
+        let device = self
+            .active_device_name
+            .clone()
+            .ok_or_else(|| "virtual display has no GDI name".to_string())?;
+
+        // Already there? Change nothing. A client re-asserting the mode it
+        // already has is ordinary (a reconnect replays its preference), and
+        // re-committing a topology costs a visible flicker for no gain.
+        if let (Some((w, h)), Some(hz)) = (
+            Self::query_ccd_source_size(&device),
+            Self::query_ccd_target_refresh(&device),
+        ) {
+            if (w, h) == (width, height) && (hz - refresh_hz as f64).abs() <= 1.0 {
+                self.active_resolution = Some((width, height));
+                println!("🖥️  {device} is already at {width}x{height}@{refresh_hz}Hz — nothing to do");
+                return Ok(());
+            }
+        }
+
+        if let Err(e) = self.configure_mode(width, height, refresh_hz) {
+            println!("⚠️  Could not record {width}x{height}@{refresh_hz}Hz in vdd_settings.xml: {e}");
+        }
+
+        Self::force_resolution(&device, width, height, refresh_hz);
+        Self::wait_for_display_resolution(&device, width, height);
+
+        // Read back; never trust. `force_resolution` passes SDC_ALLOW_CHANGES,
+        // which lets Windows substitute a mode and still return success — the
+        // same false success that had a 2560x1440 monitor come back at
+        // 1024x768 while the log said it had worked.
+        match Self::query_ccd_source_size(&device) {
+            Some((w, h)) if (w, h) == (width, height) => {
+                self.active_resolution = Some((width, height));
+                let committed = Self::query_ccd_target_refresh(&device).unwrap_or(0.0);
+                println!(
+                    "🖥️  {device} re-moded live to {width}x{height} \
+                     (committed refresh {committed:.0}Hz)"
+                );
+                Ok(())
+            }
+            Some((w, h)) => Err(format!(
+                "{device} stayed at {w}x{h} — the driver is not advertising \
+                 {width}x{height}@{refresh_hz}Hz in this devnode generation. It is in \
+                 vdd_settings.xml now, so the next activation can reach it."
+            )),
+            None => Err(format!("{device} left the active topology during the mode change")),
+        }
+    }
     /// Is the virtual display currently activated for a stream?
     ///
     /// Read by `apply_configure_start` on the Desktop path: app 1 mirrors the

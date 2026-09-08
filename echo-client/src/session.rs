@@ -456,6 +456,16 @@ pub struct Uplink {
     /// sends; the datagrams are dropped at the demultiplexer for the cost of a
     /// channel send that goes nowhere.
     pub audio: Option<std::sync::Arc<crate::audio::AudioPlayout>>,
+    /// Commands the platform layer wants issued on the LIVE control tunnel,
+    /// one JSON object per item: `{"command": "...", "params": { ... }}`.
+    ///
+    /// `Vec<u8>` rather than a typed pair so this rides the same relay slots as
+    /// input and the microphone (see `handover::UplinkRelay`), and so it inherits
+    /// their discard-on-gap policy - which is the right policy here too. A
+    /// `set_display` issued across a handover gap asks a session that no longer
+    /// exists to re-mode a display it no longer owns; the platform re-asks after
+    /// the new grant if it still wants to.
+    pub control: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 impl Uplink {
@@ -967,7 +977,8 @@ async fn stream_inner(
     audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
-    let Uplink { input: input_rx, mic: mic_rx, audio: playout } = uplink;
+    let Uplink { input: input_rx, mic: mic_rx, audio: playout, control: control_cmd_rx } =
+        uplink;
     let lan = match &opts.control {
         Some(addr) => Some(
             tokio::net::lookup_host(addr)
@@ -1098,6 +1109,35 @@ async fn stream_inner(
                 let _ = ctl.lock().await.call(command, params).await;
             }
         }
+    });
+
+    // Commands the platform layer raises mid-stream, on the same tunnel and
+    // behind the same lock as everything else. The only one today is
+    // `set_display`, which is how a client re-modes the host display without
+    // restarting the session - see the Xbox bridge's `echo_set_display`.
+    //
+    // Deliberately fire-and-forget for the same reason `idr_task` is: the reply
+    // is `accepted`, not `applied`, so waiting on it here would block the
+    // platform thread on a round trip that still tells it nothing. The host
+    // reports what actually happened by re-moding, which the client sees as a
+    // format change on its own decoder.
+    let control_cmd_task = control_cmd_rx.map(|mut rx| {
+        let ctl = ctl.clone();
+        tokio::spawn(async move {
+            while let Some(raw) = rx.recv().await {
+                let Ok(Value::Object(mut envelope)) = serde_json::from_slice::<Value>(&raw) else {
+                    continue;
+                };
+                let Some(Value::String(command)) = envelope.remove("command") else {
+                    continue;
+                };
+                let params = match envelope.remove("params") {
+                    Some(Value::Object(p)) => p,
+                    _ => serde_json::Map::new(),
+                };
+                let _ = ctl.lock().await.call(&command, params).await;
+            }
+        })
     });
 
     // Measure the wire. `get_status` is the cheapest command the host answers
@@ -1304,6 +1344,9 @@ async fn stream_inner(
     // Dropped senders end the task; abort covers a request in flight.
     idr_task.abort();
     rtt_task.abort();
+    if let Some(t) = control_cmd_task {
+        t.abort();
+    }
     if let Some(t) = input_task {
         t.abort();
     }

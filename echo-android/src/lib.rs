@@ -49,7 +49,10 @@
 //! }
 //! ```
 
-pub mod frames;
+// The frame queue moved into `echo-client` when the Xbox bridge needed the
+// same drop policy. Re-exported rather than re-pathed so `frames::FrameQueue`
+// still names the one implementation from here.
+pub use echo_client::frames;
 
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -1083,7 +1086,12 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         async move {
             let mut progress = ChannelProgress(event_tx);
             let uplink =
-                Uplink { input: Some(input_rx), mic: Some(mic_rx), audio: Some(audio) };
+                Uplink {
+                    input: Some(input_rx),
+                    mic: Some(mic_rx),
+                    audio: Some(audio),
+                    control: None,
+                };
             let outcome =
                 run_session(&identity, connect, stream, &queue, &mut progress, stop_rx, uplink)
                     .await;

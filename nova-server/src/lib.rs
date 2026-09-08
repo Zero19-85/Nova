@@ -2427,12 +2427,76 @@ fn static_duplicate_is_due(streak: u32, last_sent: &mut Option<Instant>) -> bool
 /// since `input.rs`'s `sync_desktop_for_input` is thread-affine (see its doc
 /// comment) and that dedicated thread is this process's equivalent of the
 /// monolithic path's single long-lived ENet control thread.
+/// Change the display's mode under a LIVE session, and re-point capture and the
+/// encoder at the result.
+///
+/// This is what makes a remote screen behave like a monitor instead of like a
+/// fixed stream: a client asks for a different resolution and gets it, with the
+/// desktop, the windows on it and the session itself all untouched.
+///
+/// **Why this is safe here and refused everywhere else.** `handle_set_display`
+/// turns a mid-session change away unless the caller passes `force`, because a
+/// Moonlight client builds its decoder once at ANNOUNCE and a geometry change
+/// under it yields a black frame with a green region (live 2026-08-10). The
+/// bitstream is what carries the change — new VPS/SPS/PPS on the IDR forced at
+/// the end of this function — so whether it is safe is entirely a property of
+/// the DECODER at the far end. Media Foundation's HEVC MFT answers a resolution
+/// change with `MF_E_TRANSFORM_STREAM_CHANGE` and renegotiates its output type,
+/// which is why the Xbox client sets `force` and Moonlight must never be given
+/// a way to.
+///
+/// Returns the geometry actually committed, which is read back out of CCD and
+/// may differ from what was asked for.
+fn apply_hot_display_mode(
+    display_id: &str,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    vd: &mut virtual_display::VirtualDisplay,
+    capturer: &mut capture::DesktopManager,
+    enc: &mut Encoder,
+) -> std::result::Result<(u32, u32), String> {
+    // Only the virtual display is Nova's to re-mode. A physical panel belongs
+    // to whoever is sitting in front of it — the same policy `DisplaySeat::
+    // reconfigurable` states from the Master's side, restated here because this
+    // is the process that would actually do it.
+    if !vd.is_active() {
+        return Err(format!(
+            "\"{display_id}\": no virtual display is up, and Nova does not re-mode a physical one"
+        ));
+    }
+
+    vd.reconfigure_active(width, height, refresh_hz)?;
+
+    // Same call `apply_configure_start` makes on its hot-resume path: the
+    // display moved, so capture has to follow it and the encoder has to be
+    // rebuilt at the new size.
+    rebind_capture_and_encoder(
+        capturer,
+        enc,
+        vd.active_device_name(),
+        Some((width, height)),
+        Some((width, height)),
+        Some(false),
+    )?;
+
+    // The client's decoder has just been handed a stream whose geometry no
+    // longer matches the frames it holds. Nova's GOP is infinite, so without
+    // this there is no scheduled IDR to recover on and the picture stays broken
+    // until something else asks.
+    enc.request_idr();
+    Ok((width, height))
+}
+
 enum WorkerCommand {
     Configure(ipc::ConfigureStart),
     Deactivate { cancelled: bool },
     /// Suspend or resume capture/encode/transmit without touching session
     /// state — see `ipc::ControlMsg::PauseEncode`.
     PauseEncode { paused: bool },
+    /// Re-mode the live display without ending the session — see
+    /// [`apply_hot_display_mode`].
+    SetDisplayMode { display_id: String, width: u32, height: u32, refresh_hz: u32 },
     Stop,
 }
 
@@ -3165,17 +3229,23 @@ pub async fn run_worker() -> Result<()> {
                                 Some(Ok(ipc::ControlMsg::SetDisplayMode {
                                     display_id, width, height, refresh_hz, hdr,
                                 })) => {
-                                    // Wire is live; applying it is the next step
-                                    // (graceful capture/encoder rebuild + the
-                                    // client-side format-change handshake). Logged
-                                    // rather than silently swallowed so an Echo
-                                    // client's command is visible end-to-end in
-                                    // nova.log before any of it can misbehave.
-                                    println!(
-                                        "🎛️  Worker: Echo set_display received for \"{display_id}\" \
-                                         → {width}x{height}@{refresh_hz}Hz hdr={hdr} — not applied \
-                                         yet (hot format change is not implemented)"
-                                    );
+                                    // `hdr` is deliberately dropped here. The
+                                    // encoder's dynamic range is fixed by the
+                                    // session (the client built a Main10/PQ
+                                    // decoder, or it did not), so flipping it
+                                    // mid-stream is a different and much less
+                                    // recoverable change than a resize —
+                                    // see apply_configure_start's HDR10 gate.
+                                    if hdr {
+                                        println!("🎛️  Worker: set_display asked for HDR; \r
+                                            dynamic range is fixed for a session's life and is \r
+                                            not changed here — resizing to {width}x{height} only");
+                                    }
+                                    if cmd_tx.send(WorkerCommand::SetDisplayMode {
+                                        display_id, width, height, refresh_hz,
+                                    }).is_err() {
+                                        break; // main loop gone
+                                    }
                                 }
                                 Some(Ok(ipc::ControlMsg::OpenPairDialog)) => {
                                     println!("🔑 Worker: Master requests the pair dialog — opening");
@@ -3351,6 +3421,22 @@ pub async fn run_worker() -> Result<()> {
                                 Err(e) => println!("❌ apply_configure_start failed: {e}"),
                             }
                         }
+                        Some(WorkerCommand::SetDisplayMode {
+                            display_id, width, height, refresh_hz,
+                        }) => {
+                            match apply_hot_display_mode(&display_id, width, height,
+                                refresh_hz, &mut vd, &mut capturer, &mut enc)
+                            {
+                                Ok((w, h)) => {
+                                    stats::session_started(w, h, enc.config.fps.max(0) as u32,
+                                        enc.config.codec, enc.config.is_hdr,
+                                        enc.config.bitrate_kbps.max(0) as u32);
+                                    publish_display_inventory(&reply_tx, &vd);
+                                    next_frame_time = Instant::now();
+                                }
+                                Err(e) => println!("❌ set_display: {e}"),
+                            }
+                        }
                         Some(WorkerCommand::PauseEncode { paused }) => {
                             if paused != encode_paused {
                                 encode_paused = paused;
@@ -3446,6 +3532,21 @@ pub async fn run_worker() -> Result<()> {
                             publish_display_inventory(&reply_tx, &vd);
                         }
                         Err(e) => println!("❌ apply_configure_start failed: {e}"),
+                    }
+                }
+                WorkerCommand::SetDisplayMode { display_id, width, height, refresh_hz } => {
+                    // See the select!-arm twin above.
+                    match apply_hot_display_mode(&display_id, width, height, refresh_hz,
+                        &mut vd, &mut capturer, &mut enc)
+                    {
+                        Ok((w, h)) => {
+                            stats::session_started(w, h, enc.config.fps.max(0) as u32,
+                                enc.config.codec, enc.config.is_hdr,
+                                enc.config.bitrate_kbps.max(0) as u32);
+                            publish_display_inventory(&reply_tx, &vd);
+                            next_frame_time = Instant::now();
+                        }
+                        Err(e) => println!("❌ set_display: {e}"),
                     }
                 }
                 WorkerCommand::PauseEncode { paused } => {

@@ -1,4 +1,10 @@
-//! The frame queue between the Rust receive loop and Kotlin's decoder feeder.
+//! The frame queue between the Rust receive loop and a platform decoder feeder.
+//!
+//! Shared by every bridge rather than owned by one: `echo-android` feeds
+//! MediaCodec from it and `echo-xbox` feeds a Media Foundation HEVC transform,
+//! and the drop policy below is a property of *live streaming*, not of either
+//! platform. It lived in `echo-android` until the Xbox port needed the same
+//! behaviour; two copies of a policy this subtle would have diverged.
 //!
 //! ## Why bounded, and why drop-oldest
 //!
@@ -27,20 +33,21 @@
 //!
 //! The queue therefore re-arms a [`KeyframeGate`] whenever it drops, and admits
 //! nothing until the next keyframe. This is the *second* gate in the pipeline:
-//! [`echo_client::receiver::run_receiver`] holds one for session start, and this
+//! [`crate::receiver::run_receiver`] holds one for session start, and this
 //! one covers loss that happens after the frame was already received. They are
 //! genuinely different events, which is why one gate cannot cover both.
 //!
-//! Standing limitation: Echo has no client→host path yet, so it cannot request
-//! an IDR — recovery waits for the host's next scheduled one. When input lands,
-//! [`FrameQueue::push`]'s overflow branch is where that request belongs.
+//! That request does reach the host: [`FrameQueue::push`]'s overflow branch
+//! records it, the feeder reports it through [`FrameSink::take_keyframe_request`],
+//! and the receiver forwards it. Under Nova's infinite GOP nothing else would
+//! ever produce the IDR that reopens the gate.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use echo_client::gate::KeyframeGate;
-use echo_client::receiver::{DecodedFrame, FrameSink};
+use crate::gate::KeyframeGate;
+use crate::receiver::{DecodedFrame, FrameSink};
 
 /// Frames held before the decoder. Deliberately shallow: this is a jitter
 /// absorber, not a buffer. At 60 fps it is ~50 ms of slack, which covers
