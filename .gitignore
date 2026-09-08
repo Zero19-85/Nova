@@ -64,3 +64,34 @@ relay-data/
 # run is not a build artifact, it is a disclosure.
 recordings/
 bugreports/
+
+# Xbox / UWP client
+#
+# `bridge/` holds the staged Rust DLL + import lib — build output, reproduced by
+# xbox\build-bridge.ps1. `packages/` is the C++/WinRT NuGet restore. "Generated
+# Files" is the C++/WinRT projection, regenerated on every build and large.
+xbox/EchoXbox/bridge/
+xbox/packages/
+xbox/EchoXbox/Generated Files/
+xbox/EchoXbox/x64/
+xbox/EchoXbox/Debug/
+xbox/EchoXbox/Release/
+xbox/.vs/
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+# The package signing key. A temporary VS-generated one is still a private key,
+# and a committed one signs anything anybody builds from this tree.
+*.pfx
+xbox/EchoXbox/*.cer
+# MSBuild's intermediate dir for this project is EchoXbox\EchoXbox\<plat>\<cfg>\
+# (IntDir defaults to $(ProjectName)\...), which the x64/ rule above does not
+# reach. Ignore the whole nested build tree.
+xbox/EchoXbox/EchoXbox/
+
+# The sideload bundle build-app.ps1 produces: a copy of the .msix, the signing
+# certificate and a redistributable framework package, zipped. Every byte of it
+# is reproducible from a build, and it is ~3 MB per run.
+xbox/dist/

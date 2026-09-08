@@ -19,22 +19,23 @@
 # genuinely common is the wire format and the identity model — that is what
 # nova-core holds.
 [workspace]
-members = ["nova-core", "nova-server", "echo-client", "echo-android", "nova-relay"]
+members = ["nova-core", "nova-server", "echo-client", "echo-android", "echo-xbox", "nova-relay"]
 
-# `echo-android` is a member (so `cargo check --workspace` and `cargo test
-# --workspace` compile the JNI bridge on the dev box — a signature typo is
-# otherwise an UnsatisfiedLinkError on a phone) but NOT a default member.
+# `echo-android` and `echo-xbox` are members (so `cargo check --workspace` and
+# `cargo test --workspace` compile both bridges on the dev box — a signature
+# typo is otherwise an UnsatisfiedLinkError on a phone or a load failure on a
+# console) but NEITHER is a default member.
 #
 # The distinction is about binary size, and it is not theoretical: Cargo unifies
 # features across whatever it is asked to build, so a bare `cargo build
-# --release` that included echo-android would enable `nova-core/ring` alongside
+# --release` that included either bridge would enable `nova-core/ring` alongside
 # the host's `aws-lc-rs` and link *both* crypto providers into nova-server.exe.
 # The host would gain a second copy of a TLS backend it never calls, which is
 # exactly the kind of drift this project's footprint goal exists to prevent.
 #
 # So: deployment builds (`cargo build --release`) skip it, verification builds
-# (`--workspace`) include it, and the Android build targets it directly with
-# `cargo ndk … -p echo-android`.
+# (`--workspace`) include them, and each platform build targets its own crate:
+# `cargo ndk … -p echo-android`, and `xbox/build-bridge.ps1` for `-p echo-xbox`.
 default-members = ["nova-core", "nova-server", "echo-client", "nova-relay"]
 resolver = "2"
 

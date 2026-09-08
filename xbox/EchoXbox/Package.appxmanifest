@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Echo for Xbox — package manifest.
+
+  Three things here are load-bearing and easy to get wrong:
+
+  1. THE CAPABILITIES ARE THE NETWORK. A UWP app with none of them gets a
+     socket that binds and then silently reaches nothing, which looks exactly
+     like a host that is switched off. `internetClientServer` is what permits
+     INBOUND datagrams — Echo's whole transport is a UDP hole punch, so
+     `internetClient` alone would let the punch leave and drop every reply.
+     `privateNetworkClientServer` is the LAN half of the same story and is what
+     the LAN-direct cascade and any mDNS discovery need.
+
+  2. `microphone` is a DeviceCapability, and on a console it gates the headset.
+     Declared here it produces a one-time consent prompt, not a silent failure —
+     but a mic that is never opened costs the user nothing, so it stays.
+
+  3. TargetDeviceFamily is `Windows.Universal`, not `Windows.Xbox`. The Xbox
+     family exists but narrows the app to that device; Universal runs on the
+     console AND on the dev box, which is the difference between debugging this
+     on a PC and only ever debugging it on a TV.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap mp rescap">
+
+  <!-- Name/Publisher must match the certificate the package is signed with.
+       Visual Studio rewrites Publisher when it generates a temporary key; leave
+       it alone unless you are signing by hand. -->
+  <Identity
+    Name="Nova.EchoXbox"
+    Publisher="CN=Nova"
+    Version="0.1.0.0" />
+
+  <mp:PhoneIdentity PhoneProductId="6f1c2a10-4e9c-4d5f-9a3f-0d4c6b7e8a01"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>Echo</DisplayName>
+    <PublisherDisplayName>Nova</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- 17763 (1809) is the floor the Xbox One generation shipped against;
+         raising it buys nothing Echo uses and drops hardware for no reason. -->
+    <TargetDeviceFamily Name="Windows.Universal"
+                        MinVersion="10.0.17763.0"
+                        MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="x-generate" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App"
+                 Executable="$targetnametoken$.exe"
+                 EntryPoint="EchoXbox.App">
+      <uap:VisualElements
+        DisplayName="Echo"
+        Description="Nova's native client"
+        BackgroundColor="#0B0C10"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Outbound to the relay and the host over the internet. -->
+    <Capability Name="internetClient" />
+    <!-- INBOUND datagrams. Without this the hole punch is one-way and every
+         reply is dropped by the container, not by the network. -->
+    <Capability Name="internetClientServer" />
+    <!-- The LAN half: the direct rendezvous, and discovery if it is added. -->
+    <Capability Name="privateNetworkClientServer" />
+    <!-- Headset microphone, for upstream passthrough. -->
+    <DeviceCapability Name="microphone" />
+  </Capabilities>
+</Package>

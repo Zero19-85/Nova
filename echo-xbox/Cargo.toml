@@ -1,0 +1,37 @@
+[package]
+name = "echo-xbox"
+version = "0.1.0"
+edition = "2021"
+description = "Flat C ABI exposing the Echo client to a UWP (Xbox) app"
+
+# `cdylib` is what the UWP app links against: `echo_xbox.dll` ships inside the
+# .appx and is bound at load time through its import library. `rlib` is here for
+# the same reason `echo-android` has one — so `cargo check --workspace` and
+# `cargo test` compile the bridge on the dev box, where an ABI typo is a
+# compiler error rather than a mystery crash on a console in the living room.
+[lib]
+name = "echo_xbox"
+crate-type = ["cdylib", "rlib"]
+
+# ── Why `ring` and not `aws-lc-rs` ──────────────────────────────────────────
+#
+# The DLL is built with a **statically linked CRT** (`-C
+# target-feature=+crt-static`, see `xbox/build-bridge.ps1`) so it carries no
+# dependency on `vcruntime140.dll`. A UWP app links the Store CRT
+# (`vcruntime140_app.dll`) instead, and having both in one process is a class of
+# bug nobody should have to debug on a console.
+#
+# `ring` builds its C through the `cc` crate, which honours `crt-static` and
+# emits `/MT` objects to match. `aws-lc-rs` builds through cmake, which does
+# not, so its objects would ask for the dynamic CRT and the link would fail — or
+# worse, succeed. Same reasoning as the Android build, arrived at from the
+# opposite direction.
+[features]
+default = ["ring"]
+ring = ["echo-client/ring", "nova-core/ring"]
+
+[dependencies]
+echo-client = { path = "../echo-client", default-features = false }
+nova-core = { path = "../nova-core", default-features = false }
+tokio = { workspace = true }
+serde_json = { workspace = true }

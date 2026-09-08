@@ -3,7 +3,7 @@
 ## ⚠️ READ FIRST — this file covers the Nova HOST only
 
 The repo is a **Cargo workspace**, not a single crate: `nova-core`,
-`nova-server`, `nova-relay`, `echo-client`, `echo-android`, plus an `android/`
+`nova-server`, `nova-relay`, `echo-client`, `echo-android`, `echo-xbox`, plus an `android/`
 Gradle project. Everything below describes the Nova host (`nova-server`) and is
 accurate for it.
 
@@ -16,6 +16,7 @@ handoffs, and they are the authority for anything client-side:
 | `HANDOFF_ECHO_ANDROID.md` | the Android app, JNI surface, NDK toolchain |
 | `HANDOFF_ECHO_INPUT.md` | mouse/keyboard, latency diagnosis, microphone passthrough |
 | `HANDOFF_ECHO_AUDIO.md` | downstream game audio, ghost-sink isolation, A/V sync engine |
+| `HANDOFF_ECHO_XBOX.md` | the Xbox/UWP client — **LIVE**: the C ABI bridge, the CRT rule, MF decoding, the decode pixel-rate budget, the input architecture |
 
 **Host-side changes Echo made that ARE in this file's territory:**
 
@@ -89,7 +90,125 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-09-06): **STREAM INTEGRITY** — the picture stopped
+## Current Phase (2026-09-07): **THE XBOX PORT IS LIVE** — and it took three
+host-side changes, all small
+
+**`HANDOFF_ECHO_XBOX.md` is the authority for the client.** What follows is only
+the part that lives in this file's territory: the host.
+
+The console now discovers Nova over mDNS, pairs with a PIN, and streams
+**3840x2160@60 HEVC onto a headless virtual display** with mouse, keyboard and
+controller reaching the PC. Two of the three host changes below were needed; the
+third turned out not to be, and that is worth as much as the ones that were.
+
+### The IDD/4K story: the host already did this, the CLIENT was asking wrongly
+
+The operator asked for "Virtual Display Driver logic so Nova spawns a headless
+4K monitor". **It was already built and already working.** Two facts settled it
+without touching the driver:
+
+1. **`app_launcher::uses_virtual_display` early-returns `false` for app 1
+   (Desktop) BEFORE it consults `headless_for_all_apps`.** So a Desktop session
+   always mirrors the physical monitor no matter what `nova.toml` says, and the
+   client was asking for app 1. Requesting **app 5 (Virtual Desktop)** — the
+   headless one, whose `launch_app` is a deliberate no-op — makes the Worker
+   activate the VDD at the requested size, make it primary, and rename the
+   monitor. **Zero host changes, no redeploy.**
+   *(The "Universal VDD (all apps)" line further down this file is misleading on
+   exactly this point. The code disagrees with it. Believe the code.)*
+2. **`vdd_settings.xml` already advertises 3840x2160**, and `<g_refresh_rate>`
+   carries 60/90/120/144/165/244 which replicate to every resolution.
+   `configure_mode` had been logging `✅ vdd_settings.xml already advertises
+   3840x2160@120Hz` the whole time. Nothing needed adding.
+
+**The general rule, third instance now: check whether the feature exists before
+building it.** See `verify-a-diagnosis-before-implementing-it` in memory.
+
+### `ControlMsg::SetDisplayMode` is no longer a stub — live re-mode, no restart
+
+It used to `println!` "not applied yet (hot format change is not implemented)".
+The chain is now real:
+
+`set_display` RPC → `WorkerCommand::SetDisplayMode` → **`apply_hot_display_mode`**
+(lib.rs) → **`VirtualDisplay::reconfigure_active`** → `rebind_capture_and_encoder`
+→ forced IDR.
+
+Three things about it are load-bearing:
+
+1. **`reconfigure_active` is NOT `activate_for_stream`.** It re-modes in place —
+   CCD `force_resolution` plus a read-back — instead of saving topology, cycling
+   the devnode and waiting for GDI enumeration. The display already exists; only
+   its mode is wrong.
+2. **MttVDD reads `vdd_settings.xml` when the devnode starts and never again.**
+   So `SetDisplayConfig` can only reach a mode the driver was advertising at that
+   moment. `configure_mode` still runs (it makes the mode reachable after the
+   *next* start), and **the read-back is what turns "not advertised" into an
+   honest error rather than a success that changed nothing** — the same
+   false-success family as the 2560x1440 monitor that came back at 1024x768.
+3. **`handle_set_display` still refuses this to Moonlight, and must keep doing
+   so.** A Moonlight client fixes its decoder at ANNOUNCE and a geometry change
+   under it yields a black frame with a green region (live 2026-08-10). The Xbox
+   client passes `force` **as a claim about its own decoder**: a Media Foundation
+   HEVC MFT answers a resolution change with `MF_E_TRANSFORM_STREAM_CHANGE` and
+   renegotiates. Whether `force` is safe is a property of the far end, never of
+   the host.
+
+Both `WorkerCommand` dispatch sites in `run_worker` handle it (the `select!` arm
+and the `try_recv` drain). The monolithic `run()` does not — it has no command
+channel, and Echo RPC needs the Master anyway.
+
+### The client's mid-stream control channel
+
+`Uplink` gained a `control` receiver: JSON envelopes
+(`{"command": ..., "params": {...}}`) issued on the **live** control tunnel,
+draining through the same `Arc<Mutex<ControlChannel>>` as the IDR repair path.
+It rides `handover::UplinkRelay`'s existing slots, so it inherits
+**discard-on-gap** — which is the right policy here: a `set_display` issued
+across a handover gap asks a session that no longer exists to re-mode a display
+it no longer owns.
+
+### The one host lever the Xbox deliberately does NOT use
+
+**`gamepad_mouse.rs` is reachable from Echo** — an Echo pad datagram reaches
+`input::handle_input_packet`, whose gamepad arm gives `gamepad_mouse::intercept`
+first refusal on every frame. It had never fired only because no Echo client
+sent gamepad packets until now.
+
+The Xbox client implements mouse mode **itself** and **swallows the Menu+View
+chord** so the host's copy never sees it. That is not duplication for its own
+sake: if the chord reached the host, both would toggle on the same press — two
+cursor drivers integrating the same stick at double speed, with the host also
+swallowing the pad so nothing could turn it off again. **Exactly one
+implementation may see the chord.** Client-side also wins on latency: the cursor
+motion never crosses the network, only the pixels it moved do. Moonlight clients
+still get the host's copy, unchanged.
+
+### What the Xbox port confirmed about this file's open items
+
+- **The capture-slot stall did not reproduce** across the port's sessions.
+- **Tier 1 (LTR) is still unexercised.** Nothing needed repairing.
+- **Controller mouse mode has now met a physical pad** — but the client's copy,
+  not the host's. The host implementation remains untested on real hardware.
+- **`⏱️ inject cost` is healthy under a real input load**: `52 datagrams, 19
+  applied, last inject 2µs` at 4K60. The injection path is not a bottleneck.
+
+### The diagnostic rule this phase produced
+
+**A client that cannot DECODE what it is sent asks for one keyframe at session
+start and then goes silent.** `echo_fill_buffer` keeps delivering, `Submit` keeps
+succeeding, and nothing upstream notices. Contrast the Android MediaCodec wedge,
+where a client that stops CONSUMING floods the host with keyframe requests.
+
+One request then silence = the decoder is eating frames and producing nothing.
+A flood = the client's queue is overflowing. They look identical from the sofa
+and opposite in `nova-service.log`. This cost ten blank sessions to learn, with
+the host logging `NVENC READY (hevc @ 3840x2160, 39488 Kbps, 120 fps)` and
+perfect RTT throughout — the client had asked for a frame rate the console can
+display but cannot decode.
+
+---
+
+## Previous Phase (2026-09-06): **STREAM INTEGRITY** — the picture stopped
 flashing, and loss recovery stopped costing a keyframe
 
 Four commits, all on `main`, all deployed to the live install. Tier 0 is
@@ -1183,7 +1302,7 @@ All previous phases (1–10) confirmed working. Phase 11 delivers static-desktop
 ### Working end-to-end (confirmed):
 - Pairing (RSA/AES-ECB). **Critical:** `plaincert` must hex-encode the **PEM** bytes (not DER).
 - RTSP handshake (port 48010), ENet control (UDP 47999), H.264 RTP + RS-FEC (UDP 47998), WASAPI→Opus audio (UDP 48000), mouse/keyboard/gamepad input, cursor compositing.
-- **Universal VDD (all apps):** every Moonlight app routes through the Virtual Display Driver. Controlled by `nova.toml → headless_for_all_apps` (default `true`). Set `false` to restrict headless mode to App 5 only.
+- **Universal VDD — but NOT app 1.** ⚠️ This line used to say "every Moonlight app routes through the Virtual Display Driver", and that is **wrong**: `app_launcher::uses_virtual_display` early-returns `false` for `APP_ID_DESKTOP` (app 1) **before** it ever consults `headless_for_all_apps`, so a Desktop session always mirrors the physical primary regardless of the setting. Apps 2/3/4/5 honour it (default `true`; set `false` to restrict headless mode to app 5 only). This cost a session's worth of hunting on the Xbox port — a client that wants its own monitor must ask for **app 5**, not app 1.
 - **VDD hardware-disabled at boot (Phase 10):** `DICS_DISABLE` via SetupAPI leaves the devnode `CM_PROB_DISABLED` — invisible to DXGI, CCD, and PnP. Cannot steal primary on a graphics-stack crash or Safe Mode reboot. `activate_for_stream` calls `DICS_ENABLE` on client connect; `deactivate_after_stream` calls `DICS_DISABLE` on disconnect. `ensure_enabled_at_boot` cycles the devnode once to flush `vdd_settings.xml`, then disables it. CCD guard (`ccd_deactivate_vdd_path`) fires immediately after the devnode appears in GDI to prevent arrival-order primary hijack before `set_primary_display` runs.
 - **Dynamic monitor naming:** after `activate_for_stream`, `SetupDiSetDeviceRegistryPropertyW(SPDRP_FRIENDLYNAME)` renames the VDD devnode to the connected client's paired name (e.g. "Xbox"), visible in Device Manager and Display Settings.
 - **HDR10 pipeline:** WGC FP16 scRGB → typed-RTV pixel shaders → P010 BT.2020 PQ → HEVC Main10 NVENC. SEI (MDCV type 137 + MaxCLL type 144) injected manually via `seiPayloadArray`. VUI: BT.2020 / SMPTE ST 2084 / NCL / full-range.
