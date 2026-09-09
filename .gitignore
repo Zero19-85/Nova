@@ -95,3 +95,9 @@ xbox/EchoXbox/EchoXbox/
 # certificate and a redistributable framework package, zipped. Every byte of it
 # is reproducible from a build, and it is ~3 MB per run.
 xbox/dist/
+
+# FFmpeg for the Xbox app container: a BUILD OUTPUT, not a vendored dependency.
+# `xbox\build-ffmpeg.ps1` produces it (and verifies it with dumpbin before
+# staging), so committing ~13 MB of DLLs and generated headers would only make
+# the tree heavier and the provenance less clear.
+xbox/EchoXbox/ffmpeg/

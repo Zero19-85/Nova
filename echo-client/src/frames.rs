@@ -49,10 +49,42 @@ use std::time::{Duration, Instant};
 use crate::gate::KeyframeGate;
 use crate::receiver::{DecodedFrame, FrameSink};
 
-/// Frames held before the decoder. Deliberately shallow: this is a jitter
-/// absorber, not a buffer. At 60 fps it is ~50 ms of slack, which covers
-/// scheduling noise without hiding a decoder that has genuinely fallen behind.
-const CAPACITY: usize = 3;
+/// How much slack the queue absorbs, in TIME.
+///
+/// This used to be a frame count — `CAPACITY = 3`, documented as "~50 ms at
+/// 60 fps". The number was right and the unit was wrong, and at 120 fps the
+/// same three slots are 25 ms. Measured on an Xbox at 3840x2160@120 on
+/// 2026-09-08: `worst_frame_age_ms` 88, `dropped_overflow` climbing steadily,
+/// and the identical session at 60 fps completely clean.
+///
+/// The consequences of overflowing are much worse than the comment above it
+/// implied, and worth spelling out because they arrive disguised:
+///
+///   1. a dropped frame makes `last_delivered` jump, and the receiver reads
+///      that as TRANSIT LOSS — so the client asks the host to invalidate
+///      frames that were never lost on the wire at all
+///   2. the drop re-arms the keyframe gate, so more frames are refused behind
+///      it (74 of them, against 39 overflow drops, in the measured session)
+///   3. at 4K the host's DPB is only 5 frames, so a 4-5 frame invalidation
+///      range immediately exceeds it: `RFI range 25082-25086 >= DPB 5 —
+///      forcing IDR`, and `[LTR] no usable long-term reference`. Both repair
+///      rungs are structurally unable to help, so every one of these costs a
+///      full 4K keyframe
+///   4. which the viewer sees as the picture blinking, at four or five
+///      keyframes a second and ~20 Mbps of repair traffic
+///
+/// So the slack is a duration now, and the frame count follows the rate. It is
+/// still a jitter absorber and not a buffer — 50 ms is the same latency budget
+/// the original chose, just held constant across frame rates instead of
+/// halving at exactly the rate this client exists to reach.
+const SLACK_MS: u32 = 50;
+
+/// Frames held before the decoder, sized from [`SLACK_MS`] at [`MAX_FPS`].
+///
+/// Against MAX_FPS rather than the negotiated rate for the same reason the
+/// delay line is: over-sizing costs a few `Vec` slots, and under-sizing costs
+/// the cascade above.
+const CAPACITY: usize = (SLACK_MS * MAX_FPS).div_ceil(1000) as usize;
 
 /// Frame rate the delay line sizes itself against.
 ///
@@ -475,7 +507,12 @@ mod tests {
         let q = FrameQueue::new();
         assert_eq!(q.delay_ms(), 0);
         q.push(frame(1, 2, 16));
-        for i in 2..=6u32 {
+        // Relative to CAPACITY, not a hardcoded 6. The literal was written when
+        // CAPACITY was 3 and quietly stopped testing anything the moment the
+        // queue was sized from a duration instead of a frame count — six frames
+        // fit exactly, nothing overflowed, and the assertion failed for the one
+        // reason it was never meant to catch.
+        for i in 2..=(CAPACITY as u32 + 2) {
             q.push(frame(i, 1, 16));
         }
         assert!(q.stats().dropped_overflow > 0, "still a shallow drop-oldest queue");

@@ -123,11 +123,17 @@ try {
     $names = $zip.Entries | ForEach-Object { $_.FullName }
 } finally { $zip.Dispose() }
 
-if ($names -contains "echo_xbox.dll") {
-    Write-Host "  echo_xbox.dll at package root - OK" -ForegroundColor Green
-} else {
-    $where = ($names | Where-Object { $_ -like "*echo_xbox.dll" }) -join ", "
-    throw "echo_xbox.dll is NOT at the package root (found: '$where'). The app will fail to launch. Check the <Link> metadata on the None item in EchoXbox.vcxproj."
+# Every implicitly-linked DLL, not just the bridge. The loader resolves them
+# from the application directory and does not search subfolders, so one in a
+# subfolder is a package that builds, deploys, and dies at launch naming the app
+# rather than the DLL. FFmpeg joined the list on 2026-09-08.
+foreach ($required in @("echo_xbox.dll", "avcodec-61.dll", "avutil-59.dll")) {
+    if ($names -contains $required) {
+        Write-Host "  $required at package root - OK" -ForegroundColor Green
+    } else {
+        $where = ($names | Where-Object { $_ -like "*$required" }) -join ", "
+        throw "$required is NOT at the package root (found: '$where'). The app will fail to launch. Check the <Link> metadata on its None item in EchoXbox.vcxproj."
+    }
 }
 if ($names -contains "AppxSignature.p7x") {
     Write-Host "  signed - OK" -ForegroundColor Green

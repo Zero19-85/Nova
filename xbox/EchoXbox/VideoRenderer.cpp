@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 using namespace winrt;
 using namespace Windows::UI::Xaml::Controls;
@@ -22,8 +23,19 @@ std::wstring DescribeMode(HdmiDisplayMode const& mode) {
     swprintf_s(hz, L" @ %.2f Hz", mode.RefreshRate());
     out += hz;
     out += L", " + std::to_wstring(mode.BitsPerPixel()) + L" bpp";
-    if (mode.IsSmpte2084Supported())    out += L" PQ";
-    if (mode.Is2086MetadataSupported()) out += L" HDR10";
+    // What this mode IS, which is not what it SUPPORTS. `IsSmpte2084Supported`
+    // says the mode is *capable* of PQ; the colour space says which variant
+    // this entry actually is. Only the second answers "is the console about to
+    // be driven in a colour space this app does not render in", and that
+    // distinction is why the log could look right while the picture was not.
+    switch (mode.ColorSpace()) {
+        case HdmiDisplayColorSpace::BT2020:      out += L", BT2020"; break;
+        case HdmiDisplayColorSpace::BT709:       out += L", BT709"; break;
+        case HdmiDisplayColorSpace::RgbFull:     out += L", RGB full"; break;
+        case HdmiDisplayColorSpace::RgbLimited:  out += L", RGB limited"; break;
+    }
+    if (mode.IsSmpte2084Supported())    out += L" (PQ capable)";
+    if (mode.Is2086MetadataSupported()) out += L" (HDR10 capable)";
     return out;
 }
 
@@ -64,16 +76,70 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
         // tie-break rather than bit depth because this is a *latency* path: a
         // 120 Hz mode halves the time a finished frame waits for a scanout,
         // and that is worth more here than 10-bit colour.
+        //
+        // SDR modes are preferred at equal refresh, and that is not a
+        // preference — it is a correctness requirement today. This pipeline is
+        // SDR end to end: BGRA8 swap chain, BT.709 video processor output, no
+        // PQ anywhere (see "Not done: HDR10"). `GetSupportedDisplayModes`
+        // returns SDR and HDR10 variants of the SAME resolution and refresh,
+        // and nothing here used to tell them apart — so the console could be
+        // driven in BT.2020 PQ while the app fed it Rec.709 values. Bright
+        // content survives that surprisingly well; near-black does not, which
+        // is why it shows up as a background that has gone blue and washed out
+        // rather than as an obviously broken picture.
+        //
+        // When HDR10 lands, this becomes a real choice rather than a filter.
         HdmiDisplayMode best{ nullptr };
         double bestRefresh = 0.0;
+        bool bestIsSdr = false;
         for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
             if (mode.ResolutionWidthInRawPixels() != width ||
                 mode.ResolutionHeightInRawPixels() != height) {
                 continue;
             }
-            if (mode.RefreshRate() > bestRefresh) {
+            // There is no `IsSdr`. The colour space is the classification:
+            // BT2020 is the wide-gamut entry the console pairs with PQ, and
+            // BT709 / RgbFull / RgbLimited are the Rec.709 ones this pipeline
+            // actually renders.
+            const bool isSdr =
+                mode.ColorSpace() != HdmiDisplayColorSpace::BT2020;
+            const bool better = mode.RefreshRate() > bestRefresh ||
+                                (mode.RefreshRate() == bestRefresh && isSdr && !bestIsSdr);
+            if (better) {
                 bestRefresh = mode.RefreshRate();
+                bestIsSdr = isSdr;
                 best = mode;
+            }
+        }
+
+        // Every refresh rate offered at the requested size, listed once.
+        //
+        // `moonlight-xbox` logs the whole mode table and it is the first thing
+        // worth having when a mode request disappoints: "the console refused
+        // 4K120" and "this console was never offered 4K120" look identical
+        // from the sofa and mean completely different things — the first is an
+        // app bug, the second is Settings → General → TV & display options →
+        // Video modes → Allow 4K120 being off, or a cable that cannot carry it.
+        {
+            std::vector<uint32_t> rates;
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.ResolutionWidthInRawPixels() != width ||
+                    mode.ResolutionHeightInRawPixels() != height) {
+                    continue;
+                }
+                const auto hz = static_cast<uint32_t>(mode.RefreshRate() + 0.5);
+                if (std::find(rates.begin(), rates.end(), hz) == rates.end()) rates.push_back(hz);
+            }
+            std::sort(rates.begin(), rates.end());
+            outcome.offered = L"offered at " + std::to_wstring(width) + L"x" +
+                              std::to_wstring(height) + L": ";
+            if (rates.empty()) {
+                outcome.offered += L"nothing";
+            } else {
+                for (size_t i = 0; i < rates.size(); ++i) {
+                    if (i) outcome.offered += L", ";
+                    outcome.offered += std::to_wstring(rates[i]) + L" Hz";
+                }
             }
         }
 
@@ -85,11 +151,62 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
         }
 
         // Blocking. This runs on a background thread - see the header.
-        const bool applied = hdmi.RequestSetCurrentDisplayModeAsync(best).get();
+        //
+        // `EotfSdr` is stated rather than left to the console's discretion.
+        // Choosing an SDR-colour-space mode above says which ENTRY we want;
+        // this says which transfer function the console should actually drive,
+        // and the two are separate knobs. Asking for both is what makes it
+        // deterministic instead of dependent on whatever the console last had
+        // configured — and until HDR10 exists in this pipeline, SDR is simply
+        // the truth about what we are sending.
+        // ── `None`, NOT `EotfSdr` ───────────────────────────────────────────
+        //
+        // `EotfSdr` looks like the obvious way to say "drive this SDR" and the
+        // console answers it with E_INVALIDARG — thrown, not returned. That
+        // took the whole function out through the catch below, so the mode was
+        // never set, the console stayed at 1920x1080@60, and the swap chain
+        // sized itself to match. One wrong enum value cost the app 4K entirely.
+        //
+        // `moonlight-xbox` uses `HdmiDisplayHdrOption::None` for SDR and
+        // `Eotf2084` for HDR, and never anything else. Checked against
+        // `State/MoonlightClient.cpp:137-150` rather than reasoned about.
+        //
+        // Each attempt gets its own try/catch, because "returns false" and
+        // "throws" are both real answers here and only one of them was being
+        // handled. A fallback that cannot run is not a fallback.
+        const auto attempt = [&hdmi, &best](HdmiDisplayHdrOption option) noexcept {
+            try {
+                return hdmi.RequestSetCurrentDisplayModeAsync(best, option).get();
+            } catch (...) {
+                return false;
+            }
+        };
+
+        bool applied = attempt(HdmiDisplayHdrOption::None);
+        if (!applied) {
+            // The overload without an HDR option at all: let the console keep
+            // whatever transfer function it was using. Losing the transfer
+            // function is a far better trade than losing the resolution.
+            try {
+                applied = hdmi.RequestSetCurrentDisplayModeAsync(best).get();
+                if (applied) outcome.note = L"HDR option refused - took the mode as offered: ";
+            } catch (...) {
+                applied = false;
+            }
+        }
         readBack(outcome);
-        outcome.note = applied ? (L"set " + DescribeMode(best) + L"  (was " + before + L")")
-                               : (L"console refused " + DescribeMode(best) +
-                                  L"; staying at " + before);
+        outcome.note += applied ? (L"set " + DescribeMode(best) + L"  (was " + before + L")")
+                                : (L"console refused " + DescribeMode(best) +
+                                   L"; staying at " + before);
+        // What the console is ACTUALLY driving, which is the number every later
+        // decision should use. `readBack` has already filled it in from the
+        // console rather than from what we asked for — see HdmiOutcome.
+        {
+            wchar_t actual[80]{};
+            swprintf_s(actual, L"  [output now %ux%u @ %.0f Hz]",
+                       outcome.width, outcome.height, outcome.refreshHz);
+            outcome.note += actual;
+        }
         return outcome;
     } catch (hresult_error const& e) {
         readBack(outcome);
@@ -109,6 +226,11 @@ VideoRenderer::~VideoRenderer() { Shutdown(); }
 void VideoRenderer::SetFrameSource(FrameSource source) noexcept {
     std::lock_guard<std::mutex> guard(m_sourceLock);
     m_frameSource = std::move(source);
+}
+
+void VideoRenderer::SetSourceSize(uint32_t width, uint32_t height) noexcept {
+    m_sourceWidth.store(width, std::memory_order_relaxed);
+    m_sourceHeight.store(height, std::memory_order_relaxed);
 }
 
 DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
@@ -396,6 +518,26 @@ bool VideoRenderer::BlitFrame(ID3D11Texture2D* nv12, uint32_t subresource) noexc
         return false;
     }
 
+    // ── Crop the decoder's padding ──────────────────────────────────────────
+    //
+    // A decoder surface is allocated at the ALIGNED size — 1088 rows for a
+    // 1080-line stream, 2176 for 2160 — and `srcDesc` above reports that
+    // allocation, not the picture. Without a source rect the processor scales
+    // all 1088 rows onto the output, so eight rows of undefined memory are
+    // stretched across the screen. That is the green bar along the edge at
+    // 1080p, and it is a crop rather than anything to do with stride.
+    //
+    // Free: the video processor is already scaling, so it costs nothing to
+    // scale from the right rectangle.
+    const uint32_t codedW = m_sourceWidth.load(std::memory_order_relaxed);
+    const uint32_t codedH = m_sourceHeight.load(std::memory_order_relaxed);
+    if (codedW && codedH &&
+        (codedW != srcDesc.Width || codedH != srcDesc.Height)) {
+        const RECT src{ 0, 0, static_cast<LONG>(codedW),
+                        static_cast<LONG>(codedH) };
+        m_videoContext->VideoProcessorSetStreamSourceRect(m_processor.get(), 0, TRUE, &src);
+    }
+
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.OutputIndex = 0;
@@ -513,7 +655,20 @@ void VideoRenderer::PresentLoop() noexcept {
             // A solid field, deliberately not the animated pulse the bring-up
             // build used: an animation here is indistinguishable from the
             // flashing bug it caused.
-            const float clear[4] = { 0.043f, 0.051f, 0.063f, 1.0f };
+            //
+            // Ion Void (#050508), and it must MATCH the XAML ground exactly.
+            // This was 0.043/0.051/0.063 — #0B0D10 — which is both twice as
+            // bright as the page behind it and blue-dominant (R11 G13 B16).
+            // The swap chain covers the whole screen, so that was the app's
+            // real background colour whatever the Page said, and a lifted
+            // blue-leaning near-black is precisely what a television's shadow
+            // handling exaggerates into "the background is blue".
+            //
+            // The format is B8G8R8A8_UNORM, not _SRGB, so these are written
+            // straight through: 5/255, 5/255, 8/255. If the swap chain ever
+            // becomes an _SRGB format these must be linearised or the field
+            // comes back four times too bright — and blue-tinted again.
+            const float clear[4] = { 5.0f / 255.0f, 5.0f / 255.0f, 8.0f / 255.0f, 1.0f };
             ID3D11RenderTargetView* rtv = m_backBufferView.get();
             m_context->OMSetRenderTargets(1, &rtv, nullptr);
             m_context->ClearRenderTargetView(rtv, clear);

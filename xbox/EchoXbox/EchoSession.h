@@ -12,7 +12,7 @@
 
 namespace echo {
 
-class HevcDecoder;
+class VideoDecoder;
 struct DiscoveredHost;
 
 // Every control-plane event, as the JSON the bridge emits. Called from the pump
@@ -56,7 +56,7 @@ public:
     // Both return immediately; progress arrives through `sink`.
     bool Pair(std::string const& configJson, EventSink sink, std::wstring& error) noexcept;
     bool Connect(std::string const& configJson, EventSink sink,
-                 HevcDecoder* decoder, std::wstring& error) noexcept;
+                 VideoDecoder* decoder, std::wstring& error) noexcept;
 
     // Uplink. All fire-and-forget, all safe on a closed session: the bridge
     // answers a dead handle with `false` rather than faulting, which is what
@@ -75,17 +75,25 @@ public:
 
     bool IsOpen() const noexcept { return m_handle != 0; }
     uint64_t FramesFed() const noexcept { return m_framesFed.load(std::memory_order_relaxed); }
+    /// Keyframes asked for because the DECODER failed, not because a frame was
+    /// lost. A steady climb here means the decode path is unhappy in a way the
+    /// network counters cannot show.
+    uint64_t IdrRequests() const noexcept { return m_idrRequests.load(std::memory_order_relaxed); }
+
+    /// The shared core's receive-path counters as JSON. Empty when no session
+    /// is open. See the note on the implementation.
     std::string Stats() const noexcept;
 
 private:
     void PumpEvents(EventSink sink) noexcept;
-    void FeedFrames(HevcDecoder* decoder) noexcept;
+    void FeedFrames(VideoDecoder* decoder) noexcept;
 
     uint64_t m_handle = 0;
     std::thread m_pump;
     std::thread m_feed;
     std::atomic<bool> m_running{false};
     std::atomic<uint64_t> m_framesFed{0};
+    std::atomic<uint64_t> m_idrRequests{0};
 };
 
 }  // namespace echo

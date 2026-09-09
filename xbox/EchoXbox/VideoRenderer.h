@@ -37,6 +37,10 @@ struct HdmiOutcome {
     uint32_t height = 0;
     double   refreshHz = 0.0;
     std::wstring note;   // human-readable, for the log
+    /// Every refresh rate the console offers at the requested size. The one
+    /// thing that separates "the console refused 4K120" from "this console was
+    /// never offered 4K120" — an app bug versus a console setting.
+    std::wstring offered;
 };
 
 // Ask the console to output at `width` x `height`, preferring the highest
@@ -81,6 +85,12 @@ public:
     // Install the decoder. Until this is set the renderer shows a solid
     // background; once frames arrive it holds the last one between them.
     void SetFrameSource(FrameSource source) noexcept;
+
+    /// The CODED size of the decoded picture, which is not the size of the
+    /// texture it arrives in — a decoder surface is allocated at the aligned
+    /// size (1088 rows for 1080). Without this the processor scales the
+    /// padding onto the screen; see the source rect in BlitFrame.
+    void SetSourceSize(uint32_t width, uint32_t height) noexcept;
 
     uint64_t PresentedFrames() const noexcept { return m_presented.load(std::memory_order_relaxed); }
     uint64_t BlittedFrames()   const noexcept { return m_blitted.load(std::memory_order_relaxed); }
@@ -141,6 +151,11 @@ private:
 
     FrameSource m_frameSource;
     std::mutex  m_sourceLock;
+    // Atomics rather than guarded by m_sourceLock: they are read on the present
+    // thread every frame and written from the UI thread only on a geometry
+    // change, and a torn read of a width is not worth a lock on that path.
+    std::atomic<uint32_t> m_sourceWidth{ 0 };
+    std::atomic<uint32_t> m_sourceHeight{ 0 };
 
     std::thread           m_presentThread;
     std::atomic<bool>     m_running{false};

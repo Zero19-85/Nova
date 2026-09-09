@@ -1,26 +1,31 @@
 # HANDOFF — Echo for Xbox (UWP)
 
-**Status (2026-09-07): LIVE ON HARDWARE.** The console discovers the host over
-mDNS, pairs with a PIN, hands itself off into a stream, and decodes 4K60 HEVC in
-hardware onto a headless virtual display, with mouse, keyboard and controller
-reaching the PC. Clean picture, low latency, no flashing, no frame backlog.
+**Status (2026-09-09): LIVE ON HARDWARE AT 4K120.** The console discovers the
+host over mDNS, pairs with a PIN, hands itself off into a stream, and decodes
+3840x2160@120 HEVC in hardware onto a headless virtual display, with mouse,
+keyboard and controller reaching the PC. Clean picture, low latency, no
+flashing, no frame backlog.
+
+120 fps needed FFmpeg driving D3D11VA directly — Media Foundation hands this app
+container no hardware decoder at all (§12.1) — plus a frame queue sized in time
+rather than frames (§12.2c). Both are live-confirmed.
 
 What is settled, in one place:
 
 | | |
 |---|---|
-| Stream | 3840x2160 **@60** HEVC, app 5 (headless Virtual Desktop) |
-| Frame rate | from a **pixel-rate budget**, never from the panel refresh — §4b.2 |
+| Stream | 3840x2160 **@120** HEVC, app 5 (headless Virtual Desktop) — §12.2c |
+| Frame rate | 120 via FFmpeg/D3D11VA; the MF path is budget-capped — §12.1, §12.2c |
 | Resolution | the console's **HDMI output** size, never the swap chain's — §4b.1 |
 | Present | `SyncInterval 0`, `FLIP_DISCARD`, frame-latency 1, never queue — §4b.3 |
 | Pointer | `CreateCoreIndependentInputSource` on a high-priority pool thread — §6.1 |
 | Pad | 250 Hz on a high-resolution timer — §6.2 |
 | Mouse mode | **client-side**, Menu+View, chord swallowed — §6.3 |
-| Overlay | hold VIEW 700 ms; nothing on screen otherwise — §6.4 |
+| Overlay | hold **Menu+View** 700 ms; a tap toggles mouse mode — §6.4, §12.2b |
 | Live re-mode | `echo_set_display` → the Worker's `apply_hot_display_mode` — §4c |
 
-**Not done:** audio in either direction (§5), HDR10, and visual parity with the
-Android "Ion" dashboard — the behaviour matches, the styling does not.
+**Not done:** audio in either direction (§5) and HDR10. The Ion dashboard is
+styled but its layout pass is queued for the next session.
 
 **Before touching the video or input path, read §4b.** Four separate blank
 screens paid for the rules in it, and three of them looked like something other
@@ -356,7 +361,7 @@ on the wire, RTT 5–17 ms, input flowing. A 120 Hz TV had made the client ask f
 4K120, and **the Xbox HEVC decoder produces nothing at all from it.**
 
 So the frame rate comes from a **pixel-rate budget**
-(`kMaxDecodePixelRate = 520M px/s` in `MainPage.cpp`), and the display refresh
+(`g_maxDecodePixelRate`, 520M px/s in `MainPage.cpp`), and the display refresh
 only ever caps it:
 
 | mode | pixel rate | |
@@ -370,6 +375,16 @@ A budget rather than a table of known-good modes, because the overlay lets a use
 pick any resolution and every combination has to land somewhere sensible without
 being enumerated. `DecodableFps` is applied at startup **and** in the overlay, so
 choosing 4K and then 120 by hand cannot reproduce it.
+
+**520M is an inference, and as of 2026-09-08 it is no longer the only word.**
+What those ten sessions established is that 4K120 produced nothing. What they
+did *not* establish is why — a decode block that cannot do the pixel rate and a
+Media Foundation transform that declines to try are indistinguishable from a
+sofa, and they point at completely different work. `HevcDecoder::Probe` now
+reads `MF_VIDEO_MAX_MB_PER_SEC` off the transform and asks `ID3D11VideoDevice`
+for a 4K HEVC decoder configuration; `AdoptProbedBudget` replaces the guess when
+the decoder declares anything, and the overlay's **Decode limit** button lifts
+it for a deliberate test. See "Phase 2" at the end of this document.
 
 **The diagnostic signature is the part to remember.** A client that cannot decode
 what it is sent asks for **one keyframe at session start and then goes silent** —
@@ -624,19 +639,23 @@ Two rules carried over from the host implementation, both real hazards:
    moving whole pixels means anything under 250 px/s rounds to zero every tick —
    removing precisely the slow, careful movement a stick is worst at.
 
-### 6.4 The overlay gesture: hold VIEW
+### 6.4 The overlay gesture — SUPERSEDED 2026-09-08, see §12.2b
 
-While streaming there is no on-screen UI at all. Holding **View** for 700 ms
+**As of 2026-09-08 both gestures are on the chord**: tap Menu+View to toggle
+mouse mode, hold it 700 ms for the overlay. View alone is an ordinary button
+again and reaches the PC on the tick it was pressed. What follows describes the
+arrangement that replaced, and the press-trap reasoning still applies — it moved
+to the chord rather than going away.
+
+~~While streaming there is no on-screen UI at all. Holding **View** for 700 ms
 opens the overlay (resolution, frame rate, disconnect, diagnostics); a short
-press still reaches the PC.
+press still reaches the PC.~~
 
-View is **withheld** while it might still become a hold — the same delay-rather-
+View was **withheld** while it might still become a hold — the same delay-rather-
 than-retract trap as the Android client's 60 ms touch press-trap. The first
 moment of a gesture is indistinguishable from the start of an ordinary press, and
-retraction cannot work: the host has already pressed the button.
-
-The gesture is skipped entirely while the chord is in play. Menu+View is a chord,
-not a View press that happens to overlap one.
+retraction cannot work: the host has already pressed the button. **That cost
+every View press 700 ms, which is why the gesture moved.**
 
 Opening the overlay **parks forwarding** (`SetForwarding(false)`), which sends a
 `release-all` first — otherwise the button press that dismisses the panel also
@@ -923,13 +942,11 @@ not.
 
 The port is live and stable. What remains, in the order it is worth doing:
 
-1. **UI styling to match the Android "Ion" dashboard.** The *behaviour* is
-   already matched — persistent host list with paired/presence badges, automatic
-   handoff, no chrome at all while streaming, settings behind a gesture. The
-   *look* is not: `MainPage.xaml` is functional XAML, not Ion. Read the last
-   section of `HANDOFF_ECHO_ANDROID.md` for the design it should meet, and note
-   that a TV is a ten-foot display with gamepad focus, so Ion's phone layout is a
-   reference and not a template.
+1. ~~**UI styling to match the Android "Ion" dashboard.**~~ Landed 2026-09-08,
+   not yet seen on a TV — see §12.2. The palette and control styling are Ion;
+   what is still worth a pass once it has been looked at from a sofa is the host
+   *rows*, which are built in code and carry no presence badge the way Android's
+   cards do.
 2. **Audio, both directions.** Milestone 5, and the one with a real design
    question in it: Windows ships an Opus decoder but no encoder, so the mic path
    needs the codec inside the bridge rather than on the platform side. See §5.
@@ -952,3 +969,212 @@ The one process rule worth more than any of them: **`fed / decoded / drawn /
 dropped` name the stuck stage exactly, and they were hidden behind a button
 nobody had a reason to press.** They are on screen now whenever there is no
 picture. Keep them there.
+
+---
+## 12. Phase 2 (2026-09-08) — the decode probe, Ion, and the overlay's missing control
+
+Branch `phase2-xbox-4k120-ion`. Built and signed; **none of it has run on the
+console yet.**
+
+### 12.1 The decode probe — measure the ceiling before porting FFmpeg to lift it
+
+The plan for 4K120 was an FFmpeg + D3D11VA decoder. That may still be the
+answer, but it was about to be built on top of an unmeasured premise: **D3D11VA
+and the Media Foundation MFT are two front doors onto the same VCN decode
+block.** If the wall is the silicon, an FFmpeg port costs a week and buys
+nothing. Nobody had asked the hardware.
+
+`HevcDecoder::Probe(device)` asks, in two independent ways:
+
+| | |
+|---|---|
+| `MF_VIDEO_MAX_MB_PER_SEC` | what the transform **declares**. A macroblock is 16x16, so `× 256` is the pixel rate it is claiming. Zero means it exposes nothing, which is allowed and is itself a result. |
+| `ID3D11VideoDevice` | profile enumeration, `CheckVideoDecoderFormat`, and `GetVideoDecoderConfigCount` for HEVC Main at 3840x2160 — **the same questions FFmpeg's d3d11va hwaccel asks when it sets up.** A refusal here means an FFmpeg port hits the identical wall one layer down. |
+
+`DecoderProbe::Report()` ends in a verdict in words, because three lines of
+capability numbers are only useful to somebody who already knows what they
+imply. It runs at startup, lands in the dashboard log, and is repeated in the
+overlay's diagnostics.
+
+Three things came out of writing it:
+
+1. **`AdoptProbedBudget`** replaces the inferred 520M with the declared number
+   when there is one, and re-decides the frame rate the startup path already
+   picked. It does **not** invent a number when the decoder declares none —
+   silence is not a claim, and the guess stays as visible a guess as it was.
+2. **The overlay's "Decode limit" button** lifts the budget entirely, so 4K120
+   can be tested from a sideload rather than a rebuild. Deliberately not sticky:
+   it lives for the life of the process, because the failure it can produce is a
+   blank screen and nobody should meet that on a launch they did not ask for.
+3. **`MF_MT_FRAME_RATE` was hard-coded to 60/1** on the input type, commented as
+   nominal because it "only helps the decoder size its internal pool". Sizing the
+   pool is not nothing — a hardware MFT picks its surfaces and its internal path
+   from what it is told — so a decoder handed 60 and then fed 120 is a live
+   candidate for the blank screen that got blamed on the silicon. It now carries
+   the negotiated rate. **This alone may be the whole bug.**
+
+**What to report back from the console:** the `decoder` / `max rate` / `dxva` /
+`verdict` block from the dashboard log, then a 4K120 attempt with the decode
+limit off. `decoded 0` with `fed` climbing is the decoder eating frames and
+producing nothing — the known signature from §4b.2.
+
+### 12.2 Ion
+
+`Ion.xaml` is a `ResourceDictionary` merged by `App.xaml`, carrying the Android
+`Theme.kt` palette **unchanged** — Void, Carbon, Edge, Ion cyan, Matrix green,
+and the rule that nothing else may be green. The type ramp is deliberately *not*
+carried over: Compose sizes for a phone at 30 cm, this is read at three metres.
+
+The one technique worth knowing: a UWP Button's hover/pressed/focus appearance
+comes from its template's VisualStateManager, which reads **theme resources by
+key**. Setting `Background` in a `Style` restyles the rest state and nothing
+else, so the button turns grey again the moment it takes focus — which on a
+console is most of the time. Overriding the keys themselves is what makes every
+state consistent, and it does it **without replacing a single ControlTemplate**,
+so the console's own focus behaviour — which gamepad navigation depends on
+entirely — is left exactly as Microsoft shipped it.
+
+`Ion.xaml` must be a `<Page>` in the vcxproj, not `<None>`. As `None` it is
+packaged but never compiled, and the failure is a runtime "cannot find a
+resource with the key" on first navigation rather than anything at build time.
+
+### 12.2b The chord now carries both gestures, and View got its latency back
+
+Menu+View: **tap toggles mouse mode, hold (700 ms) opens the overlay.** The
+View-hold gesture is gone.
+
+That is better than consistency alone, and the reason is worth keeping. The old
+arrangement had to **withhold every single View press for 700 ms** in case it
+turned into a hold — so an ordinary Back/View press reaching the game was always
+a third of a second late, on a button plenty of games bind. Only the chord pays
+that delay now, and a chord pressed together is never meant for the game anyway.
+
+Two rules inside it:
+
+- **Nothing happens on the press edge.** Same delay-rather-than-retract rule the
+  old View trap followed: the first moment of a hold is indistinguishable from a
+  quick press, and retraction cannot work, because by the time we know we have
+  already toggled the mode and un-toggling it is a second visible event the user
+  did not ask for.
+- **`chordFired` makes the two exclusive.** Without it, holding the chord opens
+  the overlay at 700 ms and *also* toggles mouse mode on release — so every
+  overlay summon would leave the controller driving a cursor nobody asked for.
+
+The whole chord is still swallowed either way, which is still what keeps
+`gamepad_mouse.rs` out of the picture (§6.3).
+
+### 12.2c 4K120 is LIVE — and the four bugs between here and there
+
+**Live-confirmed 2026-09-09**: 3840x2160@120, 56 of 61 host samples at 120-121
+fps, **4 invalidations and 6 IDRs for the whole session**, worst frame age 92 ms.
+The comparable session two builds earlier had **822 invalidations**.
+
+Getting there took four fixes, and the order matters because each one hid the
+next.
+
+**1. The frame queue was sized in FRAMES, not TIME** (`echo-client/src/frames.rs`).
+`CAPACITY = 3`, documented as "~50 ms of slack at 60 fps" — which is 25 ms at
+120. The number was right and the unit was wrong, and it halved at exactly the
+rate this client exists to reach. It is now `SLACK_MS = 50` sized against
+`MAX_FPS`.
+
+**The cascade this produced is the part worth remembering**, because none of it
+looks like a queue problem from the sofa:
+
+  1. the queue drops a frame locally
+  2. `last_delivered` jumps, so the receiver reports **transit loss** — the
+     client asks the host to invalidate frames that were never lost on the wire
+  3. the drop re-arms the keyframe gate, so more frames are refused behind it
+  4. at 4K the host's DPB is 5 frames, so a 4-5 frame invalidation range
+     immediately exceeds it: `RFI range … >= DPB 5 — forcing IDR`, then
+     `[LTR] no usable long-term reference`. **Both repair rungs are
+     structurally unable to help at this resolution.**
+  5. so every one costs a full 4K keyframe — 84 in 400 log lines, 20 Mbps of
+     repair traffic, and a picture that visibly blinks
+
+**2. `HdmiDisplayHdrOption::EotfSdr` does not work.** It reads like the obvious
+way to say "drive this SDR" and the console answers `E_INVALIDARG` — **thrown,
+not returned**, so it escaped through the outer catch, the mode was never set,
+and the console sat at 1920x1080@60 with the swap chain sized to match. One
+wrong enum cost the app 4K entirely, and it presented as a UWP container
+restriction.
+
+`moonlight-xbox` uses **`None` for SDR and `Eotf2084` for HDR, and nothing
+else** (`State/MoonlightClient.cpp:137-150`). Checked against their source
+rather than reasoned about. Each attempt now has its own try/catch, because
+"returns false" and "throws" are both real answers and only one was handled — a
+fallback that cannot run is not a fallback.
+
+**3. The green bar was padding, not stride.** A decoder surface is allocated at
+the ALIGNED size (1088 rows for 1080), and `BlitFrame` sized its video processor
+from `srcDesc`, so eight rows of undefined memory were stretched onto the
+screen. Fixed with `VideoProcessorSetStreamSourceRect` at the coded size, which
+is free because the processor is already scaling.
+
+**4. `extra_hw_frames`.** The D3D11VA pool is sized from the stream's DPB on the
+assumption the caller returns every frame immediately; this decoder holds one
+for the renderer. Missing, the decoder cannot obtain a surface and it presents
+as missing references.
+
+#### Two dead ends recorded so they are not re-run
+
+- **A private NV12 copy in `TryGetFrame` was built, tested and removed.** The
+  theory was that handing out the decoder's live pool surface aliased against
+  its own reference pictures. It does not: `fed == decoded` with every decoder
+  counter at zero was the frame queue all along. And the copy was actively
+  harmful here — it runs on the present thread inside `m_lock`, which `Submit`
+  also needs, so a per-frame 4K copy put the decode-context mutex and the shared
+  D3D context in the feeder's way: `dropped overflow` 308 and worst frame age
+  483 ms at 4K120, against 0 at 4K60.
+- **Do not make the HDMI refresh rate a hard cap on the requested fps.** It was,
+  briefly, and it immediately removed the operator's ability to test 120 at all
+  when the output read 60 Hz. One reading from one API is too thin a basis for
+  overruling an explicit press. It warns now.
+
+#### The diagnostic that ended it
+
+`echo_stats` had been in the bridge since the start and this client never called
+it. It already tracked `frames_dropped_overflow` — the exact counter that names
+this fault — while several sessions went into adding decoder-side counters that
+**structurally could not see it**, because a frame that never completes never
+reaches the decoder. `fed == decoded` and "the picture is decaying" are entirely
+consistent, and that is the trap.
+
+**Before adding an instrument, check what the shared core already measures.**
+
+### 12.3 The overlay already existed — what was missing was one control
+
+Worth recording, because it is the third time on this project: the request was
+to *build* an in-game overlay with disconnect, mouse-mode toggle and
+diagnostics. **Disconnect and diagnostics were already there** (§6.4), along
+with live resolution and frame-rate switching. What was genuinely missing was
+the mouse-mode control, and the real complaint underneath it — that the chord
+toggles **silently**.
+
+Two additions:
+
+- **`MouseModeButton`**, because a chord is not discoverable and a user who hits
+  Menu+View by accident had no way back that did not require knowing what they
+  had pressed.
+- **A toast**, 1.8 s, bottom centre, `IsHitTestVisible="False"`. It appears over
+  a live stream while input is being forwarded, so it must never take focus, eat
+  a button, or move where the gamepad is pointing.
+
+**The button does not write the flag.** `InputBridge::RequestMouseMode` posts an
+atomic request that `PadLoop` consumes, and the loop performs the transition
+through the identical path the chord takes. That indirection is load-bearing: a
+transition is four things, not a bool — the flag, a zeroed snapshot on **both**
+edges (a pad that merely goes quiet leaves the host holding Menu, and games read
+Menu as pause), lifting whatever the triggers were holding on the way out, and
+clearing the sub-pixel accumulator. A UI thread that set the atomic directly
+would skip three of the four, and the resulting bug — a click that outlives the
+mode that made it — would present as a host-side input fault a long way from
+here.
+
+The request is consumed **before** the forwarding gate, because the overlay is
+open (and forwarding therefore parked) at exactly the moment the button is
+pressed.
+
+Also fixed: `InputBridge.h`'s header comment still said mouse mode was
+implemented host-side and that "this file must not implement it". That was true
+of an earlier draft and had been backwards since 2026-09-07.

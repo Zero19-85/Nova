@@ -45,8 +45,16 @@ constexpr auto kPadInterval = std::chrono::microseconds(4000);
 // so this bounds how long a lost one can leave the host holding a stale stick.
 constexpr auto kPadKeepAlive = std::chrono::milliseconds(50);
 
-// How long View must be held before it means "show me the overlay" rather than
-// "press View on the PC".
+// How long Menu+View must be HELD before it means "show me the overlay"
+// rather than "toggle mouse mode".
+//
+// Both gestures are now on the chord: a quick press toggles mouse emulation, a
+// hold summons the overlay. That replaced a split where the chord toggled the
+// mode and a long press of View ALONE opened the overlay, and it is better for
+// a reason beyond consistency — the old arrangement had to withhold every
+// single View press for 700 ms in case it turned into a hold, so an ordinary
+// Back/View press reaching the game was always a third of a second late. Only
+// the chord pays that delay now, and a chord is never meant for the game.
 constexpr auto kOverlayHold = std::chrono::milliseconds(700);
 
 // ── Controller mouse mode ───────────────────────────────────────────────────
@@ -107,11 +115,19 @@ void PreciseSleep(std::chrono::microseconds duration) noexcept {
 
 InputBridge::~InputBridge() { Stop(); }
 
-void InputBridge::SetSinks(InputSink input, PadSink pad, Gesture overlay) noexcept {
+void InputBridge::SetSinks(InputSink input, PadSink pad, Gesture overlay,
+                           ModeSink mouseMode) noexcept {
     std::lock_guard<std::mutex> guard(m_sinkLock);
     m_input = std::move(input);
     m_pad = std::move(pad);
     m_overlay = std::move(overlay);
+    m_mouseModeSink = std::move(mouseMode);
+}
+
+void InputBridge::RequestMouseMode(bool on) noexcept {
+    // Just post it. The pad loop performs the transition — see the header, and
+    // the mouse-mode section below for what that transition actually involves.
+    m_mouseModeRequest.store(on ? 1 : 0, std::memory_order_release);
 }
 
 void InputBridge::SetSurfaceSize(float width, float height) noexcept {
@@ -343,14 +359,17 @@ void InputBridge::PadLoop() noexcept {
     auto lastSent = std::chrono::steady_clock::now();
     auto lastTick = lastSent;
 
-    // The View-hold gesture.
-    bool viewDown = false;
-    bool viewSwallowed = false;
-    std::chrono::steady_clock::time_point viewSince{};
-
-    // Menu+View.
+    // Menu+View, which now carries BOTH gestures: released before
+    // `kOverlayHold` toggles mouse mode, held past it opens the overlay.
+    //
+    // `chordFired` is what makes the two exclusive. Without it, holding the
+    // chord would open the overlay at 700 ms and then ALSO toggle mouse mode
+    // on release, so every overlay summon would leave the controller driving
+    // a cursor the user never asked for.
     bool chordHeld = false;
-    bool chordSwallow = false;
+    bool chordFired = false;      // the hold already opened the overlay
+    bool chordSwallow = false;    // keep both bits off the wire until released
+    std::chrono::steady_clock::time_point chordSince{};
 
     // Cursor integration. Sub-pixel remainder is carried between ticks: at
     // 250 Hz, `SendInput` moving in whole pixels means anything under 250 px/s
@@ -366,6 +385,50 @@ void InputBridge::PadLoop() noexcept {
             sink = m_pad;
         }
         if (sink) sink(0, activeMask, snapshot);
+    };
+
+    // ── The ONE mouse-mode transition ───────────────────────────────────────
+    //
+    // Both ways in and out land here: the Menu+View chord below, and a request
+    // posted by the overlay button through `RequestMouseMode`. Having exactly
+    // one of these is the point — a transition is four things, not a bool:
+    //
+    //   1. the flag itself
+    //   2. a zeroed snapshot on BOTH edges. Not "stop sending": a pad that goes
+    //      quiet leaves the host holding what it last saw, and what it last saw
+    //      has Menu held. Games read Menu as pause, so the mode would open a
+    //      pause menu going in and another coming out.
+    //   3. on the way out, lift whatever the triggers were holding — otherwise
+    //      a click outlives the mode that made it, and it presents as a
+    //      host-side input fault a long way from here.
+    //   4. clear the sub-pixel accumulator, so a remainder cannot twitch the
+    //      cursor the next time the stick moves.
+    //
+    // A caller on another thread that set the atomic directly would skip 2, 3
+    // and 4. That is why the public surface is a request and not a setter.
+    const auto applyMouseMode = [&](bool entering) {
+        m_mouseMode.store(entering, std::memory_order_release);
+
+        if (m_forwarding.load(std::memory_order_acquire)) sendPad(1, PadState{});
+        everSent = false;
+        last = PadState{};
+
+        if (!entering) {
+            if (leftHeld)  Emit(InputEvent{ kMouseButton, kLeft, 0, 0, 0 });
+            if (rightHeld) Emit(InputEvent{ kMouseButton, kRight, 0, 0, 0 });
+        }
+        leftHeld = rightHeld = false;
+        accumX = accumY = 0.0f;
+
+        // Tell the UI. Before this existed the chord was silent, and a user who
+        // hit it by accident had no way to find out why their controller had
+        // stopped reaching the game.
+        ModeSink sink;
+        {
+            std::lock_guard<std::mutex> guard(m_sinkLock);
+            sink = m_mouseModeSink;
+        }
+        if (sink) sink(entering);
     };
 
     while (m_running.load(std::memory_order_acquire)) {
@@ -400,35 +463,58 @@ void InputBridge::PadLoop() noexcept {
         const bool viewNow  = (state.buttons & kBack) != 0;
         const bool chordNow = menuNow && viewNow;
 
+        // ── Menu+View: quick press toggles the mode, hold opens the overlay ─
+        //
+        // Nothing happens on the press edge any more. That is the same
+        // delay-rather-than-retract rule the old View gesture followed and the
+        // Android client's touch press-trap follows: the first moment of a
+        // hold is indistinguishable from the start of a quick press, and
+        // retraction cannot work — by the time we know, we have already
+        // toggled the mode, and "un-toggling" it is a second visible event
+        // the user did not ask for.
+        //
+        // The whole chord is swallowed either way. Menu+View pressed together
+        // is never meant for the game, and it must not reach the host at all:
+        // `gamepad_mouse.rs` gives itself first refusal on exactly this chord,
+        // so a copy arriving there would toggle a SECOND cursor driver.
         if (chordNow && !chordHeld) {
-            const bool entering = !m_mouseMode.load(std::memory_order_acquire);
-            m_mouseMode.store(entering, std::memory_order_release);
+            chordSince = now;
+            chordFired = false;
             chordSwallow = true;
+        }
 
-            // Neutralise the pad on BOTH toggle edges. Not "stop sending" — a
-            // pad that merely goes quiet leaves the host holding whatever it
-            // last saw, and what it last saw has Menu held. Games read Menu as
-            // pause, so the mode would open a pause menu going in and another
-            // coming out.
-            if (m_forwarding.load(std::memory_order_acquire)) sendPad(1, PadState{});
-            everSent = false;
-            last = PadState{};
-
-            // Leaving: lift anything the triggers were holding down, or a click
-            // outlives the mode that made it.
-            if (!entering) {
-                if (leftHeld)  Emit(InputEvent{ kMouseButton, kLeft, 0, 0, 0 });
-                if (rightHeld) Emit(InputEvent{ kMouseButton, kRight, 0, 0, 0 });
+        if (chordNow && !chordFired && (now - chordSince) >= kOverlayHold) {
+            // Held long enough: the overlay, and this press is now spent.
+            chordFired = true;
+            Gesture overlay;
+            {
+                std::lock_guard<std::mutex> guard(m_sinkLock);
+                overlay = m_overlay;
             }
-            leftHeld = rightHeld = false;
-            accumX = accumY = 0.0f;
+            if (overlay) overlay();
+        }
 
-            // A chord is not a View press. Abandon any hold in progress so the
-            // gesture cannot fire a stray View on the way out.
-            viewDown = false;
-            viewSwallowed = false;
+        if (!chordNow && chordHeld) {
+            // Released. A quick press — one that never reached the hold — is
+            // the mouse-mode toggle.
+            if (!chordFired) {
+                applyMouseMode(!m_mouseMode.load(std::memory_order_acquire));
+            }
+            chordFired = false;
         }
         chordHeld = chordNow;
+
+        // ── The same toggle, asked for from the overlay ─────────────────────
+        //
+        // Consumed here rather than acted on where it was posted, so a button
+        // press gets the identical treatment the chord does. Checked before the
+        // forwarding gate below because the overlay is open — and therefore
+        // forwarding is parked — at exactly the moment the button is pressed.
+        if (const int32_t wanted = m_mouseModeRequest.exchange(-1, std::memory_order_acq_rel);
+            wanted >= 0) {
+            const bool on = wanted != 0;
+            if (on != m_mouseMode.load(std::memory_order_acquire)) applyMouseMode(on);
+        }
 
         // Held past the toggle, or half-released: keep both bits off the wire
         // until the user has let go of both. See the header note above — this
@@ -441,50 +527,14 @@ void InputBridge::PadLoop() noexcept {
             }
         }
 
-        // ── The overlay gesture ─────────────────────────────────────────────
+        // ── The View-hold gesture is GONE, on purpose ───────────────────────
         //
-        // View is WITHHELD while it might still turn into a hold, exactly like
-        // the Android client's 60 ms press trap: the first moment of a gesture
-        // is indistinguishable from the start of an ordinary press, so the input
-        // is delayed rather than sent and then retracted. Retraction cannot
-        // work — the host has already pressed the button.
-        //
-        // Skipped entirely while the chord is in play: Menu+View is a chord, not
-        // a View press that happens to overlap one.
-        if (!chordSwallow && !chordNow) {
-            if (viewNow && !viewDown) {
-                viewDown = true;
-                viewSwallowed = false;
-                viewSince = now;
-            } else if (!viewNow && viewDown) {
-                viewDown = false;
-                if (!viewSwallowed) {
-                    // A short press. It was never sent, so send it now as one
-                    // complete snapshot with View set; the next pass reports it
-                    // released, because by then it genuinely is.
-                    PadState tap = state;
-                    tap.buttons |= kBack;
-                    if (m_forwarding.load(std::memory_order_acquire) &&
-                        !m_mouseMode.load(std::memory_order_acquire)) {
-                        sendPad(1, tap);
-                    }
-                }
-                viewSwallowed = false;
-            }
-
-            if (viewDown) {
-                state.buttons &= ~static_cast<int32_t>(kBack);   // pending the verdict
-                if (!viewSwallowed && (now - viewSince) >= kOverlayHold) {
-                    viewSwallowed = true;
-                    Gesture overlay;
-                    {
-                        std::lock_guard<std::mutex> guard(m_sinkLock);
-                        overlay = m_overlay;
-                    }
-                    if (overlay) overlay();
-                }
-            }
-        }
+        // Holding View alone used to open the overlay, which meant every View
+        // press had to be withheld for 700 ms in case it became a hold — so an
+        // ordinary Back/View press reaching the game was always a third of a
+        // second late, on a button plenty of games bind. Now that the chord
+        // carries both gestures, View is just a button again and goes out on
+        // the tick it was pressed.
 
         if (!m_forwarding.load(std::memory_order_acquire)) {
             // Parked: keep tracking the gestures — that is how the overlay is

@@ -7,6 +7,9 @@
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
+// The D3D11_DECODER_PROFILE_* GUIDs are DEFINE_GUID declarations in d3d11.h;
+// their definitions live here. Without it the probe is three link errors.
+#pragma comment(lib, "dxguid.lib")
 
 using namespace winrt;
 
@@ -21,10 +24,243 @@ std::wstring Hr(const wchar_t* what, HRESULT hr) {
 
 }  // namespace
 
+// ── The capability probe ────────────────────────────────────────────────────
+//
+// Read the header for why this exists. In short: the 4K120 ceiling this client
+// enforces is a number somebody inferred from ten blank screens, and until it
+// is read off the hardware there is no way to tell whether an FFmpeg/D3D11VA
+// port would lift it or hit exactly the same wall one layer down.
+//
+// Everything here is read-only and nothing it touches survives the call.
+
+std::wstring DecoderProbe::Report() const {
+    if (!ran) return L"decode      probe did not run";
+
+    wchar_t buf[256]{};
+    std::wstring out = L"decoder     ";
+    out += name;
+    out += hardware ? L"  [hardware" : L"  [software";
+    out += async ? L", async]" : L", sync]";
+
+    // The enumeration itself, because the decoder's NAME is a conclusion and
+    // this is what it was concluded from.
+    out += L"\nenumerated  ";
+    swprintf_s(buf, L"hardware: %u", hardwareCount);
+    out += buf;
+    if (hardwareCount) out += L" (" + hardwareName + L")";
+    swprintf_s(buf, L"   software: %u", softwareCount);
+    out += buf;
+    if (softwareCount) out += L" (" + softwareName + L")";
+
+    out += L"\nmax rate    ";
+    if (maxMbPerSec) {
+        swprintf_s(buf, L"%u MB/s = %.0fM px/s  (4K60 needs 498M, 4K120 needs 995M)",
+                   maxMbPerSec, static_cast<double>(maxPixelRate) / 1e6);
+        out += buf;
+    } else {
+        out += L"MF_VIDEO_MAX_MB_PER_SEC not exposed by this decoder";
+    }
+
+    out += L"\ndxva        ";
+    swprintf_s(buf, L"HEVC Main %s   Main10 %s   NV12@4K %s   configs %u",
+               dxvaMain ? L"yes" : L"NO", dxvaMain10 ? L"yes" : L"NO",
+               nv12At4K ? L"yes" : L"NO", configs4K);
+    out += buf;
+
+    if (!notes.empty()) out += L"\nnotes       " + notes;
+
+    // The verdict, because three lines of capability numbers are only useful
+    // to somebody who already knows what they imply — and the whole point of
+    // this probe is to hand a number to a decision.
+    out += L"\nverdict     ";
+    if (hardwareCount == 0 && dxvaMain && nv12At4K && configs4K > 0) {
+        // The interesting split, and the strongest case for the FFmpeg port
+        // there is: Media Foundation offered this container NO hardware
+        // decoder, while the D3D11 video device underneath it will happily
+        // hand out a 4K HEVC decoder. That gap is a Media Foundation policy
+        // boundary, not silicon — and D3D11VA goes straight to the layer that
+        // said yes.
+        out += L"MF offered NO hardware decoder, but the D3D11 video device\n"
+               L"            offers 4K HEVC with configurations. That gap is an MF\n"
+               L"            policy boundary rather than the silicon, and D3D11VA\n"
+               L"            addresses the layer that said yes. Strongest case for\n"
+               L"            the FFmpeg port.";
+    } else if (!dxvaMain || !nv12At4K || configs4K == 0) {
+        out += L"the D3D11 video device itself refuses HEVC at 3840x2160.\n"
+               L"            FFmpeg/D3D11VA asks this same question and would get\n"
+               L"            the same answer, so a port would not lift the ceiling.";
+    } else if (maxPixelRate && maxPixelRate < 900ull * 1000 * 1000) {
+        swprintf_s(buf, L"%.0fM px/s declared, under the 995M that 4K120 needs.",
+                   static_cast<double>(maxPixelRate) / 1e6);
+        out += buf;
+        out += L"\n            The decoder is telling us 4K120 is out of reach. Believe\n"
+               L"            it before building anything: this is a declaration, not\n"
+               L"            an inference from a blank screen.";
+    } else if (maxPixelRate >= 900ull * 1000 * 1000) {
+        out += L"the hardware claims enough rate for 4K120 and DXVA offers\n"
+               L"            4K HEVC. The wall is above the silicon — worth testing\n"
+               L"            with the budget unlocked, and FFmpeg/D3D11VA is on the\n"
+               L"            table if MF is what refuses.";
+    } else {
+        out += L"DXVA offers 4K HEVC but the decoder declares no rate, so\n"
+               L"            nothing here confirms or denies 4K120. The unlocked-budget\n"
+               L"            test is the only way to settle it.";
+    }
+    return out;
+}
+
+DecoderProbe HevcDecoder::Probe(ID3D11Device* device) noexcept {
+    DecoderProbe probe;
+    if (!device) {
+        probe.notes = L"no D3D11 device";
+        return probe;
+    }
+    probe.ran = true;
+
+    // MFStartup is reference counted per process. This one is deliberately
+    // NOT paired with an MFShutdown — see the note at the end of the function.
+    const bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+
+    // ── What Media Foundation declares ──────────────────────────────────────
+    //
+    // Read-only, and that is a correctness requirement rather than tidiness:
+    // this runs immediately before the real decoder is created on the same
+    // thread, so anything it activates, holds or tears down is a candidate for
+    // breaking the thing it exists to measure. The attributes below all live
+    // on the ACTIVATION object; none of them needs the transform instantiated.
+    const auto readName = [](IMFActivate* activate) -> std::wstring {
+        LPWSTR friendly = nullptr;
+        UINT32 len = 0;
+        if (SUCCEEDED(activate->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+                                                   &friendly, &len))) {
+            std::wstring name = friendly;
+            CoTaskMemFree(friendly);
+            return name;
+        }
+        return L"(unnamed)";
+    };
+
+    if (started) {
+        MFT_REGISTER_TYPE_INFO inputType{ MFMediaType_Video, MFVideoFormat_HEVC };
+
+        // Both enumerations are run and both counts are reported, because
+        // "which decoder did we get" is a conclusion and "what was on offer"
+        // is the evidence. A hardware count of zero is the single most
+        // important number this probe can produce: it means the container was
+        // offered no hardware HEVC decoder AT ALL, at any resolution — which
+        // is a completely different fact from a decoder refusing 4K120, and
+        // points at completely different work.
+        const auto enumerate = [&](UINT32 flags, uint32_t& count,
+                                   std::wstring& firstName, uint32_t& mbPerSec) {
+            IMFActivate** activates = nullptr;
+            UINT32 found = 0;
+            const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags,
+                                         &inputType, nullptr, &activates, &found);
+            if (FAILED(hr)) {
+                wchar_t buf[64]{};
+                swprintf_s(buf, L"MFTEnumEx 0x%08X; ", static_cast<unsigned>(hr));
+                probe.notes += buf;
+            }
+            count = found;
+            if (SUCCEEDED(hr) && found > 0 && activates) {
+                firstName = readName(activates[0]);
+                UINT32 mb = 0;
+                if (SUCCEEDED(activates[0]->GetUINT32(MF_VIDEO_MAX_MB_PER_SEC, &mb))) {
+                    mbPerSec = mb;
+                }
+                UINT32 isAsync = 0;
+                if (SUCCEEDED(activates[0]->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync))) {
+                    probe.async = isAsync != 0;
+                }
+            }
+            if (activates) {
+                for (UINT32 i = 0; i < found; ++i) activates[i]->Release();
+                CoTaskMemFree(activates);
+            }
+        };
+
+        enumerate(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                  probe.hardwareCount, probe.hardwareName, probe.maxMbPerSec);
+        probe.hardware = probe.hardwareCount > 0;
+
+        uint32_t ignoredMb = 0;
+        enumerate(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
+                      MFT_ENUM_FLAG_SORTANDFILTER,
+                  probe.softwareCount, probe.softwareName, ignoredMb);
+
+        probe.name = probe.hardware ? probe.hardwareName : probe.softwareName;
+        if (probe.maxMbPerSec == 0) probe.maxMbPerSec = ignoredMb;
+        // A macroblock is 16x16.
+        probe.maxPixelRate = static_cast<uint64_t>(probe.maxMbPerSec) * 256ull;
+    } else {
+        probe.notes += L"MFStartup failed; ";
+    }
+
+    // ── What the D3D11 video device offers ──────────────────────────────────
+    //
+    // This is deliberately the same question FFmpeg's d3d11va hwaccel asks:
+    // enumerate profiles, check the output format, then ask for a decoder
+    // configuration at the size in question. If this refuses, the ceiling is
+    // below Media Foundation and no decoder library can route around it.
+    {
+        com_ptr<ID3D11Device> dev;
+        dev.copy_from(device);
+        if (auto video = dev.try_as<ID3D11VideoDevice>()) {
+            const UINT profiles = video->GetVideoDecoderProfileCount();
+            for (UINT i = 0; i < profiles; ++i) {
+                GUID guid{};
+                if (FAILED(video->GetVideoDecoderProfile(i, &guid))) continue;
+                if (guid == D3D11_DECODER_PROFILE_HEVC_VLD_MAIN)   probe.dxvaMain = true;
+                if (guid == D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10) probe.dxvaMain10 = true;
+            }
+
+            if (probe.dxvaMain) {
+                BOOL supported = FALSE;
+                if (SUCCEEDED(video->CheckVideoDecoderFormat(
+                        &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+                        DXGI_FORMAT_NV12, &supported))) {
+                    probe.nv12At4K = supported != FALSE;
+                }
+
+                D3D11_VIDEO_DECODER_DESC desc{};
+                desc.Guid = D3D11_DECODER_PROFILE_HEVC_VLD_MAIN;
+                desc.SampleWidth = 3840;
+                desc.SampleHeight = 2160;
+                desc.OutputFormat = DXGI_FORMAT_NV12;
+                UINT configs = 0;
+                const HRESULT hr = video->GetVideoDecoderConfigCount(&desc, &configs);
+                if (SUCCEEDED(hr)) {
+                    probe.configs4K = configs;
+                } else {
+                    wchar_t buf[96]{};
+                    swprintf_s(buf, L"GetVideoDecoderConfigCount 0x%08X; ",
+                               static_cast<unsigned>(hr));
+                    probe.notes += buf;
+                }
+            }
+        } else {
+            probe.notes += L"device has no ID3D11VideoDevice "
+                           L"(created without D3D11_CREATE_DEVICE_VIDEO_SUPPORT?); ";
+        }
+    }
+
+    // NO MFShutdown here, deliberately.
+    //
+    // MFStartup/MFShutdown are reference counted, so shutting down here takes
+    // the count to zero and tears the platform down completely — microseconds
+    // before `Initialize` starts it again and enumerates the hardware decoder
+    // it needs. That full stop-start is not something the platform is exercised
+    // for, and a probe that perturbs the thing it measures is worse than no
+    // probe at all. The reference this leaks is one per process, held for the
+    // life of an app that runs Media Foundation from startup to exit anyway.
+    (void)started;
+    return probe;
+}
+
 HevcDecoder::~HevcDecoder() { Shutdown(); }
 
 bool HevcDecoder::Initialize(ID3D11Device* device, uint32_t width, uint32_t height,
-                             std::wstring& error) noexcept {
+                             uint32_t fps, std::wstring& error) noexcept {
     m_device.copy_from(device);
     m_width = width;
     m_height = height;
@@ -125,7 +361,7 @@ bool HevcDecoder::Initialize(ID3D11Device* device, uint32_t width, uint32_t heig
         if (m_hardware) { error = Hr(L"MFT_MESSAGE_SET_D3D_MANAGER", hr); return false; }
     }
 
-    if (!ConfigureTypes(width, height, error)) return false;
+    if (!ConfigureTypes(width, height, fps, error)) return false;
 
     m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
@@ -133,7 +369,7 @@ bool HevcDecoder::Initialize(ID3D11Device* device, uint32_t width, uint32_t heig
     return true;
 }
 
-bool HevcDecoder::ConfigureTypes(uint32_t width, uint32_t height,
+bool HevcDecoder::ConfigureTypes(uint32_t width, uint32_t height, uint32_t fps,
                                  std::wstring& error) noexcept {
     com_ptr<IMFMediaType> input;
     HRESULT hr = MFCreateMediaType(input.put());
@@ -144,9 +380,16 @@ bool HevcDecoder::ConfigureTypes(uint32_t width, uint32_t height,
     input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_HEVC);
     input->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     MFSetAttributeSize(input.get(), MF_MT_FRAME_SIZE, width, height);
-    // Nominal. The stream is live and its real cadence varies; this only helps
-    // the decoder size its internal pool.
-    MFSetAttributeRatio(input.get(), MF_MT_FRAME_RATE, 60, 1);
+    // The NEGOTIATED rate, not a nominal one.
+    //
+    // This used to be hard-coded 60/1 with a comment calling it nominal on the
+    // grounds that it "only helps the decoder size its internal pool". Sizing
+    // the pool is not a nothing: a hardware MFT allocates its surfaces and
+    // picks its internal path from what it is told here, and a decoder handed
+    // "60" and then fed 120 is a live candidate for the 4K120 blank screen
+    // that ten sessions blamed on the silicon. It costs nothing to be honest,
+    // and being honest is what makes the blank screen mean something.
+    MFSetAttributeRatio(input.get(), MF_MT_FRAME_RATE, fps ? fps : 60, 1);
     MFSetAttributeRatio(input.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
     hr = m_transform->SetInputType(0, input.get(), 0);

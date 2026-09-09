@@ -26,6 +26,10 @@
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+// The toast's accent bar and the dashboard's identity rule are Rectangles, and
+// MainPage.g.h projects them — without this the generated header does not
+// compile, and the error names the generated file rather than this omission.
+#include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.UI.Xaml.Navigation.h>
 #include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.Gaming.Input.h>

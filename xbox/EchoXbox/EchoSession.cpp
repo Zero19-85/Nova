@@ -1,7 +1,7 @@
 #include "pch.h"
 #include "EchoSession.h"
 #include "EchoBridge.h"
-#include "HevcDecoder.h"
+#include "VideoDecoder.h"
 #include "HostDiscovery.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -213,7 +213,7 @@ bool EchoSession::Pair(std::string const& configJson, EventSink sink,
 }
 
 bool EchoSession::Connect(std::string const& configJson, EventSink sink,
-                          HevcDecoder* decoder, std::wstring& error) noexcept {
+                          VideoDecoder* decoder, std::wstring& error) noexcept {
     if (m_handle) { error = L"a session is already open"; return false; }
 
     m_handle = echo_connect(configJson.c_str());
@@ -243,7 +243,7 @@ void EchoSession::PumpEvents(EventSink sink) noexcept {
     }
 }
 
-void EchoSession::FeedFrames(HevcDecoder* decoder) noexcept {
+void EchoSession::FeedFrames(VideoDecoder* decoder) noexcept {
     std::vector<uint8_t> buffer(kInitialFrameBuffer);
     int64_t meta[3]{};
 
@@ -251,6 +251,10 @@ void EchoSession::FeedFrames(HevcDecoder* decoder) noexcept {
     // decoder its reference chain restarts here. `echo-client`'s keyframe gate
     // guarantees the first frame we ever see is an IDR.
     bool discontinuity = true;
+
+    // Decode-failure repair state — see the block at the bottom of the loop.
+    uint64_t lastErrors = 0;
+    auto lastIdrRequest = std::chrono::steady_clock::now() - std::chrono::seconds(10);
 
     while (m_running.load(std::memory_order_acquire)) {
         const int32_t got = echo_fill_buffer(
@@ -276,6 +280,38 @@ void EchoSession::FeedFrames(HevcDecoder* decoder) noexcept {
         }
         discontinuity = false;
         m_framesFed.fetch_add(1, std::memory_order_relaxed);
+
+        // ── A decode error has to reach the host, or it is permanent ────────
+        //
+        // `echo-client` has two keyframe gates and both work, but they guard
+        // what ARRIVES: the session's first frame, and frames after a queue
+        // drop. Neither can see a frame that arrived intact and then failed to
+        // DECODE — a surface the decoder could not obtain, a reference it no
+        // longer holds. Nothing upstream knows anything went wrong.
+        //
+        // On a moving picture that heals itself as blocks get intra-coded. On
+        // a STATIC desktop it does not, and that is the case that produced a
+        // grey screen with a mouse trail cut through it: the host had dropped
+        // to the 5 fps keep-alive, was sending duplicate P-frames, and the only
+        // regions ever repainted were the ones the cursor moved over. Measured
+        // live on 2026-09-08 — 72 invalidations early in the session, ZERO for
+        // the several minutes it then sat broken. Nothing was going to fix it.
+        //
+        // So: ask. Rate-limited to one request every two seconds, because the
+        // opposite failure is on record too — the Android MediaCodec wedge sent
+        // 198 keyframe requests in 59 seconds and buried the host.
+        if (decoder) {
+            const uint64_t errors = decoder->DecodeErrors();
+            if (errors != lastErrors) {
+                lastErrors = errors;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - lastIdrRequest > std::chrono::seconds(2)) {
+                    lastIdrRequest = now;
+                    echo_request_idr(m_handle);
+                    m_idrRequests.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
     }
 }
 

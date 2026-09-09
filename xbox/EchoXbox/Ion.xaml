@@ -1,0 +1,242 @@
+<!--
+  "Ion Cyber-Terminal" — the one place colour is decided, ported from the
+  Android client's `Theme.kt` so the two clients are recognisably one product.
+
+  The values here are the Android values, unchanged. What is NOT carried over
+  is the type ramp: Compose sizes 11-22sp for a phone held at 30 cm, and this
+  is read from a sofa at three metres. The sizes below are the TV ramp; the
+  colours, the geometry and the rules are identical.
+
+  The two accents are load-bearing rather than decorative, and the rule is the
+  same one Theme.kt documents:
+
+    Ion (cyan)     this app did something — selection, focus, an active
+                   control, a path that went out to the internet.
+    Matrix (green) the network answered — a host on this LAN, a healthy probe,
+                   a low round trip. NOTHING else is allowed to be green.
+
+  Pitch black rather than a dark grey, and on a television that is a functional
+  choice before an aesthetic one: this app surrounds someone else's desktop,
+  and a #121212 surround glows around a black video frame where #050508 does
+  not.
+
+  ── Why the system brush keys are overridden here ─────────────────────────
+  A UWP Button's hover, pressed and focus appearance comes from its template's
+  VisualStateManager, which reads theme resources by key. Setting Background in
+  a Style therefore restyles the rest state and nothing else — the button turns
+  grey again the moment it takes focus, which on a console is most of the time.
+  Overriding the keys themselves ("lightweight styling") is what makes every
+  state consistent, and it does it without replacing a single ControlTemplate —
+  so the console's own focus behaviour, which gamepad navigation depends on
+  entirely, is left exactly as Microsoft shipped it.
+-->
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ===== The palette — identical to Theme.kt ========================= -->
+    <Color x:Key="IonVoidColor">#FF050508</Color>
+    <Color x:Key="IonCarbonColor">#FF101318</Color>
+    <Color x:Key="IonCarbonLightColor">#FF161B23</Color>
+    <Color x:Key="IonEdgeColor">#FF1E2638</Color>
+    <Color x:Key="IonAccentColor">#FF00F0FF</Color>
+    <Color x:Key="IonMatrixColor">#FF00FF66</Color>
+    <Color x:Key="IonAmberColor">#FFFFB020</Color>
+    <Color x:Key="IonCrimsonColor">#FFFF3355</Color>
+    <Color x:Key="IonTextColor">#FFE6EDF3</Color>
+    <Color x:Key="IonTextDimColor">#FF7D8BA1</Color>
+
+    <SolidColorBrush x:Key="IonVoid" Color="{StaticResource IonVoidColor}" />
+    <SolidColorBrush x:Key="IonCarbon" Color="{StaticResource IonCarbonColor}" />
+    <SolidColorBrush x:Key="IonCarbonLight" Color="{StaticResource IonCarbonLightColor}" />
+    <SolidColorBrush x:Key="IonEdge" Color="{StaticResource IonEdgeColor}" />
+    <SolidColorBrush x:Key="IonAccent" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="IonMatrix" Color="{StaticResource IonMatrixColor}" />
+    <SolidColorBrush x:Key="IonAmber" Color="{StaticResource IonAmberColor}" />
+    <SolidColorBrush x:Key="IonCrimson" Color="{StaticResource IonCrimsonColor}" />
+    <SolidColorBrush x:Key="IonText" Color="{StaticResource IonTextColor}" />
+    <SolidColorBrush x:Key="IonTextDim" Color="{StaticResource IonTextDimColor}" />
+
+    <!-- Scrims. The overlay sits over live video, so its ground is a wash
+         rather than a fill: the picture stays visible underneath, which is
+         what tells a user the stream did not stop. -->
+    <SolidColorBrush x:Key="IonScrim" Color="#C8050508" />
+    <SolidColorBrush x:Key="IonPanel" Color="#F2101318" />
+    <SolidColorBrush x:Key="IonAccentWash" Color="#1A00F0FF" />
+    <SolidColorBrush x:Key="IonAccentEdge" Color="#8C00F0FF" />
+
+    <!-- ===== The TV type ramp =========================================== -->
+    <x:Double x:Key="EchoTelemetrySize">16</x:Double>
+    <x:Double x:Key="EchoLabelSize">18</x:Double>
+    <x:Double x:Key="EchoBodySize">22</x:Double>
+    <x:Double x:Key="EchoHeadingSize">28</x:Double>
+    <x:Double x:Key="EchoTitleSize">44</x:Double>
+    <x:Double x:Key="EchoPinSize">72</x:Double>
+
+    <!-- 6, matching Android's RoundedCornerShape(6.dp). The Ion look is
+         terminal-sharp; a soft radius reads as a different product. -->
+    <CornerRadius x:Key="EchoCardRadius">6</CornerRadius>
+
+    <!-- ===== Killing the system accent ================================== -->
+    <!--
+      Overriding the individual `Button*` / `ListViewItem*` keys below restyles
+      the controls this app names. It does NOT reach everything: a XAML control
+      template can also reference `SystemAccentColor` and its six shades
+      directly, and on a console that is where Microsoft blue keeps coming back
+      — a focus rect here, a selected-row fill there, a scroll thumb, the
+      ProgressRing. Chasing those one key at a time is a losing game because
+      the list is template-private and changes between SDK versions.
+
+      Redefining the accent colour ITSELF is the one lever that reaches all of
+      them at once, including the controls this app has not used yet. Ion cyan
+      is the accent for the whole application; nothing derives from Microsoft
+      blue any more because Microsoft blue is no longer defined.
+
+      The Light/Dark shades are the accent lightened and darkened. XAML picks
+      between them per control and per visual state, so they must ALL be
+      Ion-derived — leaving one at its default is how a single blue hover state
+      survives a purge and takes a session to find.
+    -->
+    <Color x:Key="SystemAccentColor">#FF00F0FF</Color>
+    <Color x:Key="SystemAccentColorLight1">#FF4DF5FF</Color>
+    <Color x:Key="SystemAccentColorLight2">#FF80F8FF</Color>
+    <Color x:Key="SystemAccentColorLight3">#FFB3FBFF</Color>
+    <Color x:Key="SystemAccentColorDark1">#FF00C2CF</Color>
+    <Color x:Key="SystemAccentColorDark2">#FF00949E</Color>
+    <Color x:Key="SystemAccentColorDark3">#FF00666E</Color>
+
+    <!-- Text drawn ON the accent. The accent is a bright cyan, so white on it
+         is unreadable — this is the one place near-black is correct. -->
+    <SolidColorBrush x:Key="SystemControlForegroundAltHighBrush" Color="{StaticResource IonVoidColor}" />
+
+    <!-- ===== Lightweight styling of the stock controls =================== -->
+    <SolidColorBrush x:Key="ButtonBackground" Color="{StaticResource IonCarbonLightColor}" />
+    <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#2600F0FF" />
+    <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="#4D00F0FF" />
+    <SolidColorBrush x:Key="ButtonBackgroundDisabled" Color="#FF0C0F14" />
+    <SolidColorBrush x:Key="ButtonForeground" Color="{StaticResource IonTextColor}" />
+    <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ButtonForegroundPressed" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ButtonForegroundDisabled" Color="#FF445061" />
+    <SolidColorBrush x:Key="ButtonBorderBrush" Color="{StaticResource IonEdgeColor}" />
+    <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ButtonBorderBrushDisabled" Color="#FF141922" />
+
+    <!-- Focus is the cursor on a console. It is cyan for the same reason
+         selection is: this is the app saying where it is. -->
+    <SolidColorBrush x:Key="SystemControlFocusVisualPrimaryBrush" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="SystemControlFocusVisualSecondaryBrush" Color="#FF050508" />
+
+    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#2600F0FF" />
+    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#3300F0FF" />
+    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="#4D00F0FF" />
+    <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#FF161B23" />
+    <SolidColorBrush x:Key="ListViewItemBackgroundPressed" Color="#2600F0FF" />
+    <SolidColorBrush x:Key="ListViewItemForeground" Color="{StaticResource IonTextColor}" />
+    <SolidColorBrush x:Key="ListViewItemForegroundSelected" Color="{StaticResource IonTextColor}" />
+    <SolidColorBrush x:Key="ListViewItemForegroundPointerOver" Color="{StaticResource IonTextColor}" />
+    <SolidColorBrush x:Key="ListViewItemFocusBorderBrush" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ListViewItemFocusSecondaryBorderBrush" Color="{StaticResource IonVoidColor}" />
+
+    <!-- The scroll bar on the diagnostics panel. Left at defaults it is the
+         one grey-and-blue object on an otherwise Ion screen. -->
+    <SolidColorBrush x:Key="ScrollBarThumbFill" Color="#8000F0FF" />
+    <SolidColorBrush x:Key="ScrollBarThumbFillPointerOver" Color="{StaticResource IonAccentColor}" />
+    <SolidColorBrush x:Key="ScrollBarThumbFillDisabled" Color="{StaticResource IonEdgeColor}" />
+    <SolidColorBrush x:Key="ScrollBarTrackFill" Color="#FF0C0F14" />
+    <SolidColorBrush x:Key="ScrollBarPanningThumbBackground" Color="#8000F0FF" />
+
+    <!-- ===== Named styles ============================================== -->
+    <Style x:Key="IonCard" TargetType="Border">
+        <Setter Property="Background" Value="{StaticResource IonCarbon}" />
+        <Setter Property="BorderBrush" Value="{StaticResource IonEdge}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource EchoCardRadius}" />
+        <Setter Property="Padding" Value="24" />
+    </Style>
+
+    <Style x:Key="IonButton" TargetType="Button">
+        <Setter Property="FontSize" Value="{StaticResource EchoBodySize}" />
+        <Setter Property="Padding" Value="24,10,24,10" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="4" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+    </Style>
+
+    <!-- The one action on a panel that the user most likely came for. -->
+    <Style x:Key="IonPrimaryButton" TargetType="Button" BasedOn="{StaticResource IonButton}">
+        <Setter Property="Background" Value="{StaticResource IonAccentWash}" />
+        <Setter Property="BorderBrush" Value="{StaticResource IonAccentEdge}" />
+        <Setter Property="Foreground" Value="{StaticResource IonAccent}" />
+    </Style>
+
+    <!-- An icon button: square, quiet, and it belongs in a corner.
+         Sized to 56 because a console cursor is a focus rect the user steers
+         with a stick, and a target smaller than this is genuinely hard to land
+         on from a sofa — the ten-foot equivalent of a 24 px hit box. -->
+    <Style x:Key="IonIconButton" TargetType="Button" BasedOn="{StaticResource IonButton}">
+        <Setter Property="Width" Value="56" />
+        <Setter Property="Height" Value="56" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="HorizontalContentAlignment" Value="Center" />
+        <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <!-- Segoe MDL2 Assets ships with Windows and with the console, so an icon
+         costs no asset, no font file and nothing in the package. -->
+    <Style x:Key="IonGlyph" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="Segoe MDL2 Assets" />
+        <Setter Property="FontSize" Value="22" />
+        <Setter Property="Foreground" Value="{StaticResource IonTextDim}" />
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <!-- SELECTED, which is a different thing from PRIMARY.
+         `IonPrimaryButton` marks the action you probably came for; this marks
+         the option that is currently in force. They are deliberately not the
+         same style: on the overlay both appear at once, and if "4K" and "Back
+         to the stream" looked identical then the highlight would read as
+         "press this" rather than "this is what you are running".
+
+         Solid fill and a bold accent border, so it survives being next to a
+         focus rect — on a console the selected item and the focused item are
+         usually different items, and both have to be legible at three metres. -->
+    <Style x:Key="IonActiveButton" TargetType="Button" BasedOn="{StaticResource IonButton}">
+        <Setter Property="Background" Value="#3300F0FF" />
+        <Setter Property="BorderBrush" Value="{StaticResource IonAccent}" />
+        <Setter Property="BorderThickness" Value="2" />
+        <Setter Property="Foreground" Value="{StaticResource IonAccent}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+
+    <!-- Destructive, and it is the only red thing on any panel. -->
+    <Style x:Key="IonDangerButton" TargetType="Button" BasedOn="{StaticResource IonButton}">
+        <Setter Property="Background" Value="#1AFF3355" />
+        <Setter Property="BorderBrush" Value="#8CFF3355" />
+        <Setter Property="Foreground" Value="{StaticResource IonCrimson}" />
+    </Style>
+
+    <!-- Monospace everywhere a number, an address or a hash appears.
+         Proportional digits jitter as a value changes, and a latency figure
+         that dances while it updates is genuinely harder to read. -->
+    <Style x:Key="IonTelemetry" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="Consolas" />
+        <Setter Property="FontSize" Value="{StaticResource EchoTelemetrySize}" />
+        <Setter Property="Foreground" Value="{StaticResource IonTextDim}" />
+        <Setter Property="LineHeight" Value="24" />
+    </Style>
+
+    <Style x:Key="IonLabel" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource EchoLabelSize}" />
+        <Setter Property="Foreground" Value="{StaticResource IonTextDim}" />
+        <Setter Property="CharacterSpacing" Value="80" />
+    </Style>
+
+    <Style x:Key="IonHeading" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource EchoHeadingSize}" />
+        <Setter Property="Foreground" Value="{StaticResource IonText}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+</ResourceDictionary>

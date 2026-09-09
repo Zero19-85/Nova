@@ -19,12 +19,16 @@
 // is polled, not pushed. There is no event to wait on, so someone has to ask,
 // and asking on a frame boundary would sample the pad at the frame rate.
 //
-// ── What is NOT here ────────────────────────────────────────────────────────
+// ── Controller mouse mode IS here ───────────────────────────────────────────
 //
-// Controller *mouse mode* — Start+Select (on this platform Menu+View) driving
-// the host cursor — is implemented HOST-side in `gamepad_mouse.rs`, on the
-// controller packet every client already sends. This file must not implement
-// it; it only has to avoid swallowing the chord. See `HoldGesture`.
+// This note used to say the opposite — that mouse mode lived host-side in
+// `gamepad_mouse.rs` and that this file "must not implement it, only avoid
+// swallowing the chord". That was true of an earlier draft and is now exactly
+// backwards; `PadLoop` owns it and the chord is deliberately swallowed here.
+// The reasoning is at the top of the mouse-mode section in the .cpp, and the
+// short version is that exactly one implementation may see Menu+View: if both
+// did, two cursor drivers would integrate the same stick at double speed with
+// the host also swallowing the pad, so nothing could turn it off again.
 #pragma once
 
 #include <cstdint>
@@ -69,6 +73,11 @@ public:
     using InputSink = std::function<void(InputEvent const&)>;
     using PadSink   = std::function<void(int32_t slot, int32_t activeMask, PadState const&)>;
     using Gesture   = std::function<void()>;
+    // Called from the pad thread on every mouse-mode transition, whichever way
+    // it was caused. The UI has no other way to learn: before this, the chord
+    // toggled silently and a user who hit it by accident just watched their
+    // controller stop reaching the game.
+    using ModeSink  = std::function<void(bool on)>;
 
     ~InputBridge();
 
@@ -79,7 +88,8 @@ public:
                std::wstring& error) noexcept;
     void Stop() noexcept;
 
-    void SetSinks(InputSink input, PadSink pad, Gesture overlay) noexcept;
+    void SetSinks(InputSink input, PadSink pad, Gesture overlay,
+                  ModeSink mouseMode = nullptr) noexcept;
 
     // The panel's logical size, pushed from the UI thread because the input
     // thread cannot read `ActualWidth`. Absolute mouse positions are sent in
@@ -90,9 +100,20 @@ public:
     // released first so the host is not left holding a button.
     void SetForwarding(bool on) noexcept;
 
-    // Menu+View has put the right stick on the host's cursor. Read-only: the
-    // chord is the only way in or out, so there is nothing to set.
+    // Menu+View has put the right stick on the host's cursor.
     bool MouseMode() const noexcept { return m_mouseMode.load(std::memory_order_acquire); }
+
+    // Ask for the mode to change. Deliberately a REQUEST and not a setter.
+    //
+    // Entering and leaving is not a bool assignment: both edges neutralise the
+    // pad (a pad that merely goes quiet leaves the host holding Menu, and games
+    // read Menu as pause), leaving lifts whatever the triggers were holding
+    // down, and both clear the sub-pixel accumulator. All three live in the pad
+    // loop, which is the only thread that may touch that state — so the flag is
+    // set THERE, through the same code path the chord takes, and this call just
+    // posts the intent. It is honoured within one 4 ms tick and answered on the
+    // ModeSink; nothing should assume it took effect because it was asked for.
+    void RequestMouseMode(bool on) noexcept;
 
 private:
     void PadLoop() noexcept;
@@ -101,6 +122,7 @@ private:
     InputSink m_input;
     PadSink   m_pad;
     Gesture   m_overlay;
+    ModeSink  m_mouseModeSink;
     std::mutex m_sinkLock;
 
     // Written by the pool thread, read by whoever calls Stop, so it is guarded.
@@ -121,6 +143,10 @@ private:
     std::atomic<uint32_t> m_buttonsDown{ 0 };
     // Controller mouse mode, toggled by Menu+View inside the pad loop.
     std::atomic<bool> m_mouseMode{ false };
+    // A pending request from outside the pad loop. -1 = nothing asked for;
+    // 0/1 = the state somebody wants. Consumed by the loop, which is what
+    // makes an overlay press take the identical path the chord does.
+    std::atomic<int32_t> m_mouseModeRequest{ -1 };
 };
 
 }  // namespace echo
