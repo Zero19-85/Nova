@@ -119,7 +119,16 @@ uint32_t echo_set_video_delay(uint64_t handle, uint32_t delay_ms);
 uint64_t echo_network_changed(uint64_t handle);
 
 // Idempotent, and safe on 0. Wakes every blocked caller.
+//
+// Sends the host `stop_session` on the way out, so the host ENDS the session and
+// gives back the display it was driving. That is the goodbye, not a detail of
+// teardown — if the intent is to walk away and come back, use echo_detach.
 void echo_close(uint64_t handle);
+
+// Leave without the goodbye. The host sees the client go quiet, detaches, and
+// HOLDS its virtual display for the grace period so a reconnect resumes into the
+// same desktop. Ending such a session afterwards is echo_release's job.
+void echo_detach(uint64_t handle);
 
 // Ask the host to end a session it is holding for this device. BLOCKING, and
 // deliberately: ending a session never needed a session. Worker thread only.

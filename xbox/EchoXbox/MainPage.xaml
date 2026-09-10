@@ -3,429 +3,724 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:EchoXbox"
+    IsTabStop="True"
     Background="{StaticResource IonVoid}">
 
     <!-- The root Grid paints Void too, not just the Page. A Page's Background
          fills the Page, but anything that sizes the Grid differently — or any
          stock container that brings its own theme ground — leaves a band of
-         whatever is underneath. Stating it twice costs one fill. -->
+         whatever is underneath. Stating it twice costs one fill, and on a
+         local-dimming panel a band of not-quite-black is exactly what the
+         pure-black palette exists to remove. -->
     <Grid Background="{StaticResource IonVoid}">
         <!-- The video surface. Everything else floats above it, so a running
              stream always has the whole screen and nothing is composited over
-             it unless somebody asked for it. -->
+             it unless somebody asked for it.
+
+             Deliberately OUTSIDE ChromeRoot: the picture is sized by the window
+             and scaled by the renderer, and putting it inside a transformed
+             container would scale it twice. -->
         <SwapChainPanel x:Name="VideoPanel"
                         HorizontalAlignment="Stretch"
                         VerticalAlignment="Stretch" />
 
-        <!-- ===== The dashboard =============================================
-             One column, centred. The right-hand column that used to carry the
-             event log is gone: it was telemetry sitting permanently beside the
-             one decision this screen exists to support, and it now lives on its
-             own screen where there is room to actually read it. -->
-        <Grid x:Name="SetupRoot" Margin="96,64">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
-            </Grid.RowDefinitions>
+        <!-- ===== ChromeRoot: the 3840x2160 design space ====================
+             Every panel below is authored in real 4K pixels rather than in the
+             1920x1080 logical space an Xbox hands a XAML app by default. That
+             is the fix for "the boxes look massive": the console composes this
+             view at 200%, so a 22 px label was 44 real pixels and a card with
+             24 px padding took 48.
 
-            <Grid Grid.Row="0" Margin="0,0,0,32">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="16">
-                    <Rectangle Width="4" Height="52"
-                               Fill="{StaticResource IonAccent}"
-                               VerticalAlignment="Center" />
-                    <StackPanel>
-                        <TextBlock Text="ECHO"
-                                   Foreground="{StaticResource IonText}"
-                                   FontSize="{StaticResource EchoTitleSize}"
-                                   FontWeight="SemiBold"
-                                   CharacterSpacing="120" />
-                        <TextBlock x:Name="StatusLine"
-                                   Text="starting…"
-                                   Foreground="{StaticResource IonAccent}"
-                                   FontFamily="Consolas"
-                                   FontSize="{StaticResource EchoLabelSize}"
-                                   Margin="0,2,0,0" />
-                    </StackPanel>
-                </StackPanel>
+             The size is FIXED and the scale is computed at runtime
+             (`ApplyChromeScale`) rather than the layout being left to stretch.
+             That is what makes the same numbers correct in both regimes — a
+             console that gives the app native 4K pixels scales by 1.0, and one
+             that insists on a 1080p logical view scales by 0.5 and gets exactly
+             the proportions it would have had anyway. Nothing here needs to
+             know which happened.
 
-                <!-- Top right: rescan, then the gear. Both are icons from
-                     Segoe MDL2 Assets, which ships on every Windows and every
-                     Xbox — no asset, no font file, nothing to package. A text
-                     button here competed with the host names for attention;
-                     an icon in the corner is furniture, which is what a
-                     settings entry point should be. -->
-                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10"
-                            VerticalAlignment="Center">
-                    <Button x:Name="RescanButton"
-                            Style="{StaticResource IonIconButton}"
-                            Click="OnRescanClick"
-                            ToolTipService.ToolTip="Search again">
-                        <TextBlock Text="&#xE72C;" Style="{StaticResource IonGlyph}" />
-                    </Button>
-                    <Button x:Name="SettingsButton"
-                            Style="{StaticResource IonIconButton}"
-                            Click="OnSettingsClick"
-                            ToolTipService.ToolTip="Settings">
-                        <TextBlock Text="&#xE713;" Style="{StaticResource IonGlyph}" />
-                    </Button>
-                </StackPanel>
-            </Grid>
+             Left/Top alignment matters: a fixed-size child in a stretched Grid
+             is centred by default, and a 3840-wide child centred in a 1920-wide
+             parent starts 960 px off the left of the screen. -->
+        <Grid x:Name="ChromeRoot"
+              Width="3840" Height="2160"
+              HorizontalAlignment="Left" VerticalAlignment="Top">
+            <Grid.RenderTransform>
+                <ScaleTransform x:Name="ChromeScale" ScaleX="1" ScaleY="1" />
+            </Grid.RenderTransform>
 
-            <Border Grid.Row="1"
-                    Style="{StaticResource IonCard}"
-                    MaxWidth="1180"
-                    HorizontalAlignment="Stretch">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                    <TextBlock Grid.Row="0"
-                               x:Name="HostsHeader"
-                               Text="SEARCHING THE NETWORK…"
-                               Style="{StaticResource IonLabel}"
-                               Margin="0,0,0,14" />
-
-                    <!-- IsItemClickEnabled is what makes A on a host mean
-                         something. Selection alone only moves a highlight;
-                         ItemClick is the press. Rows are built in code — a
-                         DataTemplate with x:Bind would need a WinRT
-                         runtimeclass per row, which is a lot of projection
-                         machinery for three lines. -->
-                    <ListView Grid.Row="1"
-                              x:Name="HostList"
-                              SelectionMode="Single"
-                              IsItemClickEnabled="True"
-                              ItemClick="OnHostInvoked"
-                              SelectionChanged="OnHostSelectionChanged" />
-
-                    <!-- The apps for the selected host, revealed by pressing A
-                         on it. Collapsed until then: a list of five apps under
-                         every host turns a host picker into a wall. -->
-                    <StackPanel Grid.Row="2" x:Name="AppPanel"
-                                Visibility="Collapsed"
-                                Margin="0,18,0,0" Spacing="10">
-                        <TextBlock x:Name="AppHeader"
-                                   Text="LAUNCH ON THIS HOST"
-                                   Style="{StaticResource IonLabel}" />
-                        <StackPanel x:Name="AppRow" Orientation="Horizontal"
-                                    Spacing="10" />
-                        <TextBlock x:Name="AppHint"
-                                   Text=""
-                                   Style="{StaticResource IonTelemetry}" />
-                    </StackPanel>
-
-                    <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="12"
-                                Margin="0,18,0,0">
-                        <Button x:Name="StreamButton" Content="Stream"
-                                Style="{StaticResource IonPrimaryButton}"
-                                IsEnabled="False" Click="OnStreamClick" />
-                        <Button x:Name="PairButton" Content="Pair"
-                                Style="{StaticResource IonButton}"
-                                IsEnabled="False" Click="OnPairClick" />
-                    </StackPanel>
-                </Grid>
-            </Border>
-        </Grid>
-
-        <!-- ===== The PIN ===================================================
-             Its own centred card now rather than a corner of a side panel.
-             This is the one moment the app asks the user to go and do something
-             on another machine, and it should be the only thing on screen. -->
-        <Grid x:Name="PinPanel" Visibility="Collapsed"
-              Canvas.ZIndex="60"
-              Background="{StaticResource IonScrim}">
-            <Border Style="{StaticResource IonCard}"
-                    Background="{StaticResource IonPanel}"
-                    Padding="56,40"
-                    HorizontalAlignment="Center" VerticalAlignment="Center">
-                <StackPanel Spacing="8" HorizontalAlignment="Center">
-                    <TextBlock Text="TYPE THIS PIN INTO NOVA ON THE PC"
-                               Style="{StaticResource IonLabel}"
-                               HorizontalAlignment="Center" />
-                    <TextBlock x:Name="PinText"
-                               Text="----"
-                               Foreground="{StaticResource IonAccent}"
-                               FontFamily="Consolas"
-                               FontSize="{StaticResource EchoPinSize}"
-                               FontWeight="SemiBold"
-                               CharacterSpacing="200"
-                               HorizontalAlignment="Center" />
-                </StackPanel>
-            </Border>
-        </Grid>
-
-        <!-- ===== Diagnostics, on its own screen ============================
-             Everything telemetry-shaped lives here: the decode probe, the
-             per-stage counters, and the full event log. It was previously two
-             different half-visible things — a log column pinned beside the host
-             picker, and a scroller squeezed into the overlay under the buttons.
-             The second of those is why it kept vanishing during a stream: it
-             was competing for leftover height inside a panel capped at 920 px,
-             and the overlay's own lifecycle collapsed it. A screen cannot be
-             starved of space by its neighbours. -->
-        <Grid x:Name="DiagnosticsRoot" Visibility="Collapsed"
-              Canvas.ZIndex="120"
-              Background="{StaticResource IonVoid}">
-            <Grid Margin="96,56">
+            <!-- ===== The dashboard ======================================
+                 One column, centred. There are no Stream or Pair buttons here
+                 any more: A opens the app drawer, Start opens the menu, and
+                 every gesture is named in the hint bar at the bottom. A arrives
+                 from the pad thread and Start from XAML - see
+                 `MainPage::OnPadAccept` for why those are two different routes. -->
+            <Grid x:Name="SetupRoot" Margin="150,100">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
+                    <!-- The app drawer. Auto, so the host card's `*` row above
+                         gives up exactly the height the drawer takes and the
+                         layout genuinely moves — which is the whole difference
+                         between a drawer and the flyout this replaced. -->
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <Grid Grid.Row="0" Margin="0,0,0,24">
+                <Grid Grid.Row="0" Margin="0,0,0,50">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="16">
-                        <Rectangle Width="4" Height="44"
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="26">
+                        <Rectangle Width="6" Height="84"
                                    Fill="{StaticResource IonAccent}"
                                    VerticalAlignment="Center" />
-                        <TextBlock Text="DIAGNOSTICS"
-                                   Foreground="{StaticResource IonText}"
-                                   FontSize="{StaticResource EchoHeadingSize}"
-                                   FontWeight="SemiBold"
-                                   CharacterSpacing="120"
-                                   VerticalAlignment="Center" />
-                    </StackPanel>
-                    <Button Grid.Column="1"
-                            x:Name="DiagnosticsCloseButton"
-                            Content="Close"
-                            Style="{StaticResource IonPrimaryButton}"
-                            Click="OnDiagnosticsCloseClick"
-                            VerticalAlignment="Center" />
-                </Grid>
-
-                <Grid Grid.Row="1">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="1.1*" />
-                        <ColumnDefinition Width="20" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-
-                    <!-- Live: what the hardware said it could do, and what each
-                         stage of the pipeline has actually done since. -->
-                    <Border Grid.Column="0" Style="{StaticResource IonCard}">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="DECODER AND PIPELINE"
-                                       Style="{StaticResource IonLabel}"
-                                       Margin="0,0,0,12" />
-                            <ScrollViewer Grid.Row="1"
-                                          x:Name="DiagnosticsScroller"
-                                          VerticalScrollBarVisibility="Auto"
-                                          HorizontalScrollMode="Disabled"
-                                          IsTabStop="True"
-                                          IsFocusEngagementEnabled="True"
-                                          UseSystemFocusVisuals="True">
-                                <TextBlock x:Name="DiagnosticsText"
-                                           Style="{StaticResource IonTelemetry}"
-                                           TextWrapping="Wrap"
-                                           Margin="0,0,16,0" />
-                            </ScrollViewer>
-                        </Grid>
-                    </Border>
-
-                    <!-- The event log, which is the same JSON the CLI and the
-                         Android client print — so a failure here can be
-                         compared line for line against nova-service.log. -->
-                    <Border Grid.Column="2" Style="{StaticResource IonCard}">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="SESSION LOG"
-                                       Style="{StaticResource IonLabel}"
-                                       Margin="0,0,0,12" />
-                            <ScrollViewer Grid.Row="1" x:Name="LogScroller"
-                                          VerticalScrollBarVisibility="Auto"
-                                          HorizontalScrollMode="Disabled"
-                                          IsTabStop="True"
-                                          IsFocusEngagementEnabled="True"
-                                          UseSystemFocusVisuals="True">
-                                <TextBlock x:Name="LogText"
-                                           Text=""
-                                           Style="{StaticResource IonTelemetry}"
-                                           TextWrapping="Wrap"
-                                           Margin="0,0,16,0" />
-                            </ScrollViewer>
-                        </Grid>
-                    </Border>
-                </Grid>
-            </Grid>
-        </Grid>
-
-        <!-- ===== No picture yet ============================================
-             Shown only while a session is live and nothing has ever been
-             drawn. A blank field with no explanation is how ten sessions in a
-             row failed silently. -->
-        <Border x:Name="NoVideoPanel"
-                Visibility="Collapsed"
-                Canvas.ZIndex="80"
-                Style="{StaticResource IonCard}"
-                Background="{StaticResource IonPanel}"
-                BorderBrush="{StaticResource IonAmber}"
-                Padding="32,24"
-                HorizontalAlignment="Center"
-                VerticalAlignment="Center">
-            <StackPanel Spacing="10">
-                <TextBlock Text="Waiting for video"
-                           Style="{StaticResource IonHeading}" />
-                <TextBlock x:Name="NoVideoText"
-                           Text=""
-                           Style="{StaticResource IonTelemetry}" />
-            </StackPanel>
-        </Border>
-
-        <!-- ===== The in-stream toast ======================================
-             IsHitTestVisible is False on purpose: it appears over a live stream
-             while input is being forwarded, and must never take focus, eat a
-             button, or move where the gamepad is pointing. -->
-        <Border x:Name="ToastRoot"
-                Visibility="Collapsed"
-                IsHitTestVisible="False"
-                Canvas.ZIndex="90"
-                Background="{StaticResource IonPanel}"
-                BorderBrush="{StaticResource IonEdge}"
-                BorderThickness="1"
-                CornerRadius="{StaticResource EchoCardRadius}"
-                Padding="0,0,22,0"
-                HorizontalAlignment="Center"
-                VerticalAlignment="Bottom"
-                Margin="0,0,0,84">
-            <StackPanel Orientation="Horizontal" Spacing="18">
-                <Rectangle x:Name="ToastAccent" Width="4" Fill="{StaticResource IonAccent}" />
-                <TextBlock x:Name="ToastText"
-                           Text=""
-                           Foreground="{StaticResource IonText}"
-                           FontFamily="Consolas"
-                           FontSize="{StaticResource EchoLabelSize}"
-                           Margin="0,14,0,14"
-                           VerticalAlignment="Center" />
-            </StackPanel>
-        </Border>
-
-        <!-- ===== The overlay: hold Menu+View for 700 ms ====================
-             The scrim is a wash rather than a fill: the picture stays visible
-             underneath, which is what tells the user the stream did not stop.
-
-             Diagnostics are NOT here any more — the button opens the
-             diagnostics screen instead. Nothing on this panel now competes for
-             vertical space with anything else. -->
-        <Grid x:Name="OverlayRoot" Visibility="Collapsed"
-              Canvas.ZIndex="100"
-              Background="{StaticResource IonScrim}">
-            <Border Background="{StaticResource IonPanel}"
-                    BorderBrush="{StaticResource IonEdge}"
-                    BorderThickness="1"
-                    CornerRadius="{StaticResource EchoCardRadius}"
-                    Padding="0"
-                    MinWidth="820"
-                    MaxWidth="1500"
-                    MaxHeight="920"
-                    HorizontalAlignment="Center"
-                    VerticalAlignment="Center">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <Rectangle Grid.Column="0" Width="4"
-                               Fill="{StaticResource IonAccent}" />
-
-                    <StackPanel Grid.Column="1" Spacing="22" Margin="36,30,40,32">
                         <StackPanel>
                             <TextBlock Text="ECHO"
                                        Foreground="{StaticResource IonText}"
-                                       FontSize="{StaticResource EchoHeadingSize}"
+                                       FontSize="{StaticResource EchoTitleSize}"
                                        FontWeight="SemiBold"
                                        CharacterSpacing="120" />
-                            <TextBlock x:Name="OverlaySubtitle"
-                                       Text=""
-                                       Foreground="{StaticResource IonTextDim}"
+                            <!-- Blue, not yellow: this line reports what the app
+                                 is doing, it never offers a choice. -->
+                            <TextBlock x:Name="StatusLine"
+                                       Text="starting…"
+                                       Foreground="{StaticResource IonBlue}"
                                        FontFamily="Consolas"
                                        FontSize="{StaticResource EchoLabelSize}"
                                        Margin="0,4,0,0" />
                         </StackPanel>
+                    </StackPanel>
 
-                        <StackPanel Spacing="8">
-                            <TextBlock Text="RESOLUTION" Style="{StaticResource IonLabel}" />
-                            <!-- Changing this mid-stream re-modes the host display
-                                 live; it does not restart the session. -->
-                            <StackPanel x:Name="ResolutionRow" Orientation="Horizontal" Spacing="10" />
+                    <!-- The one thing that must be visible without opening
+                         anything: a session this console walked away from is
+                         still holding a monitor on the PC. -->
+                    <Border Grid.Column="1"
+                            x:Name="HeldBadge"
+                            Visibility="Collapsed"
+                            Background="{StaticResource IonBlueWash}"
+                            BorderBrush="{StaticResource IonBlueEdge}"
+                            BorderThickness="1"
+                            CornerRadius="{StaticResource EchoCardRadius}"
+                            Padding="30,18"
+                            VerticalAlignment="Center">
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="SESSION STILL HELD"
+                                       Style="{StaticResource IonLabel}"
+                                       Foreground="{StaticResource IonBlue}" />
+                            <TextBlock Text="the host is keeping its display · press Start, then Stop Stream"
+                                       Style="{StaticResource IonTelemetry}" />
                         </StackPanel>
+                    </Border>
+                </Grid>
 
-                        <StackPanel Spacing="8">
-                            <TextBlock Text="FRAME RATE" Style="{StaticResource IonLabel}" />
-                            <StackPanel x:Name="FrameRateRow" Orientation="Horizontal" Spacing="10" />
+                <Border Grid.Row="1"
+                        Style="{StaticResource IonCard}"
+                        MaxWidth="2400"
+                        HorizontalAlignment="Stretch">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0"
+                                   x:Name="HostsHeader"
+                                   Text="SEARCHING THE NETWORK…"
+                                   Style="{StaticResource IonLabel}"
+                                   Margin="0,0,0,22" />
+
+                        <!-- ItemClick is OFF on purpose. XAML delivers A to the
+                             focused row like it does to any control - the pad
+                             gesture does not suppress it - so with ItemClick on,
+                             one press would both invoke the row and drive the
+                             gesture. Off, the row does nothing and A means only
+                             what `OnPadAccept` decides. Selection follows the
+                             focus rect, which is what the stick already moves. -->
+                        <ListView Grid.Row="1"
+                                  x:Name="HostList"
+                                  SelectionMode="Single"
+                                  SingleSelectionFollowsFocus="True"
+                                  IsItemClickEnabled="False"
+                                  SelectionChanged="OnHostSelectionChanged" />
+                    </Grid>
+                </Border>
+
+                <!-- ===== The app drawer =============================
+                     Inline, in its own layout row, directly under the host
+                     card. It is NOT a pop-up: opening it shortens the card
+                     above rather than covering it, so the dashboard behaves
+                     like one surface instead of a screen with things thrown
+                     on top.
+
+                     The height is animated between 0 and its natural size
+                     (`MainPage::AnimateDrawer`), which is what makes the push
+                     read as an accordion rather than a jump cut. `Clip` is why
+                     that works at all — a Grid does not clip its children, so
+                     mid-animation the card's content would otherwise spill over
+                     the hint bar below. The rectangle is resized from
+                     SizeChanged, so it tracks every frame of the animation.
+
+                     Only ever shown for a PAIRED host; see FireSingleTap. -->
+                <Grid x:Name="AppDrawer" Grid.Row="2"
+                      Visibility="Collapsed"
+                      Height="0"
+                      SizeChanged="OnAppDrawerSizeChanged">
+                    <Grid.Clip>
+                        <RectangleGeometry x:Name="AppDrawerClip" />
+                    </Grid.Clip>
+                    <Border x:Name="AppDrawerContent"
+                            Style="{StaticResource IonCard}"
+                            Margin="0,26,0,0"
+                            MaxWidth="2400"
+                            VerticalAlignment="Top"
+                            HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="22">
+                            <TextBlock x:Name="AppMenuHeader"
+                                       Text="LAUNCH ON THIS HOST"
+                                       Style="{StaticResource IonLabel}" />
+                            <StackPanel x:Name="AppMenuRow" Orientation="Horizontal"
+                                        Spacing="18" />
+                            <!-- The hover line. It is the whole reason this is a
+                                 strip of tabs and not a row of unexplained
+                                 words: "Mirror" and "Virtual Desktop" sound like
+                                 the same thing and behave completely
+                                 differently, and somebody picking blind gets it
+                                 wrong about half the time. Updated from
+                                 GotFocus, so moving the stick changes it. -->
+                            <TextBlock x:Name="AppMenuHint"
+                                       Text=""
+                                       Style="{StaticResource IonTelemetry}"
+                                       Foreground="{StaticResource IonBlue}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="down to pick an app  ·  A or B to close"
+                                       Style="{StaticResource IonTelemetry}" />
                         </StackPanel>
+                    </Border>
+                </Grid>
 
-                        <StackPanel Spacing="8">
-                            <TextBlock Text="CONTROLLER" Style="{StaticResource IonLabel}" />
-                            <StackPanel Orientation="Horizontal" Spacing="14">
-                                <Button x:Name="MouseModeButton"
-                                        Content="Mouse mode: off"
+                <!-- The gesture legend. With the buttons gone this is the only
+                     place the A presses are written down, so it is not
+                     decoration — it is the UI's documentation, on screen. -->
+                <Border Grid.Row="3"
+                        Margin="0,34,0,0"
+                        Background="{StaticResource IonCarbon}"
+                        BorderBrush="{StaticResource IonEdge}"
+                        BorderThickness="1"
+                        CornerRadius="{StaticResource EchoCardRadius}"
+                        Padding="34,22">
+                    <StackPanel Orientation="Horizontal" Spacing="46">
+                        <TextBlock Style="{StaticResource IonTelemetry}"
+                                   Foreground="{StaticResource IonText}">
+                            <Run Text="A" Foreground="#FFFFF200" FontWeight="Bold" />
+                            <Run Text="  app drawer" />
+                        </TextBlock>
+                        <TextBlock Style="{StaticResource IonTelemetry}"
+                                   Foreground="{StaticResource IonText}">
+                            <Run Text="A A" Foreground="#FFFFF200" FontWeight="Bold" />
+                            <Run Text="  Virtual Desktop now" />
+                        </TextBlock>
+                        <TextBlock Style="{StaticResource IonTelemetry}"
+                                   Foreground="{StaticResource IonText}">
+                            <Run Text="START" Foreground="#FFFFF200" FontWeight="Bold" />
+                            <Run Text="  menu, pair, settings" />
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ===== Start: everything else =============================
+                 The actions that are not "launch something": ending a held
+                 session, the plain stream and pair paths that used to be
+                 buttons on the dashboard, and the way into settings. -->
+            <Grid x:Name="ActionMenuRoot" Visibility="Collapsed"
+                  Canvas.ZIndex="50"
+                  Background="{StaticResource IonScrim}">
+                <Border Style="{StaticResource IonCard}"
+                        Background="{StaticResource IonPanel}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        MinWidth="1000">
+                    <StackPanel Spacing="18">
+                        <TextBlock Text="ECHO"
+                                   Style="{StaticResource IonHeading}"
+                                   CharacterSpacing="120" />
+                        <TextBlock x:Name="ActionMenuSubtitle"
+                                   Text=""
+                                   Style="{StaticResource IonTelemetry}"
+                                   Margin="0,0,0,12" />
+
+                        <Button x:Name="ActionStopButton"
+                                Content="Stop Stream"
+                                Style="{StaticResource IonMenuButton}"
+                                Click="OnActionStopClick" />
+                        <Button x:Name="ActionStreamButton"
+                                Content="Stream"
+                                Style="{StaticResource IonMenuButton}"
+                                Click="OnActionStreamClick" />
+                        <Button x:Name="ActionPairButton"
+                                Content="Pair"
+                                Style="{StaticResource IonMenuButton}"
+                                Click="OnActionPairClick" />
+                        <Button x:Name="ActionSettingsButton"
+                                Style="{StaticResource IonMenuButton}"
+                                Click="OnSettingsClick">
+                            <StackPanel Orientation="Horizontal" Spacing="18">
+                                <TextBlock Text="&#xE713;"
+                                           Style="{StaticResource IonGlyph}"
+                                           Foreground="{StaticResource IonText}" />
+                                <TextBlock Text="Settings"
+                                           FontSize="{StaticResource EchoBodySize}"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                        </Button>
+
+                        <TextBlock Text="B to go back"
+                                   Style="{StaticResource IonTelemetry}"
+                                   Margin="0,12,0,0" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ===== The PIN ==============================================
+                 Its own centred card. This is the one moment the app asks the
+                 user to go and do something on another machine, and it should
+                 be the only thing on screen. -->
+            <Grid x:Name="PinPanel" Visibility="Collapsed"
+                  Canvas.ZIndex="60"
+                  Background="{StaticResource IonScrim}">
+                <Border Style="{StaticResource IonCard}"
+                        Background="{StaticResource IonPanel}"
+                        Padding="90,64"
+                        HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <StackPanel Spacing="14" HorizontalAlignment="Center">
+                        <TextBlock Text="TYPE THIS PIN INTO NOVA ON THE PC"
+                                   Style="{StaticResource IonLabel}"
+                                   HorizontalAlignment="Center" />
+                        <TextBlock x:Name="PinText"
+                                   Text="----"
+                                   Foreground="{StaticResource IonAccent}"
+                                   FontFamily="Consolas"
+                                   FontSize="{StaticResource EchoPinSize}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="200"
+                                   HorizontalAlignment="Center" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ===== No picture yet =======================================
+                 Shown only while a session is live and nothing has ever been
+                 drawn. A blank field with no explanation is how ten sessions in
+                 a row failed silently. -->
+            <Border x:Name="NoVideoPanel"
+                    Visibility="Collapsed"
+                    Canvas.ZIndex="80"
+                    Style="{StaticResource IonCard}"
+                    Background="{StaticResource IonPanel}"
+                    BorderBrush="{StaticResource IonAmber}"
+                    Padding="52,38"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center">
+                <StackPanel Spacing="16">
+                    <TextBlock Text="Waiting for video"
+                               Style="{StaticResource IonHeading}" />
+                    <TextBlock x:Name="NoVideoText"
+                               Text=""
+                               Style="{StaticResource IonTelemetry}" />
+                </StackPanel>
+            </Border>
+
+            <!-- ===== The in-stream toast ==================================
+                 IsHitTestVisible is False on purpose: it appears over a live
+                 stream while input is being forwarded, and must never take
+                 focus, eat a button, or move where the gamepad is pointing. -->
+            <Border x:Name="ToastRoot"
+                    Visibility="Collapsed"
+                    IsHitTestVisible="False"
+                    Canvas.ZIndex="90"
+                    Background="{StaticResource IonPanel}"
+                    BorderBrush="{StaticResource IonEdge}"
+                    BorderThickness="1"
+                    CornerRadius="{StaticResource EchoCardRadius}"
+                    Padding="0,0,36,0"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Bottom"
+                    Margin="0,0,0,134">
+                <StackPanel Orientation="Horizontal" Spacing="28">
+                    <Rectangle x:Name="ToastAccent" Width="6" Fill="{StaticResource IonAccent}" />
+                    <TextBlock x:Name="ToastText"
+                               Text=""
+                               Foreground="{StaticResource IonText}"
+                               FontFamily="Consolas"
+                               FontSize="{StaticResource EchoLabelSize}"
+                               Margin="0,22,0,22"
+                               VerticalAlignment="Center" />
+                </StackPanel>
+            </Border>
+
+            <!-- ===== The in-stream overlay: hold Menu+View for 700 ms ======
+                 The scrim is a wash rather than a fill: the picture stays
+                 visible underneath, which is what tells the user the stream did
+                 not stop.
+
+                 "Disconnect" is now "Leave the stream", and the difference is
+                 not wording — see `OnLeaveStreamClick`. Leaving detaches; only
+                 the confirmation behind Start actually hands the host's monitor
+                 back. -->
+            <Grid x:Name="OverlayRoot" Visibility="Collapsed"
+                  Canvas.ZIndex="100"
+                  Background="{StaticResource IonScrim}">
+                <Border Background="{StaticResource IonPanel}"
+                        BorderBrush="{StaticResource IonEdge}"
+                        BorderThickness="1"
+                        CornerRadius="{StaticResource EchoCardRadius}"
+                        Padding="0"
+                        MinWidth="1310"
+                        MaxWidth="2400"
+                        MaxHeight="1600"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Rectangle Grid.Column="0" Width="6"
+                                   Fill="{StaticResource IonAccent}" />
+
+                        <StackPanel Grid.Column="1" Spacing="34" Margin="58,48,64,52">
+                            <StackPanel>
+                                <TextBlock Text="ECHO"
+                                           Foreground="{StaticResource IonText}"
+                                           FontSize="{StaticResource EchoHeadingSize}"
+                                           FontWeight="SemiBold"
+                                           CharacterSpacing="120" />
+                                <TextBlock x:Name="OverlaySubtitle"
+                                           Text=""
+                                           Foreground="{StaticResource IonBlue}"
+                                           FontFamily="Consolas"
+                                           FontSize="{StaticResource EchoLabelSize}"
+                                           Margin="0,6,0,0" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="RESOLUTION" Style="{StaticResource IonLabel}" />
+                                <!-- Changing this mid-stream re-modes the host
+                                     display live; it does not restart the
+                                     session. -->
+                                <StackPanel x:Name="ResolutionRow" Orientation="Horizontal" Spacing="16" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="FRAME RATE" Style="{StaticResource IonLabel}" />
+                                <StackPanel x:Name="FrameRateRow" Orientation="Horizontal" Spacing="16" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="CONTROLLER" Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="22">
+                                    <Button x:Name="MouseModeButton"
+                                            Content="Mouse mode: off"
+                                            Style="{StaticResource IonButton}"
+                                            Click="OnMouseModeClick" />
+                                    <TextBlock x:Name="MouseModeHint"
+                                               Text=""
+                                               Style="{StaticResource IonTelemetry}"
+                                               VerticalAlignment="Center"
+                                               TextWrapping="Wrap"
+                                               MaxWidth="700" />
+                                </StackPanel>
+                            </StackPanel>
+
+                            <StackPanel Orientation="Horizontal" Spacing="18" Margin="0,10,0,0">
+                                <Button x:Name="ResumeButton" Content="Back to the stream"
+                                        Style="{StaticResource IonPrimaryButton}"
+                                        Click="OnResumeClick" />
+                                <Button x:Name="LeaveButton" Content="Leave the stream"
                                         Style="{StaticResource IonButton}"
-                                        Click="OnMouseModeClick" />
-                                <TextBlock x:Name="MouseModeHint"
-                                           Text=""
-                                           Style="{StaticResource IonTelemetry}"
-                                           VerticalAlignment="Center"
-                                           TextWrapping="Wrap"
-                                           MaxWidth="440" />
+                                        Click="OnLeaveStreamClick" />
+                                <Button x:Name="DiagnosticsButton" Content="Diagnostics"
+                                        Style="{StaticResource IonButton}"
+                                        Click="OnDiagnosticsClick" />
+                            </StackPanel>
+
+                            <!-- Leaving is not ending, and the panel says so
+                                 rather than letting somebody find out from a
+                                 monitor that never came back. -->
+                            <TextBlock Style="{StaticResource IonTelemetry}"
+                                       TextWrapping="Wrap"
+                                       MaxWidth="1600"
+                                       Text="Leaving keeps the host's display reserved so you can drop straight back in. To hand the monitor back, press Start on the dashboard and choose Stop Stream." />
+
+                            <!-- The A/B. Swapping restarts the stream, because
+                                 a new decoder has an empty DPB and the only
+                                 frame it can start from is a keyframe. -->
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="DECODER" Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="22">
+                                    <Button x:Name="DecoderButton"
+                                            Content="Decoder: FFmpeg / D3D11VA"
+                                            Style="{StaticResource IonActiveButton}"
+                                            Click="OnDecoderToggleClick" />
+                                    <TextBlock x:Name="DecoderHint"
+                                               Text=""
+                                               Style="{StaticResource IonTelemetry}"
+                                               VerticalAlignment="Center"
+                                               TextWrapping="Wrap"
+                                               MaxWidth="830" />
+                                </StackPanel>
                             </StackPanel>
                         </StackPanel>
+                    </Grid>
+                </Border>
+            </Grid>
 
-                        <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,6,0,0">
-                            <Button x:Name="ResumeButton" Content="Back to the stream"
-                                    Style="{StaticResource IonPrimaryButton}"
-                                    Click="OnResumeClick" />
-                            <Button x:Name="DisconnectButton" Content="Disconnect"
-                                    Style="{StaticResource IonDangerButton}"
-                                    Click="OnStopClick" />
-                            <Button x:Name="DiagnosticsButton" Content="Diagnostics"
-                                    Style="{StaticResource IonButton}"
-                                    Click="OnDiagnosticsClick" />
-                            <!-- The decode ceiling, off and on. Reachable
-                                 without a rebuild; deliberately not sticky. -->
-                            <Button x:Name="BudgetButton" Content="Decode limit: on"
-                                    Style="{StaticResource IonButton}"
-                                    Click="OnBudgetClick" />
+            <!-- ===== Settings ============================================
+                 Reached from the gear in the Start menu. Everything here is a
+                 preference or a way into diagnostics; nothing on this screen
+                 starts or stops a session. -->
+            <Grid x:Name="SettingsRoot" Visibility="Collapsed"
+                  Canvas.ZIndex="110"
+                  Background="{StaticResource IonVoid}">
+                <Grid Margin="150,90">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,38">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="26">
+                            <Rectangle Width="6" Height="70"
+                                       Fill="{StaticResource IonAccent}"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Text="SETTINGS"
+                                       Foreground="{StaticResource IonText}"
+                                       FontSize="{StaticResource EchoHeadingSize}"
+                                       FontWeight="SemiBold"
+                                       CharacterSpacing="120"
+                                       VerticalAlignment="Center" />
                         </StackPanel>
+                        <Button Grid.Column="1"
+                                x:Name="SettingsCloseButton"
+                                Content="Close"
+                                Style="{StaticResource IonPrimaryButton}"
+                                Click="OnSettingsCloseClick"
+                                VerticalAlignment="Center" />
+                    </Grid>
 
-                        <!-- The A/B. Swapping restarts the stream, because a new
-                             decoder has an empty DPB and the only frame it can
-                             start from is a keyframe. -->
-                        <StackPanel Spacing="8">
-                            <TextBlock Text="DECODER" Style="{StaticResource IonLabel}" />
-                            <StackPanel Orientation="Horizontal" Spacing="14">
-                                <Button x:Name="DecoderButton"
-                                        Content="Decoder: FFmpeg / D3D11VA"
-                                        Style="{StaticResource IonActiveButton}"
-                                        Click="OnDecoderToggleClick" />
-                                <TextBlock x:Name="DecoderHint"
-                                           Text=""
-                                           Style="{StaticResource IonTelemetry}"
-                                           VerticalAlignment="Center"
+                    <StackPanel Grid.Row="1" Spacing="30" MaxWidth="2000"
+                                HorizontalAlignment="Left">
+                        <Border Style="{StaticResource IonCard}">
+                            <StackPanel Spacing="14">
+                                <TextBlock Text="MICROPHONE PASSTHROUGH"
+                                           Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="34">
+                                    <!-- A placeholder with a real value, not a
+                                         disabled control: a disabled slider
+                                         cannot take focus, so on a console it
+                                         is invisible to the only input device
+                                         there is, and the point of putting it
+                                         in now is that the layout and the
+                                         navigation order are settled before the
+                                         audio path arrives. -->
+                                    <Slider x:Name="MicSlider"
+                                            Width="900"
+                                            Minimum="0" Maximum="100"
+                                            StepFrequency="5"
+                                            TickFrequency="25"
+                                            Value="0"
+                                            IsFocusEngagementEnabled="True"
+                                            ValueChanged="OnMicLevelChanged"
+                                            VerticalAlignment="Center" />
+                                    <TextBlock x:Name="MicValueText"
+                                               Text="off"
+                                               Style="{StaticResource IonTelemetry}"
+                                               Foreground="{StaticResource IonBlue}"
+                                               VerticalAlignment="Center" />
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource IonTelemetry}"
                                            TextWrapping="Wrap"
-                                           MaxWidth="520" />
+                                           Text="Not connected to the microphone path yet — the level is remembered for this session and sent nowhere. The uplink exists on the bridge (echo_send_mic); nothing on this console captures into it." />
                             </StackPanel>
-                        </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource IonCard}">
+                            <StackPanel Spacing="14">
+                                <TextBlock Text="DIAGNOSTICS" Style="{StaticResource IonLabel}" />
+                                <TextBlock Style="{StaticResource IonTelemetry}"
+                                           TextWrapping="Wrap"
+                                           Text="Per-stage counters, the decoder probe, the HDMI mode, and the session log. This is where the numbers that used to sit on the dashboard live." />
+                                <Button x:Name="OpenDiagnosticsButton"
+                                        Content="Open diagnostics"
+                                        Style="{StaticResource IonPrimaryButton}"
+                                        HorizontalAlignment="Left"
+                                        Click="OnDiagnosticsClick" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource IonCard}">
+                            <StackPanel Spacing="14">
+                                <TextBlock Text="NETWORK" Style="{StaticResource IonLabel}" />
+                                <TextBlock Style="{StaticResource IonTelemetry}"
+                                           TextWrapping="Wrap"
+                                           Text="Hosts are found over mDNS and kept in the list while their records are live." />
+                                <Button x:Name="RescanButton"
+                                        Content="Search again"
+                                        Style="{StaticResource IonButton}"
+                                        HorizontalAlignment="Left"
+                                        Click="OnRescanClick" />
+                            </StackPanel>
+                        </Border>
                     </StackPanel>
                 </Grid>
-            </Border>
+            </Grid>
+
+            <!-- ===== Diagnostics, on its own screen =======================
+                 Everything telemetry-shaped lives here: the decode probe, the
+                 per-stage counters, and the full event log. A screen cannot be
+                 starved of space by its neighbours, which is what happened
+                 every time this was a drawer inside something else. -->
+            <Grid x:Name="DiagnosticsRoot" Visibility="Collapsed"
+                  Canvas.ZIndex="120"
+                  Background="{StaticResource IonVoid}">
+                <Grid Margin="150,90">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,38">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="26">
+                            <Rectangle Width="6" Height="70"
+                                       Fill="{StaticResource IonBlue}"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Text="DIAGNOSTICS"
+                                       Foreground="{StaticResource IonText}"
+                                       FontSize="{StaticResource EchoHeadingSize}"
+                                       FontWeight="SemiBold"
+                                       CharacterSpacing="120"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                        <Button Grid.Column="1"
+                                x:Name="DiagnosticsCloseButton"
+                                Content="Close"
+                                Style="{StaticResource IonPrimaryButton}"
+                                Click="OnDiagnosticsCloseClick"
+                                VerticalAlignment="Center" />
+                    </Grid>
+
+                    <Grid Grid.Row="1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="1.1*" />
+                            <ColumnDefinition Width="32" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Live: what the hardware said it could do, and what
+                             each stage of the pipeline has actually done. -->
+                        <Border Grid.Column="0" Style="{StaticResource IonCard}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Text="DECODER AND PIPELINE"
+                                           Style="{StaticResource IonLabel}"
+                                           Margin="0,0,0,20" />
+                                <ScrollViewer Grid.Row="1"
+                                              x:Name="DiagnosticsScroller"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollMode="Disabled"
+                                              IsTabStop="True"
+                                              IsFocusEngagementEnabled="True"
+                                              UseSystemFocusVisuals="True">
+                                    <TextBlock x:Name="DiagnosticsText"
+                                               Style="{StaticResource IonTelemetry}"
+                                               TextWrapping="Wrap"
+                                               Margin="0,0,26,0" />
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+
+                        <!-- The event log, which is the same JSON the CLI and
+                             the Android client print — so a failure here can be
+                             compared line for line against nova-service.log. -->
+                        <Border Grid.Column="2" Style="{StaticResource IonCard}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Text="SESSION LOG"
+                                           Style="{StaticResource IonLabel}"
+                                           Margin="0,0,0,20" />
+                                <ScrollViewer Grid.Row="1" x:Name="LogScroller"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollMode="Disabled"
+                                              IsTabStop="True"
+                                              IsFocusEngagementEnabled="True"
+                                              UseSystemFocusVisuals="True">
+                                    <TextBlock x:Name="LogText"
+                                               Text=""
+                                               Style="{StaticResource IonTelemetry}"
+                                               TextWrapping="Wrap"
+                                               Margin="0,0,26,0" />
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </Grid>
+
+            <!-- ===== The safety catch ====================================
+                 The second half of the two-step teardown. Leaving a stream
+                 detaches; THIS is the only thing in the app that tells the host
+                 to give its monitor back, and it is deliberately behind a
+                 button no thumb lands on by accident.
+
+                 Highest ZIndex in the app: it can be raised from the dashboard
+                 and from the Start menu, and it must never open behind the
+                 thing that opened it. -->
+            <Grid x:Name="EndStreamRoot" Visibility="Collapsed"
+                  Canvas.ZIndex="130"
+                  Background="{StaticResource IonScrim}">
+                <Border Style="{StaticResource IonCard}"
+                        Background="{StaticResource IonPanel}"
+                        BorderBrush="{StaticResource IonCrimson}"
+                        Padding="70,54"
+                        MaxWidth="1700"
+                        HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <StackPanel Spacing="24">
+                        <TextBlock Text="END STREAM"
+                                   Style="{StaticResource IonHeading}"
+                                   CharacterSpacing="120" />
+                        <TextBlock x:Name="EndStreamText"
+                                   Style="{StaticResource IonTelemetry}"
+                                   TextWrapping="Wrap"
+                                   Text="" />
+                        <StackPanel Orientation="Horizontal" Spacing="18" Margin="0,12,0,0">
+                            <Button x:Name="EndStreamCancelButton"
+                                    Content="Keep it held"
+                                    Style="{StaticResource IonPrimaryButton}"
+                                    Click="OnEndStreamCancelClick" />
+                            <Button x:Name="EndStreamConfirmButton"
+                                    Content="End Stream"
+                                    Style="{StaticResource IonDangerButton}"
+                                    Click="OnEndStreamConfirmClick" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
         </Grid>
     </Grid>
 </Page>

@@ -116,12 +116,13 @@ void PreciseSleep(std::chrono::microseconds duration) noexcept {
 InputBridge::~InputBridge() { Stop(); }
 
 void InputBridge::SetSinks(InputSink input, PadSink pad, Gesture overlay,
-                           ModeSink mouseMode) noexcept {
+                           ModeSink mouseMode, Gesture accept) noexcept {
     std::lock_guard<std::mutex> guard(m_sinkLock);
     m_input = std::move(input);
     m_pad = std::move(pad);
     m_overlay = std::move(overlay);
     m_mouseModeSink = std::move(mouseMode);
+    m_accept = std::move(accept);
 }
 
 void InputBridge::RequestMouseMode(bool on) noexcept {
@@ -371,6 +372,10 @@ void InputBridge::PadLoop() noexcept {
     bool chordSwallow = false;    // keep both bits off the wire until released
     std::chrono::steady_clock::time_point chordSince{};
 
+    // A's previous state, so the dashboard sink fires once per press rather
+    // than 250 times a second for as long as a thumb rests on the button.
+    bool aHeld = false;
+
     // Cursor integration. Sub-pixel remainder is carried between ticks: at
     // 250 Hz, `SendInput` moving in whole pixels means anything under 250 px/s
     // rounds to zero every tick and the cursor does not move at all — removing
@@ -525,6 +530,36 @@ void InputBridge::PadLoop() noexcept {
             } else {
                 state.buttons &= ~static_cast<int32_t>(kStart | kBack);
             }
+        }
+
+        // ── A, for the dashboard ────────────────────────────────────────────
+        //
+        // Rising edge only, and only while forwarding is parked. During a
+        // stream this never fires: A belongs to the game, goes out on the wire
+        // with every other button, and the page is not listening anyway.
+        //
+        // Read here rather than from a XAML key handler because XAML never
+        // delivered it. See the note on SetSinks in the header — A is the
+        // console's Accept button and the framework consumes it to invoke
+        // whatever has focus, so a page-level PreviewKeyDown saw GamepadMenu
+        // every time and GamepadA never. This path cannot be consumed by a
+        // control because no control is on it.
+        //
+        // Nothing is stripped from `state.buttons`: the parked branch below
+        // sends nothing at all, so there is no wire copy to worry about, and
+        // while a panel IS open the page ignores this and lets XAML's own copy
+        // of A press the button that has focus.
+        {
+            const bool aNow = (state.buttons & kA) != 0;
+            if (aNow && !aHeld && !m_forwarding.load(std::memory_order_acquire)) {
+                Gesture accept;
+                {
+                    std::lock_guard<std::mutex> guard(m_sinkLock);
+                    accept = m_accept;
+                }
+                if (accept) accept();
+            }
+            aHeld = aNow;
         }
 
         // ── The View-hold gesture is GONE, on purpose ───────────────────────

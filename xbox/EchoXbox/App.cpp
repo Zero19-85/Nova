@@ -13,6 +13,16 @@ using namespace Windows::UI::ViewManagement;
 
 namespace winrt::EchoXbox::implementation
 {
+    namespace
+    {
+        // Set once in OnLaunched, read by the diagnostics screen. A plain bool
+        // rather than an atomic: it is written before the first frame exists and
+        // only ever read from the UI thread afterwards.
+        bool g_nativeScaling = false;
+    }
+
+    bool App::NativeScaling() noexcept { return g_nativeScaling; }
+
     App::App()
     {
         InitializeComponent();
@@ -64,6 +74,28 @@ namespace winrt::EchoXbox::implementation
         ApplicationView::GetForCurrentView().SetDesiredBoundsMode(
             ApplicationViewBoundsMode::UseCoreWindow);
 
+        // ── Native pixels instead of 200% ───────────────────────────────────
+        //
+        // A console hands a XAML app a 1920x1080 LOGICAL view and composes it at
+        // 200%, on the reasonable assumption that an app is read from a sofa and
+        // would otherwise be a wall of small text. The cost is that every size
+        // in the app is doubled before it reaches the panel: a 24 px label is 48
+        // real pixels, a 1 px hairline is 2, and a 4K screen is being used to
+        // display a 1080p layout. That is the "everything looks blown up"
+        // this call fixes.
+        //
+        // `TrySetDisableLayoutScaling` is the documented opt-out, and it is the
+        // scaling equivalent of the bounds-mode call above: both trade a default
+        // that protects a careless app for control this one actually wants. With
+        // it, the view is 3840x2160 logical at 100% and XAML lays out in real
+        // pixels — which is the space `Ion.xaml`'s type ramp is authored in.
+        //
+        // The return value is not ignored and not fatal. It is false on a PC and
+        // on any console that declines, and `MainPage::ApplyChromeScale` handles
+        // that by measuring the view it actually got rather than trusting this
+        // to have worked. Nothing downstream needs to know which happened.
+        g_nativeScaling = ApplicationViewScaling::TrySetDisableLayoutScaling(true);
+
         Frame rootFrame{ nullptr };
         auto content = Window::Current().Content();
         if (content) {
@@ -72,6 +104,14 @@ namespace winrt::EchoXbox::implementation
 
         if (rootFrame == nullptr) {
             rootFrame = Frame();
+            // The Frame is a full-screen rectangle between the CoreWindow and
+            // the Page, and its default ground is the theme's page brush — a
+            // lifted chrome near-black, not #000000. Stated here rather than
+            // left to the theme override in Ion.xaml because this one is the
+            // root of the visual tree: if anything above the Page is going to
+            // put light on a dimming zone, it is this.
+            rootFrame.Background(
+                Media::SolidColorBrush(Windows::UI::Colors::Black()));
             rootFrame.NavigationFailed({ this, &App::OnNavigationFailed });
             Window::Current().Content(rootFrame);
         }

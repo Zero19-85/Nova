@@ -656,19 +656,29 @@ void VideoRenderer::PresentLoop() noexcept {
             // build used: an animation here is indistinguishable from the
             // flashing bug it caused.
             //
-            // Ion Void (#050508), and it must MATCH the XAML ground exactly.
-            // This was 0.043/0.051/0.063 — #0B0D10 — which is both twice as
-            // bright as the page behind it and blue-dominant (R11 G13 B16).
-            // The swap chain covers the whole screen, so that was the app's
-            // real background colour whatever the Page said, and a lifted
-            // blue-leaning near-black is precisely what a television's shadow
-            // handling exaggerates into "the background is blue".
+            // Pure black, and this is THE background of the application.
+            //
+            // Not a figure of speech: the SwapChainPanel is stretched across the
+            // whole window and sits above the Page's own fill, so whatever is
+            // cleared here is what fills every pixel the chrome does not cover.
+            // The Page's Background, the Frame's, and every theme brush behind
+            // them are painted underneath it and never seen. A "the background
+            // is not black" report is answered HERE first and in XAML second.
+            //
+            // It was 5/5/8 — the old Ion Void #050508 — which it was right to
+            // match at the time. The palette is #000000 now for a reason that
+            // makes this line load-bearing rather than cosmetic: a Mini-LED or
+            // OLED panel switches its backlight OFF only for a genuinely black
+            // pixel, and R5 G5 B8 keeps every dimming zone under the UI lit at
+            // its floor. Being blue-dominant on top of that (B8 against R5) is
+            // what a television's shadow handling then exaggerates into a
+            // visibly blue-grey field.
             //
             // The format is B8G8R8A8_UNORM, not _SRGB, so these are written
-            // straight through: 5/255, 5/255, 8/255. If the swap chain ever
-            // becomes an _SRGB format these must be linearised or the field
-            // comes back four times too bright — and blue-tinted again.
-            const float clear[4] = { 5.0f / 255.0f, 5.0f / 255.0f, 8.0f / 255.0f, 1.0f };
+            // straight through. Zero is zero under either encoding, so unlike
+            // the old value this one survives a later move to an _SRGB swap
+            // chain unchanged.
+            const float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             ID3D11RenderTargetView* rtv = m_backBufferView.get();
             m_context->OMSetRenderTargets(1, &rtv, nullptr);
             m_context->ClearRenderTargetView(rtv, clear);

@@ -71,7 +71,15 @@ public:
     // See `echo_set_display` in EchoBridge.h for what makes that safe here.
     bool SetDisplay(uint32_t width, uint32_t height, uint32_t refreshHz) noexcept;
 
+    // End the session and tell the host so. The host tears down and gives back
+    // whatever display it was driving.
     void Close() noexcept;
+
+    // Walk away without telling the host. It detaches and keeps the display
+    // reserved for its grace period, so a reconnect resumes into the same
+    // desktop. The two are a pair, and the difference between them is not an
+    // implementation detail — see `echo_detach`.
+    void Detach() noexcept;
 
     bool IsOpen() const noexcept { return m_handle != 0; }
     uint64_t FramesFed() const noexcept { return m_framesFed.load(std::memory_order_relaxed); }

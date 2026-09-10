@@ -80,7 +80,13 @@
            the generated headers assume conforming two-phase lookup. -->
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalOptions>%(AdditionalOptions) /bigobj /await</AdditionalOptions>
+      <!-- /utf-8 says the sources ARE UTF-8, which they are, and have been.
+           Without it MSVC reads them in the system ANSI code page, so a
+           multi-byte character inside a wide string literal became two wrong
+           characters: an interpunct in a status line arrived on the television
+           as "Â·". Comments were unaffected, which is why it survived — the
+           damage only shows in text the user reads. -->
+      <AdditionalOptions>%(AdditionalOptions) /bigobj /await /utf-8</AdditionalOptions>
       <DisableSpecificWarnings>28204</DisableSpecificWarnings>
       <!-- `_VSDESIGNER_DONT_LOAD_AS_DLL` is NOT optional, and the failure it
            prevents is unhelpful. The XAML compiler's generated

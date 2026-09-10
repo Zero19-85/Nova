@@ -26,6 +26,15 @@
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+// Storyboard/DoubleAnimation, for the app drawer's accordion. The drawer
+// animates a LAYOUT property, so it needs EnableDependentAnimation — see
+// MainPage::AnimateDrawer.
+#include <winrt/Windows.UI.Xaml.Media.Animation.h>
+// KeyRoutedEventArgs, for the A-button gesture handler on MainPage. The whole
+// dashboard is driven from PreviewKeyDown/Up now, so this is not optional.
+#include <winrt/Windows.UI.Xaml.Input.h>
+// VirtualKey — GamepadA and GamepadMenu specifically.
+#include <winrt/Windows.System.h>
 // The toast's accent bar and the dashboard's identity rule are Rectangles, and
 // MainPage.g.h projects them — without this the generated header does not
 // compile, and the error names the generated file rather than this omission.

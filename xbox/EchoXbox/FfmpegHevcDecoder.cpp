@@ -151,14 +151,23 @@ bool FfmpegHevcDecoder::Initialize(ID3D11Device* device, uint32_t width, uint32_
     if (!m_packet || !m_scratch || !m_current) { error = L"av_packet/frame_alloc failed"; return false; }
 
     m_hardware = true;
-    // The name says which FRAME PATH is running, not just which decoder.
+    // The name says which FRAME PATH is running, not just which decoder, and it
+    // is shown on the diagnostics screen and in the overlay's DECODER row.
     //
-    // Worth the few characters: a build with the private copy and one without
-    // are visually identical until the picture has had time to decay, and a
-    // test run against the wrong build is a wasted session and a misleading
-    // result. This line appears on the dashboard and in the overlay's DECODER
-    // row, so "which build is on the console" is answerable in one glance.
-    m_name = L"FFmpeg hevc (D3D11VA, private copy)";
+    // It read "private copy" long after the private copy was gone. That was
+    // worse than a cosmetic slip: the whole reason this string names the frame
+    // path is so somebody reading it off a television knows which pipeline the
+    // console is running, and a stale label answers that question wrongly with
+    // complete confidence. Two builds that differ only in the frame path look
+    // identical until the picture has had time to decay, which is exactly when
+    // the label gets consulted.
+    //
+    // What it describes now is verifiable in one place: `TryGetFrame` hands the
+    // renderer the decoder's own surface, and nothing in this file, HevcDecoder
+    // or VideoRenderer calls CreateTexture2D, CopyResource or
+    // CopySubresourceRegion. Decode block to video processor to back buffer,
+    // untouched. If a copy is ever reintroduced, this string changes with it.
+    m_name = L"FFmpeg hevc (D3D11VA, zero-copy)";
     if (fps) m_name += L" @" + std::to_wstring(fps);
     m_started = true;
     return true;
@@ -350,15 +359,15 @@ bool FfmpegHevcDecoder::TryGetFrame(com_ptr<ID3D11Texture2D>& texture,
     // Handed back as the decoder owns it: `data[0]` is the texture array and
     // `data[1]` the slice inside it, straight into
     // CreateVideoProcessorInputView. Nothing is copied, converted or read
-    // back � the picture goes from the decode block to the screen untouched.
+    // back - the picture goes from the decode block to the screen untouched.
     //
     // The surface is only valid until the next call on this object, which is
     // the contract VideoDecoder.h states and which the renderer honours by
     // blitting before it asks again.
     //
     // The renderer is told the CODED size separately (VideoRenderer::
-    // SetSourceSize) because this texture is allocated at the ALIGNED size �
-    // 1088 rows for a 1080-line stream � and without a source rect the video
+    // SetSourceSize) because this texture is allocated at the ALIGNED size -
+    // 1088 rows for a 1080-line stream - and without a source rect the video
     // processor scales those extra rows of undefined memory onto the screen.
     texture = nullptr;
     texture.copy_from(native);

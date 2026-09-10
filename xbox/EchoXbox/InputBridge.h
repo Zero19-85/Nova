@@ -88,8 +88,31 @@ public:
                std::wstring& error) noexcept;
     void Stop() noexcept;
 
+    // `accept` fires on the rising edge of the A button, and ONLY while
+    // forwarding is parked — so during a stream it never fires and A belongs to
+    // the game, unchanged.
+    //
+    // ── Why the dashboard's A comes from HERE and not from XAML ─────────────
+    //
+    // A is the console's Accept button, and XAML owns it: the framework runs
+    // its own state machine over GamepadA to invoke whatever has focus. On this
+    // hardware a page-level `PreviewKeyDown` never saw the press at all — not
+    // with focus on a host row, not with focus anywhere else — while GamepadMenu
+    // in the same handler arrived every time. Two builds were spent proving that
+    // from the wrong side of the boundary.
+    //
+    // This loop reads `Windows.Gaming.Input` directly at 250 Hz. It is the same
+    // mechanism the Menu+View chord has always used, it predates XAML's focus
+    // entirely, and no control can consume from it. It cannot be eaten by a
+    // ListViewItem because the ListViewItem is not on this path.
+    //
+    // Nothing is suppressed: XAML still gets its own copy of A and still
+    // invokes whatever has focus. That is deliberate and it is what makes menus
+    // keep working — on the bare dashboard there is nothing for A to activate,
+    // and the moment a panel is open the page ignores this sink and lets XAML
+    // do its job.
     void SetSinks(InputSink input, PadSink pad, Gesture overlay,
-                  ModeSink mouseMode = nullptr) noexcept;
+                  ModeSink mouseMode = nullptr, Gesture accept = nullptr) noexcept;
 
     // The panel's logical size, pushed from the UI thread because the input
     // thread cannot read `ActualWidth`. Absolute mouse positions are sent in
@@ -122,6 +145,7 @@ private:
     InputSink m_input;
     PadSink   m_pad;
     Gesture   m_overlay;
+    Gesture   m_accept;
     ModeSink  m_mouseModeSink;
     std::mutex m_sinkLock;
 

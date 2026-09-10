@@ -370,4 +370,20 @@ void EchoSession::Close() noexcept {
     if (m_pump.joinable()) m_pump.join();
 }
 
+void EchoSession::Detach() noexcept {
+    m_running.store(false, std::memory_order_release);
+
+    // Identical shape to Close, with one different bridge call. `echo_detach`
+    // suppresses the goodbye rather than merely skipping the wait for it, so
+    // nothing here has to race anything: by the time this returns the host has
+    // been told nothing at all, and it reaches its own detach path when the
+    // tunnel goes quiet.
+    const uint64_t handle = m_handle;
+    m_handle = 0;
+    if (handle) echo_detach(handle);
+
+    if (m_feed.joinable()) m_feed.join();
+    if (m_pump.joinable()) m_pump.join();
+}
+
 }  // namespace echo

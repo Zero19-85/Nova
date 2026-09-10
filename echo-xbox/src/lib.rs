@@ -980,6 +980,61 @@ pub unsafe extern "C" fn echo_close(handle: u64) {
     }));
 }
 
+/// Leave the session **without telling the host it is over**. Idempotent, and
+/// safe on 0.
+///
+/// This is [`echo_close`] with one thing deliberately left out, and the omission
+/// is the entire feature. `close` waits [`CLOSE_GRACE`] for the session task to
+/// unwind so its `stop_session` reaches the host, and the host answers that by
+/// tearing the session down and handing back the display it was driving.
+/// `detach` instead drops the runtime out from under the task, so no goodbye is
+/// ever sent: the host sees the client go quiet, takes the
+/// `detach_on_disconnect` path, and **holds the virtual display for its detach
+/// grace period** so a reconnect walks back into the same desktop with the same
+/// windows on it.
+///
+/// The client's `stop` watch channel is deliberately NOT signalled here. It
+/// would be the tidy way to wake the task, and it is exactly wrong: signalling
+/// asks the task to shut down gracefully, and a graceful shutdown is what sends
+/// the goodbye. Whether it won the race with the runtime drop would decide
+/// whether the user's monitor came back — so the race is removed rather than
+/// tuned. Blocked callers are woken anyway: the frame queue is closed
+/// explicitly, and the event channel's sender dies with the task.
+///
+/// The counterpart is [`echo_release`], which is how a detached session is
+/// finally ended. The two exist as a pair on purpose — a client that can only
+/// end a session can never leave one running, and a client that can only leave
+/// can never let a monitor go.
+///
+/// # Safety
+/// Same contract as [`echo_close`]: `handle` must be a value returned by
+/// [`echo_connect`] or [`echo_pair`] and not yet closed or detached.
+#[no_mangle]
+pub unsafe extern "C" fn echo_detach(handle: u64) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = EchoHandle::from_raw(handle) else {
+            return;
+        };
+        // Clear the magic first, exactly as close does: from here on every other
+        // entry point answers "not a session" rather than racing the teardown.
+        session.magic = 0;
+        let mut boxed = Box::from_raw(handle as *mut EchoHandle);
+
+        // The one wake-up that is safe to perform: it unblocks C++'s feeder
+        // thread and says nothing to the host.
+        boxed.frames.close();
+
+        // Dropped, never awaited. See the note above.
+        drop(boxed.session.lock().unwrap_or_else(|e| e.into_inner()).take());
+
+        if let Some(runtime) = boxed.runtime.take() {
+            // Shorter than close's two seconds because nothing is being waited
+            // FOR here — this only bounds the blocking tasks' own teardown.
+            runtime.shutdown_timeout(Duration::from_millis(500));
+        }
+    }));
+}
+
 /// Ask the host to end whatever session it is holding for this device.
 ///
 /// **Blocking**, unlike every other entry point here, and deliberately: it is a
@@ -1400,6 +1455,10 @@ mod tests {
             // C++ holds 0 whenever it is idle, and calls close() from a
             // destructor that cannot know whether connect ever succeeded.
             echo_close(0);
+            // Same contract, and the same caller shape: the overlay's "leave the
+            // stream" runs whether or not a session was ever open, and a second
+            // press must be a no-op rather than a second free.
+            echo_detach(0);
         }
     }
 
