@@ -1,10 +1,14 @@
 # HANDOFF — Echo for Xbox (UWP)
 
-**Status (2026-09-09): LIVE ON HARDWARE AT 4K120.** The console discovers the
-host over mDNS, pairs with a PIN, hands itself off into a stream, and decodes
-3840x2160@120 HEVC in hardware onto a headless virtual display, with mouse,
-keyboard and controller reaching the PC. Clean picture, low latency, no
-flashing, no frame backlog.
+**Status (2026-09-10): LIVE ON HARDWARE AT 4K120.** The console discovers the
+host over mDNS, pairs with a PIN, and decodes 3840x2160@120 HEVC in hardware
+onto a headless virtual display, with mouse, keyboard and controller reaching
+the PC. Clean picture, low latency, no flashing, no frame backlog.
+
+The dashboard is **gesture-driven** as of Phase 3 (§13): no Stream or Pair
+buttons, A opens an inline app drawer or launches Virtual Desktop, Start carries
+the menu. **A is read from the pad thread, not from XAML — §13.3, and read it
+before touching any dashboard input.**
 
 120 fps needed FFmpeg driving D3D11VA directly — Media Foundation hands this app
 container no hardware decoder at all (§12.1) — plus a frame queue sized in time
@@ -15,7 +19,7 @@ What is settled, in one place:
 | | |
 |---|---|
 | Stream | 3840x2160 **@120** HEVC, app 5 (headless Virtual Desktop) — §12.2c |
-| Frame rate | 120 via FFmpeg/D3D11VA; the MF path is budget-capped — §12.1, §12.2c |
+| Frame rate | 120 via FFmpeg/D3D11VA; no ceiling is enforced any more — §12.1, §13.7 |
 | Resolution | the console's **HDMI output** size, never the swap chain's — §4b.1 |
 | Present | `SyncInterval 0`, `FLIP_DISCARD`, frame-latency 1, never queue — §4b.3 |
 | Pointer | `CreateCoreIndependentInputSource` on a high-priority pool thread — §6.1 |
@@ -23,9 +27,15 @@ What is settled, in one place:
 | Mouse mode | **client-side**, Menu+View, chord swallowed — §6.3 |
 | Overlay | hold **Menu+View** 700 ms; a tap toggles mouse mode — §6.4, §12.2b |
 | Live re-mode | `echo_set_display` → the Worker's `apply_hot_display_mode` — §4c |
+| Dashboard **A** | from the **pad thread**, never XAML; tap = drawer, tap-tap = Virtual Desktop — §13.3, §13.4 |
+| Dashboard **Start** | the menu: Stop Stream, Stream, Pair, Settings — §13.4 |
+| Leaving a stream | `echo_detach` — the host **holds** its display; only Start → Stop Stream releases it — §13.5 |
+| Pairing | Start menu only, and it does **not** auto-launch — §13.6 |
+| Chrome | authored at 3840x2160, scale **measured** not assumed — §13.2 |
+| Decode ceiling | **deleted** — the panel rate advises, nothing vetoes — §13.7 |
 
-**Not done:** audio in either direction (§5) and HDR10. The Ion dashboard is
-styled but its layout pass is queued for the next session.
+**Not done:** audio in either direction (§5) and HDR10. The mic slider in
+Settings is a deliberate placeholder — §13.9.
 
 **Before touching the video or input path, read §4b.** Four separate blank
 screens paid for the rules in it, and three of them looked like something other
@@ -352,7 +362,15 @@ request would demand four times the pixels the panel can show. That is what
 `HdmiOutcome` exists for. The renderer scales whatever arrives into whatever
 surface XAML gives it, which it was already doing for free.
 
-### 4b.2 The panel's refresh rate is NOT the decodable frame rate
+### 4b.2 The panel's refresh rate is NOT the decodable frame rate — the DIAGNOSIS stands, the CEILING is GONE
+
+**Superseded 2026-09-10, see §13.7.** The pixel-rate budget described below has
+been **deleted from the code**: §12.1 explained the ten blank sessions as Media
+Foundation handing the app container a *software* decoder, so 520M px/s
+described that decoder and never this console. The reasoning is kept because the
+failure mode is real and worth recognising; the mechanism is not. Today the
+panel rate advises and nothing vetoes. `g_maxDecodePixelRate` and
+`DecodableFps` no longer exist — do not go looking for them.
 
 Conflating those two cost **ten consecutive sessions of blank screen**, and the
 host was flawless through every one of them: VDD at 3840x2160@120 primary
@@ -718,14 +736,17 @@ xbox/
     EchoBridge.h                    the ABI, as C sees it
     GamepadInput.h                  WinRT buttons → XInput bits
     App.xaml / App.h / App.cpp      full-bleed opt-in, RequiresPointerMode
-    MainPage.xaml / .h / .cpp       dashboard, overlay, no-video panel
+    MainPage.xaml / .h / .cpp       dashboard, inline app drawer, Start menu,
+                                    settings, diagnostics, overlay,
+                                    no-video panel, the A gestures (§13)
     VideoRenderer.h / .cpp          D3D11 device, composition swap chain,
                                     HDMI mode, present pacing
     HevcDecoder.h / .cpp            the MFT, and the never-queue drain
     HostDiscovery.h / .cpp          DNS-SD; the advertised fp is a LABEL
     EchoSession.h / .cpp            handle, event pump, feeder, hosts.json
     InputBridge.h / .cpp            core-independent pointer, 250 Hz pad,
-                                    mouse mode, the VIEW-hold gesture
+                                    mouse mode, the Menu+View chord, and the
+                                    dashboard A sink (§13.3)
     MainPage.idl                    the only IDL — see the first-build fixes
     pch.h / pch.cpp
     packages.config                 C++/WinRT NuGet
@@ -942,11 +963,11 @@ not.
 
 The port is live and stable. What remains, in the order it is worth doing:
 
-1. ~~**UI styling to match the Android "Ion" dashboard.**~~ Landed 2026-09-08,
-   not yet seen on a TV — see §12.2. The palette and control styling are Ion;
-   what is still worth a pass once it has been looked at from a sofa is the host
-   *rows*, which are built in code and carry no presence badge the way Android's
-   cards do.
+1. ~~**UI styling to match the Android "Ion" dashboard.**~~ Landed 2026-09-08
+   (§12.2) and reworked on hardware across Phase 3 (§13): true black, two
+   accents, a 4K design space, and a gesture-driven dashboard. What is left is
+   the list in §13.9 — the accordion's feel, the drawer's focus path, and
+   confirming the field really is black.
 2. **Audio, both directions.** Milestone 5, and the one with a real design
    question in it: Windows ships an Opus decoder but no encoder, so the mic path
    needs the codec inside the bridge rather than on the platform side. See §5.
@@ -996,16 +1017,20 @@ capability numbers are only useful to somebody who already knows what they
 imply. It runs at startup, lands in the dashboard log, and is repeated in the
 overlay's diagnostics.
 
-Three things came out of writing it:
+Three things came out of writing it. **The first two were deleted on 2026-09-10
+(§13.7)** once this probe had explained the sessions that motivated them; they
+are kept here because the reasoning is what led to the deletion:
 
-1. **`AdoptProbedBudget`** replaces the inferred 520M with the declared number
-   when there is one, and re-decides the frame rate the startup path already
-   picked. It does **not** invent a number when the decoder declares none —
-   silence is not a claim, and the guess stays as visible a guess as it was.
-2. **The overlay's "Decode limit" button** lifts the budget entirely, so 4K120
-   can be tested from a sideload rather than a rebuild. Deliberately not sticky:
-   it lives for the life of the process, because the failure it can produce is a
-   blank screen and nobody should meet that on a launch they did not ask for.
+1. ~~**`AdoptProbedBudget`**~~ replaced the inferred 520M with the declared
+   number when there was one, and re-decided the frame rate the startup path had
+   already picked. It did **not** invent a number when the decoder declared none —
+   silence is not a claim, and the guess stayed as visible a guess as it was.
+2. ~~**The overlay's "Decode limit" button**~~ lifted the budget entirely, so
+   4K120 could be tested from a sideload rather than a rebuild. Deliberately not
+   sticky: it lived for the life of the process, because the failure it could
+   produce is a blank screen and nobody should meet that on a launch they did
+   not ask for. Both are gone now — nothing enforces a ceiling, so there is
+   nothing left to lift.
 3. **`MF_MT_FRAME_RATE` was hard-coded to 60/1** on the input type, commented as
    nominal because it "only helps the decoder size its internal pool". Sizing the
    pool is not nothing — a hardware MFT picks its surfaces and its internal path
@@ -1020,10 +1045,16 @@ producing nothing — the known signature from §4b.2.
 
 ### 12.2 Ion
 
-`Ion.xaml` is a `ResourceDictionary` merged by `App.xaml`, carrying the Android
-`Theme.kt` palette **unchanged** — Void, Carbon, Edge, Ion cyan, Matrix green,
-and the rule that nothing else may be green. The type ramp is deliberately *not*
-carried over: Compose sizes for a phone at 30 cm, this is read at three metres.
+**The palette in this section was replaced on 2026-09-10 — see §13.1 for the
+current one** (pure black, Ion Yellow and Ion Blue). Everything below about
+*technique* still holds; only the colours moved.
+
+`Ion.xaml` is a `ResourceDictionary` merged by `App.xaml`. It originally carried
+the Android `Theme.kt` palette unchanged — Void, Carbon, Edge, Ion cyan, Matrix
+green, and the rule that nothing else may be green. Matrix green and that rule
+survive; the ground and the accent do not. The type ramp is deliberately *not*
+carried over from Compose: it sizes for a phone at 30 cm, this is read at three
+metres — and it is now authored in the 4K design space (§13.2).
 
 The one technique worth knowing: a UWP Button's hover/pressed/focus appearance
 comes from its template's VisualStateManager, which reads **theme resources by
@@ -1151,6 +1182,10 @@ with live resolution and frame-rate switching. What was genuinely missing was
 the mouse-mode control, and the real complaint underneath it — that the chord
 toggles **silently**.
 
+(That "Disconnect" button is now **"Leave the stream"** and it *detaches* rather
+than ending the session — §13.5. The toast below has been generalised into
+`ShowToast` and is used for refusals on the dashboard too.)
+
 Two additions:
 
 - **`MouseModeButton`**, because a chord is not discoverable and a user who hits
@@ -1178,3 +1213,285 @@ pressed.
 Also fixed: `InputBridge.h`'s header comment still said mouse mode was
 implemented host-side and that "this file must not implement it". That was true
 of an earlier draft and had been backwards since 2026-09-07.
+
+---
+## 13. Phase 3 (2026-09-10) — the dashboard becomes gesture-driven
+
+Four rounds of live testing, and the headline is not the styling: **the
+dashboard has no Stream or Pair buttons any more.** A drives launching, Start
+carries everything else, and the two arrive by completely different routes for a
+reason that took three builds to find.
+
+Read §13.3 before touching anything that reads a button on the dashboard.
+
+### 13.1 True black, and where the blue was actually coming from
+
+The palette is `#000000`, not the old `#050508`. That is a functional choice
+before an aesthetic one: a Mini-LED or OLED panel switches a dimming zone **off**
+only for a genuinely black pixel, and a near-black keeps every zone under the UI
+lit at its floor — visible as a grey haze framing the video.
+
+One cyan became two accents with a rule, because a single hue on black gives a
+screen no depth:
+
+| | |
+|---|---|
+| **Ion Yellow** `#FFF200` | WHERE YOU ARE / WHAT YOU CHOSE — focus, selection, the active mode |
+| **Ion Blue** `#2B8CFF` | WHAT IS HAPPENING NOW — live state, telemetry, a value still moving |
+| **Matrix green** | unchanged: THE NETWORK ANSWERED, and nothing else |
+
+The yellow is a *true* yellow rather than the chartreuse that "neon yellow"
+usually means, and that is the Matrix rule doing work: at three metres a
+green-shifted yellow and Matrix green are the same colour.
+
+**The pixels that were reported as blue-grey were not XAML's.** They came from
+the SWAP CHAIN. `VideoRenderer`'s background clear still matched the old palette
+(`RGB(5,5,8)` — and blue-dominant, B8 against R5), and the `SwapChainPanel` is
+stretched across the whole window ABOVE the Page's fill, the Frame's, and every
+theme brush. Whatever that clear paints **is** the app's background wherever the
+chrome does not cover it. A "the background is not black" report is answered
+there first and in XAML second.
+
+The XAML side is now hardened too — `ApplicationPageBackgroundThemeBrush` and
+three sibling page grounds overridden, plus an explicit black on the root
+`Frame`, which sits between the CoreWindow and the Page and had been using the
+theme's lifted near-black. That is defence in depth, not the fix.
+
+### 13.2 The 4K design space
+
+`ApplicationViewScaling::TrySetDisableLayoutScaling(true)` at launch asks the
+console for native pixels instead of a 200%-scaled 1080p view. But the layout
+does **not** trust the answer: `ChromeRoot` is a fixed 3840x2160 canvas whose
+scale is **measured** from the view it actually got (`ApplyChromeScale`), so
+
+- request honoured → view is 3840x2160 logical, scale 1.0, every number lands on
+  the pixel it names;
+- request refused (a PC, an older console, a policy change) → view is 1920x1080,
+  scale 0.5, and the same layout renders at exactly the proportions it would
+  have had anyway.
+
+The bool that call returns says whether the request was *accepted*, which is a
+different question from what the view ended up being. A layout built on the
+first question is wrong, silently, in every case where they disagree.
+
+**The type ramp is 1.6x the old 1080p-space numbers, not 2x.** At 2x the chrome
+would be pixel-identical to before — still enormous — and at 1x it would be half
+the physical size and unreadable from a sofa. 1.6x lands at about 80% of the old
+physical size: denser, more on screen, still above the ten-foot floor (~24 px
+measured in the 1080p space, which is 38 here).
+
+`ChromeRoot` is `HorizontalAlignment="Left" VerticalAlignment="Top"` on purpose —
+a fixed-size child is centred by default, and a 3840-wide child centred in a
+1920-wide parent starts 960 px off the left of the screen. The leftover after
+scaling is taken out by hand in `ApplyChromeScale`, because `RenderTransform`
+does not move layout.
+
+### 13.3 A COMES FROM THE PAD THREAD — read this one
+
+**`GamepadA` is not yours to intercept from XAML.** A is the console's Accept
+button; the framework runs its own state machine over it to invoke whatever has
+focus, and on this hardware a page-level `PreviewKeyDown` **never saw it at
+all** — not with focus on a host row, not with focus on the page, not with the
+press marked handled and not with it left alone.
+
+Three builds were spent on the wrong side of that boundary. What finally named
+it was **which button still worked**: `GamepadMenu` arrived through the *same*
+handler, behind the *same* arming condition, through the *same* intercept, every
+single time. That ruled out the intercept, the condition and the focus rect
+together — the only thing not shared was the key itself.
+
+The fix is `InputBridge`'s existing 250 Hz `Windows.Gaming.Input` poll — the
+same mechanism the Menu+View chord has always used. It predates XAML's focus
+entirely and **no control can consume from it**, because no control is on it.
+`SetSinks` gained an `accept` sink that fires on A's rising edge, and only while
+forwarding is parked, so during a stream A belongs to the game untouched.
+
+Three rules that are load-bearing:
+
+1. **Nothing is suppressed.** XAML still gets its own copy of A and still
+   invokes whatever has focus. That is what keeps menus working — on the bare
+   dashboard there is nothing for A to activate (`IsItemClickEnabled="False"` on
+   the host list), and the moment a panel is open the page ignores the sink and
+   lets XAML press the focused button.
+2. **`FocusInsideDrawer()` is the arbitration.** A on the host list toggles the
+   drawer; A on a tab inside it launches that app. Same physical press, same
+   thread — what it is pointing AT is the only thing that can tell them apart.
+3. **The sink arrives on the PAD THREAD.** `OnPadAccept` hops to the dispatcher
+   before touching a timer or a panel. Getting that wrong is silent, not a
+   crash: `DispatcherTimer` off-thread throws inside a `noexcept` pad loop, and
+   the visible result is a gesture that does nothing.
+
+**Both gestures resolve on the PRESS, never the release.** An earlier build
+queued the outcome on the down edge and executed it on the up edge, and neither
+gesture ever fired — marking a `GamepadA` KeyDown handled is what stops its
+KeyUp from being routed at all. Suppressing a press and then waiting for its
+release asks for an event that the act of suppressing removed. A first press
+arms a 400 ms timer; a second inside the window IS the double tap and fires
+immediately.
+
+**The Diagnostics screen counts both paths**: `A pad N :: A xaml N down / N up`.
+`pad` climbing while `xaml` stays at **zero** is the expected reading and the
+evidence for this whole design. If `pad` does not climb while A is pressed, the
+pad thread is not running or forwarding is on. If `xaml` starts climbing, the
+platform changed and §13.3 needs revisiting.
+
+### 13.4 The gesture map, and the inline drawer
+
+| gesture | unpaired host | paired host |
+|---|---|---|
+| **A** | amber `NOT PAIRED :: press Start` toast | toggle the app drawer |
+| **A A** | same toast | launch Virtual Desktop (app 5) |
+| **Start** | the menu: Stop Stream, Stream, Pair, Settings | same |
+| **B** | unwinds the innermost panel; leaves the app from the bare dashboard | same |
+
+**The drawer is inline, not a flyout.** It lives in its own `Auto` row of
+`SetupRoot` directly under the host card, so the card's `*` row gives up exactly
+the height the drawer takes and the layout genuinely moves. It animates its own
+`Height` (160 ms, ease-out) between 0 and its natural size.
+
+Four things about it are not obvious:
+
+- **The natural height is measured through real layout** — set `Height` to Auto,
+  force a pass, read `ActualHeight` — not by measuring the content by hand. Hand
+  measurement gets the hint line's wrapping wrong, because that depends on the
+  width the row actually gets.
+- **A `Grid` does not clip its children.** Without the `RectangleGeometry` on
+  `AppDrawer.Clip`, resized from `SizeChanged`, the card spills over the hint bar
+  for the whole of a collapse.
+- **`EnableDependentAnimation` is not optional.** `Height` is a layout property;
+  without it the animation silently does nothing and the panel simply appears at
+  its final size, which looks like the code was never called.
+- **Focus deliberately STAYS on the host list when it opens.** That is what lets
+  a second A close it. Down moves into the strip when the user wants it.
+
+Virtual Desktop is deliberately **absent** from the strip: it is what a double
+tap launches, and listing it would make the fast path look like one more equal
+option. The strip is Steam / Xbox / RetroArch / Mirror, each with a description
+that follows the focus rect — because "Mirror" and "Virtual Desktop" sound like
+the same thing and behave completely differently, and somebody picking blind
+gets it wrong about half the time.
+
+The drawer only ever opens for a **paired** host, with a backstop inside
+`ShowAppDrawer` itself: every entry in it launches something, launching needs a
+fingerprint, so for an unpaired host it would be four buttons that all answer
+with the same refusal.
+
+### 13.5 Two-step teardown — `echo_detach` is new, and it is the whole feature
+
+`echo_close` **sends the host a goodbye** (`stop_session`), which the host
+answers by tearing the session down and handing back the display it was driving.
+So before this, every way out of a stream was the destructive one.
+
+New bridge entry point `echo_detach(handle)`: same teardown, minus the wait for
+the session task to unwind, and **the `stop` watch channel is deliberately NOT
+signalled**. Signalling asks the task to shut down gracefully, and a graceful
+shutdown is what sends the goodbye — whether it won the race with the runtime
+drop would decide whether the user's monitor came back, so the race is removed
+rather than tuned. The host sees the client go quiet, takes
+`detach_on_disconnect`, and **holds the virtual display for its detach grace
+period** so a reconnect walks back into the same desktop.
+
+| action | call | host result |
+|---|---|---|
+| overlay → **Leave the stream** | `echo_detach` | detaches, **holds** its display |
+| Start → Stop Stream → **End Stream**, live | `echo_close` | tears down, releases |
+| Start → Stop Stream → **End Stream**, detached | `echo_release` | tears down, releases |
+
+`echo_release` needs no session at all — ending a session never did — which is
+what makes the detached case work when there is no handle left to ask. The
+config used for the stream is kept for exactly this.
+
+Both block, so both run on a pool thread: `echo_close` can take a second and a
+half waiting for the goodbye, and on the UI thread that is a frozen screen at
+the moment somebody is watching for their monitor to come back. **A failed
+release does not clear the held state** — the badge and the confirmation behind
+Start are the only two things pointing at an outstanding session, and clearing
+them would leave a monitor nobody can get back and no sign anything is wrong.
+
+### 13.6 Pairing initiates from Start only, and ends at paired
+
+Two deliberate reversals of earlier behaviour:
+
+- **`BeginPairing` has exactly one caller**, the Start menu's Pair button. The
+  double tap and the app strip no longer fall through to it. Pairing is not a
+  fast action — it opens a session, puts a PIN on the television and asks
+  somebody to walk to another room — and reaching that by mashing A is a worse
+  failure than not reaching it at all.
+- **Pairing no longer auto-launches a stream.** Setup and streaming are two
+  decisions; running them together means a user who wanted to set the console up
+  now owns a live session, a virtual display on the PC, and a teardown to
+  perform before they can do anything else.
+
+`closed` fires whether the handshake succeeded or not, so success is read back
+from what pairing actually **left behind** (`SelectedHostPaired()`) rather than
+assumed from having reached that point. The host list is *rebuilt* rather than
+re-labelled — each row's badge is built from `LoadHostFingerprint` at
+construction, so PAIRED only appears if the rows are made again.
+
+One trap worth keeping in mind: the Start menu's Pair button is gated on
+`CanPair()`, which needs a selected host, and selection follows the focus rect.
+On a freshly-booted console nobody has touched there is no selection — so the
+**only** entry point to pairing would open with its button greyed out, and a
+disabled control cannot take focus on a gamepad. Visible, greyed, unreachable.
+`ShowActionMenu` now selects the first host when none is selected.
+
+### 13.7 The decode ceiling is DELETED
+
+`g_maxDecodePixelRate`, `DecodableFps` and the overlay's "Decode limit" toggle
+are gone — removed, not defaulted off.
+
+520M px/s was drawn through one data point: ten blank 4K120 sessions. §12.1 has
+since **explained** those — Media Foundation handed the app container a software
+HEVC decoder, and a software decoder was never going to do 4K120. The number
+described that decoder, not this console. FFmpeg/D3D11VA is the decoder now,
+4K120 is live, and a ceiling whose only remaining function is to refuse the
+thing the port was built to do is worse than no ceiling.
+
+What survives is the **panel refresh rate, which advises and does not veto** —
+asking for more frames than the TV can show is real waste and worth naming, and
+still the user's call. The decode probe (§12.1) is untouched and still on the
+Diagnostics screen: it was always the honest half of this, a measurement sitting
+next to the guess that used to overrule it.
+
+### 13.8 Four smaller things, each of which cost something
+
+- **`FfmpegHevcDecoder` reported `private copy` long after the copy was gone.**
+  The frame path hands the renderer the decoder's own surface, and
+  `CreateTexture2D` / `CopyResource` / `CopySubresourceRegion` appear **nowhere**
+  in `FfmpegHevcDecoder.cpp`, `HevcDecoder.cpp` or `VideoRenderer.cpp`. That
+  string's entire job is to say which pipeline is on the console; a stale one
+  answers wrongly with total confidence. It reads `zero-copy` now, and the
+  comment above it names what makes the claim checkable.
+- **`/utf-8` added to the vcxproj.** The sources are UTF-8 with no BOM, so MSVC
+  was reading them in the system ANSI code page: a multi-byte character inside a
+  *wide string literal* became two wrong characters, and an interpunct in a
+  status line reached the television as mojibake. Comments were unaffected,
+  which is why it survived — the damage only showed in text the user reads.
+- **`HostList().Focus()` right after appending items does not work.** A ListView
+  creates a row's visual lazily during layout; until then there is no
+  `ListViewItem` to receive focus and `Focus()` returns false. The symptom was a
+  dashboard where the D-pad highlighted nothing, and the tell was the
+  workaround — opening the Start menu and backing out calls the *same* `Focus()`,
+  a second later, and worked every time. `FocusHostList()` forces the layout
+  pass, focuses the **container** rather than the list, and posts one retry at
+  `Low` priority.
+- **XAML-referenced handlers must be `public`.** The generated code is not a
+  friend of the implementation class, so a handler in the private section is a
+  C2248 raised from inside `MainPage.xaml.g.hpp`.
+
+### 13.9 Still not verified on hardware
+
+Everything in §13 was reasoned and compiled, not measured, except where a live
+report is quoted:
+
+- the 160 ms accordion feel, and whether Down out of a single-item ListView
+  lands cleanly on the drawer's tabs;
+- whether the field is now genuinely black. If it is not, the next suspect is
+  the swap chain being created as an `_SRGB` format — zero survives that
+  unchanged, so it would point somewhere else entirely;
+- the mic passthrough slider in Settings is a **placeholder**. It is a real,
+  focusable control with a remembered value that is sent nowhere; the panel says
+  so in words. It is enabled rather than disabled on purpose — a disabled
+  control cannot take focus, so on a console it is invisible to the only input
+  device there is, and the point of putting it in early is to settle the layout
+  and the navigation order before the audio path arrives.
