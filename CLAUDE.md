@@ -90,7 +90,80 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-09-07): **THE XBOX PORT IS LIVE** — and it took three
+## Current Phase (2026-09-21): **INTRA REFRESH IS TIERED BY DPB DEPTH** — and
+the capture-slot stall finally named its culprit
+
+Two changes, both live on the dev box, both from reading logs rather than
+theorising. The stall finding is in the Open section below and **corrects a
+guess this file had been carrying**; the intra-refresh change is here.
+
+### `kEnableIntraRefresh` is gone — the sweep now follows the DPB
+
+The constant is replaced by a per-session decision made in `InitEncoder`,
+immediately beside `g_refFramesInDpb`, because the two must never disagree:
+
+```cpp
+g_intraRefreshActive = (g_refFramesInDpb <= kShallowDpbForIntraRefresh); // 8
+```
+
+- **Shallow DPB — 5 at 4K, 8 for AV1 → sweep ON.** The safety net is back.
+- **Deep DPB — 12, or 16 with `allow_level6_dpb` → sweep OFF.** Unchanged, and
+  for the unchanged reason: RFI demonstrably services ~68% of repairs there with
+  a P-frame, so the sweep would only cost picture.
+
+`[IR]` now logs the reasoning, so a session says which tier it chose and why:
+
+```
+[IR] h264: requested=OFF ... - DPB 16 is the deep tier, so the rolling sweep is not needed (RFI repairs with a P-frame)
+[IR] hevc: requested=ON  ... - DPB 5 is the shallow tier, so the rolling sweep is the repair path of last resort
+```
+
+**This is not a revert of 2026-08-23.** That decision turned the sweep off on
+1440p evidence and explicitly named the condition that would bring it back —
+"the DPB drops back to 5 (4K) AND the IDR fallback proves insufficient". That
+condition came true and was measured; the fix honours the condition rather than
+the conclusion, which is why it is a tier and not a flag flip.
+
+**What it was diagnosed from, because the symptom is worth recognising.** The
+operator reported a small stuck artefact on a 4K120 HEVC Echo session that never
+healed and that **appeared to travel with a window being dragged**. That last
+detail is the whole diagnosis: it is CLIENT-side decode damage, and motion
+compensation drags it along because the encoder predicts the moving window FROM
+the region that is damaged on the client. The host was never at fault — its
+`🎞️ frame N plaintext NALs` were complete throughout, and the session dropped
+zero frames.
+
+**Why 4K specifically could not self-heal:** 4 keyframe requests and 7
+invalidations in a whole session, against the ~198 requests/session that make
+RFI sufficient at 1440p. A 5-frame DPB only spans 5 frames of invalidation, so
+most 4K damage cannot be repaired by re-pointing a reference at all, and under
+an infinite GOP nothing else ever rewrites those macroblocks.
+
+**The generalisable rule:** an artefact that moves WITH dragged content is
+client-side decode damage. One fixed in screen space is the encoder. Check the
+plaintext-NAL line first — it logs before sealing, so it says what the host
+actually emitted (cf. the 2026-08-19 honest-NAL-logging fix).
+
+**The cost, stated honestly:** a band of intra macroblocks on every frame, which
+under CBR is paid for by the content around it — visible on crisp UI edges as a
+faint sweeping line, one pass every ~2.5 s at 120 fps. It is a safety net, not a
+quality feature. It remains wrong to enable it to "improve" a picture.
+
+### `WgcCapturer` could serve a stale frame for a whole session
+
+`try_get_frame`'s in-place pool `Recreate` updated `self.width`/`self.height`
+but left `self.last_frame` at the OLD size. `cache_frame` only ever *allocates*
+when `last_frame` is `None`, so the next `CopyResource` ran against mismatched
+dimensions — which **D3D11 drops silently**, a debug-layer error and no HRESULT.
+The cache then never updated again and `cached_texture()` served the last
+pre-resize frame for the rest of the session. `rebind` had always cleared it for
+exactly this reason; the in-place path had not. Reached whenever the display
+re-modes under a live WGC session — i.e. precisely what the hot
+`SetDisplayMode` added on 2026-09-07 now does.
+
+---
+
+## Previous Phase (2026-09-07): **THE XBOX PORT IS LIVE** — and it took three
 host-side changes, all small
 
 **`HANDOFF_ECHO_XBOX.md` is the authority for the client.** What follows is only
@@ -309,14 +382,26 @@ Tunables at the top of the module: `MAX_SPEED_PX_S`, `DEADZONE`,
 
 ### Open, and what the Xbox port should watch
 
-- **The capture-slot stall.** `⏱️ Capture slot stalled N ms` (worst seen: 405 ms
-  = ~50 frames that never went out). `b778d29` splits the report into
-  `encode N ms, send N ms` so the next occurrence names the culprit. Every stall
-  so far lands while encoder output is LOW (8–603 Kbps), on the throttled
-  keep-alive rather than under load — including both pre-Tier-0 stalls. "Slowest
-  when it has least to do" points at NVENC waking from a downclock rather than at
-  the media pipe, but the split is what will settle it. **Read this before
-  touching rate control.**
+- **The capture-slot stall — SETTLED 2026-09-21, and the guess here was wrong.**
+  The `encode N ms, send N ms` split (`b778d29`) has now named the culprit, and
+  it is **the media pipe, not NVENC**. Both stalls of the 2026-09-21 session:
+  `encode 4 ms, send 216 ms` and `encode 4 ms, send 8914 ms`. Encode is flat at
+  4 ms in both; the entire cost is `send`, which in `lib.rs` is
+  `slot_cost - encode_cost` and contains exactly one thing —
+  `ipc::send_media(&mut media_pipe, MediaMsg::VideoFrame { .. }).await`, an await
+  on the `\\.\pipe\NovaMedia` write to the Master. It is not `RtpSender` (that
+  lives in the Master and never blocks the Worker). The old "slowest when it has
+  least to do ⇒ NVENC downclock" reading is **superseded** — do not act on it.
+  **Both stalls landed on a secure-desktop transition**, the 8.9 s one directly
+  after `🔀 Capture backend: WGC → DDA (secure desktop active)` while the Master
+  was starting the SYSTEM input helper: the Master stops draining the pipe and
+  the Worker blocks behind it. Corroborating, and the reason a stall costs ~1114
+  frames of wall time with no wire-index gap: `Media pipe send failed` = 0 and
+  RTP `queue full` = 0 for the whole session — the pipeline **blocked, it did
+  not shed**. **How to read it next time:** `encode` high ⇒ NVENC/GPU; `send`
+  high ⇒ the Master is not draining `NovaMedia`, so look at what the Master was
+  doing at that instant (input-helper spawn, backend swap, session change), not
+  at rate control.
 - **Tier 1 has never repaired anything**, because nothing has needed repairing
   since Tier 0. It stays unexercised until real loss occurs.
 - **Mouse mode has never seen a physical controller.** The tests cover the toggle

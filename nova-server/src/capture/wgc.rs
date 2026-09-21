@@ -337,6 +337,17 @@ impl WgcCapturer {
         if size.Width as u32 != self.width || size.Height as u32 != self.height {
             self.width  = size.Width  as u32;
             self.height = size.Height as u32;
+            // Drop the cache with the pool. `cache_frame` only ever ALLOCATES
+            // when `last_frame` is None, so a cache left over at the old size
+            // would be handed to `CopyResource` against a new-size pool
+            // texture — a dimension mismatch, which D3D11 drops silently (a
+            // debug-layer error, no HRESULT). The cache would then never
+            // update again, and `try_get_frame`/`cached_texture` would serve
+            // the last pre-resize frame for the rest of the session. `rebind`
+            // already clears it for the same reason; this in-place path is
+            // reached whenever the display re-modes under a live WGC session,
+            // which is exactly what a hot `SetDisplayMode` now does.
+            self.last_frame = None;
             let _ = self.frame_pool.Recreate(
                 &self.wrt_device,
                 Self::pixel_format(self.is_hdr),

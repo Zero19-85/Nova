@@ -308,9 +308,35 @@ static std::atomic<bool>     g_lastFrameLtrRecovery{false};
 // stops requesting repairs, or if the DPB drops back to 5 (4K) AND the IDR
 // fallback proves insufficient. It is a safety net, not a quality feature --
 // do not switch it back on to "improve" a picture.
-static const bool     kEnableIntraRefresh  = false;
+//
+// 2026-09-21: the third condition came true, measured. On a 4K120 HEVC Echo
+// session (DPB 5, the shallow tier) the operator reported a small stuck
+// artefact that never healed and appeared to travel with a window being
+// dragged -- which is what decoder damage looks like once motion compensation
+// starts predicting the moving content FROM the damaged region. The session's
+// repair traffic explains why nothing scrubbed it: 4 keyframe requests and 7
+// invalidations in a whole session, against the ~198 per session that make RFI
+// a sufficient repair path at 1440p. A 5-frame DPB only spans 5 frames of
+// invalidation, so most damage at 4K cannot be repaired by re-pointing a
+// reference at all, and with an infinite GOP nothing else ever touches those
+// macroblocks.
+//
+// So the switch is no longer global: it follows the DPB depth, which is the
+// thing the condition was actually about. Shallow DPB (4K and up, or AV1's 8
+// slots) gets the rolling sweep back as its safety net; the deep tier (<=1440p,
+// 12 or 16 slots) keeps it off, because there RFI demonstrably services ~68% of
+// repairs with a P-frame and the sweep would only cost picture. Set once in
+// InitEncoder beside g_refFramesInDpb -- the two must never disagree.
 static const uint32_t kIntraRefreshPeriod  = 300;
 static const uint32_t kIntraRefreshCnt     = 299;
+
+// DPB depth at or below which the rolling sweep is the repair path of last
+// resort. 5 is the 4K tier; 8 is AV1's ceiling. 12 and 16 are the deep tier.
+static const uint32_t kShallowDpbForIntraRefresh = 8;
+
+// Whether THIS session enabled the sweep. Derived from g_refFramesInDpb in
+// InitEncoder; read by the three codec config blocks and the [IR] log line.
+static bool g_intraRefreshActive = false;
 
 // How many frames' worth of bits the CBR rate controller may hold in its VBV.
 //
@@ -1576,6 +1602,12 @@ extern "C" __declspec(dllexport) int InitEncoder(
     // config blocks below plus InvalidateRefFrames' range check -- they must
     // never disagree, which is why it is computed exactly once, here.
     g_refFramesInDpb = dpb_depth_for_geometry(width, height, codecGuid, g_deepDpbAuthorized);
+    // A shallow DPB cannot span a typical loss, so RFI's P-frame repair mostly
+    // falls through to IDR -- and at 4K an on-demand IDR is both the most
+    // expensive frame in the stream and one this client rarely asks for. Give
+    // those sessions the rolling sweep back as a passive floor. See the
+    // kIntraRefreshPeriod block for the measurement that brought it back.
+    g_intraRefreshActive = (g_refFramesInDpb <= kShallowDpbForIntraRefresh);
 
     ShimLog("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
            codec, is_hdr ? "/HDR10" : "", width, height, bitrate_kbps, fps);
@@ -1725,7 +1757,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             // oscillation that manifests as "pulsing" text.
             h264.enableFillerDataInsertion = kEnableFillerData ? 1 : 0;
             h264.h264VUIParameters = vuiParams;
-            if (kEnableIntraRefresh) {
+            if (g_intraRefreshActive) {
                 h264.enableIntraRefresh      = 1;
                 h264.intraRefreshPeriod      = kIntraRefreshPeriod;
                 h264.intraRefreshCnt         = kIntraRefreshCnt;
@@ -1769,7 +1801,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
                 hevc.hevcVUIParameters.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
                 hevc.hevcVUIParameters.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
             }
-            if (kEnableIntraRefresh) {
+            if (g_intraRefreshActive) {
                 hevc.enableIntraRefresh      = 1;
                 hevc.intraRefreshPeriod      = kIntraRefreshPeriod;
                 hevc.intraRefreshCnt         = kIntraRefreshCnt;
@@ -1813,7 +1845,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
                 av1.matrixCoefficients      = NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 av1.colorRange              = 0;
             }
-            if (kEnableIntraRefresh) {
+            if (g_intraRefreshActive) {
                 // AV1's repair path, and the reason this block exists.
                 //
                 // Nova runs AV1 with idrPeriod = NVENC_INFINITE_GOPLENGTH, and
@@ -1876,11 +1908,16 @@ extern "C" __declspec(dllexport) int InitEncoder(
         // assuming. The capability is reported per codec GUID.
         const bool irSupported = g_nvEncoder->GetCapabilityValue(
                                      codecGuid, NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0;
-        ShimLog("[IR] Intra refresh for %s: cap=%s, requested=%s (period=%u, sweep=%u frames)\n",
+        ShimLog("[IR] Intra refresh for %s: cap=%s, requested=%s (period=%u, sweep=%u frames) "
+                "- DPB %u is the %s tier, so the rolling sweep is %s\n",
                codec, irSupported ? "YES" : "no",
-               kEnableIntraRefresh ? "ON" : "OFF",
-               kIntraRefreshPeriod, kIntraRefreshCnt);
-        if (kEnableIntraRefresh && !irSupported) {
+               g_intraRefreshActive ? "ON" : "OFF",
+               kIntraRefreshPeriod, kIntraRefreshCnt,
+               g_refFramesInDpb,
+               g_intraRefreshActive ? "shallow" : "deep",
+               g_intraRefreshActive ? "the repair path of last resort"
+                                    : "not needed (RFI repairs with a P-frame)");
+        if (g_intraRefreshActive && !irSupported) {
             ShimLog("[IR] WARNING: intra refresh requested but UNSUPPORTED for %s on this GPU "
                     "- this codec has no repair path for lost packets.\n", codec);
         }
