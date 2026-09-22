@@ -57,12 +57,15 @@ struct HdmiOutcome {
 // refresh rate it offers at that size. Blocking — call it from a background
 // thread, never the UI thread. Never throws.
 //
-// `wantHdr` selects which colour space the mode is chosen from and which
-// transfer function is requested. It is a preference, not a guarantee: a
-// console that offers no BT.2020 entry at this size, or refuses `Eotf2084`,
-// comes back with `hdrActive == false` and an SDR picture, which is correct
-// and must not be second-guessed by the caller.
-HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) noexcept;
+// **Does nothing at all when the console is already that size**, which is the
+// common case on a console whose dashboard is set to 4K: touching a mode that
+// is already right cannot improve it and can cost the dynamic range, because
+// every mode request carries a transfer function with it.
+//
+// It never chooses a dynamic range. When the size does have to change it
+// carries the console's CURRENT transfer function through the change;
+// [`RequestHdrMode`] owns that decision, and the two must not undo each other.
+HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept;
 
 // Switch the console's transfer function, leaving resolution and refresh
 // exactly where they are.

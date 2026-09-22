@@ -718,7 +718,7 @@ namespace winrt::EchoXbox::implementation
         // precisely what this call reports. The escape hatch, if HDR ever needs
         // taking out of the picture on a given box, is a hand-written echo.json
         // with "hdr": false -- it replaces the session config verbatim.
-        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight, false);
+        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight);
         Append(L"\nhdmi        " + hstring(hdmi.note));
 
         // Step 2b, and it is SEPARATE on purpose. Resolution and refresh are

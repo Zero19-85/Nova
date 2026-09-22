@@ -63,7 +63,7 @@ static_assert(sizeof(CscConstants) % 16 == 0,
 
 // ── HDMI output mode ────────────────────────────────────────────────────────
 
-HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) noexcept {
+HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
     HdmiOutcome outcome;
     HdmiDisplayInformation hdmi{ nullptr };
     try {
@@ -104,6 +104,42 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
     try {
         auto current = hdmi.GetCurrentDisplayMode();
         const std::wstring before = current ? DescribeMode(current) : L"(unknown)";
+
+        // ── If the console is already the right size, DO NOT TOUCH IT ──────
+        //
+        // This is the whole fix for "HDR only at 60 Hz", and the bug it ends
+        // was self-inflicted (live 2026-09-22: 4K120 HDR on the dashboard,
+        // Echo landing on 4K60 HDR or 4K120 SDR and never both).
+        //
+        // This function used to request a mode unconditionally, and it asked
+        // for an SDR one. On a console whose dashboard is already set to
+        // 4K120 HDR that is actively destructive: it drives the panel OUT of
+        // PQ, and `RequestHdrMode` then has to find a PQ entry at 119.88 Hz to
+        // get back -- which `GetSupportedDisplayModes` does not reliably flag,
+        // so it could not.
+        //
+        // `moonlight-xbox` never hits this because it never requests a mode at
+        // all: `SetDisplayHDR` reads the CURRENT mode and, when the console is
+        // already in HDR, simply resends that same mode with metadata
+        // (`resendCurrentMode`, State/MoonlightClient.cpp:74). It adapts to the
+        // console instead of arguing with it.
+        //
+        // Nova still needs the resolution takeover, because a console WILL sit
+        // at 1080p for something it thinks is an app. But taking it when it is
+        // already correct buys nothing and costs the dynamic range.
+        if (current &&
+            current.ResolutionWidthInRawPixels()  == width &&
+            current.ResolutionHeightInRawPixels() == height) {
+            readBack(outcome);
+            outcome.note = L"already at " + before + L" - left alone";
+            return outcome;
+        }
+
+        // The size is wrong and has to change. Carry the console's CURRENT
+        // dynamic range through that change rather than picking one: this
+        // function moves the resolution, `RequestHdrMode` moves the transfer
+        // function, and neither may undo the other.
+        const bool currentIsPq = current && current.IsSmpte2084Supported();
 
         // Pick the highest refresh rate at the requested size. Refresh is the
         // tie-break rather than bit depth because this is a *latency* path: a
@@ -178,16 +214,15 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
             // 10,000-nit ceiling, which is exactly "blacks go grey, whites
             // blow out".
             //
-            // This function now only takes the RESOLUTION back from the shell,
-            // and it does that in SDR. HDR is a separate second step
-            // (`RequestHdrMode`) that switches transfer function against
-            // whatever mode this one lands on -- which is how `moonlight-xbox`
-            // does it, and the reason is not style. A console asked for a
-            // resolution, a refresh AND a transfer function in one call can
-            // refuse the whole request for any one of them, and it does not
-            // say which. Asking for one thing at a time means a refusal names
-            // itself.
-            if (isPq != wantHdr) continue;
+            // Match whatever the console is ALREADY doing, rather than
+            // forcing a transfer function here.
+            //
+            // This read `isPq != wantHdr` with wantHdr false, i.e. "always
+            // pick an SDR mode" -- which dragged a console that was happily in
+            // HDR down into SDR just to change resolution. This function's job
+            // is the RESOLUTION; `RequestHdrMode` owns the dynamic range, and
+            // the two must not fight over it.
+            if (isPq != currentIsPq) continue;
             const bool better = mode.RefreshRate() > bestRefresh;
             if (better) {
                 bestRefresh = mode.RefreshRate();
@@ -276,10 +311,9 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
             // Worth a line of its own: the picture is now riding on the
             // requested transfer actually being honoured. If a washed-out
             // report ever survives this fix, this is the note that says why.
-            outcome.note = wantHdr
-                ? L"no BT2020 entry at this size - took a Rec.709 one: "
-                : L"no Rec.709 entry at this size - took the BT2020 one "
-                  L"and asked for an SDR transfer: ";
+            outcome.note = currentIsPq
+                ? L"no PQ entry at this size - took a Rec.709 one: "
+                : L"no Rec.709 entry at this size - took a PQ one: ";
         }
 
         // `Eotf2084` for HDR, `None` for SDR, and never anything else --
@@ -291,7 +325,7 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
         // a session that asks the host for PQ on the strength of a successful
         // call is exactly the washed-out picture this whole path exists to end.
         const HdmiDisplayHdrOption wanted =
-            wantHdr ? HdmiDisplayHdrOption::Eotf2084 : HdmiDisplayHdrOption::None;
+            currentIsPq ? HdmiDisplayHdrOption::Eotf2084 : HdmiDisplayHdrOption::None;
 
         bool applied = attempt(wanted);
         if (!applied) {
@@ -345,9 +379,19 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         auto current = hdmi.GetCurrentDisplayMode();
         if (!current) { note = L"no current display mode"; return false; }
 
+        // ── Already there: RESEND the current mode, do not search ──────────
+        //
+        // `moonlight-xbox`'s `resendCurrentMode` (State/MoonlightClient.cpp:74),
+        // and on a console whose dashboard is set to 4K120 HDR this is the ONLY
+        // branch that ever runs. It is why moonlight reaches 4K120 HDR10 on
+        // hardware where a mode search cannot: it never performs one. The
+        // resend exists to push our mastering metadata to the TV -- the mode
+        // itself is already right.
+        bool resendCurrentMode = false;
         if (current.IsSmpte2084Supported() == enable) {
-            note = enable ? L"already in HDR" : L"already in SDR";
-            return enable;
+            if (!enable) { note = L"already in SDR"; return false; }
+            resendCurrentMode = true;
+            note = L"already in HDR - resending with metadata: ";
         }
 
         // The mode that differs from the current one ONLY in PQ support.
@@ -370,50 +414,40 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // moonlight matches width, height, refresh and non-stereo, and nothing
         // else, for the same reason.
         HdmiDisplayMode target{ nullptr };
-        for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-            if (mode.IsSmpte2084Supported() == enable &&
-                mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
-                mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels() &&
-                !mode.StereoEnabled() &&
-                std::fabs(mode.RefreshRate() - current.RefreshRate()) <= 0.00001) {
-                target = mode;
-                break;
-            }
-        }
-
-        // ── Second pass: keep the resolution, give up the refresh ──────────
-        //
-        // A console can support 4K120 and 4K HDR without supporting both at
-        // once -- 10-bit at 120 Hz needs bandwidth that 8-bit at 120 Hz does
-        // not. moonlight never meets this because it never asks for a refresh
-        // rate; Nova does, so it can land on a mode with no PQ counterpart.
-        //
-        // Dropping refresh to get HDR is a real trade and it is made here
-        // deliberately, because the operator asked for true HDR10 explicitly.
-        // It is reported in the note rather than made quietly: a session that
-        // silently halves its frame rate is worse than one that says so.
-        bool refreshGivenUp = false;
-        if (!target && enable) {
-            double bestRefresh = 0.0;
+        if (resendCurrentMode) {
+            target = current;
+        } else {
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (mode.IsSmpte2084Supported() &&
+                if (mode.IsSmpte2084Supported() == enable &&
                     mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
                     mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels() &&
                     !mode.StereoEnabled() &&
-                    mode.RefreshRate() > bestRefresh) {
-                    bestRefresh = mode.RefreshRate();
+                    std::fabs(mode.RefreshRate() - current.RefreshRate()) <= 0.00001) {
                     target = mode;
+                    break;
                 }
             }
-            if (target) {
-                refreshGivenUp = true;
-                note = L"no PQ mode at this refresh - dropping to ";
-                wchar_t hz[32]{};
-                swprintf_s(hz, L"%.2f Hz: ", bestRefresh);
-                note += hz;
-            }
         }
-        (void)refreshGivenUp;
+
+        // ── Last resort: ask on the CURRENT mode anyway ────────────────────
+        //
+        // `GetSupportedDisplayModes` is not reliable about `IsSmpte2084Supported`
+        // at high refresh rates: a console that streams 4K120 HDR natively can
+        // still enumerate its 119.88 Hz entries with the flag clear, so a
+        // search finds nothing while the OS would accept the command happily.
+        //
+        // Dropping to 60 Hz to satisfy that enumeration was the previous
+        // behaviour and it was the wrong trade -- it gave up half the frame
+        // rate on the strength of a flag the console contradicts in practice.
+        // Asking on the current mode costs one refused call when the flag is
+        // honest, and wins 4K120 HDR when it is not. The read-back below
+        // decides which happened, so a refusal cannot be mistaken for success.
+        bool speculative = false;
+        if (!target && enable) {
+            target = current;
+            speculative = true;
+            note = L"no PQ mode enumerated at this refresh - asking on the current mode anyway: ";
+        }
 
         if (!target) {
             // The mode table, because this is the one failure where "this TV
@@ -483,7 +517,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             // of the mode or the transfer function.
             try {
                 applied = hdmi.RequestSetCurrentDisplayModeAsync(target, option).get();
-                if (applied) note = L"(accepted without 2086 metadata) ";
+                if (applied) note += L"(accepted without 2086 metadata) ";
             } catch (...) {
                 applied = false;
             }
@@ -499,6 +533,13 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         note += applied ? (L"set " + DescribeMode(target))
                         : (L"console refused " + DescribeMode(target));
         note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
+        if (speculative && nowPq) {
+            // Worth recording loudly: the console accepted PQ on a mode its
+            // own enumeration said could not do it. That is the API quirk,
+            // confirmed rather than assumed, and it is why the 60 Hz fallback
+            // is gone.
+            note += L"  (enumeration said this mode had no PQ - it was wrong)";
+        }
         return nowPq;
     } catch (hresult_error const& e) {
         note = std::wstring(L"HDR mode request failed: ") + e.message().c_str();
