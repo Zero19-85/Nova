@@ -89,13 +89,29 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
         // rather than as an obviously broken picture.
         //
         // When HDR10 lands, this becomes a real choice rather than a filter.
+        // Two candidates, not one, and the second is what stops this fix from
+        // costing a resolution. A console may offer a size ONLY as a BT2020
+        // entry; filtering those out unconditionally would then find nothing
+        // and leave the console wherever it was -- trading a washed-out 4K
+        // picture for a correct 1080p one, which is not the trade being asked
+        // for. So: take the best Rec.709 mode when one exists, and otherwise
+        // fall back to the best mode of any colour space and lean on
+        // `HdmiDisplayHdrOption::None` below to drive it with an SDR transfer.
+        // `outcome.note` says which of the two happened, because "picked an
+        // SDR mode" and "picked a BT2020 entry and asked for SDR anyway" fail
+        // differently and must not look identical in the log.
         HdmiDisplayMode best{ nullptr };
         double bestRefresh = 0.0;
-        bool bestIsSdr = false;
+        HdmiDisplayMode bestAny{ nullptr };
+        double bestAnyRefresh = 0.0;
         for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
             if (mode.ResolutionWidthInRawPixels() != width ||
                 mode.ResolutionHeightInRawPixels() != height) {
                 continue;
+            }
+            if (mode.RefreshRate() > bestAnyRefresh) {
+                bestAnyRefresh = mode.RefreshRate();
+                bestAny = mode;
             }
             // There is no `IsSdr`. The colour space is the classification:
             // BT2020 is the wide-gamut entry the console pairs with PQ, and
@@ -103,13 +119,37 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
             // actually renders.
             const bool isSdr =
                 mode.ColorSpace() != HdmiDisplayColorSpace::BT2020;
-            const bool better = mode.RefreshRate() > bestRefresh ||
-                                (mode.RefreshRate() == bestRefresh && isSdr && !bestIsSdr);
+            // A HARD FILTER, not a tie-break -- and that distinction is the
+            // whole bug (reported 2026-09-22 as "overly white, blacks grey").
+            //
+            // This used to prefer SDR only at EQUAL refresh. Consoles do not
+            // offer the two variants symmetrically: where the BT2020 entry
+            // carries a refresh the Rec.709 entry does not, the old test took
+            // the higher number and drove the panel in BT.2020 PQ while this
+            // pipeline kept sending Rec.709. Feeding sRGB values down a PQ
+            // transfer lifts near-black off the floor and pushes highlights
+            // toward PQ's 10,000-nit ceiling, which is precisely "blacks go
+            // grey, whites blow out" -- the failure the comment above already
+            // described, arrived at through the one path it left open.
+            //
+            // Refusing the mode outright can cost a refresh rate. That is the
+            // correct trade while the pipeline is Rec.709 end to end: a
+            // correct picture at 60 Hz beats a washed-out one at 120. When the
+            // HDR10 path lands this becomes a real choice again -- see the
+            // colour-space block in CreateResources.
+            if (!isSdr) continue;
+            const bool better = mode.RefreshRate() > bestRefresh;
             if (better) {
                 bestRefresh = mode.RefreshRate();
-                bestIsSdr = isSdr;
                 best = mode;
             }
+        }
+
+        // No Rec.709 entry at this size: keep the resolution, and say so.
+        bool tookWideGamutEntry = false;
+        if (!best && bestAny) {
+            best = bestAny;
+            tookWideGamutEntry = true;
         }
 
         // Every refresh rate offered at the requested size, listed once.
@@ -182,6 +222,14 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
             }
         };
 
+        if (tookWideGamutEntry) {
+            // Worth a line of its own: the picture is now riding on `None`
+            // actually being honoured. If a washed-out report ever survives
+            // this fix, this is the note that says why.
+            outcome.note = L"no Rec.709 entry at this size - took the BT2020 one "
+                           L"and asked for an SDR transfer: ";
+        }
+
         bool applied = attempt(HdmiDisplayHdrOption::None);
         if (!applied) {
             // The overload without an HDR option at all: let the console keep
@@ -189,7 +237,10 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
             // function is a far better trade than losing the resolution.
             try {
                 applied = hdmi.RequestSetCurrentDisplayModeAsync(best).get();
-                if (applied) outcome.note = L"HDR option refused - took the mode as offered: ";
+                // `+=`, not `=`: the wide-gamut-fallback note above must not be
+                // overwritten here. Both facts matter, and together they are
+                // the exact combination that can still wash the picture out.
+                if (applied) outcome.note += L"HDR option refused - took the mode as offered: ";
             } catch (...) {
                 applied = false;
             }
@@ -346,7 +397,24 @@ DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
         DXGI_SWAP_CHAIN_DESC1 desc{};
         desc.Width  = width;
         desc.Height = height;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // 10-bit, matching `moonlight-xbox` (`Common/DeviceResources.cpp:59`,
+        // `m_backBufferFormat(DXGI_FORMAT_R10G10B10A2_UNORM) // 10-bit for HDR`),
+        // which uses it unconditionally for SDR and HDR alike.
+        //
+        // It earns its place before HDR10 exists here. The video processor
+        // writes Rec.709 RGB into this buffer at 8 bits per channel today, and
+        // 8-bit is where near-black banding in a dark UI comes from; 10-bit
+        // costs one extra byte per pixel of bandwidth and nothing in latency.
+        // It is also a precondition for ever declaring a PQ colour space,
+        // because DXGI will not accept `RGB_FULL_G2084_NONE_P2020` on an 8-bit
+        // swap chain -- so adopting it now removes a step from the HDR work
+        // rather than adding one.
+        //
+        // `CreateSwapChainSurfaces` asks for a render-target view with a null
+        // desc, which takes the buffer's own format, and the clear colour is
+        // (0,0,0,1) -- zero is zero under either format. Nothing else in this
+        // file names the back-buffer format, so this is the only line to change.
+        desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
@@ -370,6 +438,14 @@ DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
             hr = factory->CreateSwapChainForComposition(m_device.get(), &desc, nullptr,
                                                         swapChain1.put());
         }
+        if (FAILED(hr) && desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            // 10-bit composition swap chains are not universally creatable.
+            // The picture matters more than the extra two bits, so fall back
+            // to the format this shipped with rather than failing outright.
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            hr = factory->CreateSwapChainForComposition(m_device.get(), &desc, nullptr,
+                                                        swapChain1.put());
+        }
         if (FAILED(hr)) {
             wchar_t buf[96]{};
             swprintf_s(buf, L"CreateSwapChainForComposition failed: 0x%08X", static_cast<unsigned>(hr));
@@ -378,6 +454,37 @@ DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
         }
 
         m_swapChain = swapChain1.as<IDXGISwapChain2>();
+
+        // ── Declare the colour space, which nothing here ever did ───────────
+        //
+        // Without this the swap chain carries DXGI's default,
+        // `RGB_FULL_G22_NONE_P709`, by assumption rather than by statement --
+        // and an assumption is exactly what fails when the console is already
+        // being driven in BT.2020 PQ (Moonlight sets `Eotf2084` and the
+        // console can still be in it when this app starts). Saying it
+        // explicitly is what lets the compositor convert instead of passing
+        // Rec.709 values down a PQ transfer.
+        //
+        // `moonlight-xbox` does this in `Streaming/VideoRenderer.cpp:161-181`,
+        // and the shape is copied from it deliberately: check first with
+        // `CheckColorSpaceSupport` for the PRESENT flag, and only then set.
+        // An unchecked `SetColorSpace1` is a hard failure on a swap chain that
+        // cannot honour the space, and losing the picture to a colour-accuracy
+        // call would be a bad trade.
+        //
+        // SDR today. When the HDR10 path lands, this same call takes
+        // `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` instead, chosen from
+        // the stream's transfer characteristics the way moonlight chooses it
+        // from `frame->color_trc`.
+        if (auto swapChain3 = m_swapChain.try_as<IDXGISwapChain3>()) {
+            const DXGI_COLOR_SPACE_TYPE space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            UINT support = 0;
+            if (SUCCEEDED(swapChain3->CheckColorSpaceSupport(space, &support)) &&
+                (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+                swapChain3->SetColorSpace1(space);
+            }
+        }
+
         m_swapChain->SetMaximumFrameLatency(1);
         m_frameLatencyWaitable.attach(m_swapChain->GetFrameLatencyWaitableObject());
 
