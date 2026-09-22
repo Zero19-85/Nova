@@ -227,6 +227,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Compiled shader bytecode, packaged as content and loaded at runtime.
+         NOT <FxCompile>: this project targets UWP, where D3DCompile is
+         unavailable, so the HLSL is compiled ahead of time by build-app.ps1
+         and only the .cso ships. The .hlsl sources sit beside them in the repo
+         and are deliberately NOT packaged: they are the source of truth for a
+         human, not for the app. moonlight-xbox ships pre-built .fxc the same
+         way and for the same reason. -->
+    <None Include="Assets\Shader\echo_video_vertex.cso">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="Assets\Shader\echo_video_pixel.cso">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
     <Image Include="Assets\SplashScreen.png" />
     <Image Include="Assets\Square150x150Logo.png" />
     <Image Include="Assets\Square44x44Logo.png" />

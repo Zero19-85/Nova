@@ -1100,6 +1100,11 @@ fn start_session(config_json: &str) -> Result<u64, String> {
             .get("bitrate_kbps")
             .and_then(|v| v.as_u64())
             .unwrap_or(defaults.bitrate_kbps as u64) as u32,
+        // Absent means SDR, matching the host's own default. The app sets it
+        // from what the CONSOLE can actually output, not from a preference:
+        // asking for PQ on a panel that cannot present it buys nothing and
+        // costs the accuracy of the SDR path.
+        hdr: cfg.get("hdr").and_then(|v| v.as_bool()).unwrap_or(defaults.hdr),
         // Which app the session opens into. Absent means Desktop, matching the
         // host's own default.
         app_id: cfg.get("app_id").and_then(|v| v.as_u64()).unwrap_or(defaults.app_id as u64) as u32,

@@ -33,6 +33,31 @@
 
 namespace echo {
 
+// What the renderer must know to turn YCbCr into RGB correctly.
+//
+// Read from the STREAM rather than assumed from the session, which is the
+// thing that makes the colour conversion honest. Nova's host has a fixed
+// convention today -- SDR is BT.709 limited range, HDR is BT.2020 PQ FULL
+// range (`videoFullRangeFlag = is_hdr ? 1 : 0` in the shim) -- and it would be
+// less code to hardcode that here. It would also be wrong the first time
+// either side changed, and silently: a range mismatch does not fail, it just
+// lifts the blacks. `moonlight-xbox` derives all of this per frame from the
+// AVFrame (`getFramePremultipliedCscConstants`) and this mirrors it.
+struct FrameColor {
+    // 8 for NV12, 10 for P010. Drives the offsets and scaling, not the
+    // sampling: a P010 SRV is R16_UNORM and normalises to [0,1] either way.
+    int  bitsPerChannel = 8;
+    // AVCOL_RANGE_JPEG. Limited (16-235) is the SDR default and full is what
+    // Nova sends for HDR, which is precisely why this cannot be a constant.
+    bool fullRange = false;
+    enum class Matrix { Bt601, Bt709, Bt2020 };
+    Matrix matrix = Matrix::Bt709;
+    // AVCOL_TRC_SMPTE2084. The renderer needs this separately from the matrix
+    // because it selects the SWAP CHAIN's colour space, and a BT.2020 stream
+    // is not necessarily PQ.
+    bool pq = false;
+};
+
 class VideoDecoder {
 public:
     virtual ~VideoDecoder() = default;
@@ -49,6 +74,11 @@ public:
     // ownership.
     virtual bool TryGetFrame(winrt::com_ptr<ID3D11Texture2D>& texture,
                              uint32_t& subresource) noexcept = 0;
+
+    /// Colour description of the picture the last `TryGetFrame` handed back.
+    /// Defaulted rather than pure: the Media Foundation path decodes SDR only,
+    /// and BT.709 limited 8-bit is exactly what it produces.
+    virtual FrameColor LastFrameColor() const noexcept { return {}; }
 
     virtual void Shutdown() noexcept = 0;
 

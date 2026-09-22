@@ -708,8 +708,21 @@ namespace winrt::EchoXbox::implementation
         //    chain exists: the request is what makes the composition scale
         //    report 2.0, and the swap chain is sized from that.
         SetStatus(L"requesting 4K output...");
-        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight);
+        // HDR is ASKED FOR here and DECIDED by the read-back. A console with no
+        // BT.2020 entry at this size, or one that refuses `Eotf2084`, falls
+        // through to the Rec.709 path with `hdrActive == false` and streams SDR
+        // exactly as before -- the request costs nothing when it cannot be met.
+        //
+        // Asked for unconditionally rather than from a setting because the
+        // honest input to the decision is what the CONSOLE can output, which is
+        // precisely what this call reports. The escape hatch, if HDR ever needs
+        // taking out of the picture on a given box, is a hand-written echo.json
+        // with "hdr": false -- it replaces the session config verbatim.
+        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight, true);
+        m_hdrActive = hdmi.hdrActive;
         Append(L"\nhdmi        " + hstring(hdmi.note));
+        Append(L"\ndynamic rng " + hstring(m_hdrActive ? L"HDR10 (BT.2020 PQ)"
+                                                       : L"SDR (Rec.709)"));
         // Kept, because this is the line that answers "what is the TV actually
         // being driven at" and the startup log scrolls away long before anyone
         // needs it. It belongs beside the counters, not in history.
@@ -1461,7 +1474,7 @@ namespace winrt::EchoXbox::implementation
                    std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp));
             config = echo::BuildConnectConfig(m_stateDir, host, fingerprint,
                                               res, m_streamFps, kStreamBitrate,
-                                              m_selectedApp);
+                                              m_selectedApp, m_hdrActive);
         }
 
         m_session->Close();
@@ -1788,6 +1801,11 @@ namespace winrt::EchoXbox::implementation
                 // mid-session and the decoder learns the new size before
                 // anything else does.
                 renderer->SetSourceSize(decoder->Width(), decoder->Height());
+                // How to convert it, read off the stream rather than assumed.
+                // Pushed per frame for the same reason the size is: an HDR
+                // session and an SDR one differ in range as well as matrix,
+                // and the decoder is what knows which arrived.
+                renderer->SetFrameColor(decoder->LastFrameColor());
                 return true;
             });
 

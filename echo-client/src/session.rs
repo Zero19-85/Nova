@@ -483,6 +483,20 @@ pub struct StreamOptions {
     pub fps: u32,
     pub codec: String,
     pub bitrate_kbps: u32,
+    /// Ask for HEVC Main10 / BT.2020 PQ instead of BT.709 SDR.
+    ///
+    /// **A claim about this client's RENDERER, not about its decoder.** Any
+    /// HEVC Main10 decoder will produce pictures from an HDR stream; what
+    /// decides whether they look right is whether the far end declares a PQ
+    /// colour space to its display and converts with a full-range BT.2020
+    /// matrix. A client that sets this without doing both gets a washed-out
+    /// picture and no error anywhere — which is exactly how the Xbox client
+    /// spent a session looking broken while the host was correct.
+    ///
+    /// Note the range asymmetry it commits to: Nova encodes SDR at LIMITED
+    /// range and HDR at FULL range (`videoFullRangeFlag = is_hdr ? 1 : 0`), so
+    /// turning this on changes the conversion, not just the transfer curve.
+    pub hdr: bool,
     /// Which Nova app the session opens into — `app_launcher::APP_ID_*`,
     /// where 1 is Desktop.
     ///
@@ -524,6 +538,10 @@ impl Default for StreamOptions {
             fps: 60,
             codec: "hevc".into(),
             bitrate_kbps: 20000,
+            // SDR by default: a client that has not said it can render PQ
+            // should not be handed PQ, and every caller that can render it
+            // knows so at the point it builds these options.
+            hdr: false,
             app_id: 1,
             control: None,
             // Say goodbye, which is what a one-shot caller means by returning.
@@ -1020,6 +1038,12 @@ async fn stream_inner(
     params.insert("codec".into(), json!(opts.codec));
     params.insert("bitrate_kbps".into(), json!(opts.bitrate_kbps));
     params.insert("app_id".into(), json!(opts.app_id));
+    // Sent unconditionally, including when false. The host defaults `hdr` to
+    // false when the key is absent, so omitting it would mean the same thing —
+    // but a request that states its dynamic range is one whose log line says
+    // what the client asked for, and "absent means SDR" is a convention only
+    // one side of the wire can see.
+    params.insert("hdr".into(), json!(opts.hdr));
 
     let grant = match ctl.call("start_session", params).await {
         Ok(g) => g,

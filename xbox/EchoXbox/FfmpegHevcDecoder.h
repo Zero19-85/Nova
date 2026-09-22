@@ -67,6 +67,8 @@ public:
                      uint32_t& subresource) noexcept override;
     void Shutdown() noexcept override;
 
+    FrameColor LastFrameColor() const noexcept override { return m_colour; }
+
     uint32_t Width()  const noexcept override { return m_width; }
     uint32_t Height() const noexcept override { return m_height; }
     const wchar_t* Name() const noexcept override { return m_name.c_str(); }
@@ -109,6 +111,11 @@ private:
     std::wstring m_name = L"(none)";
     bool     m_hardware = false;
     bool     m_started  = false;
+    /// Colour of the picture most recently handed to the renderer. Written in
+    /// TryGetFrame under m_lock, read on the render thread; a torn read would
+    /// at worst mis-describe one frame, and the fields only change on a
+    /// codec/range switch, which is already a keyframe boundary.
+    FrameColor m_colour{};
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint64_t m_decoded = 0;

@@ -98,6 +98,32 @@ $msbuildArgs = @(
     "/nologo"
 )
 
+# ---- Shaders -------------------------------------------------------------
+#
+# Compiled here rather than by the project, because UWP has no runtime HLSL
+# compiler: D3DCompile is not in the app-container surface, so the bytecode has
+# to exist before the app does. The .cso files are packaged as content (see the
+# <None DeploymentContent> entries in the .vcxproj) and the .hlsl sources ship
+# nowhere -- they are the source of truth for a human.
+#
+# Always recompiled, never timestamp-checked: two shaders take milliseconds,
+# and a stale .cso silently rendering last week's colour conversion is the kind
+# of failure that costs an evening to even notice.
+$shaderDir = Join-Path $PSScriptRoot "EchoXbox\Assets\Shader"
+$fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse -ErrorAction SilentlyContinue |
+       Where-Object { $_.FullName -match '\\x64\\' } |
+       Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $fxc) { throw "fxc.exe not found. Install the Windows SDK." }
+
+Write-Host "`nshaders..." -ForegroundColor DarkGray
+foreach ($s in @(@{n="echo_video_vertex"; t="vs_5_0"}, @{n="echo_video_pixel"; t="ps_5_0"})) {
+    $src = Join-Path $shaderDir "$($s.n).hlsl"
+    $out = Join-Path $shaderDir "$($s.n).cso"
+    & $fxc.FullName /nologo /T $($s.t) /E main /O3 /Fo $out $src
+    if ($LASTEXITCODE -ne 0) { throw "fxc failed on $($s.n).hlsl" }
+    Write-Host "  $($s.n).cso" -ForegroundColor DarkGray
+}
+
 Write-Host "`nbuilding..." -ForegroundColor DarkGray
 & $msbuild @msbuildArgs
 if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }

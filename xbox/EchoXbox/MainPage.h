@@ -252,6 +252,10 @@ namespace winrt::EchoXbox::implementation
 
         // What RequestBestHdmiMode reported, kept for the diagnostics screen.
         std::wstring m_hdmiNote;
+        // Whether the console is actually being driven in BT.2020 PQ, read back
+        // from it at startup. This is what decides whether the session asks the
+        // host for HDR -- never a preference, never the request.
+        bool m_hdrActive = false;
 
         // What we ask the host to encode. Starts at the console's real output
         // size and is whatever the overlay last chose after that.

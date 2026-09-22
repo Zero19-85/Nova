@@ -154,7 +154,8 @@ std::string BuildConnectConfig(std::string const& identityDir,
                                DiscoveredHost const& host,
                                std::string const& hostFingerprint,
                                std::string const& res, uint32_t fps,
-                               uint32_t bitrateKbps, uint32_t appId) noexcept {
+                               uint32_t bitrateKbps, uint32_t appId,
+                               bool hdr) noexcept {
     std::string json = "{";
     json += "\"identity_dir\":\"" + Escape(identityDir) + "\",";
     json += "\"relay_url\":\"" + Escape(Narrow(host.relayUrl)) + "\",";
@@ -164,6 +165,11 @@ std::string BuildConnectConfig(std::string const& identityDir,
     json += "\"res\":\"" + Escape(res) + "\",";
     json += "\"fps\":" + std::to_string(fps) + ",";
     json += "\"codec\":\"hevc\",";
+    // A claim about this CLIENT, not a preference: it says the console is
+    // being driven in BT.2020 PQ and the renderer will convert for it. The
+    // host answers HEVC Main10 at FULL range, so asking for it without both
+    // halves in place produces a washed-out picture and no error anywhere.
+    json += std::string("\"hdr\":") + (hdr ? "true," : "false,");
     json += "\"bitrate_kbps\":" + std::to_string(bitrateKbps) + ",";
     // App 5 ("Virtual Desktop") is the HEADLESS one, and this single field is
     // what decides whether the console gets its own monitor or a mirror of the

@@ -33,11 +33,60 @@ std::wstring Err(const wchar_t* what, int code) {
 // looks exactly like a console that is merely slow. Returning AV_PIX_FMT_NONE
 // when D3D11 is not on offer is deliberate: a hard failure at startup is worth
 // far more than a stream that quietly runs on the CPU.
-AVPixelFormat PickD3D11(AVCodecContext*, const AVPixelFormat* formats) {
+// ── Why this allocates the frame pool by hand ───────────────────────────────
+//
+// Returning the format and letting avcodec build the pool is the short version
+// of this function, and it is what shipped while the renderer used a video
+// processor: `ID3D11VideoProcessorInputView` is legal on a texture created
+// with `D3D11_BIND_DECODER` alone, so nothing more was needed.
+//
+// A pixel shader needs a `ShaderResourceView`, and that is NOT legal on a
+// decode-only texture. FFmpeg's default pool sets `BindFlags = D3D11_BIND_DECODER`
+// and nothing else, so `CreateShaderResourceView` on one fails with
+// E_INVALIDARG -- the picture simply never appears, with no decode error to
+// find, because the decoder was working perfectly the whole time.
+//
+// `avcodec_get_hw_frames_parameters` hands back the pool avcodec WOULD have
+// built, before it is initialised, which is the documented seam for exactly
+// this: add `D3D11_BIND_SHADER_RESOURCE`, then initialise it ourselves. The
+// surfaces stay the decoder's own, so the zero-copy path is unchanged --
+// this widens what may be bound to them, it does not introduce a copy.
+AVPixelFormat PickD3D11(AVCodecContext* ctx, const AVPixelFormat* formats) {
+    bool offered = false;
     for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == AV_PIX_FMT_D3D11) return AV_PIX_FMT_D3D11;
+        if (*p == AV_PIX_FMT_D3D11) { offered = true; break; }
     }
-    return AV_PIX_FMT_NONE;
+    if (!offered) return AV_PIX_FMT_NONE;
+
+    // Already built (a mid-session re-mode calls get_format again): keep it.
+    if (ctx->hw_frames_ctx) return AV_PIX_FMT_D3D11;
+
+    AVBufferRef* frames = nullptr;
+    if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx,
+                                         AV_PIX_FMT_D3D11, &frames) < 0) {
+        return AV_PIX_FMT_NONE;
+    }
+
+    auto* framesCtx = reinterpret_cast<AVHWFramesContext*>(frames->data);
+    auto* d3dFrames = static_cast<AVD3D11VAFramesContext*>(framesCtx->hwctx);
+    d3dFrames->BindFlags |= D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+
+    // `extra_hw_frames` is applied by avcodec's own pool path, which this
+    // bypasses. Adding it here rather than trusting it to have been folded in
+    // already: over-allocating costs VRAM and nothing else, while
+    // under-allocating starves the decoder of surfaces -- and that failure
+    // does not announce itself, it just produces pictures with missing
+    // references. The asymmetry decides it.
+    if (ctx->extra_hw_frames > 0) {
+        framesCtx->initial_pool_size += ctx->extra_hw_frames;
+    }
+
+    if (av_hwframe_ctx_init(frames) < 0) {
+        av_buffer_unref(&frames);
+        return AV_PIX_FMT_NONE;
+    }
+    ctx->hw_frames_ctx = frames;   // ownership moves to the codec context
+    return AV_PIX_FMT_D3D11;
 }
 
 }  // namespace
@@ -369,6 +418,44 @@ bool FfmpegHevcDecoder::TryGetFrame(com_ptr<ID3D11Texture2D>& texture,
     // SetSourceSize) because this texture is allocated at the ALIGNED size -
     // 1088 rows for a 1080-line stream - and without a source rect the video
     // processor scales those extra rows of undefined memory onto the screen.
+    // ── Colour, read off the frame rather than assumed ──────────────────────
+    //
+    // `sw_format` on the frames context is the real pixel format behind the
+    // D3D11 surface (NV12 or P010); `m_current->format` is just AV_PIX_FMT_D3D11
+    // and says nothing about bit depth. The rest comes from the bitstream's
+    // VUI, which is the only place that knows whether the host sent limited or
+    // full range -- and Nova sends different answers for SDR and HDR.
+    {
+        FrameColor colour;
+        AVPixelFormat sw = AV_PIX_FMT_NV12;
+        if (m_current->hw_frames_ctx) {
+            const auto* fc =
+                reinterpret_cast<const AVHWFramesContext*>(m_current->hw_frames_ctx->data);
+            sw = fc->sw_format;
+        }
+        colour.bitsPerChannel = (sw == AV_PIX_FMT_P010) ? 10 : 8;
+        colour.fullRange = (m_current->color_range == AVCOL_RANGE_JPEG);
+        switch (m_current->colorspace) {
+            case AVCOL_SPC_BT470BG:
+            case AVCOL_SPC_SMPTE170M:
+                colour.matrix = FrameColor::Matrix::Bt601;
+                break;
+            case AVCOL_SPC_BT2020_NCL:
+            case AVCOL_SPC_BT2020_CL:
+                colour.matrix = FrameColor::Matrix::Bt2020;
+                break;
+            default:
+                // UNSPECIFIED included. A 10-bit stream that declined to say is
+                // far likelier to be BT.2020 than BT.709, and guessing 709 for
+                // one shows up as oversaturated greens rather than as an error.
+                colour.matrix = (colour.bitsPerChannel > 8) ? FrameColor::Matrix::Bt2020
+                                                            : FrameColor::Matrix::Bt709;
+                break;
+        }
+        colour.pq = (m_current->color_trc == AVCOL_TRC_SMPTE2084);
+        m_colour = colour;
+    }
+
     texture = nullptr;
     texture.copy_from(native);
     subresource = slice;

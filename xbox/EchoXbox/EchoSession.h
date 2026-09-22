@@ -38,7 +38,8 @@ std::string BuildConnectConfig(std::string const& identityDir,
                                DiscoveredHost const& host,
                                std::string const& hostFingerprint,
                                std::string const& res, uint32_t fps,
-                               uint32_t bitrateKbps, uint32_t appId) noexcept;
+                               uint32_t bitrateKbps, uint32_t appId,
+                               bool hdr) noexcept;
 
 // Escape hatch: if `echo.json` exists in LocalState it is used verbatim for
 // STREAM, bypassing discovery entirely. Only needed if DNS-SD turns out to be

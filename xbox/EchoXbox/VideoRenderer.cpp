@@ -39,11 +39,31 @@ std::wstring DescribeMode(HdmiDisplayMode const& mode) {
     return out;
 }
 
+// The pixel shader constant buffer, and the layout is the load-bearing part.
+//
+// HLSL packs a `float3x3` in a constant buffer as three float4 registers, one
+// per COLUMN, so the 9 raw coefficients become 12 floats with a pad after each
+// group of 3 -- and the CPU side must transpose into that shape or every
+// colour comes out of the wrong channel. `offsets` is a float3 and needs its
+// own pad to land the following float2 pair on a 16-byte boundary.
+//
+// Mirrors `moonlight-xbox`'s `_CSC_CONST_BUF` exactly, including the padding
+// field, because the shader it feeds is the same shader.
+struct CscConstants {
+    float cscMatrix[12];
+    float offsets[3];
+    float padding;
+    float chromaOffset[2];
+    float chromaTexMax[2];
+};
+static_assert(sizeof(CscConstants) % 16 == 0,
+              "constant buffers must be a multiple of 16 bytes");
+
 }  // namespace
 
 // ── HDMI output mode ────────────────────────────────────────────────────────
 
-HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
+HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) noexcept {
     HdmiOutcome outcome;
     HdmiDisplayInformation hdmi{ nullptr };
     try {
@@ -63,6 +83,13 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
                 out.width = mode.ResolutionWidthInRawPixels();
                 out.height = mode.ResolutionHeightInRawPixels();
                 out.refreshHz = mode.RefreshRate();
+                // The authority on whether this session may ask for HDR.
+                // Deliberately the mode the console REPORTS, not the one that
+                // was requested: a request can succeed and still leave the
+                // panel in Rec.709, and asking the host for PQ on the strength
+                // of a successful call is how the washed-out picture happens.
+                out.hdrActive = mode.ColorSpace() == HdmiDisplayColorSpace::BT2020 &&
+                                mode.IsSmpte2084Supported();
             }
         } catch (...) {
         }
@@ -115,29 +142,25 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
             }
             // There is no `IsSdr`. The colour space is the classification:
             // BT2020 is the wide-gamut entry the console pairs with PQ, and
-            // BT709 / RgbFull / RgbLimited are the Rec.709 ones this pipeline
-            // actually renders.
-            const bool isSdr =
-                mode.ColorSpace() != HdmiDisplayColorSpace::BT2020;
-            // A HARD FILTER, not a tie-break -- and that distinction is the
+            // BT709 / RgbFull / RgbLimited are the Rec.709 ones.
+            const bool isBt2020 = mode.ColorSpace() == HdmiDisplayColorSpace::BT2020;
+            // A HARD FILTER, not a tie-break -- and that distinction was the
             // whole bug (reported 2026-09-22 as "overly white, blacks grey").
             //
             // This used to prefer SDR only at EQUAL refresh. Consoles do not
             // offer the two variants symmetrically: where the BT2020 entry
             // carries a refresh the Rec.709 entry does not, the old test took
-            // the higher number and drove the panel in BT.2020 PQ while this
-            // pipeline kept sending Rec.709. Feeding sRGB values down a PQ
-            // transfer lifts near-black off the floor and pushes highlights
-            // toward PQ's 10,000-nit ceiling, which is precisely "blacks go
-            // grey, whites blow out" -- the failure the comment above already
-            // described, arrived at through the one path it left open.
+            // the higher number and drove the panel in BT.2020 PQ while the
+            // pipeline kept sending Rec.709. Values down the wrong transfer
+            // lift near-black off the floor and push highlights toward PQ's
+            // 10,000-nit ceiling, which is exactly "blacks go grey, whites
+            // blow out".
             //
-            // Refusing the mode outright can cost a refresh rate. That is the
-            // correct trade while the pipeline is Rec.709 end to end: a
-            // correct picture at 60 Hz beats a washed-out one at 120. When the
-            // HDR10 path lands this becomes a real choice again -- see the
-            // colour-space block in CreateResources.
-            if (!isSdr) continue;
+            // Now that the shader can render either, the filter has a
+            // direction rather than a fixed answer: match the mode's colour
+            // space to what this session will actually be sending. Getting it
+            // wrong is the same failure in whichever direction it happens.
+            if (isBt2020 != wantHdr) continue;
             const bool better = mode.RefreshRate() > bestRefresh;
             if (better) {
                 bestRefresh = mode.RefreshRate();
@@ -223,14 +246,27 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
         };
 
         if (tookWideGamutEntry) {
-            // Worth a line of its own: the picture is now riding on `None`
-            // actually being honoured. If a washed-out report ever survives
-            // this fix, this is the note that says why.
-            outcome.note = L"no Rec.709 entry at this size - took the BT2020 one "
-                           L"and asked for an SDR transfer: ";
+            // Worth a line of its own: the picture is now riding on the
+            // requested transfer actually being honoured. If a washed-out
+            // report ever survives this fix, this is the note that says why.
+            outcome.note = wantHdr
+                ? L"no BT2020 entry at this size - took a Rec.709 one: "
+                : L"no Rec.709 entry at this size - took the BT2020 one "
+                  L"and asked for an SDR transfer: ";
         }
 
-        bool applied = attempt(HdmiDisplayHdrOption::None);
+        // `Eotf2084` for HDR, `None` for SDR, and never anything else --
+        // `EotfSdr` is the value that throws E_INVALIDARG (see above).
+        //
+        // `outcome.hdrActive` is NOT set from this succeeding. `readBack`
+        // fills it from the mode the console reports afterwards, because a
+        // request can return true and still leave the panel in Rec.709 -- and
+        // a session that asks the host for PQ on the strength of a successful
+        // call is exactly the washed-out picture this whole path exists to end.
+        const HdmiDisplayHdrOption wanted =
+            wantHdr ? HdmiDisplayHdrOption::Eotf2084 : HdmiDisplayHdrOption::None;
+
+        bool applied = attempt(wanted);
         if (!applied) {
             // The overload without an HDR option at all: let the console keep
             // whatever transfer function it was using. Losing the transfer
@@ -312,14 +348,6 @@ DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
         // which sends the search to the network where nothing is wrong.
         if (auto mt = m_device.try_as<ID3D10Multithread>()) {
             mt->SetMultithreadProtected(TRUE);
-        }
-
-        m_videoDevice  = m_device.try_as<ID3D11VideoDevice>();
-        m_videoContext = m_context.try_as<ID3D11VideoContext>();
-        m_videoContext1 = m_context.try_as<ID3D11VideoContext1>();
-        if (!m_videoDevice || !m_videoContext) {
-            facts.note = L"no ID3D11VideoDevice — hardware video is unavailable";
-            return facts;
         }
 
         // Adapter name.
@@ -528,131 +556,356 @@ DisplayFacts VideoRenderer::Initialize(SwapChainPanel const& panel) noexcept {
 
 bool VideoRenderer::CreateSwapChainSurfaces() noexcept {
     m_backBufferView = nullptr;
-    m_outputView = nullptr;          // bound to the old back buffer
     com_ptr<ID3D11Texture2D> backBuffer;
     if (FAILED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put())))) return false;
     return SUCCEEDED(m_device->CreateRenderTargetView(backBuffer.get(), nullptr, m_backBufferView.put()));
 }
 
-bool VideoRenderer::EnsureVideoProcessor(uint32_t srcWidth, uint32_t srcHeight) noexcept {
-    if (m_processor && srcWidth == m_processorSrcWidth && srcHeight == m_processorSrcHeight) {
-        return true;
-    }
-    m_processor = nullptr;
-    m_processorEnum = nullptr;
-    m_outputView = nullptr;
+// ── The shader pipeline ─────────────────────────────────────────────────────
+//
+// Built once and kept. `m_shaderTried` makes a failure sticky: the bytecode is
+// packaged content, so if it is missing it will be missing every frame, and
+// retrying the load sixty times a second would bury the reason rather than
+// report it.
+bool VideoRenderer::EnsureShaderPipeline() noexcept {
+    if (m_shaderReady) return true;
+    if (m_shaderTried) return false;
+    m_shaderTried = true;
 
-    DXGI_SWAP_CHAIN_DESC1 desc{};
-    if (FAILED(m_swapChain->GetDesc1(&desc))) return false;
+    // Packaged beside the app, compiled by build-app.ps1. Read synchronously:
+    // this runs once, on the render thread, before the first picture.
+    const auto load = [](wchar_t const* name, std::vector<uint8_t>& out) noexcept {
+        try {
+            const auto path = std::wstring(
+                winrt::Windows::ApplicationModel::Package::Current()
+                    .InstalledLocation().Path().c_str()) + L"\\Assets\\Shader\\" + name;
+            winrt::file_handle file{ CreateFile2(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                                 OPEN_EXISTING, nullptr) };
+            if (!file) return false;
+            LARGE_INTEGER size{};
+            if (!GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 ||
+                size.QuadPart > (1 << 20)) {
+                return false;
+            }
+            out.resize(static_cast<size_t>(size.QuadPart));
+            DWORD read = 0;
+            return ReadFile(file.get(), out.data(), static_cast<DWORD>(out.size()), &read, nullptr)
+                   && read == out.size();
+        } catch (...) {
+            return false;
+        }
+    };
 
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
-    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    content.InputWidth   = srcWidth;
-    content.InputHeight  = srcHeight;
-    content.OutputWidth  = desc.Width;
-    content.OutputHeight = desc.Height;
-    // The stream sets our cadence, not the processor; NORMAL keeps it from
-    // trying to be clever about frame rate conversion.
-    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    std::vector<uint8_t> vs, ps;
+    if (!load(L"echo_video_vertex.cso", vs) || !load(L"echo_video_pixel.cso", ps)) return false;
 
-    if (FAILED(m_videoDevice->CreateVideoProcessorEnumerator(&content, m_processorEnum.put()))) {
-        return false;
-    }
-    if (FAILED(m_videoDevice->CreateVideoProcessor(m_processorEnum.get(), 0, m_processor.put()))) {
-        return false;
-    }
+    if (FAILED(m_device->CreateVertexShader(vs.data(), vs.size(), nullptr,
+                                            m_vertexShader.put()))) return false;
+    if (FAILED(m_device->CreatePixelShader(ps.data(), ps.size(), nullptr,
+                                           m_pixelShader.put()))) return false;
 
-    // ── Colour space, and the classic washed-out-video bug ──────────────────
-    //
-    // GameStream video is BT.709 STUDIO range (16-235). Telling the processor
-    // it is full range stretches those levels again: blacks go grey, whites
-    // clip, and it reads as "the encoder is wrong" rather than as a conversion
-    // setting. If a future HDR path lands, this is the line that changes.
-    if (m_videoContext1) {
-        m_videoContext1->VideoProcessorSetStreamColorSpace1(
-            m_processor.get(), 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
-        m_videoContext1->VideoProcessorSetOutputColorSpace1(
-            m_processor.get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    } else {
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE stream{};
-        stream.Usage        = 0;  // 0 = playback (video), 1 = processing
-        stream.RGB_Range    = 0;  // full range RGB out
-        stream.YCbCr_Matrix = 1;  // 1 = BT.709
-        stream.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-        m_videoContext->VideoProcessorSetStreamColorSpace(m_processor.get(), 0, &stream);
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE output = stream;
-        output.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-        m_videoContext->VideoProcessorSetOutputColorSpace(m_processor.get(), &output);
-    }
+    const D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    if (FAILED(m_device->CreateInputLayout(layout, 2, vs.data(), vs.size(),
+                                           m_inputLayout.put()))) return false;
 
-    // No frame-rate conversion, no deinterlacing: the source is progressive and
-    // already paced by the host.
-    m_videoContext->VideoProcessorSetStreamOutputRate(
-        m_processor.get(), 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, nullptr);
+    // LINEAR, and CLAMP on both axes. The clamp is a second line of defence
+    // behind the shader chroma clamp: between them, nothing the sampler does
+    // can reach the alignment padding past the coded picture.
+    D3D11_SAMPLER_DESC samp{};
+    samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samp.AddressU = samp.AddressV = samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samp.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(m_device->CreateSamplerState(&samp, m_sampler.put()))) return false;
 
-    m_processorSrcWidth = srcWidth;
-    m_processorSrcHeight = srcHeight;
+    D3D11_BUFFER_DESC cb{};
+    cb.ByteWidth = sizeof(CscConstants);
+    cb.Usage = D3D11_USAGE_DEFAULT;          // UpdateSubresource, not a map
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(m_device->CreateBuffer(&cb, nullptr, m_cscBuffer.put()))) return false;
+
+    m_shaderReady = true;
     return true;
 }
 
-bool VideoRenderer::BlitFrame(ID3D11Texture2D* nv12, uint32_t subresource) noexcept {
-    D3D11_TEXTURE2D_DESC srcDesc{};
-    nv12->GetDesc(&srcDesc);
-    if (!EnsureVideoProcessor(srcDesc.Width, srcDesc.Height)) return false;
+// One SRV pair per array slice, built on demand.
+//
+// The decoder pool is a texture ARRAY, so the views must be TEXTURE2DARRAY
+// with FirstArraySlice naming the picture. A TEXTURE2D view silently reads
+// slice 0, which looks like a stream stuck on one frame.
+bool VideoRenderer::EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
+                                     D3D11_TEXTURE2D_DESC const& desc,
+                                     ID3D11ShaderResourceView* out[2]) noexcept {
+    if (m_planeViewsFor != frame) {
+        // A new pool: every cached view points into the old one.
+        m_planeViews.clear();
+        m_planeViews.resize(desc.ArraySize);
+        m_planeViewsFor = frame;
+    }
+    if (slice >= m_planeViews.size()) return false;
 
-    if (!m_outputView) {
-        com_ptr<ID3D11Texture2D> backBuffer;
-        if (FAILED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put())))) return false;
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outDesc{};
-        outDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        if (FAILED(m_videoDevice->CreateVideoProcessorOutputView(
-                backBuffer.get(), m_processorEnum.get(), &outDesc, m_outputView.put()))) {
-            return false;
+    auto& pair = m_planeViews[slice];
+    if (!pair[0] || !pair[1]) {
+        // P010 keeps its 10 bits in the HIGH bits of a 16-bit word, so an
+        // R16_UNORM view normalises to very nearly code/1023 -- the scale the
+        // CSC constants are derived at. NV12 is the 8-bit pair.
+        const bool tenBit = (desc.Format == DXGI_FORMAT_P010);
+        const DXGI_FORMAT planeFormats[2] = {
+            tenBit ? DXGI_FORMAT_R16_UNORM    : DXGI_FORMAT_R8_UNORM,
+            tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
+        };
+        for (int i = 0; i < 2; ++i) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = planeFormats[i];
+            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            srv.Texture2DArray.MostDetailedMip = 0;
+            srv.Texture2DArray.MipLevels = 1;
+            srv.Texture2DArray.FirstArraySlice = slice;
+            srv.Texture2DArray.ArraySize = 1;
+            if (FAILED(m_device->CreateShaderResourceView(frame, &srv, pair[i].put()))) {
+                pair[0] = nullptr;
+                pair[1] = nullptr;
+                return false;
+            }
         }
     }
+    out[0] = pair[0].get();
+    out[1] = pair[1].get();
+    return true;
+}
 
-    // The decoder hands back a texture ARRAY plus an index; the input view has
-    // to name that slice or every frame shows whatever is in slice 0.
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inDesc{};
-    inDesc.FourCC = 0;                       // inherit the texture's format
-    inDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    inDesc.Texture2D.MipSlice = 0;
-    inDesc.Texture2D.ArraySlice = subresource;
+// The letterbox, baked into clip space.
+//
+// The video processor used to do this scaling; a shader does it by drawing a
+// smaller quad. Same result, and it costs one vertex-buffer rebuild whenever
+// the picture or the back buffer changes size rather than anything per frame.
+void VideoRenderer::EnsureQuad(D3D11_TEXTURE2D_DESC const& desc) noexcept {
+    DXGI_SWAP_CHAIN_DESC1 sc{};
+    if (FAILED(m_swapChain->GetDesc1(&sc))) return;
 
-    com_ptr<ID3D11VideoProcessorInputView> inputView;
-    if (FAILED(m_videoDevice->CreateVideoProcessorInputView(
-            nv12, m_processorEnum.get(), &inDesc, inputView.put()))) {
-        return false;
+    // The CODED size, not the texture size: a decoder surface is allocated
+    // aligned (1088 rows for 1080) and the extra rows are undefined memory.
+    uint32_t codedW = m_sourceWidth.load(std::memory_order_relaxed);
+    uint32_t codedH = m_sourceHeight.load(std::memory_order_relaxed);
+    if (!codedW || !codedH || codedW > desc.Width || codedH > desc.Height) {
+        codedW = desc.Width;
+        codedH = desc.Height;
     }
 
-    // ── Crop the decoder's padding ──────────────────────────────────────────
-    //
-    // A decoder surface is allocated at the ALIGNED size — 1088 rows for a
-    // 1080-line stream, 2176 for 2160 — and `srcDesc` above reports that
-    // allocation, not the picture. Without a source rect the processor scales
-    // all 1088 rows onto the output, so eight rows of undefined memory are
-    // stretched across the screen. That is the green bar along the edge at
-    // 1080p, and it is a crop rather than anything to do with stride.
-    //
-    // Free: the video processor is already scaling, so it costs nothing to
-    // scale from the right rectangle.
-    const uint32_t codedW = m_sourceWidth.load(std::memory_order_relaxed);
-    const uint32_t codedH = m_sourceHeight.load(std::memory_order_relaxed);
-    if (codedW && codedH &&
-        (codedW != srcDesc.Width || codedH != srcDesc.Height)) {
-        const RECT src{ 0, 0, static_cast<LONG>(codedW),
-                        static_cast<LONG>(codedH) };
-        m_videoContext->VideoProcessorSetStreamSourceRect(m_processor.get(), 0, TRUE, &src);
+    if (m_quad && m_quadSrcW == desc.Width && m_quadSrcH == desc.Height &&
+        m_quadDstW == sc.Width && m_quadDstH == sc.Height &&
+        m_quadCodedW == codedW && m_quadCodedH == codedH) {
+        return;
     }
 
-    D3D11_VIDEO_PROCESSOR_STREAM stream{};
-    stream.Enable = TRUE;
-    stream.OutputIndex = 0;
-    stream.InputFrameOrField = 0;
-    stream.pInputSurface = inputView.get();
+    const float scale = (std::min)(static_cast<float>(sc.Width) / codedW,
+                                   static_cast<float>(sc.Height) / codedH);
+    const float w = codedW * scale;
+    const float h = codedH * scale;
+    const float x = (sc.Width - w) * 0.5f;
+    const float y = (sc.Height - h) * 0.5f;
 
-    return SUCCEEDED(m_videoContext->VideoProcessorBlt(
-        m_processor.get(), m_outputView.get(), 0, 1, &stream));
+    // Screen space to NDC. Y is flipped: NDC +1 is the top of the screen.
+    const float l = (x / (sc.Width * 0.5f)) - 1.0f;
+    const float r = ((x + w) / (sc.Width * 0.5f)) - 1.0f;
+    const float t = 1.0f - (y / (sc.Height * 0.5f));
+    const float b = 1.0f - ((y + h) / (sc.Height * 0.5f));
+
+    // Crop the alignment padding through the texture coordinates, which is
+    // what the video processor source rect used to do.
+    const float uMax = static_cast<float>(codedW) / desc.Width;
+    const float vMax = static_cast<float>(codedH) / desc.Height;
+
+    struct Vertex { float x, y, u, v; };
+    const Vertex verts[4] = {          // triangle strip
+        { l, t, 0.0f, 0.0f },
+        { r, t, uMax, 0.0f },
+        { l, b, 0.0f, vMax },
+        { r, b, uMax, vMax },
+    };
+
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(verts);
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = verts;
+
+    m_quad = nullptr;
+    if (FAILED(m_device->CreateBuffer(&bd, &init, m_quad.put()))) return;
+    m_quadSrcW = desc.Width;  m_quadSrcH = desc.Height;
+    m_quadDstW = sc.Width;    m_quadDstH = sc.Height;
+    m_quadCodedW = codedW;    m_quadCodedH = codedH;
+}
+
+// The colour matrix and range offsets, premultiplied on the CPU.
+//
+// Straight from the moonlight-xbox `getFramePremultipliedCscConstants`, which
+// is the point: this is the arithmetic that lets a FULL-range PQ stream be
+// rendered correctly, and DXGI video-processor colour spaces cannot express it
+// at all -- there is no full-range PQ YCbCr entry in DXGI_COLOR_SPACE_TYPE.
+void VideoRenderer::EnsureCscConstants(D3D11_TEXTURE2D_DESC const& desc) noexcept {
+    const FrameColor colour = m_frameColor;
+    if (m_cscValid && m_cscFor.bitsPerChannel == colour.bitsPerChannel &&
+        m_cscFor.fullRange == colour.fullRange && m_cscFor.matrix == colour.matrix &&
+        m_cscSrcW == desc.Width && m_cscSrcH == desc.Height) {
+        return;
+    }
+
+    // Full-range coefficients; the range scaling is folded in below.
+    static const float kBt601[9] = {
+        1.0f, 1.0f, 1.0f,
+        0.0f, -0.3441f, 1.7720f,
+        1.4020f, -0.7141f, 0.0f,
+    };
+    static const float kBt709[9] = {
+        1.0f, 1.0f, 1.0f,
+        0.0f, -0.1873f, 1.8556f,
+        1.5748f, -0.4681f, 0.0f,
+    };
+    static const float kBt2020[9] = {
+        1.0f, 1.0f, 1.0f,
+        0.0f, -0.1646f, 1.8814f,
+        1.4746f, -0.5714f, 0.0f,
+    };
+
+    const int bits = colour.bitsPerChannel;
+    const int channelRange = 1 << bits;
+    const double yMin  = colour.fullRange ? 0.0 : double(16 << (bits - 8));
+    const double yMax  = colour.fullRange ? double(channelRange - 1) : double(235 << (bits - 8));
+    const double uvMin = colour.fullRange ? 0.0 : double(16 << (bits - 8));
+    const double uvMax = colour.fullRange ? double(channelRange - 1) : double(240 << (bits - 8));
+    const double yScale  = (channelRange - 1) / (yMax - yMin);
+    const double uvScale = (channelRange - 1) / (uvMax - uvMin);
+
+    const float* base = colour.matrix == FrameColor::Matrix::Bt601  ? kBt601
+                      : colour.matrix == FrameColor::Matrix::Bt2020 ? kBt2020
+                                                                    : kBt709;
+    float m[9];
+    for (int i = 0; i < 9; ++i) m[i] = base[i];
+    for (int i = 0; i < 3; ++i) m[i] = static_cast<float>(m[i] * yScale);
+    for (int i = 3; i < 9; ++i) m[i] = static_cast<float>(m[i] * uvScale);
+
+    CscConstants constants{};
+    // Transposed into 3 rows of float3-plus-padding, which is how HLSL packs a
+    // float3x3 in a constant buffer.
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) constants.cscMatrix[i * 4 + j] = m[j * 3 + i];
+    }
+    constants.offsets[0] = static_cast<float>(yMin / double(channelRange - 1));
+    constants.offsets[1] = static_cast<float>((channelRange / 2) / double(channelRange - 1));
+    constants.offsets[2] = constants.offsets[1];
+
+    // Chroma siting. HEVC and H.264 both default to LEFT (MPEG-2 style) and
+    // the host never says otherwise, so this is a constant rather than another
+    // field on FrameColor. If a codec that cosites differently is ever added,
+    // this is where AVFrame::chroma_location belongs.
+    constants.chromaOffset[0] = 0.5f / desc.Width;
+    constants.chromaOffset[1] = 0.0f;
+
+    uint32_t codedW = m_sourceWidth.load(std::memory_order_relaxed);
+    uint32_t codedH = m_sourceHeight.load(std::memory_order_relaxed);
+    if (!codedW || !codedH || codedW > desc.Width || codedH > desc.Height) {
+        codedW = desc.Width;
+        codedH = desc.Height;
+    }
+    constants.chromaTexMax[0] = codedW != desc.Width
+        ? static_cast<float>(codedW - 1) / desc.Width : 1.0f;
+    constants.chromaTexMax[1] = codedH != desc.Height
+        ? static_cast<float>(codedH - 1) / desc.Height : 1.0f;
+
+    m_context->UpdateSubresource(m_cscBuffer.get(), 0, nullptr, &constants, 0, 0);
+    m_cscFor = colour;
+    m_cscSrcW = desc.Width;
+    m_cscSrcH = desc.Height;
+    m_cscValid = true;
+}
+
+// Tell the compositor what is in the back buffer.
+//
+// The shader writes PQ-encoded RGB for an HDR stream and Rec.709 RGB for an
+// SDR one, and those are different colour spaces in the same buffer format.
+// Declaring it is what makes the console convert instead of passing the values
+// straight through -- the failure this whole path exists to end.
+//
+// Checked with CheckColorSpaceSupport first, exactly as moonlight-xbox does
+// (Streaming/VideoRenderer.cpp:172): SetColorSpace1 fails hard on a swap chain
+// that cannot honour the space, and losing the picture to a colour call would
+// be a bad trade.
+void VideoRenderer::ApplySwapChainColorSpace(bool pq) noexcept {
+    const DXGI_COLOR_SPACE_TYPE want = pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                                          : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (m_colorSpaceApplied == static_cast<int>(want)) return;
+
+    auto swapChain3 = m_swapChain.try_as<IDXGISwapChain3>();
+    if (!swapChain3) return;
+    UINT support = 0;
+    if (FAILED(swapChain3->CheckColorSpaceSupport(want, &support)) ||
+        !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+        // Leave whatever is set. A console that will not present PQ is one
+        // that should keep showing an SDR picture, not a black screen.
+        return;
+    }
+    if (SUCCEEDED(swapChain3->SetColorSpace1(want))) {
+        m_colorSpaceApplied = static_cast<int>(want);
+    }
+}
+
+bool VideoRenderer::RenderFrame(ID3D11Texture2D* frame, uint32_t slice) noexcept {
+    if (!EnsureShaderPipeline()) return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    frame->GetDesc(&desc);
+
+    ID3D11ShaderResourceView* planes[2]{};
+    if (!EnsurePlaneViews(frame, slice, desc, planes)) return false;
+
+    EnsureQuad(desc);
+    if (!m_quad) return false;
+    EnsureCscConstants(desc);
+    ApplySwapChainColorSpace(m_frameColor.pq);
+
+    DXGI_SWAP_CHAIN_DESC1 sc{};
+    if (FAILED(m_swapChain->GetDesc1(&sc))) return false;
+
+    ID3D11RenderTargetView* rtv = m_backBufferView.get();
+    m_context->OMSetRenderTargets(1, &rtv, nullptr);
+
+    // Cleared every frame because the quad may not cover the buffer: the
+    // letterbox bars would otherwise hold whatever was last presented, which
+    // at a resolution change is the previous picture behind the new one.
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    m_context->ClearRenderTargetView(rtv, black);
+
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<float>(sc.Width);
+    vp.Height = static_cast<float>(sc.Height);
+    vp.MaxDepth = 1.0f;
+    m_context->RSSetViewports(1, &vp);
+
+    const UINT stride = sizeof(float) * 4, offset = 0;
+    ID3D11Buffer* vb = m_quad.get();
+    m_context->IASetInputLayout(m_inputLayout.get());
+    m_context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    m_context->VSSetShader(m_vertexShader.get(), nullptr, 0);
+    m_context->PSSetShader(m_pixelShader.get(), nullptr, 0);
+    m_context->PSSetShaderResources(0, 2, planes);
+    ID3D11SamplerState* sampler = m_sampler.get();
+    m_context->PSSetSamplers(0, 1, &sampler);
+    ID3D11Buffer* cb = m_cscBuffer.get();
+    m_context->PSSetConstantBuffers(0, 1, &cb);
+
+    m_context->Draw(4, 0);
+
+    // Unbind: these views name a decoder surface the decoder will reuse, and
+    // leaving them bound holds a reference into a slice it wants back.
+    ID3D11ShaderResourceView* none[2]{};
+    m_context->PSSetShaderResources(0, 2, none);
+    return true;
 }
 
 void VideoRenderer::Resize(uint32_t panelWidth, uint32_t panelHeight,
@@ -704,16 +957,16 @@ void VideoRenderer::PresentLoop() noexcept {
         bool resized = false;
         if (m_resizePending.exchange(false, std::memory_order_acq_rel)) {
             m_backBufferView = nullptr;
-            m_outputView = nullptr;
             m_context->OMSetRenderTargets(0, nullptr, nullptr);
             m_context->Flush();
             if (SUCCEEDED(m_swapChain->ResizeBuffers(
                     0, m_pendingWidth, m_pendingHeight, DXGI_FORMAT_UNKNOWN,
                     SwapChainFlags()))) {
                 CreateSwapChainSurfaces();
-                // Output geometry changed, so the processor must be rebuilt.
-                m_processor = nullptr;
-                m_processorEnum = nullptr;
+                // The back buffer changed size, so the letterbox quad no longer
+                // matches it. The plane views are untouched: they name decoder
+                // surfaces, which a swap-chain resize does not affect.
+                m_quad = nullptr;
                 resized = true;
             }
         }
@@ -727,7 +980,7 @@ void VideoRenderer::PresentLoop() noexcept {
                 com_ptr<ID3D11Texture2D> frame;
                 uint32_t subresource = 0;
                 if (m_frameSource(frame, subresource) && frame) {
-                    drew = BlitFrame(frame.get(), subresource);
+                    drew = RenderFrame(frame.get(), subresource);
                     if (drew) m_blitted.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -869,11 +1122,14 @@ void VideoRenderer::Shutdown() noexcept {
         m_frameSource = nullptr;
     }
     std::lock_guard<std::mutex> guard(m_lock);
-    m_outputView = nullptr;
-    m_processor = nullptr;
-    m_processorEnum = nullptr;
-    m_videoContext = nullptr;
-    m_videoDevice = nullptr;
+    m_planeViews.clear();
+    m_planeViewsFor = nullptr;
+    m_quad = nullptr;
+    m_cscBuffer = nullptr;
+    m_sampler = nullptr;
+    m_inputLayout = nullptr;
+    m_pixelShader = nullptr;
+    m_vertexShader = nullptr;
     m_backBufferView = nullptr;
     m_swapChain = nullptr;
     m_frameLatencyWaitable.close();

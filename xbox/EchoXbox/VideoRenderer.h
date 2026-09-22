@@ -17,11 +17,15 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <vector>
+#include <array>
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 #include <winrt/base.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+
+#include "VideoDecoder.h"   // FrameColor
 
 namespace echo {
 
@@ -41,12 +45,24 @@ struct HdmiOutcome {
     /// thing that separates "the console refused 4K120" from "this console was
     /// never offered 4K120" — an app bug versus a console setting.
     std::wstring offered;
+    /// Whether the console ended up in BT.2020 PQ. **Read this rather than
+    /// assuming the request was honoured**: it decides whether the session may
+    /// ask the host for HDR at all. Asking for PQ content and then presenting
+    /// it on a panel driven in Rec.709 is the washed-out picture, and the only
+    /// thing that reliably prevents it is believing the read-back.
+    bool hdrActive = false;
 };
 
 // Ask the console to output at `width` x `height`, preferring the highest
 // refresh rate it offers at that size. Blocking — call it from a background
 // thread, never the UI thread. Never throws.
-HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept;
+//
+// `wantHdr` selects which colour space the mode is chosen from and which
+// transfer function is requested. It is a preference, not a guarantee: a
+// console that offers no BT.2020 entry at this size, or refuses `Eotf2084`,
+// comes back with `hdrActive == false` and an SDR picture, which is correct
+// and must not be second-guessed by the caller.
+HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) noexcept;
 
 struct DisplayFacts {
     uint32_t panelWidth = 0;        // logical (DIP) size of the SwapChainPanel
@@ -92,6 +108,12 @@ public:
     /// padding onto the screen; see the source rect in BlitFrame.
     void SetSourceSize(uint32_t width, uint32_t height) noexcept;
 
+    /// How to convert the next picture, read off the stream by the decoder.
+    /// Pushed per frame from the frame-source callback for the same reason
+    /// `SetSourceSize` is: a live re-mode or an HDR renegotiation changes it
+    /// mid-session, and the decoder learns before anything else does.
+    void SetFrameColor(FrameColor colour) noexcept { m_frameColor = colour; }
+
     uint64_t PresentedFrames() const noexcept { return m_presented.load(std::memory_order_relaxed); }
     uint64_t BlittedFrames()   const noexcept { return m_blitted.load(std::memory_order_relaxed); }
     uint32_t SyncInterval()    const noexcept { return m_syncInterval.load(std::memory_order_relaxed); }
@@ -102,29 +124,71 @@ private:
     void PresentLoop() noexcept;
     void IdleWait() noexcept;   // 1 ms, high-resolution; never a hot spin
     bool CreateSwapChainSurfaces() noexcept;
-    bool EnsureVideoProcessor(uint32_t srcWidth, uint32_t srcHeight) noexcept;
-    bool BlitFrame(ID3D11Texture2D* nv12, uint32_t subresource) noexcept;
+    bool EnsureShaderPipeline() noexcept;
+    bool EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
+                          D3D11_TEXTURE2D_DESC const& desc,
+                          ID3D11ShaderResourceView* out[2]) noexcept;
+    void EnsureQuad(D3D11_TEXTURE2D_DESC const& desc) noexcept;
+    void EnsureCscConstants(D3D11_TEXTURE2D_DESC const& desc) noexcept;
+    void ApplySwapChainColorSpace(bool pq) noexcept;
+    bool RenderFrame(ID3D11Texture2D* frame, uint32_t slice) noexcept;
 
     winrt::com_ptr<ID3D11Device>           m_device;
     winrt::com_ptr<ID3D11DeviceContext>    m_context;
     winrt::com_ptr<IDXGISwapChain2>        m_swapChain;
     winrt::com_ptr<ID3D11RenderTargetView> m_backBufferView;
 
-    // The colour-conversion path. A video processor rather than a pixel shader:
-    // UWP cannot compile HLSL at runtime, so a shader would need a build-time
-    // step, and the processor does BT.709 studio-range conversion in fixed
-    // function hardware anyway.
-    winrt::com_ptr<ID3D11VideoDevice>                m_videoDevice;
-    winrt::com_ptr<ID3D11VideoContext>               m_videoContext;
-    // The DXGI-colour-space entry points live on VideoContext1, not on the
-    // base interface. Optional: without it we fall back to the older enum,
-    // which expresses the same BT.709 studio-range intent less precisely.
-    winrt::com_ptr<ID3D11VideoContext1>              m_videoContext1;
-    winrt::com_ptr<ID3D11VideoProcessor>             m_processor;
-    winrt::com_ptr<ID3D11VideoProcessorEnumerator>   m_processorEnum;
-    winrt::com_ptr<ID3D11VideoProcessorOutputView>   m_outputView;
-    uint32_t m_processorSrcWidth = 0;
-    uint32_t m_processorSrcHeight = 0;
+    // ── The colour-conversion path: a pixel shader ─────────────────────────
+    //
+    // This was a `ID3D11VideoProcessor` because UWP has no runtime HLSL
+    // compiler, and a fixed-function BT.709 studio-range conversion was all
+    // the pipeline needed. HDR10 is what ended that: the host sends BT.2020
+    // PQ at FULL range, and DXGI has no full-range PQ YCbCr colour space to
+    // describe it with -- `VideoProcessorSetStreamColorSpace1` simply cannot
+    // express the stream, so the processor would be told studio range and
+    // crush every black in the picture.
+    //
+    // A shader can express it, because the range and the matrix are just
+    // numbers in a constant buffer. The runtime-compiler problem is solved the
+    // way `moonlight-xbox` solves it: compile ahead of time (build-app.ps1)
+    // and package the bytecode.
+    winrt::com_ptr<ID3D11VertexShader>       m_vertexShader;
+    winrt::com_ptr<ID3D11PixelShader>        m_pixelShader;
+    winrt::com_ptr<ID3D11InputLayout>        m_inputLayout;
+    winrt::com_ptr<ID3D11Buffer>             m_quad;
+    winrt::com_ptr<ID3D11Buffer>             m_cscBuffer;
+    winrt::com_ptr<ID3D11SamplerState>       m_sampler;
+    bool m_shaderReady = false;
+    bool m_shaderTried = false;
+
+    // One SRV pair per slice of the decoder's texture array, built on first
+    // use. The array is stable for a session, so this is keyed on the texture
+    // pointer and thrown away wholesale when that changes -- a decoder swap or
+    // a live re-mode allocates a new pool, and a stale view would then be
+    // reading freed memory.
+    ID3D11Texture2D* m_planeViewsFor = nullptr;
+    std::vector<std::array<winrt::com_ptr<ID3D11ShaderResourceView>, 2>> m_planeViews;
+
+    // Geometry the quad was last built for. The quad carries the letterbox, so
+    // it has to be rebuilt when either the picture or the back buffer changes.
+    uint32_t m_quadSrcW = 0, m_quadSrcH = 0, m_quadDstW = 0, m_quadDstH = 0;
+    uint32_t m_quadCodedW = 0, m_quadCodedH = 0;
+    // Geometry the CSC constants were built for: chromaOffset and chromaTexMax
+    // both depend on the texture size, so a re-mode must rebuild them even when
+    // the colour description itself has not changed.
+    uint32_t m_cscSrcW = 0, m_cscSrcH = 0;
+
+    // The colour of the picture being rendered, pushed per frame from the
+    // decoder. `m_cscFor` is what the constant buffer currently holds, so the
+    // buffer is only rewritten when it actually changes.
+    //
+    // Not atomic, unlike `m_sourceWidth`: `SetFrameColor` is called from the
+    // frame-source callback, which `PresentLoop` invokes on the render thread
+    // itself. Writer and reader are the same thread.
+    FrameColor m_frameColor{};
+    FrameColor m_cscFor{};
+    bool m_cscValid = false;
+    int  m_colorSpaceApplied = -1;   // DXGI_COLOR_SPACE_TYPE, -1 = never set
 
     winrt::handle m_frameLatencyWaitable;
     winrt::handle m_idleTimer;
