@@ -58,8 +58,25 @@ AVPixelFormat PickD3D11(AVCodecContext* ctx, const AVPixelFormat* formats) {
     }
     if (!offered) return AV_PIX_FMT_NONE;
 
-    // Already built (a mid-session re-mode calls get_format again): keep it.
-    if (ctx->hw_frames_ctx) return AV_PIX_FMT_D3D11;
+    // ── Always REBUILD, never reuse ─────────────────────────────────────────
+    //
+    // This used to keep an existing `hw_frames_ctx` and return early, on the
+    // reasoning that a second `get_format` meant the pool was already good.
+    // That is exactly backwards, and it produced grey macroblocks and smearing
+    // at stream start (live 2026-09-22).
+    //
+    // `get_format` is called BECAUSE the stream parameters changed. A
+    // mid-stream resolution change is the main reason it fires at all, and
+    // Nova's startup sequence provokes one every time: the host log shows the
+    // display settling 4K -> 1440p -> 4K while it hands the virtual display
+    // back and forth, recreating the encoder at each step. Keeping the old
+    // pool then decodes a 4K picture into surfaces allocated for 1440p.
+    //
+    // Rebuilding costs a pool allocation on an event that already costs a
+    // keyframe, so there is nothing to save by being clever here. The unref is
+    // what makes it safe: assigning over a live `hw_frames_ctx` would leak it,
+    // and the surfaces it owns are the decoder's whole working set.
+    if (ctx->hw_frames_ctx) av_buffer_unref(&ctx->hw_frames_ctx);
 
     AVBufferRef* frames = nullptr;
     if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx,
