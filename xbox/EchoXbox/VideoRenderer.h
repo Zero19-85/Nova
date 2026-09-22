@@ -64,6 +64,25 @@ struct HdmiOutcome {
 // and must not be second-guessed by the caller.
 HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) noexcept;
 
+// Switch the console's transfer function, leaving resolution and refresh
+// exactly where they are.
+//
+// **Separate from the resolution request on purpose.** This mirrors
+// `moonlight-xbox`'s `MoonlightClient::SetDisplayHDR`, which never asks for a
+// size or a refresh: it finds the mode that matches the CURRENT one in every
+// respect except `IsSmpte2084Supported` and applies that. A console asked for a
+// resolution, a refresh and a transfer function at once can refuse the whole
+// request for any one of them and does not say which -- and bundling them is
+// what left the stream clamped to HEVC Main 8 on 2026-09-22.
+//
+// Returns whether the console is in PQ AFTERWARDS, read back from it. Never
+// throws. Blocking: background thread only.
+//
+// `note` receives a human-readable account of what happened, including the
+// mode table when no suitable mode exists -- the difference between "this TV
+// is not HDR" and "we asked wrongly" is otherwise invisible.
+bool RequestHdrMode(bool enable, std::wstring& note) noexcept;
+
 struct DisplayFacts {
     uint32_t panelWidth = 0;        // logical (DIP) size of the SwapChainPanel
     uint32_t panelHeight = 0;

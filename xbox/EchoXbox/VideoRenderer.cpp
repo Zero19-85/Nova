@@ -88,8 +88,14 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
                 // was requested: a request can succeed and still leave the
                 // panel in Rec.709, and asking the host for PQ on the strength
                 // of a successful call is how the washed-out picture happens.
-                out.hdrActive = mode.ColorSpace() == HdmiDisplayColorSpace::BT2020 &&
-                                mode.IsSmpte2084Supported();
+                //
+                // `IsSmpte2084Supported` ALONE. This also tested
+                // `ColorSpace() == BT2020`, which is a different property and
+                // is false for the RgbFull/RgbLimited entries many consoles
+                // use for HDR -- so a console that had genuinely switched to
+                // PQ was still reported as SDR. Same mistake as the selection
+                // filter above, in the one place that would have caught it.
+                out.hdrActive = mode.IsSmpte2084Supported();
             }
         } catch (...) {
         }
@@ -140,10 +146,26 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
                 bestAnyRefresh = mode.RefreshRate();
                 bestAny = mode;
             }
-            // There is no `IsSdr`. The colour space is the classification:
-            // BT2020 is the wide-gamut entry the console pairs with PQ, and
-            // BT709 / RgbFull / RgbLimited are the Rec.709 ones.
-            const bool isBt2020 = mode.ColorSpace() == HdmiDisplayColorSpace::BT2020;
+            // ── The discriminator is PQ SUPPORT, not the colour space ──────
+            //
+            // This read `ColorSpace() == BT2020` and that was wrong, in a way
+            // that cost the HDR handshake outright (2026-09-22: 4K reached,
+            // stream clamped to HEVC Main 8).
+            //
+            // The two properties are independent. A console's HDR entries are
+            // frequently `RgbFull` or `RgbLimited` rather than `BT2020` --
+            // `moonlight-xbox` logs them as separate columns for exactly that
+            // reason (`State/MoonlightClient.cpp:38-47`) and keys every HDR
+            // decision it makes on `IsSmpte2084Supported` alone. Filtering on
+            // the colour space therefore skipped every PQ-capable RGB mode, so
+            // the HDR search found nothing and fell back to SDR -- which looks
+            // from the sofa exactly like a console refusing the request.
+            //
+            // `IsSmpte2084Supported` is the property that decides the TRANSFER
+            // FUNCTION, which is the thing that actually has to match what the
+            // shader emits. It is also what moonlight verifies against after
+            // the change, so it is the same question asked the same way.
+            const bool isPq = mode.IsSmpte2084Supported();
             // A HARD FILTER, not a tie-break -- and that distinction was the
             // whole bug (reported 2026-09-22 as "overly white, blacks grey").
             //
@@ -156,11 +178,16 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
             // 10,000-nit ceiling, which is exactly "blacks go grey, whites
             // blow out".
             //
-            // Now that the shader can render either, the filter has a
-            // direction rather than a fixed answer: match the mode's colour
-            // space to what this session will actually be sending. Getting it
-            // wrong is the same failure in whichever direction it happens.
-            if (isBt2020 != wantHdr) continue;
+            // This function now only takes the RESOLUTION back from the shell,
+            // and it does that in SDR. HDR is a separate second step
+            // (`RequestHdrMode`) that switches transfer function against
+            // whatever mode this one lands on -- which is how `moonlight-xbox`
+            // does it, and the reason is not style. A console asked for a
+            // resolution, a refresh AND a transfer function in one call can
+            // refuse the whole request for any one of them, and it does not
+            // say which. Asking for one thing at a time means a refusal names
+            // itself.
+            if (isPq != wantHdr) continue;
             const bool better = mode.RefreshRate() > bestRefresh;
             if (better) {
                 bestRefresh = mode.RefreshRate();
@@ -303,6 +330,126 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height, bool wantHdr) n
         readBack(outcome);
         outcome.note = L"HDMI mode request failed";
         return outcome;
+    }
+}
+
+bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
+    HdmiDisplayInformation hdmi{ nullptr };
+    try {
+        hdmi = HdmiDisplayInformation::GetForCurrentView();
+    } catch (...) {
+    }
+    if (!hdmi) { note = L"(not a console - HDR left alone)"; return false; }
+
+    try {
+        auto current = hdmi.GetCurrentDisplayMode();
+        if (!current) { note = L"no current display mode"; return false; }
+
+        if (current.IsSmpte2084Supported() == enable) {
+            note = enable ? L"already in HDR" : L"already in SDR";
+            return enable;
+        }
+
+        // The mode that differs from the current one ONLY in PQ support.
+        //
+        // Straight from `moonlight-xbox` (`State/MoonlightClient.cpp:113-125`),
+        // including the epsilon on refresh -- `RefreshRate` is a double and the
+        // 119.88 Hz entries do not compare equal to themselves across calls.
+        // `StereoEnabled` is excluded because a stereo mode matching on every
+        // other axis would otherwise be a legal answer here, and it is not one.
+        HdmiDisplayMode target{ nullptr };
+        for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+            if (mode.IsSmpte2084Supported() == enable &&
+                mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
+                mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels() &&
+                !mode.StereoEnabled() &&
+                std::fabs(mode.RefreshRate() - current.RefreshRate()) <= 0.00001) {
+                target = mode;
+                break;
+            }
+        }
+
+        if (!target) {
+            // The mode table, because this is the one failure where "this TV
+            // cannot do HDR at this resolution" and "we asked wrongly" look
+            // identical and mean opposite things.
+            note = L"no mode matches " + DescribeMode(current) + L" with PQ ";
+            note += enable ? L"ON" : L"OFF";
+            note += L"; offered:";
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
+                    mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels()) {
+                    note += L"\n              " + DescribeMode(mode);
+                }
+            }
+            return current.IsSmpte2084Supported();
+        }
+
+        // ── The 2086 metadata, and why it is not optional ───────────────────
+        //
+        // `moonlight-xbox` uses the THREE-argument overload
+        // (mode, option, metadata) and never the two-argument one for HDR.
+        // Asking for `Eotf2084` with no mastering metadata gives the console
+        // nothing to put in the HDMI infoframe, and that is a plausible reason
+        // for a refusal that reports nothing -- which is what the two-argument
+        // call was getting.
+        //
+        // Echo has no equivalent of Sunshine's SS_HDR_METADATA on the wire, so
+        // these are the BT.2020 primaries and D65 white point (fixed by the
+        // standard) plus the luminance Nova's own HDR10 SEI is built from --
+        // `[hdr]` in nova.toml, defaults 1000/1000/400. Host and console
+        // therefore describe the same mastering display.
+        //
+        // Units are not nits across the board: primaries are 0.00002 each,
+        // MaxMasteringLuminance is 1 nit, MinMasteringLuminance is 0.0001 nit.
+        HdmiDisplayHdr2086Metadata metadata{};
+        metadata.RedPrimaryX   = 35400;  metadata.RedPrimaryY   = 14600;   // 0.708, 0.292
+        metadata.GreenPrimaryX =  8500;  metadata.GreenPrimaryY = 39850;   // 0.170, 0.797
+        metadata.BluePrimaryX  =  6550;  metadata.BluePrimaryY  =  2300;   // 0.131, 0.046
+        metadata.WhitePointX   = 15635;  metadata.WhitePointY   = 16450;   // D65
+        metadata.MaxMasteringLuminance = 1000;
+        metadata.MinMasteringLuminance = 1;      // 0.0001 nit
+        metadata.MaxContentLightLevel = 1000;
+        metadata.MaxFrameAverageLightLevel = 400;
+
+        const HdmiDisplayHdrOption option =
+            enable ? HdmiDisplayHdrOption::Eotf2084 : HdmiDisplayHdrOption::None;
+
+        bool applied = false;
+        try {
+            applied = hdmi.RequestSetCurrentDisplayModeAsync(target, option, metadata).get();
+        } catch (...) {
+            applied = false;
+        }
+        if (!applied) {
+            // Without metadata, as a last try. If the console dislikes the
+            // mastering data specifically, this separates that from a refusal
+            // of the mode or the transfer function.
+            try {
+                applied = hdmi.RequestSetCurrentDisplayModeAsync(target, option).get();
+                if (applied) note = L"(accepted without 2086 metadata) ";
+            } catch (...) {
+                applied = false;
+            }
+        }
+
+        // Read back. moonlight's own comment on this line is "XXX sometimes
+        // this lies and the TV is in another mode", so it is the best answer
+        // available rather than a guarantee -- which is exactly why the
+        // session's dynamic range is decided from it rather than from
+        // `applied`.
+        current = hdmi.GetCurrentDisplayMode();
+        const bool nowPq = current && current.IsSmpte2084Supported();
+        note += applied ? (L"set " + DescribeMode(target))
+                        : (L"console refused " + DescribeMode(target));
+        note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
+        return nowPq;
+    } catch (hresult_error const& e) {
+        note = std::wstring(L"HDR mode request failed: ") + e.message().c_str();
+        return false;
+    } catch (...) {
+        note = L"HDR mode request failed";
+        return false;
     }
 }
 

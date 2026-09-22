@@ -718,11 +718,21 @@ namespace winrt::EchoXbox::implementation
         // precisely what this call reports. The escape hatch, if HDR ever needs
         // taking out of the picture on a given box, is a hand-written echo.json
         // with "hdr": false -- it replaces the session config verbatim.
-        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight, true);
-        m_hdrActive = hdmi.hdrActive;
+        const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight, false);
         Append(L"\nhdmi        " + hstring(hdmi.note));
-        Append(L"\ndynamic rng " + hstring(m_hdrActive ? L"HDR10 (BT.2020 PQ)"
-                                                       : L"SDR (Rec.709)"));
+
+        // Step 2b, and it is SEPARATE on purpose. Resolution and refresh are
+        // settled above in SDR; this asks only for the transfer function, by
+        // finding the mode that matches whatever the console just landed on in
+        // every respect except PQ. Bundling the two is what left the stream
+        // clamped to HEVC Main 8: one call carrying three demands can be
+        // refused for any of them and never says which.
+        std::wstring hdrNote;
+        m_hdrActive = echo::RequestHdrMode(true, hdrNote);
+        Append(L"\nhdr         " + hstring(hdrNote));
+        Append(L"\ndynamic rng " + hstring(m_hdrActive ? L"HDR10 - asking the host for Main10 PQ"
+                                                       : L"SDR - asking the host for Rec.709"));
+        m_hdmiNote += L"\nhdr         " + hdrNote;
         // Kept, because this is the line that answers "what is the TV actually
         // being driven at" and the startup log scrolls away long before anyone
         // needs it. It belongs beside the counters, not in history.
