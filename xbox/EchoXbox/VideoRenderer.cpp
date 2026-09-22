@@ -357,6 +357,18 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // 119.88 Hz entries do not compare equal to themselves across calls.
         // `StereoEnabled` is excluded because a stereo mode matching on every
         // other axis would otherwise be a legal answer here, and it is not one.
+        // ── Bit depth is NEVER matched, and must not be ────────────────────
+        //
+        // HDR10 IS 10-bit. The console reports that as `BitsPerPixel` 30
+        // against 24 for 8-bit, so the PQ entry at a given resolution and
+        // refresh is a DIFFERENT bit depth than the SDR one by definition.
+        // Requiring the depth to match would make the search unsatisfiable
+        // exactly when it matters, and the swap chain is already 10-bit
+        // (R10G10B10A2) so there is nothing on this side that needs to change
+        // when it moves.
+        //
+        // moonlight matches width, height, refresh and non-stereo, and nothing
+        // else, for the same reason.
         HdmiDisplayMode target{ nullptr };
         for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
             if (mode.IsSmpte2084Supported() == enable &&
@@ -369,13 +381,57 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             }
         }
 
+        // ── Second pass: keep the resolution, give up the refresh ──────────
+        //
+        // A console can support 4K120 and 4K HDR without supporting both at
+        // once -- 10-bit at 120 Hz needs bandwidth that 8-bit at 120 Hz does
+        // not. moonlight never meets this because it never asks for a refresh
+        // rate; Nova does, so it can land on a mode with no PQ counterpart.
+        //
+        // Dropping refresh to get HDR is a real trade and it is made here
+        // deliberately, because the operator asked for true HDR10 explicitly.
+        // It is reported in the note rather than made quietly: a session that
+        // silently halves its frame rate is worse than one that says so.
+        bool refreshGivenUp = false;
+        if (!target && enable) {
+            double bestRefresh = 0.0;
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.IsSmpte2084Supported() &&
+                    mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
+                    mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels() &&
+                    !mode.StereoEnabled() &&
+                    mode.RefreshRate() > bestRefresh) {
+                    bestRefresh = mode.RefreshRate();
+                    target = mode;
+                }
+            }
+            if (target) {
+                refreshGivenUp = true;
+                note = L"no PQ mode at this refresh - dropping to ";
+                wchar_t hz[32]{};
+                swprintf_s(hz, L"%.2f Hz: ", bestRefresh);
+                note += hz;
+            }
+        }
+        (void)refreshGivenUp;
+
         if (!target) {
             // The mode table, because this is the one failure where "this TV
             // cannot do HDR at this resolution" and "we asked wrongly" look
             // identical and mean opposite things.
-            note = L"no mode matches " + DescribeMode(current) + L" with PQ ";
-            note += enable ? L"ON" : L"OFF";
-            note += L"; offered:";
+            // Spell out WHAT is being matched. The previous wording printed
+            // the whole current mode, bit depth included, which read as though
+            // the depth had to match -- it never did, and that misreading sent
+            // a diagnosis down the wrong path.
+            wchar_t want[160]{};
+            swprintf_s(want,
+                       L"no mode offers PQ %s at %ux%u @ %.2f Hz "
+                       L"(matching size and refresh only - bit depth is free); offered:",
+                       enable ? L"ON" : L"OFF",
+                       current.ResolutionWidthInRawPixels(),
+                       current.ResolutionHeightInRawPixels(),
+                       current.RefreshRate());
+            note = want;
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
                 if (mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
                     mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels()) {
@@ -778,24 +834,54 @@ bool VideoRenderer::EnsureShaderPipeline() noexcept {
     return true;
 }
 
-// One SRV pair per array slice, built on demand.
+// A texture of OUR OWN, and a copy into it before anything samples.
 //
-// The decoder pool is a texture ARRAY, so the views must be TEXTURE2DARRAY
-// with FirstArraySlice naming the picture. A TEXTURE2D view silently reads
-// slice 0, which looks like a stream stuck on one frame.
+// ── Why this is not zero-copy, deliberately ────────────────────────────────
+//
+// The decoder hands back a slice of its own pool and keeps owning it. Binding
+// an SRV straight onto that slice is possible (it needs
+// `D3D11_BIND_SHADER_RESOURCE` on the pool) and it is what this did for one
+// commit. The problem is lifetime: the surface is the decoder's, it goes back
+// into rotation as soon as the AVFrame reference is dropped, and the draw that
+// samples it is asynchronous. Every guarantee that this is safe lives in the
+// driver's hazard tracking rather than in anything visible here.
+//
+// `moonlight-xbox` does not rely on that, and it is the reference this port is
+// meant to mirror: `Streaming/VideoRenderer.cpp:130` copies the slice into a
+// private single-slice texture with `CopySubresourceRegion1` +
+// `D3D11_COPY_DISCARD`, and binds SRVs to the copy. The decoder's surfaces are
+// then never read by the render thread at all.
+//
+// The cost is one GPU-side copy of an NV12/P010 picture per frame -- no CPU
+// involvement, no readback, and cheap next to the colour conversion that
+// follows it. The benefit is that the decoder and the renderer stop sharing
+// memory, which is the entire class of bug this removes rather than mitigates.
+//
+// `D3D11_COPY_DISCARD` states that the destination's previous contents are
+// dead, so the driver need not preserve them across the write -- without it a
+// copy into a texture the GPU may still be reading has to serialise.
 bool VideoRenderer::EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
                                      D3D11_TEXTURE2D_DESC const& desc,
                                      ID3D11ShaderResourceView* out[2]) noexcept {
-    if (m_planeViewsFor != frame) {
-        // A new pool: every cached view points into the old one.
+    // (Re)build our texture whenever the picture's shape or format changes.
+    if (!m_videoTexture || m_videoTexW != desc.Width || m_videoTexH != desc.Height ||
+        m_videoTexFormat != desc.Format) {
         m_planeViews.clear();
-        m_planeViews.resize(desc.ArraySize);
-        m_planeViewsFor = frame;
-    }
-    if (slice >= m_planeViews.size()) return false;
+        m_videoTexture = nullptr;
 
-    auto& pair = m_planeViews[slice];
-    if (!pair[0] || !pair[1]) {
+        D3D11_TEXTURE2D_DESC own{};
+        own.Width = desc.Width;
+        own.Height = desc.Height;
+        own.MipLevels = 1;
+        own.ArraySize = 1;               // single slice: nothing to index
+        own.Format = desc.Format;        // NV12 or P010, unchanged
+        own.SampleDesc.Count = 1;
+        own.Usage = D3D11_USAGE_DEFAULT;
+        own.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(m_device->CreateTexture2D(&own, nullptr, m_videoTexture.put()))) {
+            return false;
+        }
+
         // P010 keeps its 10 bits in the HIGH bits of a 16-bit word, so an
         // R16_UNORM view normalises to very nearly code/1023 -- the scale the
         // CSC constants are derived at. NV12 is the 8-bit pair.
@@ -804,23 +890,37 @@ bool VideoRenderer::EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
             tenBit ? DXGI_FORMAT_R16_UNORM    : DXGI_FORMAT_R8_UNORM,
             tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
         };
+        m_planeViews.resize(1);
         for (int i = 0; i < 2; ++i) {
             D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Format = planeFormats[i];
-            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srv.Texture2DArray.MostDetailedMip = 0;
-            srv.Texture2DArray.MipLevels = 1;
-            srv.Texture2DArray.FirstArraySlice = slice;
-            srv.Texture2DArray.ArraySize = 1;
-            if (FAILED(m_device->CreateShaderResourceView(frame, &srv, pair[i].put()))) {
-                pair[0] = nullptr;
-                pair[1] = nullptr;
+            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MostDetailedMip = 0;
+            srv.Texture2D.MipLevels = 1;
+            if (FAILED(m_device->CreateShaderResourceView(m_videoTexture.get(), &srv,
+                                                          m_planeViews[0][i].put()))) {
+                m_planeViews.clear();
+                m_videoTexture = nullptr;
                 return false;
             }
         }
+        m_videoTexW = desc.Width;
+        m_videoTexH = desc.Height;
+        m_videoTexFormat = desc.Format;
     }
-    out[0] = pair[0].get();
-    out[1] = pair[1].get();
+
+    // The decoder's pool is a texture ARRAY, so the source subresource must
+    // name the slice. Getting this wrong copies slice 0 every time, which
+    // looks like a stream frozen on its first picture.
+    if (auto ctx1 = m_context.try_as<ID3D11DeviceContext1>()) {
+        ctx1->CopySubresourceRegion1(m_videoTexture.get(), 0, 0, 0, 0, frame, slice,
+                                     nullptr, D3D11_COPY_DISCARD);
+    } else {
+        m_context->CopySubresourceRegion(m_videoTexture.get(), 0, 0, 0, 0, frame, slice, nullptr);
+    }
+
+    out[0] = m_planeViews[0][0].get();
+    out[1] = m_planeViews[0][1].get();
     return true;
 }
 
@@ -1270,7 +1370,7 @@ void VideoRenderer::Shutdown() noexcept {
     }
     std::lock_guard<std::mutex> guard(m_lock);
     m_planeViews.clear();
-    m_planeViewsFor = nullptr;
+    m_videoTexture = nullptr;
     m_quad = nullptr;
     m_cscBuffer = nullptr;
     m_sampler = nullptr;

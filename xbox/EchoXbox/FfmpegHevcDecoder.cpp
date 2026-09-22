@@ -33,77 +33,32 @@ std::wstring Err(const wchar_t* what, int code) {
 // looks exactly like a console that is merely slow. Returning AV_PIX_FMT_NONE
 // when D3D11 is not on offer is deliberate: a hard failure at startup is worth
 // far more than a stream that quietly runs on the CPU.
-// ── Why this allocates the frame pool by hand ───────────────────────────────
+// ── The pool is avcodec's again, and that is the fix ────────────────────────
 //
-// Returning the format and letting avcodec build the pool is the short version
-// of this function, and it is what shipped while the renderer used a video
-// processor: `ID3D11VideoProcessorInputView` is legal on a texture created
-// with `D3D11_BIND_DECODER` alone, so nothing more was needed.
+// This briefly allocated the pool by hand to add `D3D11_BIND_SHADER_RESOURCE`,
+// so the renderer's new pixel shader could bind SRVs straight onto the
+// decoder's own surfaces. It worked, and it was the wrong architecture.
 //
-// A pixel shader needs a `ShaderResourceView`, and that is NOT legal on a
-// decode-only texture. FFmpeg's default pool sets `BindFlags = D3D11_BIND_DECODER`
-// and nothing else, so `CreateShaderResourceView` on one fails with
-// E_INVALIDARG -- the picture simply never appears, with no decode error to
-// find, because the decoder was working perfectly the whole time.
+// `moonlight-xbox` does not do that. It COPIES each picture out of the decoder
+// surface into a texture of its own before the shader ever sees it
+// (`Streaming/VideoRenderer.cpp:130`, `CopySubresourceRegion1` with
+// `D3D11_COPY_DISCARD`), and binds SRVs to that copy. The decoder's surfaces
+// are therefore never read by the render thread at all, which removes the
+// entire question of whether the decoder can reuse a slice while the shader is
+// still sampling it.
 //
-// `avcodec_get_hw_frames_parameters` hands back the pool avcodec WOULD have
-// built, before it is initialised, which is the documented seam for exactly
-// this: add `D3D11_BIND_SHADER_RESOURCE`, then initialise it ourselves. The
-// surfaces stay the decoder's own, so the zero-copy path is unchanged --
-// this widens what may be bound to them, it does not introduce a copy.
-AVPixelFormat PickD3D11(AVCodecContext* ctx, const AVPixelFormat* formats) {
-    bool offered = false;
+// Reverting also deletes a bug this file had for one commit: the hand-rolled
+// version kept an existing `hw_frames_ctx` across a `get_format`, and
+// `get_format` fires precisely BECAUSE the stream parameters changed. avcodec's
+// own pool path handles that correctly and has always handled it correctly.
+//
+// So: no bind flags to widen, no pool lifecycle to own, no reuse hazard. The
+// short version of this function is the right one.
+AVPixelFormat PickD3D11(AVCodecContext*, const AVPixelFormat* formats) {
     for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == AV_PIX_FMT_D3D11) { offered = true; break; }
+        if (*p == AV_PIX_FMT_D3D11) return AV_PIX_FMT_D3D11;
     }
-    if (!offered) return AV_PIX_FMT_NONE;
-
-    // ── Always REBUILD, never reuse ─────────────────────────────────────────
-    //
-    // This used to keep an existing `hw_frames_ctx` and return early, on the
-    // reasoning that a second `get_format` meant the pool was already good.
-    // That is exactly backwards, and it produced grey macroblocks and smearing
-    // at stream start (live 2026-09-22).
-    //
-    // `get_format` is called BECAUSE the stream parameters changed. A
-    // mid-stream resolution change is the main reason it fires at all, and
-    // Nova's startup sequence provokes one every time: the host log shows the
-    // display settling 4K -> 1440p -> 4K while it hands the virtual display
-    // back and forth, recreating the encoder at each step. Keeping the old
-    // pool then decodes a 4K picture into surfaces allocated for 1440p.
-    //
-    // Rebuilding costs a pool allocation on an event that already costs a
-    // keyframe, so there is nothing to save by being clever here. The unref is
-    // what makes it safe: assigning over a live `hw_frames_ctx` would leak it,
-    // and the surfaces it owns are the decoder's whole working set.
-    if (ctx->hw_frames_ctx) av_buffer_unref(&ctx->hw_frames_ctx);
-
-    AVBufferRef* frames = nullptr;
-    if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx,
-                                         AV_PIX_FMT_D3D11, &frames) < 0) {
-        return AV_PIX_FMT_NONE;
-    }
-
-    auto* framesCtx = reinterpret_cast<AVHWFramesContext*>(frames->data);
-    auto* d3dFrames = static_cast<AVD3D11VAFramesContext*>(framesCtx->hwctx);
-    d3dFrames->BindFlags |= D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-
-    // `extra_hw_frames` is applied by avcodec's own pool path, which this
-    // bypasses. Adding it here rather than trusting it to have been folded in
-    // already: over-allocating costs VRAM and nothing else, while
-    // under-allocating starves the decoder of surfaces -- and that failure
-    // does not announce itself, it just produces pictures with missing
-    // references. The asymmetry decides it.
-    if (ctx->extra_hw_frames > 0) {
-        framesCtx->initial_pool_size += ctx->extra_hw_frames;
-    }
-
-    if (av_hwframe_ctx_init(frames) < 0) {
-        av_buffer_unref(&frames);
-        return AV_PIX_FMT_NONE;
-    }
-    ctx->hw_frames_ctx = frames;   // ownership moves to the codec context
-    return AV_PIX_FMT_D3D11;
+    return AV_PIX_FMT_NONE;
 }
 
 }  // namespace

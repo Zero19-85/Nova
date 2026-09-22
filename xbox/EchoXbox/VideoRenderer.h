@@ -180,12 +180,19 @@ private:
     bool m_shaderReady = false;
     bool m_shaderTried = false;
 
-    // One SRV pair per slice of the decoder's texture array, built on first
-    // use. The array is stable for a session, so this is keyed on the texture
-    // pointer and thrown away wholesale when that changes -- a decoder swap or
-    // a live re-mode allocates a new pool, and a stale view would then be
-    // reading freed memory.
-    ID3D11Texture2D* m_planeViewsFor = nullptr;
+    // Our OWN copy of the decoded picture, and the SRV pair onto it.
+    //
+    // Not the decoder's surface: each frame is copied in before anything
+    // samples it, so the decoder can recycle its slice whenever it likes and
+    // the render thread never shares memory with it. This is `moonlight-xbox`'s
+    // arrangement (`m_VideoTexture` + `CopySubresourceRegion1`) and the reason
+    // is in EnsurePlaneViews.
+    //
+    // Single slice, so the views are TEXTURE2D and there is no index to get
+    // wrong. Rebuilt when the picture's size or pixel format changes.
+    winrt::com_ptr<ID3D11Texture2D> m_videoTexture;
+    uint32_t    m_videoTexW = 0, m_videoTexH = 0;
+    DXGI_FORMAT m_videoTexFormat = DXGI_FORMAT_UNKNOWN;
     std::vector<std::array<winrt::com_ptr<ID3D11ShaderResourceView>, 2>> m_planeViews;
 
     // Geometry the quad was last built for. The quad carries the letterbox, so
