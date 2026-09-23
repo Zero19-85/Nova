@@ -2379,6 +2379,20 @@ namespace winrt::EchoXbox::implementation
                     line += L"\n          queue depth " + field("queue_depth") +
                             L"   frame age " + field("frame_age_ms") +
                             L" ms   worst " + field("worst_frame_age_ms") + L" ms";
+                    // The repair path, and it is a DIFFERENT story from the
+                    // two lines above. Those count frames this client dropped;
+                    // these count frames the NETWORK dropped, which no queue
+                    // counter can see -- nothing was dropped locally, so they
+                    // all read zero while the picture fills with macroblocks.
+                    //
+                    // How to read it: gaps climbing with escalations flat is
+                    // the repair path working. Both climbing means repairs are
+                    // not getting back. `held` is the freeze the viewer sees,
+                    // in frames -- it is the corruption that is NOT being
+                    // displayed.
+                    line += L"\nrepair    gaps " + field("transit_loss_gaps") +
+                            L"   held " + field("frames_dropped_after_loss") +
+                            L"   keyframe escalations " + field("keyframe_escalations");
                 }
             }
 

@@ -143,9 +143,14 @@ pub struct ReceiveStats {
     /// number worth watching on a WAN link: rising with `frames_incomplete`
     /// flat means FEC is doing its job at the current percentage.
     pub frames_recovered_by_fec: u64,
-    /// Frames withheld from the sink because no keyframe had arrived yet (see
-    /// [`crate::gate`]). Zero on a healthy session, because Nova starts one with
-    /// an IDR; a persistent nonzero count means it did not.
+    /// Frames withheld from the sink because the decoder held no usable
+    /// reference: either no keyframe had arrived yet, or transit loss broke
+    /// the chain and the host's repair had not landed. See [`crate::gate`].
+    ///
+    /// A small count after each gap is the repair path working as designed —
+    /// those are the frames that would otherwise have been decoded into
+    /// macroblock damage. A count that keeps climbing means repairs are not
+    /// getting back.
     pub frames_dropped_before_keyframe: u64,
 }
 
@@ -521,6 +526,67 @@ pub enum RepairRequest {
 /// late is a full 4K intra frame, which is four orders of magnitude worse.
 const REPAIR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// How long a closed keyframe gate waits for the host's repair before asking
+/// for a full keyframe instead.
+///
+/// The gate closes the moment transit loss is seen and reopens on whatever the
+/// host sends back -- a type-5 recovery frame or an IDR. Both normally arrive
+/// inside one control round trip plus one encode, which on a LAN at 4K120 is
+/// well under 40 ms, so this timer does not fire on a healthy repair.
+///
+/// It exists for the case that repair is ITSELF lost. Frames after it arrive
+/// contiguously, so no new gap is observed, nothing re-asks, and without this
+/// the gate would stay shut for the rest of the session -- trading a burst of
+/// corruption for a permanent freeze, which is not a trade worth making.
+///
+/// 100 ms is ~12 frames at 120 fps: long enough that the ordinary repair wins
+/// the race and no session pays for a 4K intra frame it did not need, short
+/// enough that the pathological case reads as a hitch rather than a hang.
+const GATE_STALL_ESCALATION: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Live repair-path counters, process-wide.
+///
+/// Module statics for the same reason `session::rtt_stats` uses them: these
+/// are read by a platform bridge's stats call on another thread entirely, and
+/// threading a handle down to the receive loop to carry three numbers would be
+/// more machinery than the numbers are worth.
+///
+/// **They are here because this failure is otherwise invisible.** The live
+/// stats the Xbox panel shows all come from the frame QUEUE, which never sees
+/// transit loss at all -- nothing was dropped locally, so every queue counter
+/// stays at zero while the picture fills with macroblocks. These three say
+/// what the network did and what the repair path did about it.
+static TRANSIT_LOSS_GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_DROPPED_AFTER_LOSS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static KEYFRAME_ESCALATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+use std::sync::atomic::Ordering::Relaxed;
+
+/// `(gaps observed, frames withheld behind them, keyframe escalations)`.
+///
+/// How to read them: **gaps rising with escalations flat is the repair path
+/// working** -- every gap was answered before the stall timer fired. Gaps and
+/// escalations rising together means repairs are not getting back, which is a
+/// link or a host problem, not a decoder one. `frames_dropped_after_loss`
+/// large against a small gap count means each repair is taking a long time to
+/// arrive; that number IS the freeze the viewer sees, in frames.
+pub fn repair_stats() -> (u64, u64, u64) {
+    (
+        TRANSIT_LOSS_GAPS.load(Relaxed),
+        FRAMES_DROPPED_AFTER_LOSS.load(Relaxed),
+        KEYFRAME_ESCALATIONS.load(Relaxed),
+    )
+}
+
+/// Zero the repair counters. Called when a session starts so the panel shows
+/// this stream rather than the sum of every stream since launch.
+pub fn reset_repair_stats() {
+    TRANSIT_LOSS_GAPS.store(0, Relaxed);
+    FRAMES_DROPPED_AFTER_LOSS.store(0, Relaxed);
+    KEYFRAME_ESCALATIONS.store(0, Relaxed);
+}
+
 /// Accumulates repair requests and releases them at a bounded rate.
 #[derive(Default)]
 struct RepairOutbox {
@@ -665,6 +731,10 @@ pub async fn run_receiver(
     let mut depack = VideoDepacketizer::new(keys);
     let mut gate = crate::gate::KeyframeGate::new();
     let mut outbox = RepairOutbox::default();
+    // When the gate last closed, or `None` while it is open. Drives the stall
+    // escalation below -- see GATE_STALL_ESCALATION.
+    let mut gate_closed_at: Option<std::time::Instant> = None;
+    reset_repair_stats();
     let mut keepalive = tokio::time::interval(std::time::Duration::from_millis(500));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stop = stop;
@@ -729,11 +799,75 @@ pub async fn run_receiver(
                             // gap appears rather than up to 500 ms later.
                             if let Some((first, last)) = depack.take_transit_loss() {
                                 outbox.note_range(first, last);
+
+                                // ── Stop feeding the decoder ───────────────
+                                //
+                                // THIS is what separates a clean recovery from
+                                // a screenful of smearing macroblocks, and it
+                                // is the thing moonlight-common-c does that
+                                // Echo did not.
+                                //
+                                // Every frame after a gap is a P-frame whose
+                                // motion vectors point into reference pictures
+                                // the decoder never received. A hardware
+                                // decoder does not error on that -- it
+                                // resolves the vectors against whatever is in
+                                // the surface and carries on, so the damage is
+                                // not only displayed, it is PROPAGATED into
+                                // every later frame that predicts from it.
+                                // Motion then drags it around the screen,
+                                // which is why a rolling intra refresh cannot
+                                // win the race: the sweep cleans a band while
+                                // inter-prediction re-dirties everything
+                                // behind it.
+                                //
+                                // In 10-bit PQ this is spectacular rather than
+                                // merely ugly. Undefined luma lands near the
+                                // top of a 10,000-nit transfer curve, so the
+                                // same damage that read as grey blocks on an
+                                // SDR session is blinding white on an HDR one.
+                                // Same defect, different transfer function.
+                                //
+                                // The code already knew these frames were
+                                // undecodable -- `decodable_watermark`
+                                // deliberately freezes after a gap for exactly
+                                // this reason -- and handed them to the
+                                // decoder anyway.
+                                if gate.is_open() {
+                                    gate.close();
+                                    gate_closed_at = Some(std::time::Instant::now());
+                                    TRANSIT_LOSS_GAPS.fetch_add(1, Relaxed);
+                                }
                             }
                             // The gate, not the sink, decides whether a frame is
                             // decodable yet — see this function's docs.
                             if gate.admit(&frame) {
+                                gate_closed_at = None;
                                 sink.on_frame(frame);
+                            } else if let Some(since) = gate_closed_at {
+                                // ── The escape hatch, and it is not optional ──
+                                //
+                                // Closing the gate on loss introduces a freeze
+                                // mode that did not exist before: if the
+                                // repair the host sends back is itself lost,
+                                // and the frames after it arrive CONTIGUOUSLY,
+                                // no further gap is observed, nothing re-asks,
+                                // and the gate stays shut for the rest of the
+                                // session. `FrameQueue::request_keyframe`
+                                // declines to close its gate for precisely
+                                // this reason.
+                                //
+                                // So a shut gate re-asks, and escalates while
+                                // it does: an invalidation range the host
+                                // cannot honour is answered with a keyframe
+                                // anyway, but only a keyframe is guaranteed to
+                                // reopen this gate from any state.
+                                if since.elapsed() >= GATE_STALL_ESCALATION {
+                                    outbox.note_keyframe();
+                                    gate_closed_at = Some(std::time::Instant::now());
+                                    KEYFRAME_ESCALATIONS.fetch_add(1, Relaxed);
+                                }
+                                FRAMES_DROPPED_AFTER_LOSS.fetch_add(1, Relaxed);
                             }
                             // The sink may have just dropped something of its
                             // own on that push, so collect both before
@@ -1308,5 +1442,115 @@ mod tests {
             assert!(d.push(&junk).is_none());
         }
         assert!(d.stats.frames_completed == 0);
+    }
+
+    /// A recording sink, so a test can say exactly which frames reached a
+    /// decoder rather than only how many.
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: Vec<u32>,
+    }
+    impl FrameSink for RecordingSink {
+        fn on_frame(&mut self, frame: DecodedFrame) {
+            self.seen.push(frame.index);
+        }
+    }
+
+    /// Drive `run_receiver` over a list of datagrams and report what the sink
+    /// was given and what repairs were asked for.
+    async fn run_loop(datagrams: Vec<Vec<u8>>) -> (Vec<u32>, Vec<RepairRequest>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = socket.local_addr().unwrap();
+        let (media_tx, media_rx) = tokio::sync::mpsc::unbounded_channel();
+        for d in datagrams {
+            media_tx.send(d).unwrap();
+        }
+        drop(media_tx); // the loop returns when the demultiplexer stops
+
+        let (repair_tx, mut repair_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let mut sink = RecordingSink::default();
+        run_receiver(&socket, peer, media_rx, None, &mut sink, stop_rx, Some(repair_tx))
+            .await
+            .unwrap();
+
+        let mut repairs = Vec::new();
+        while let Ok(r) = repair_rx.try_recv() {
+            repairs.push(r);
+        }
+        (sink.seen, repairs)
+    }
+
+    /// **The 2026-09-23 corruption bug.**
+    ///
+    /// Frames after a gap are P-frames whose motion vectors point into
+    /// reference pictures the decoder never received. A hardware decoder does
+    /// not error on those -- it resolves them against whatever is in the
+    /// surface and then PROPAGATES the result into every frame that predicts
+    /// from it, which is why a rolling intra refresh loses the race against
+    /// motion. In 10-bit PQ the damage lands near the top of a 10,000-nit
+    /// curve, so the same defect that read as grey blocks on SDR is blinding
+    /// white on HDR.
+    ///
+    /// `decodable_watermark` already froze after a gap for exactly this
+    /// reason. The loop handed the frames to the decoder anyway.
+    #[tokio::test]
+    async fn frames_after_transit_loss_never_reach_the_decoder() {
+        let body = vec![9u8; 300];
+        let mut datagrams = Vec::new();
+        let mut push = |index: u32, kind: u8| {
+            datagrams.extend(packetize(index, kind, &body, 200, TEST_FEC_PCT));
+        };
+
+        push(1, 2); // the opening IDR
+        push(2, 1);
+        // 3 and 4 are lost in transit -- no shard of either is ever seen.
+        push(5, 1); // reveals the gap, and is itself undecodable
+        push(6, 1);
+        push(7, 1);
+        push(8, 2); // the host's repair
+
+        let (seen, repairs) = run_loop(datagrams).await;
+
+        assert_eq!(
+            seen,
+            vec![1, 2, 8],
+            "5, 6 and 7 reference frames the decoder never had; only the \
+             repair may reopen the gate"
+        );
+        assert!(
+            repairs.contains(&RepairRequest::Invalidate { first: 3, last: 4 }),
+            "the gap must be named so the host can repair it with a P-frame; \
+             got {repairs:?}"
+        );
+
+        // `repair_stats()` is deliberately NOT asserted here: the counters are
+        // process-wide (see their definition) and the test binary runs these
+        // in parallel, so a second test's gap would land in this one's read.
+        // They are diagnostics for a single-session client, and the behaviour
+        // above is what actually has to hold.
+    }
+
+    /// A type-5 recovery frame reopens the gate exactly as a keyframe does.
+    /// This is the repair Nova actually sends when NVENC can re-point a
+    /// reference, and it is the cheap half of the ladder -- if the gate did
+    /// not admit it, closing the gate on loss would turn every gap into a
+    /// full intra frame.
+    #[tokio::test]
+    async fn an_rfi_recovery_frame_reopens_the_gate_after_loss() {
+        let body = vec![3u8; 200];
+        let mut datagrams = Vec::new();
+        let mut push = |index: u32, kind: u8| {
+            datagrams.extend(packetize(index, kind, &body, 200, TEST_FEC_PCT));
+        };
+
+        push(1, 2);
+        // 2 is lost.
+        push(3, 1); // undecodable
+        push(4, 5); // RFI recovery: decodable against a reference we hold
+        push(5, 1); // decodable again, because 4 restored the chain
+
+        let (seen, _) = run_loop(datagrams).await;
+        assert_eq!(seen, vec![1, 4, 5]);
     }
 }

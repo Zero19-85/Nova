@@ -177,7 +177,8 @@ impl FrameQueue {
                 frames: VecDeque::with_capacity(CAPACITY),
                 // Opens on the first keyframe. `run_receiver`'s gate has
                 // already guaranteed that, so in the healthy case this opens
-                // immediately and never closes again.
+                // immediately and closes only on a local overflow -- transit
+                // loss is the other gate's business, and it closes for it.
                 gate: KeyframeGate::new(),
                 closed: false,
                 stats: QueueStats::default(),

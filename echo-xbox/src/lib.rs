@@ -644,6 +644,8 @@ pub unsafe extern "C" fn echo_stats(handle: u64, out: *mut c_char, cap: i32) -> 
         // what was done with it. Popping with clean network counters is a
         // playout problem; the reverse is a path problem.
         let (play, net, highest) = session.audio.stats_or_zero();
+        let (loss_gaps, dropped_after_loss, escalations) =
+            echo_client::receiver::repair_stats();
         let json = serde_json::json!({
             // Playout side.
             "audio_rendered": play.rendered,
@@ -671,6 +673,14 @@ pub unsafe extern "C" fn echo_stats(handle: u64, out: *mut c_char, cap: i32) -> 
             "frame_age_ms": q.last_frame_age_ms,
             "worst_frame_age_ms": q.worst_frame_age_ms,
             "video_delay_ms": session.frames.delay_ms(),
+            // The repair path. These come from the RECEIVE loop, not the
+            // queue, and they are the only counters that see transit loss --
+            // nothing is dropped locally when the network loses a frame, so
+            // every queue counter above stays at zero while the picture is
+            // filling with macroblocks.
+            "transit_loss_gaps": loss_gaps,
+            "frames_dropped_after_loss": dropped_after_loss,
+            "keyframe_escalations": escalations,
         });
         write_str(out, cap, &json.to_string())
     }));
