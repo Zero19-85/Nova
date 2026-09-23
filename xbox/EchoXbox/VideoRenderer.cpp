@@ -1129,16 +1129,31 @@ void VideoRenderer::ApplySwapChainColorSpace(bool pq) noexcept {
     if (m_colorSpaceApplied == static_cast<int>(want)) return;
 
     auto swapChain3 = m_swapChain.try_as<IDXGISwapChain3>();
-    if (!swapChain3) return;
+    if (!swapChain3) { m_colorSpaceState.store(static_cast<int>(ColorSpaceState::NoSwapChain3), std::memory_order_relaxed); return; }
     UINT support = 0;
     if (FAILED(swapChain3->CheckColorSpaceSupport(want, &support)) ||
         !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
         // Leave whatever is set. A console that will not present PQ is one
         // that should keep showing an SDR picture, not a black screen.
+        //
+        // RECORDED rather than swallowed, because this is the line that
+        // explains a washed-out HDR stream: the host is sending PQ, the shader
+        // is writing PQ, and the compositor was never told -- so it passes the
+        // values through as if they were Rec.709. Refusal here means the
+        // console's output is not in HDR, whatever the stream is.
+        m_colorSpaceState.store(static_cast<int>(pq ? ColorSpaceState::PqRefused
+                                                    : ColorSpaceState::SrgbRefused),
+                                std::memory_order_relaxed);
         return;
     }
     if (SUCCEEDED(swapChain3->SetColorSpace1(want))) {
         m_colorSpaceApplied = static_cast<int>(want);
+        m_colorSpaceState.store(static_cast<int>(pq ? ColorSpaceState::Pq
+                                                    : ColorSpaceState::Srgb),
+                                std::memory_order_relaxed);
+    } else {
+        m_colorSpaceState.store(static_cast<int>(ColorSpaceState::SetRefused),
+                                std::memory_order_relaxed);
     }
 }
 

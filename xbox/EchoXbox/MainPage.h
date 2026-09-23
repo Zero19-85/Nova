@@ -33,6 +33,7 @@ namespace winrt::EchoXbox::implementation
         // Settings, and what lives on it.
         void OnSettingsClick(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
         void OnSettingsCloseClick(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
+        void OnHdrToggled(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
         void OnMicLevelChanged(IInspectable const&,
                                Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const&);
         void OnRescanClick(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
@@ -117,6 +118,19 @@ namespace winrt::EchoXbox::implementation
         void HideActionMenu();                // UI thread
         void ShowSettings();                  // UI thread
         void HideSettings();                  // UI thread
+
+        // The HDR10 preference. Stored in LocalSettings rather than beside the
+        // paired hosts in `hosts.json`: this is a property of the CONSOLE and
+        // the TV it is plugged into, not of any one host, and LocalSettings is
+        // the one store on this platform that needs no file, no parse and no
+        // failure path.
+        void LoadHdrPreference();             // UI thread
+        void SaveHdrPreference(bool on);      // UI thread
+        /// Ask the console to switch transfer function, best-effort, and report
+        /// what it actually did. BLOCKING — background thread only. Never
+        /// changes `m_hdrEnabled`: a console that refuses is a console that
+        /// will show a flatter picture, not a reason to renegotiate the stream.
+        void ApplyHdrToDisplay(bool on);      // background thread
         void ShowDiagnostics();               // UI thread
         void HideDiagnostics();               // UI thread
         void EnterStreamingUi();              // UI thread
@@ -252,9 +266,26 @@ namespace winrt::EchoXbox::implementation
 
         // What RequestBestHdmiMode reported, kept for the diagnostics screen.
         std::wstring m_hdmiNote;
-        // Whether the console is actually being driven in BT.2020 PQ, read back
-        // from it at startup. This is what decides whether the session asks the
-        // host for HDR -- never a preference, never the request.
+
+        // ── The two HDR facts, and they are NOT the same fact ───────────────
+        //
+        // `m_hdrEnabled` is the USER'S PREFERENCE, loaded from LocalSettings
+        // and defaulting to on. It is the only input to what the session asks
+        // Nova to encode. Nothing the display API reports may override it.
+        //
+        // `m_hdrActive` is what the console said it was DOING after we asked
+        // it to switch, read back from HdmiDisplayInformation. It is reporting
+        // only - the diagnostics line and the startup log.
+        //
+        // These were one variable until 2026-09-23, and collapsing them is the
+        // bug: a Series X enumerates its 119.88 Hz modes with
+        // `IsSmpte2084Supported` clear while happily outputting 4K120 HDR10,
+        // so the read-back vetoed a request the console would have honoured
+        // and every session fell back to HEVC Main 8. moonlight-xbox keeps
+        // them apart for the same reason - `enableHDR` decides the stream
+        // format, `SetDisplayHDR` decides the panel, and neither consults the
+        // other.
+        bool m_hdrEnabled = true;
         bool m_hdrActive = false;
 
         // What we ask the host to encode. Starts at the console's real output

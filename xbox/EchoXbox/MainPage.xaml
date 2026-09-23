@@ -516,6 +516,53 @@
 
                     <StackPanel Grid.Row="1" Spacing="30" MaxWidth="2000"
                                 HorizontalAlignment="Left">
+                        <!-- Dynamic range. A PREFERENCE, and the only thing
+                             that decides what the session asks the host to
+                             encode.
+
+                             It is deliberately NOT gated on what
+                             `GetSupportedDisplayModes` reports. That
+                             enumeration is unreliable about
+                             `IsSmpte2084Supported` at 120 Hz on a Series X —
+                             a console that outputs 4K120 HDR10 all day can
+                             still enumerate its 119.88 Hz entries with the
+                             flag clear — and letting it veto the request is
+                             what left the stream clamped to HEVC Main 8 while
+                             moonlight, which asks from its setting alone,
+                             streamed HDR10 on the same TV.
+
+                             moonlight-xbox does exactly this: `enableHDR` is
+                             a per-host setting, and `config.supportedVideo
+                             Formats |= VIDEO_FORMAT_H265_MAIN10` is set from
+                             it with no display probe anywhere near the
+                             decision (State/MoonlightClient.cpp:267). The
+                             display flip happens separately and later. -->
+                        <Border Style="{StaticResource IonCard}">
+                            <StackPanel Spacing="14">
+                                <TextBlock Text="DYNAMIC RANGE"
+                                           Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="34">
+                                    <ToggleSwitch x:Name="HdrToggle"
+                                                  IsOn="True"
+                                                  OnContent="HDR10 enabled"
+                                                  OffContent="SDR only"
+                                                  Foreground="{StaticResource IonText}"
+                                                  Toggled="OnHdrToggled"
+                                                  VerticalAlignment="Center" />
+                                    <TextBlock x:Name="HdrStateText"
+                                               Text=""
+                                               Style="{StaticResource IonTelemetry}"
+                                               Foreground="{StaticResource IonBlue}"
+                                               TextWrapping="Wrap"
+                                               MaxWidth="1100"
+                                               VerticalAlignment="Center" />
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource IonTelemetry}"
+                                           TextWrapping="Wrap"
+                                           Text="On, Echo asks Nova for HEVC Main10 in BT.2020 PQ and puts the console into HDR. Off, it asks for Rec.709 and leaves the console alone. Takes effect on the next stream. Remembered across restarts." />
+                            </StackPanel>
+                        </Border>
+
                         <Border Style="{StaticResource IonCard}">
                             <StackPanel Spacing="14">
                                 <TextBlock Text="MICROPHONE PASSTHROUGH"

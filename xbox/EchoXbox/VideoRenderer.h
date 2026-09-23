@@ -103,6 +103,21 @@ struct DisplayFacts {
 // ready, which is the normal case between frames.
 using FrameSource = std::function<bool(winrt::com_ptr<ID3D11Texture2D>&, uint32_t&)>;
 
+// What `SetColorSpace1` ended up doing. Kept as a small code rather than a
+// string because it is written on the render thread and read on the UI thread
+// every stats tick, and an `std::atomic<int>` needs no lock where a
+// `std::wstring` would need one on the hot path.
+enum class ColorSpaceState : int {
+    Unknown = -1,
+    Pq,             // BT.2020 PQ declared and accepted - a real HDR10 present
+    Srgb,           // Rec.709 declared and accepted
+    PqRefused,      // the console will not present PQ; the buffer stays sRGB
+    SrgbRefused,
+    SetRefused,     // the support check passed and the set still failed
+    NoSwapChain3,
+};
+
+
 class VideoRenderer {
 public:
     ~VideoRenderer();
@@ -140,6 +155,22 @@ public:
     uint64_t BlittedFrames()   const noexcept { return m_blitted.load(std::memory_order_relaxed); }
     uint32_t SyncInterval()    const noexcept { return m_syncInterval.load(std::memory_order_relaxed); }
     uint32_t LastPresentError() const noexcept { return m_lastPresentHr.load(std::memory_order_relaxed); }
+    /// What the compositor was told is in the back buffer, and whether it
+    /// agreed. **This is the line that explains a washed-out HDR picture**:
+    /// the host can be sending PQ and the shader writing PQ while the console
+    /// refuses to present BT.2020, in which case the values are passed through
+    /// as Rec.709 and nothing anywhere reports an error. Safe from any thread.
+    wchar_t const* ColorSpaceReport() const noexcept {
+        switch (static_cast<ColorSpaceState>(m_colorSpaceState.load(std::memory_order_relaxed))) {
+            case ColorSpaceState::Pq:          return L"BT.2020 PQ (HDR10)";
+            case ColorSpaceState::Srgb:        return L"Rec.709 sRGB";
+            case ColorSpaceState::PqRefused:   return L"console will not present BT.2020 PQ - back buffer left in sRGB";
+            case ColorSpaceState::SrgbRefused: return L"console will not present sRGB - back buffer left as-is";
+            case ColorSpaceState::SetRefused:  return L"SetColorSpace1 refused after the support check passed";
+            case ColorSpaceState::NoSwapChain3:return L"no IDXGISwapChain3 - colour space undeclared";
+            default:                           return L"not declared yet";
+        }
+    }
     ID3D11Device* Device() const noexcept { return m_device.get(); }
 
 private:
@@ -218,6 +249,8 @@ private:
     FrameColor m_cscFor{};
     bool m_cscValid = false;
     int  m_colorSpaceApplied = -1;   // DXGI_COLOR_SPACE_TYPE, -1 = never set
+    // Render thread writes, UI thread reads. See ColorSpaceReport().
+    std::atomic<int> m_colorSpaceState{ static_cast<int>(ColorSpaceState::Unknown) };
 
     winrt::handle m_frameLatencyWaitable;
     winrt::handle m_idleTimer;

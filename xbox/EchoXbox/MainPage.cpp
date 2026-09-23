@@ -11,6 +11,9 @@
 // quiet_NaN, which is how a FrameworkElement's Height says "Auto".
 #include <limits>
 #include <string>
+// std::thread, for the one blocking display call that must not run on the UI
+// thread: RequestSetCurrentDisplayModeAsync().get() waits on the console.
+#include <thread>
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -160,6 +163,10 @@ namespace winrt::EchoXbox::implementation
     MainPage::MainPage()
     {
         InitializeComponent();
+        // Before anything can ask what the dynamic range is. The toggle's own
+        // Toggled handler fires during this and is swallowed by its
+        // no-change guard.
+        LoadHdrPreference();
         BuildOverlayChoices();
         BuildAppMenu();
         HookBackButton();
@@ -708,39 +715,40 @@ namespace winrt::EchoXbox::implementation
         //    chain exists: the request is what makes the composition scale
         //    report 2.0, and the swap chain is sized from that.
         SetStatus(L"requesting 4K output...");
-        // HDR is ASKED FOR here and DECIDED by the read-back. A console with no
-        // BT.2020 entry at this size, or one that refuses `Eotf2084`, falls
-        // through to the Rec.709 path with `hdrActive == false` and streams SDR
-        // exactly as before -- the request costs nothing when it cannot be met.
-        //
-        // Asked for unconditionally rather than from a setting because the
-        // honest input to the decision is what the CONSOLE can output, which is
-        // precisely what this call reports. The escape hatch, if HDR ever needs
-        // taking out of the picture on a given box, is a hand-written echo.json
-        // with "hdr": false -- it replaces the session config verbatim.
+        // 2a. RESOLUTION AND REFRESH ONLY. This call never decides dynamic
+        //     range: it returns early when the console is already the size we
+        //     want, and carries the console's existing transfer function
+        //     through when it is not.
         const auto hdmi = echo::RequestBestHdmiMode(kDesiredWidth, kDesiredHeight);
         Append(L"\nhdmi        " + hstring(hdmi.note));
 
-        // Step 2b, and it is SEPARATE on purpose. Resolution and refresh are
-        // settled above in SDR; this asks only for the transfer function, by
-        // finding the mode that matches whatever the console just landed on in
-        // every respect except PQ. Bundling the two is what left the stream
-        // clamped to HEVC Main 8: one call carrying three demands can be
-        // refused for any of them and never says which.
-        std::wstring hdrNote;
-        m_hdrActive = echo::RequestHdrMode(true, hdrNote);
-        Append(L"\nhdr         " + hstring(hdrNote));
-        Append(L"\ndynamic rng " + hstring(m_hdrActive ? L"HDR10 - asking the host for Main10 PQ"
-                                                       : L"SDR - asking the host for Rec.709"));
-        m_hdmiNote += L"\nhdr         " + hdrNote;
         // Kept, because this is the line that answers "what is the TV actually
         // being driven at" and the startup log scrolls away long before anyone
         // needs it. It belongs beside the counters, not in history.
+        //
+        // Assigned BEFORE the HDR line is appended to it. The other order was
+        // here and silently threw the HDR line away.
         m_hdmiNote = hdmi.note;
         if (!hdmi.offered.empty()) {
             Append(L"            " + hstring(hdmi.offered));
             m_hdmiNote += L"\n            " + hdmi.offered;
         }
+
+        // 2b. The transfer function, and it comes from the PREFERENCE.
+        //
+        //     Separate call from the resolution on purpose: a console asked
+        //     for a size, a refresh and a transfer function at once can refuse
+        //     the whole request for any one of them and never says which.
+        //
+        //     What this does NOT do is decide what the session asks Nova for.
+        //     That was the old behaviour and it was the bug - a Series X
+        //     enumerates its 119.88 Hz modes with `IsSmpte2084Supported` clear
+        //     while outputting 4K120 HDR10 perfectly well, so letting the
+        //     read-back veto the request clamped every session to HEVC Main 8
+        //     on hardware where moonlight streams HDR10. moonlight asks from
+        //     `enableHDR` alone (State/MoonlightClient.cpp:267) and never
+        //     consults the display at all when building its stream config.
+        ApplyHdrToDisplay(m_hdrEnabled);
 
         // 3. What we ask the HOST to encode is the console's real output size -
         //    read back from the console, not inferred from the request above and
@@ -1399,6 +1407,109 @@ namespace winrt::EchoXbox::implementation
         HideSettings();
     }
 
+    // ── The HDR10 preference ────────────────────────────────────────────────
+    //
+    // Read once, at construction, before anything can ask what it is.
+    //
+    // **Default ON, and absent means on.** A console with no stored value is a
+    // fresh install, and the overwhelmingly common console-plus-TV pairing in
+    // 2026 does HDR10. The failure mode of defaulting on where HDR cannot be
+    // shown is a flatter picture; the failure mode of defaulting off is a user
+    // who never finds out their setup could have done better. Only an explicit
+    // `false` turns it off.
+    void MainPage::LoadHdrPreference()
+    {
+        try {
+            auto settings = ApplicationData::Current().LocalSettings().Values();
+            if (settings.HasKey(L"hdr10")) {
+                m_hdrEnabled = unbox_value_or<bool>(settings.Lookup(L"hdr10"), true);
+            }
+        } catch (...) {
+            // Unreadable settings are not a reason to refuse to start, and the
+            // default is the one we would have chosen anyway.
+            m_hdrEnabled = true;
+        }
+        try {
+            HdrToggle().IsOn(m_hdrEnabled);
+        } catch (...) {
+        }
+    }
+
+    void MainPage::SaveHdrPreference(bool on)
+    {
+        try {
+            ApplicationData::Current().LocalSettings().Values()
+                .Insert(L"hdr10", box_value(on));
+        } catch (...) {
+            // Costs the preference on the next launch, never this session.
+        }
+    }
+
+    // Put the CONSOLE where the preference says it should be.
+    //
+    // This is reporting-only as far as the session is concerned. It runs on a
+    // background thread because `RequestSetCurrentDisplayModeAsync().get()`
+    // blocks, and it deliberately does NOT feed its answer back into
+    // `m_hdrEnabled`: see the note on those two members.
+    void MainPage::ApplyHdrToDisplay(bool on)
+    {
+        std::wstring note;
+        m_hdrActive = echo::RequestHdrMode(on, note);
+
+        Append(L"\nhdr         " + hstring(note));
+        Append(L"\ndynamic rng " +
+               hstring(on ? L"HDR10 requested from the host - Main10 PQ"
+                          : L"SDR requested from the host - Rec.709") +
+               hstring(m_hdrActive == on
+                           ? L"  (console agrees)"
+                           : L"  (console did NOT switch - streaming anyway)"));
+
+        // The panel line. Says both halves, because they can disagree and the
+        // disagreement is the interesting case.
+        std::wstring panel = on ? L"HDR10 requested from the host"
+                                : L"SDR requested from the host";
+        panel += m_hdrActive ? L"  ::  console is in BT.2020 PQ"
+                             : L"  ::  console is in SDR";
+        if (m_hdrActive != on) {
+            panel += L"\n" + note;
+        }
+        Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this, panel]() {
+            try { HdrStateText().Text(hstring(panel)); } catch (...) {}
+        });
+
+        m_hdmiNote += L"\nhdr         " + note;
+    }
+
+    // Flipping the switch. Two things happen, and only one of them is visible
+    // straight away.
+    //
+    // The console is asked to switch NOW, so the user can see on their TV
+    // whether it took - that is the whole reason this is a toggle and not a
+    // buried config field. What does NOT happen is renegotiating a live
+    // stream: the host fixed its encoder at Main8 or Main10 when the session
+    // started, and Nova's own rule is that a geometry or format change under a
+    // client is the client's business to survive. So a running stream keeps
+    // the range it negotiated, and the next one picks this up.
+    void MainPage::OnHdrToggled(IInspectable const&, RoutedEventArgs const&)
+    {
+        bool on = false;
+        try { on = HdrToggle().IsOn(); } catch (...) { return; }
+        if (on == m_hdrEnabled) return;      // also swallows the load-time set
+
+        m_hdrEnabled = on;
+        SaveHdrPreference(on);
+
+        if (m_streaming) {
+            ShowToast(L"DYNAMIC RANGE   ::   applies to the next stream", L"IonAmber");
+        }
+
+        // Blocking display call - never on the UI thread.
+        auto lifetime = get_strong();
+        std::thread([this, lifetime, on]() {
+            ApplyHdrToDisplay(on);
+        }).detach();
+    }
+
     // The microphone level, which currently travels nowhere.
     //
     // The control is here ahead of the feature deliberately, and it is a real
@@ -1481,10 +1592,16 @@ namespace winrt::EchoXbox::implementation
             const std::string res = std::to_string(m_streamWidth) + "x" +
                                     std::to_string(m_streamHeight);
             Append(L"stream      " + to_hstring(res) + L" @ " +
-                   std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp));
+                   std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp) +
+                   (m_hdrEnabled ? L", HDR10" : L", SDR"));
+            // `m_hdrEnabled`, the PREFERENCE - never `m_hdrActive`, what the
+            // display API said it did. See the note on those two members: the
+            // enumeration this console answers with is not trustworthy enough
+            // to hold a veto over the stream format, and moonlight gives it
+            // none either.
             config = echo::BuildConnectConfig(m_stateDir, host, fingerprint,
                                               res, m_streamFps, kStreamBitrate,
-                                              m_selectedApp, m_hdrActive);
+                                              m_selectedApp, m_hdrEnabled);
         }
 
         m_session->Close();
@@ -2276,6 +2393,10 @@ namespace winrt::EchoXbox::implementation
                 // What the TV is actually being driven at, which decides
                 // whether asking for 120 is useful or just twice the work.
                 line += L"\n\nhdmi        " + m_hdmiNote;
+                // What the compositor was actually told is in the back buffer.
+                // The one line that separates "the host sent SDR" from "the
+                // console refused to present PQ" - identical on the TV.
+                line += std::wstring(L"\nbuffer      ") + m_renderer->ColorSpaceReport();
                 if (m_outputHz) {
                     line += L"\noutput      " + std::to_wstring(m_outputWidth) + L"x" +
                             std::to_wstring(m_outputHeight) + L" @ " +

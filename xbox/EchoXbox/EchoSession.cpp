@@ -165,10 +165,23 @@ std::string BuildConnectConfig(std::string const& identityDir,
     json += "\"res\":\"" + Escape(res) + "\",";
     json += "\"fps\":" + std::to_string(fps) + ",";
     json += "\"codec\":\"hevc\",";
-    // A claim about this CLIENT, not a preference: it says the console is
-    // being driven in BT.2020 PQ and the renderer will convert for it. The
-    // host answers HEVC Main10 at FULL range, so asking for it without both
-    // halves in place produces a washed-out picture and no error anywhere.
+    // The user's HDR10 preference, and nothing else.
+    //
+    // It used to be the read-back from `HdmiDisplayInformation` -- "the console
+    // says it is in PQ" -- and that was wrong twice over. A Series X reports
+    // `IsSmpte2084Supported` clear on its 119.88 Hz modes while outputting
+    // 4K120 HDR10, so the probe said SDR on hardware that was already in HDR;
+    // and the probe is answering a question about the PANEL when the field is a
+    // question about the STREAM. moonlight-xbox sets
+    // `VIDEO_FORMAT_H265_MAIN10` straight from its `enableHDR` setting with no
+    // display call anywhere near it (State/MoonlightClient.cpp:267), which is
+    // why it gets HDR10 on the same TV.
+    //
+    // What the client still owes when this is true: the renderer converts
+    // full-range PQ itself (shader CSC) and declares
+    // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 on the swap chain. The host
+    // answers Main10 at FULL range, so a client that asks for HDR without both
+    // halves in place gets a washed-out picture and no error anywhere.
     json += std::string("\"hdr\":") + (hdr ? "true," : "false,");
     json += "\"bitrate_kbps\":" + std::to_string(bitrateKbps) + ",";
     // App 5 ("Virtual Desktop") is the HEADLESS one, and this single field is
