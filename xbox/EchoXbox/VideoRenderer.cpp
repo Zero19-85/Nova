@@ -37,6 +37,10 @@ std::wstring DescribeMode(HdmiDisplayMode const& mode) {
     }
     if (mode.IsSmpte2084Supported())    out += L" (PQ capable)";
     if (mode.Is2086MetadataSupported()) out += L" (HDR10 capable)";
+    // The one search criterion the table did not show. A stereo entry is
+    // skipped by every twin search (Echo's, moonlight's, Kodi's), so a PQ
+    // mode that only exists as stereo would look findable here and not be.
+    if (mode.StereoEnabled())           out += L" (stereo)";
     return out;
 }
 
@@ -431,29 +435,40 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // to ever trade 120 Hz for 60 -- that trade is not this function's to
         // make silently.
         constexpr double kRefreshTwinToleranceHz = 0.5;
+        // A lambda because the search has to be run TWICE -- see "second
+        // look" below. It always fetches a fresh list: the whole point of the
+        // second run is that the list it gets back can differ from the first.
+        const HdmiDisplayMode original = current;
+        const auto findTwin = [&hdmi, &original, enable](bool& approx) -> HdmiDisplayMode {
+            HdmiDisplayMode best{ nullptr };
+            double bestDelta = kRefreshTwinToleranceHz;
+            approx = false;
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.IsSmpte2084Supported() != enable ||
+                    mode.ResolutionWidthInRawPixels()  != original.ResolutionWidthInRawPixels() ||
+                    mode.ResolutionHeightInRawPixels() != original.ResolutionHeightInRawPixels() ||
+                    mode.StereoEnabled()) {
+                    continue;
+                }
+                const double delta = std::fabs(mode.RefreshRate() - original.RefreshRate());
+                if (delta <= 0.00001) { approx = false; return mode; }
+                // Ties go to the higher rate: this is a latency path.
+                if (delta < bestDelta ||
+                    (delta == bestDelta && best && mode.RefreshRate() > best.RefreshRate())) {
+                    bestDelta = delta;
+                    best = mode;
+                    approx = true;
+                }
+            }
+            return best;
+        };
+
         HdmiDisplayMode target{ nullptr };
         bool tookNearTwin = false;
         if (resendCurrentMode) {
             target = current;
         } else {
-            double bestDelta = kRefreshTwinToleranceHz;
-            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (mode.IsSmpte2084Supported() != enable ||
-                    mode.ResolutionWidthInRawPixels()  != current.ResolutionWidthInRawPixels() ||
-                    mode.ResolutionHeightInRawPixels() != current.ResolutionHeightInRawPixels() ||
-                    mode.StereoEnabled()) {
-                    continue;
-                }
-                const double delta = std::fabs(mode.RefreshRate() - current.RefreshRate());
-                if (delta <= 0.00001) { target = mode; tookNearTwin = false; break; }
-                // Ties go to the higher rate: this is a latency path.
-                if (delta < bestDelta ||
-                    (delta == bestDelta && target && mode.RefreshRate() > target.RefreshRate())) {
-                    bestDelta = delta;
-                    target = mode;
-                    tookNearTwin = true;
-                }
-            }
+            target = findTwin(tookNearTwin);
         }
         if (tookNearTwin) {
             wchar_t twin[120]{};
@@ -538,23 +553,24 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         const HdmiDisplayHdrOption option =
             enable ? HdmiDisplayHdrOption::Eotf2084 : HdmiDisplayHdrOption::None;
 
-        bool applied = false;
-        try {
-            applied = hdmi.RequestSetCurrentDisplayModeAsync(target, option, metadata).get();
-        } catch (...) {
-            applied = false;
-        }
-        if (!applied) {
-            // Without metadata, as a last try. If the console dislikes the
-            // mastering data specifically, this separates that from a refusal
-            // of the mode or the transfer function.
+        // With metadata first; without it as a last try. If the console
+        // dislikes the mastering data specifically, this separates that from a
+        // refusal of the mode or the transfer function.
+        const auto ask = [&hdmi, &metadata, &note, option](HdmiDisplayMode const& mode) -> bool {
             try {
-                applied = hdmi.RequestSetCurrentDisplayModeAsync(target, option).get();
-                if (applied) note += L"(accepted without 2086 metadata) ";
+                if (hdmi.RequestSetCurrentDisplayModeAsync(mode, option, metadata).get()) return true;
             } catch (...) {
-                applied = false;
             }
-        }
+            try {
+                if (hdmi.RequestSetCurrentDisplayModeAsync(mode, option).get()) {
+                    note += L"(accepted without 2086 metadata) ";
+                    return true;
+                }
+            } catch (...) {
+            }
+            return false;
+        };
+        const bool applied = ask(target);
 
         // Read back. moonlight's own comment on this line is "XXX sometimes
         // this lies and the TV is in another mode", so it is the best answer
@@ -562,7 +578,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // session's dynamic range is decided from it rather than from
         // `applied`.
         current = hdmi.GetCurrentDisplayMode();
-        const bool nowPq = current && current.IsSmpte2084Supported();
+        bool nowPq = current && current.IsSmpte2084Supported();
         note += applied ? (L"set " + DescribeMode(target))
                         : (L"console refused " + DescribeMode(target));
         note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
@@ -573,6 +589,41 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             // is gone.
             note += L"  (enumeration said this mode had no PQ - it was wrong)";
         }
+
+        // ── Second look: the list can change underneath us ─────────────────
+        //
+        // Live 2026-10-07, 4K120 Series X, `hevcPlayback`, app type Game: the
+        // first search found NO PQ mode at 119.88 Hz, so the speculative ask
+        // went out on the plain SDR entry ("24 bpp, RGB limited") -- which the
+        // console refused, as it always would. The mode table printed straight
+        // AFTER that refusal listed "3840x2160 @ 119.88 Hz, 30 bpp, BT2020
+        // (PQ capable) (HDR10 capable)": the exact twin the search exists to
+        // find. Same API, same console, a moment apart. Whether the refusal
+        // itself or plain time made it appear is not known; moonlight never
+        // sees the gap because it asks mid-stream, long after launch.
+        //
+        // So after a speculative refusal, fetch the list again (for up to a
+        // second) and, if the real twin is there now, ask for THAT.
+        if (enable && !nowPq && speculative) {
+            HdmiDisplayMode twin{ nullptr };
+            bool approx = false;
+            for (int look = 0; look < 5 && !twin; ++look) {
+                if (look) Sleep(250);
+                twin = findTwin(approx);
+            }
+            if (twin) {
+                note += L"\n              second look after the refusal: the list now offers " +
+                        DescribeMode(twin) + L" - asking for that: ";
+                const bool again = ask(twin);
+                current = hdmi.GetCurrentDisplayMode();
+                nowPq = current && current.IsSmpte2084Supported();
+                note += again ? L"set" : L"console refused it";
+                note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
+            } else {
+                note += L"\n              second look after the refusal: still no PQ mode near this refresh";
+            }
+        }
+
         if (enable && !nowPq && current) {
             // HDR wanted, SDR got: print what the console offers at this size,
             // PQ flag included. This is the one table that separates "this

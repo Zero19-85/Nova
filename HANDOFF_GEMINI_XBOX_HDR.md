@@ -188,3 +188,14 @@ Thank you; this round tested your three points.
   `m_session`, which the input bridge holds by raw pointer. Use
   `RebuildRenderer`.
 - Manifest XML comments may not contain `--`.
+
+## Update 2 — the mode table arrived, and it changes the diagnosis
+
+The console DOES offer `3840x2160 @ 119.88 Hz, 30 bpp, BT2020 (PQ capable)
+(HDR10 capable)` to Echo -- but only in the list fetched AFTER the first
+(speculative, SDR-entry) request was refused. The search a moment earlier did
+not see it. Full table in `HANDOFF_ECHO_XBOX.md` §14.6. Echo now re-fetches
+the list after a refusal and asks for the real twin. If you know why
+`GetSupportedDisplayModes` would omit PQ entries on its first call (lazy
+population, an entitlement that settles after launch, the first
+`RequestSetCurrentDisplayModeAsync` call), that is the open question.

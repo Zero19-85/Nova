@@ -1581,3 +1581,34 @@ renderer existed. Now:
 
 Built, not yet tested. If it still refuses, the `modes at this size:` table on
 the HDR line is the next evidence.
+
+### 14.6 The mode list CHANGES: the PQ twin appeared right after the refusal
+
+The first `modes at this size:` table (2026-10-07, Game, `hevcPlayback`,
+swap chain presenting PQ):
+
+```
+[at startup, swap chain presenting 8 frames as BT.2020 PQ (HDR10)]
+no PQ mode enumerated at this refresh - asking on the current mode anyway:
+console refused 3840x2160 @ 119.88 Hz, 24 bpp, RGB limited [now SDR]
+modes at this size:
+3840x2160 @ 59.94 Hz, 24 bpp, RGB limited
+3840x2160 @ 119.88 Hz, 24 bpp, RGB limited
+3840x2160 @ 59.94 Hz, 30 bpp, BT709 (HDR10 capable)
+3840x2160 @ 59.94 Hz, 30 bpp, BT2020 (PQ capable) (HDR10 capable)
+3840x2160 @ 119.88 Hz, 30 bpp, BT2020 (PQ capable) (HDR10 capable)
+3840x2160 @ 119.88 Hz, 30 bpp, BT709 (HDR10 capable)
+```
+
+The search and the table read the same API a moment apart, and the twin the
+search exists to find -- `119.88 Hz, 30 bpp, BT2020 (PQ capable)` -- is in the
+table but was not in the list the search saw. The "refused" was the
+speculative ask on the SDR entry, which could never have worked. **The console
+does offer 4K120 PQ to Echo; the first enumeration just does not show it.**
+
+`RequestHdrMode` now takes a **second look**: after a speculative refusal it
+fetches the list again (up to five times, 250 ms apart) and, if the twin is
+there, asks for that, logging `second look after the refusal: the list now
+offers ...`. `DescribeMode` also prints `(stereo)`, the one search criterion
+the table did not show. Whether the refusal or time is what populates the list
+is still unknown.
