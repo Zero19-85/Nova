@@ -1637,3 +1637,39 @@ not visible by reading. Now:
    and a `searched for:` header with the current mode's exact values.
 
 Built, untested. The verdict column will name the failing predicate.
+
+### 14.8 THE CAUSE: `IsSmpte2084Supported` returns a non-canonical bool
+
+The verdict table (2026-10-07) for the twin the search exists to find:
+
+```
+searched for: 3840x2160, 119.880120 Hz +/- 0.5, PQ ON, not stereo (current mode stereo no)
+3840x2160 @ 119.88 Hz, 30 bpp, BT2020 (PQ capable) (HDR10 capable)
+    <- pq NO, size ok, stereo no, 119.880120 Hz (d 0.000000) ok => rejected
+```
+
+Stereo `no` on every row, refresh delta exactly `0.000000`. The ONLY failing
+predicate is the PQ flag -- on a row that prints "(PQ capable)". Both come from
+`mode.IsSmpte2084Supported()` on the same object: the label from
+`if (flag)` (nonzero test), the verdict from `flag == enable` (compare with
+C++ `true`, i.e. byte 1). Both hold only if the OS writes a "true" whose byte
+is not 1. MSVC compares bool bytes, so `== true` fails on it. That one fact
+explains every HDR search Echo ever ran coming back empty -- and means the
+0e5f2b5 claim that the Series X "reports IsSmpte2084Supported clear on its
+119.88 Hz modes" was this same bug, not the console.
+
+moonlight-xbox and Kodi never hit it: they compare two OS values
+(`mode->IsSmpte2084Supported != current->IsSmpte2084Supported`, 0xNN vs 0),
+never one against a literal.
+
+**Fix:** `RawPqByte` reads the flag through the ABI
+(`get_IsSmpte2084Supported`) into an `unsigned char`; `IsPq` is `raw != 0`.
+Every read in VideoRenderer.cpp goes through it -- including
+`RequestBestHdmiMode`'s `isPq != currentIsPq`, which the same bug had broken.
+The verdict column prints `(raw 0xNN)`; anything but 00/01 confirms it.
+**Never call `IsSmpte2084Supported()` directly, and never compare a WinRT
+bool from the OS against a literal.**
+
+Second-opinion theories ruled out by the same table: a stereo/EDID 120 Hz flag
+(stereo is `no`; and moonlight's own predicate is `StereoEnabled == false`, not
+a parity check), and 119.88 Hz floating-point drift (delta `0.000000`).

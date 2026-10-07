@@ -17,6 +17,38 @@ using namespace Windows::Graphics::Display::Core;
 namespace echo {
 namespace {
 
+// ── `IsSmpte2084Supported` is read as a BYTE, never compared as a bool ──────
+//
+// The console writes a "true" here whose byte is not 1. Shown live on
+// 2026-10-07 by the twin-search verdict table: the 4K120 BT2020 row printed
+// "(PQ capable)" -- from `if (mode.IsSmpte2084Supported())`, a nonzero test --
+// and, from the same call on the same object, "pq NO" -- from
+// `mode.IsSmpte2084Supported() == enable`, a compare against C++ `true` (1).
+// Size ok, stereo no, refresh delta 0.000000: the flag was the only failure.
+// The verdict column now prints the raw byte, which is the confirmation.
+//
+// A bool holding any byte other than 0 or 1 is not a valid bool, so C++ gives
+// no guarantee at all about comparing it; MSVC compares the bytes. That is why
+// every HDR search Echo ever ran found nothing, and why the "Series X reports
+// IsSmpte2084Supported clear on 119.88 Hz modes" conclusion of 0e5f2b5 was
+// wrong. moonlight-xbox and Kodi never hit it because they compare two OS
+// values with each other (`mode.IsSmpte2084Supported() !=
+// current.IsSmpte2084Supported()`, i.e. 0xNN != 0), never with a literal.
+//
+// So the ABI writes into an `unsigned char`, which may hold any value and is
+// read as an integer. RawPqByte is kept separate so the verdict table can show
+// the byte itself. NEVER call `IsSmpte2084Supported()` directly in this file.
+uint8_t RawPqByte(HdmiDisplayMode const& mode) noexcept {
+    if (!mode) return 0;
+    using Abi = winrt::impl::abi_t<winrt::Windows::Graphics::Display::Core::IHdmiDisplayMode>;
+    auto* abi = static_cast<Abi*>(winrt::get_abi(mode));
+    unsigned char raw = 0;
+    if (!abi || abi->get_IsSmpte2084Supported(reinterpret_cast<bool*>(&raw)) < 0) return 0;
+    return raw;
+}
+
+bool IsPq(HdmiDisplayMode const& mode) noexcept { return RawPqByte(mode) != 0; }
+
 std::wstring DescribeMode(HdmiDisplayMode const& mode) {
     std::wstring out = std::to_wstring(mode.ResolutionWidthInRawPixels()) + L"x" +
                        std::to_wstring(mode.ResolutionHeightInRawPixels());
@@ -35,7 +67,7 @@ std::wstring DescribeMode(HdmiDisplayMode const& mode) {
         case HdmiDisplayColorSpace::RgbFull:     out += L", RGB full"; break;
         case HdmiDisplayColorSpace::RgbLimited:  out += L", RGB limited"; break;
     }
-    if (mode.IsSmpte2084Supported())    out += L" (PQ capable)";
+    if (IsPq(mode))    out += L" (PQ capable)";
     if (mode.Is2086MetadataSupported()) out += L" (HDR10 capable)";
     // The one search criterion the table did not show. A stereo entry is
     // skipped by every twin search (Echo's, moonlight's, Kodi's), so a PQ
@@ -100,7 +132,7 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
                 // use for HDR -- so a console that had genuinely switched to
                 // PQ was still reported as SDR. Same mistake as the selection
                 // filter above, in the one place that would have caught it.
-                out.hdrActive = mode.IsSmpte2084Supported();
+                out.hdrActive = IsPq(mode);
             }
         } catch (...) {
         }
@@ -144,7 +176,7 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
         // dynamic range through that change rather than picking one: this
         // function moves the resolution, `RequestHdrMode` moves the transfer
         // function, and neither may undo the other.
-        const bool currentIsPq = current && current.IsSmpte2084Supported();
+        const bool currentIsPq = current && IsPq(current);
 
         // Pick the highest refresh rate at the requested size. Refresh is the
         // tie-break rather than bit depth because this is a *latency* path: a
@@ -206,7 +238,7 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept {
             // FUNCTION, which is the thing that actually has to match what the
             // shader emits. It is also what moonlight verifies against after
             // the change, so it is the same question asked the same way.
-            const bool isPq = mode.IsSmpte2084Supported();
+            const bool isPq = IsPq(mode);
             // A HARD FILTER, not a tie-break -- and that distinction was the
             // whole bug (reported 2026-09-22 as "overly white, blacks grey").
             //
@@ -393,7 +425,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // resend exists to push our mastering metadata to the TV -- the mode
         // itself is already right.
         bool resendCurrentMode = false;
-        if (current.IsSmpte2084Supported() == enable) {
+        if (IsPq(current) == enable) {
             if (!enable) { note = L"already in SDR"; return false; }
             resendCurrentMode = true;
             note = L"already in HDR - resending with metadata: ";
@@ -444,7 +476,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             double bestDelta = kRefreshTwinToleranceHz;
             approx = false;
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (mode.IsSmpte2084Supported() != enable ||
+                if (IsPq(mode) != enable ||
                     mode.ResolutionWidthInRawPixels()  != original.ResolutionWidthInRawPixels() ||
                     mode.ResolutionHeightInRawPixels() != original.ResolutionHeightInRawPixels() ||
                     mode.StereoEnabled()) {
@@ -480,7 +512,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         const auto findLoose = [&hdmi, &original, enable]() -> HdmiDisplayMode {
             const long wantCentiHz = std::lround(original.RefreshRate() * 100.0);
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (mode.IsSmpte2084Supported() == enable &&
+                if (IsPq(mode) == enable &&
                     mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
                     mode.ResolutionHeightInRawPixels() == original.ResolutionHeightInRawPixels() &&
                     std::lround(mode.RefreshRate() * 100.0) == wantCentiHz) {
@@ -490,15 +522,18 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             return HdmiDisplayMode{ nullptr };
         };
         const auto verdict = [&original, enable](HdmiDisplayMode const& mode) -> std::wstring {
-            const bool pqOk   = mode.IsSmpte2084Supported() == enable;
+            const bool pqOk   = IsPq(mode) == enable;
             const bool sizeOk = mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
                                 mode.ResolutionHeightInRawPixels() == original.ResolutionHeightInRawPixels();
             const bool stereo = mode.StereoEnabled();
             const double delta = std::fabs(mode.RefreshRate() - original.RefreshRate());
             const bool hzOk   = delta <= kRefreshTwinToleranceHz;
-            wchar_t buf[220]{};
-            swprintf_s(buf, L"   <- pq %s, size %s, stereo %s, %.6f Hz (d %.6f) %s => %s",
-                       pqOk ? L"ok" : L"NO", sizeOk ? L"ok" : L"NO",
+            // The raw byte the OS wrote for IsSmpte2084Supported -- see
+            // RawPqByte. Anything other than 0x00/0x01 confirms the cause.
+            wchar_t buf[240]{};
+            swprintf_s(buf, L"   <- pq %s (raw 0x%02X), size %s, stereo %s, %.6f Hz (d %.6f) %s => %s",
+                       pqOk ? L"ok" : L"NO", static_cast<unsigned>(RawPqByte(mode)),
+                       sizeOk ? L"ok" : L"NO",
                        stereo ? L"YES (rejected)" : L"no", mode.RefreshRate(), delta,
                        hzOk ? L"ok" : L"NO",
                        (pqOk && sizeOk && !stereo && hzOk) ? L"MATCH" : L"rejected");
@@ -569,7 +604,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
                     note += L"\n              " + DescribeMode(mode);
                 }
             }
-            return current.IsSmpte2084Supported();
+            return IsPq(current);
         }
 
         // ── The 2086 metadata, and why it is not optional ───────────────────
@@ -627,7 +662,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // session's dynamic range is decided from it rather than from
         // `applied`.
         current = hdmi.GetCurrentDisplayMode();
-        bool nowPq = current && current.IsSmpte2084Supported();
+        bool nowPq = current && IsPq(current);
         note += applied ? (L"set " + DescribeMode(target))
                         : (L"console refused " + DescribeMode(target));
         note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
@@ -666,7 +701,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
                         DescribeMode(twin) + L" - asking for that: ";
                 const bool again = ask(twin);
                 current = hdmi.GetCurrentDisplayMode();
-                nowPq = current && current.IsSmpte2084Supported();
+                nowPq = current && IsPq(current);
                 note += again ? L"set" : L"console refused it";
                 note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
             } else {

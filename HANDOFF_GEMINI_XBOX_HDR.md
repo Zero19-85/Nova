@@ -224,3 +224,24 @@ every predicate's result per row and adds a looser match (stereo not
 excluded, refresh to two decimals). If you know of `StereoEnabled()` or
 `IsSmpte2084Supported()` behaving unexpectedly on Xbox `HdmiDisplayMode`
 objects, that is the open question now.
+
+## Update 4 — the verdict table names the cause, and it is neither stereo nor drift
+
+```
+searched for: 3840x2160, 119.880120 Hz +/- 0.5, PQ ON, not stereo (current mode stereo no)
+3840x2160 @ 119.88 Hz, 30 bpp, BT2020 (PQ capable) (HDR10 capable)
+    <- pq NO, size ok, stereo no, 119.880120 Hz (d 0.000000) ok => rejected
+```
+
+- `stereo no` on every row, so the EDID/3D theory does not apply here. (Also,
+  moonlight's predicate is `mode->StereoEnabled == false`,
+  `State/MoonlightClient.cpp:117` -- not a parity check.)
+- `d 0.000000`, so there is no refresh drift.
+- `pq NO` on a row printed "(PQ capable)". The label is `if (flag)`; the
+  verdict is `flag == true`. Both hold only if the OS writes a "true" byte
+  that is not 1 -- MSVC then fails the equality. Moonlight/Kodi compare two OS
+  values with each other and never see it.
+
+Fix (`HANDOFF_ECHO_XBOX.md` §14.8): the flag is read through the ABI into an
+`unsigned char` and canonicalised; the verdict prints the raw byte as proof.
+Untested at the time of writing.
