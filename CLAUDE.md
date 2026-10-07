@@ -90,7 +90,81 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-10-07): **ECHO XBOX STREAMS 4K120 HDR10** — and Tier 1 finally fired, and was broken
+## Current Phase (2026-10-07, evening): **AUDIO TO THE TV, SDR DASHBOARD, ONE REPAIR PER STALL**
+
+**All live-confirmed the same evening** — host deployed, Xbox and Android
+sideloaded. Measured: the Pixel now acks (`[LTR] armed recovery … acked=1578`,
+both LTR repairs landed without a keyframe) and Xbox sessions open with zero
+invalidations. Next session: HDR10 on Android, the Xbox microphone.
+
+### "Something keeps forcing Steam Streaming Speakers" — it was Nova, twice over
+
+1. **The hijacker was `audio.rs`'s own 1 Hz watchdog.** In client-only mode it
+   re-asserted the ghost sink on ANY drift, so an operator picking an output in
+   Sound settings snapped back within a second. `judge_drift` now tells the two
+   kinds of drift apart by what existed when the stream began: an endpoint that
+   **appeared mid-stream** (the late-HDMI case the watchdog was built for) is
+   still overridden; one that **already existed** is a choice, and capture
+   rebinds onto it (`SendExit::OperatorChoseOutput`) and follows the default for
+   the rest of the stream. **VB-CABLE is never followed** — it is the Echo mic's
+   path, the same rule as `kGhostSinkNames` (shim export
+   `EndpointIsVirtualCable`). Every override now logs *which* device and *why*.
+   The pre-stream endpoint still restores at session end, unchanged.
+2. **No sink choice could ever have reached the TV: the Xbox client had no
+   audio renderer** (handoff §5, milestone 5, "not started"). Added
+   `GameAudio` (Xbox): FFmpeg's native Opus decoder → XAudio2, pulled one
+   `echo_poll_audio` step per finished 20 ms buffer. FFmpeg, not the Windows
+   Opus MFT, because nothing proves the console exposes the MFT; `build-ffmpeg.ps1`
+   now enables `opus` + swresample (`opus_decoder_deps`), and the package ships
+   `swresample-5.dll`. Diagnostics panel line: `audio ...`.
+
+### Repairs are decided on the ENCODE thread (shim `QueueRepair`)
+
+`InvalidateRefFrames` ran on the thread that received the request and widened
+the range to `g_lastEncodedFrameIndex` as read then — a frame mid-encode escaped
+and became a reference for the "recovery" frame. Now `encoder::queue_repair`
+only records the range; `EncodeFrame` drains it (`DrainRepairQueue`) and walks
+RFI → LTR → IDR there. The fallback-IDR congestion signal moved to
+`Encoder::encode_frame` (`TakeRepairIdrFallbacks`). Same pass: **a range ending
+before the most recent IDR is dropped** (`repair … ignored — the IDR at frame N
+already replaced those pictures`) and one straddling it is clipped.
+
+### The start-of-stream burst on the Xbox was the CLIENT's frame queue
+
+Every 4K120 session opened with `invalidated 2-2`, `3-3`, `4-4` → three 4K IDRs.
+The decoder stalls warming up on the opening IDR, the 50 ms `FrameQueue`
+overflows, and each overflow evicted ONE frame and stayed full — one
+invalidation per arriving frame, while the P-frames behind each evicted one were
+still fed to the decoder. `FrameQueue::push` now evicts the head **and every
+frame that depended on it**, up to a queued keyframe, and reports the whole range
+once. Mid-stream the same cascade showed as `138797`, `138800`, `138803`.
+
+### The dashboard is SDR; HDR is engaged only while streaming (Xbox)
+
+Startup asks for SDR; the HDR toggle only records the preference;
+`BeginStream`'s existing retry path engages HDR; `RestoreSdrAfterStream` hands
+it back on leave/end/error. Costs one HDMI mode switch at each end of a stream,
+which is the trade the operator chose.
+
+### Android acks were never missing from the code — the APK was stale
+
+The phone ran a build from 2026-08-24; acks landed 2026-09-06 in shared
+`run_receiver`. `echo-android` had also stopped compiling (`StreamOptions.hdr`,
+added for Xbox HDR). Fixed; `app-debug.apk` rebuilt. **Rule: after changing
+`echo-client`'s public structs, run `cargo check --workspace`** — it compiles
+`echo-android` on the host and would have caught this; per-crate builds of the
+crate being worked on (`-p echo-xbox`) do not.
+
+### Pruned
+
+`encoder::rfi_supported`/`ltr_active` and the shim's `LtrActive` export (dead —
+the Master builds the SDP and never probes); `ArmLtrRecovery` is no longer
+exported (only the encode thread arms LTR now); `gamepad_mouse::is_active` is
+test-only. The host builds with zero warnings.
+
+---
+
+## Previous Phase (2026-10-07): **ECHO XBOX STREAMS 4K120 HDR10** — and Tier 1 finally fired, and was broken
 
 Three things landed, all live-confirmed by the operator. Full record:
 `HANDOFF_ECHO_XBOX.md` §14; the second-opinion brief is

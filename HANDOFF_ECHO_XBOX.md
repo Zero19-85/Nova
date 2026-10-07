@@ -34,8 +34,9 @@ What is settled, in one place:
 | Chrome | authored at 3840x2160, scale **measured** not assumed — §13.2 |
 | Decode ceiling | **deleted** — the panel rate advises, nothing vetoes — §13.7 |
 
-**Not done:** audio in either direction (§5) and HDR10. The mic slider in
-Settings is a deliberate placeholder — §13.9.
+**Live:** game audio to the TV (§15.1) and 4K120 HDR10 (§14), with the
+dashboard kept SDR (§15.2). **Not done:** the microphone — the slider in
+Settings is still a placeholder (§13.9, §5).
 
 **Before touching the video or input path, read §4b.** Four separate blank
 screens paid for the rules in it, and three of them looked like something other
@@ -690,8 +691,8 @@ Each had an exit criterion that is a thing you can see, not a thing you believe.
 | **2** | A picture on the TV | ✅ hardware, 2026-09-06 — native mDNS discovery, PIN pairing, automatic handoff, live HEVC hardware decode |
 | **3** | Input | ✅ hardware, 2026-09-07 — mouse, keyboard, controller, and client-side mouse mode |
 | **4** | Resolution & pacing | ✅ hardware, 2026-09-07 — 4K60 headless virtual display, live re-mode, no frame queue, no flashing |
-| 5 | Audio both ways | **not started.** Game audio out of the TV; the headset mic into the host's VB-CABLE. Windows ships an Opus *decoder* but no encoder — see §5. |
-| 6 | HDR10 | **not started.** The pipeline is SDR BGRA8 end to end today. |
+| 5 | Audio both ways | **downstream ✅ hardware, 2026-10-07** (§15.1). Mic upstream **not started** — Windows ships no Opus *encoder*, see §5. |
+| 6 | HDR10 | ✅ hardware, 2026-10-07 — 4K120 HDR10 (§14), engaged only while streaming (§15.2). |
 | 7 | UI parity with Android "Ion" | **behaviour matched, styling not.** Next session. |
 
 **Milestone 1 was the whole point of the probe**, and it paid: every unknown in
@@ -968,12 +969,12 @@ The port is live and stable. What remains, in the order it is worth doing:
    accents, a 4K design space, and a gesture-driven dashboard. What is left is
    the list in §13.9 — the accordion's feel, the drawer's focus path, and
    confirming the field really is black.
-2. **Audio, both directions.** Milestone 5, and the one with a real design
-   question in it: Windows ships an Opus decoder but no encoder, so the mic path
-   needs the codec inside the bridge rather than on the platform side. See §5.
-3. **HDR10.** The pipeline is SDR BGRA8 end to end today. The host already
-   negotiates and encodes HDR10; the renderer's colour-space plumbing has the
-   fallbacks in place but has never been given a PQ stream.
+2. ~~Downstream audio~~ — live 2026-10-07 (§15.1). ~~HDR10~~ — live (§14, §15.2).
+3. **The microphone.** The one remaining direction, and the one with the real
+   design question: Windows ships no Opus encoder, so the codec goes in the
+   bridge (an `echo_send_mic_pcm` beside `echo_send_mic`, §5). Note the FFmpeg
+   build has no Opus *encoder* either -- FFmpeg's native one is experimental;
+   libopus is the safe choice. Capture is `AudioGraph` (§5).
 
 ### Before changing anything in the video or input path
 
@@ -1684,3 +1685,46 @@ for disproved theories were then removed: the "second look" re-fetch loop
 live-swap-chain request timing, the stream-start retry, the
 output-is-really-HDR gate, and the per-row verdict table (printed only when
 HDR fails -- it is what found this).
+
+## 15. Audio to the TV, an SDR dashboard, one repair per stall (2026-10-07, evening)
+
+All live-confirmed by the operator the same evening.
+
+### 15.1 Downstream game audio -- `GameAudio.{h,cpp}`
+
+The operator's report was "the host keeps forcing Steam Streaming Speakers and
+no sound reaches the TV". Half of it was the host's watchdog (`CLAUDE.md`);
+the other half was here: **this client had no audio renderer at all**, so no
+host routing could ever have reached the TV.
+
+- **FFmpeg's Opus decoder, not the Windows MFT.** Nothing proved the console
+  exposes the MFT to an app; FFmpeg was already packaged. `build-ffmpeg.ps1`
+  now enables `opus` plus swresample (configure: `opus_decoder_deps`), so
+  **`swresample-5.dll` ships at the package root** and `build-app.ps1` checks it.
+- **Pull model on the device clock.** `EchoSession::RenderAudio` keeps three
+  20 ms buffers queued in an XAudio2 source voice; each `OnBufferEnd` is one
+  `echo_poll_audio` step. CONCEAL and SILENCE both render silence; the codes stay
+  distinct in the counters.
+- Diagnostics: `audio  playing ... :: N decoded, N silent, N decode errors`,
+  then `arrived / lost / underran / depth` from the bridge. `OFF - ...` names
+  the stage that failed to open.
+
+### 15.2 HDR only while streaming
+
+§14.9's darker UI was the dashboard (SDR) composited into a PQ output, because
+HDR was requested at startup and held. Now: startup asks for SDR, the toggle
+only records the preference, `BeginStream`'s retry path engages HDR, and
+`RestoreSdrAfterStream` gives it back on leave, end, error or a refused connect
+(`m_hdrEngagedForStream`). `LeaveStreamingUi` skips the restore when a NEWER
+session is already open, so a late `closed` from a superseded session cannot
+pull the console out of HDR under the next stream.
+
+### 15.3 The start-of-stream burst was the shared frame queue
+
+Every 4K120 session opened with `invalidated 2-2`, `3-3`, `4-4` and a 4K IDR
+for each. The decoder stalls on the opening IDR, `FrameQueue` (50 ms) overflows,
+and each overflow evicted ONE frame and stayed full. `echo-client`'s
+`FrameQueue::push` now evicts the head and every frame that depended on it, up
+to a queued keyframe, and reports one range. The host also drops a repair
+range that an IDR already superseded. Sessions after the fix open with zero
+invalidations.

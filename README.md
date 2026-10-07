@@ -28,7 +28,7 @@ Since then the same idea has been extended past the host: a session now survives
 | ENet control stream (IDR, ping, input, disconnect) | ✅ Working |
 | Congestion control (loss-driven bitrate cut + ramp-back) | ✅ Working |
 | Audio (WASAPI loopback → Opus → RTP, AES-128-CBC) | ✅ Working |
-| Ghost audio sink + mid-session routing watchdog | ✅ Working |
+| Ghost audio sink + mid-session routing watchdog (follows an output you pick) | ✅ Working |
 | Mouse (absolute + raw relative), keyboard, gamepad (ViGEmBus) | ✅ Working |
 | Cursor compositing (WGC native; manual blend on DDA incl. HDR) | ✅ Working |
 | Universal Virtual Display Driver (all apps, headless) | ✅ Working |
@@ -66,6 +66,7 @@ encoder and audio pipeline wholesale — Echo added framing, not media.
 | NAT hole punching + relay signalling (no port forwarding) | ✅ Working |
 | Per-session sealed media (AES-128-GCM, FEC over ciphertext) | ✅ Working |
 | Android client — HEVC via MediaCodec onto a SurfaceView | ✅ Working |
+| **Xbox client (UWP) — 4K120 HEVC, HDR10 while streaming, game audio** | ✅ Working |
 | GameStream PIN pairing from the client, RSA-2048 identity | ✅ Working |
 | Mouse (relative + absolute) and keyboard, own unreliable channel | ✅ Working |
 | **Microphone passthrough — the phone becomes the PC's mic** | ✅ Working |
@@ -74,8 +75,10 @@ encoder and audio pipeline wholesale — Echo added framing, not media.
 | **Zero-config discovery — the phone finds the PC by itself (`_echo._tcp`)** | ✅ Working |
 | Reconnect into a detached session — display and desktop still there | ✅ Working |
 | Survives backgrounding, screen lock and Activity teardown | ✅ Working |
-| LAN-direct path (skip the relay on the same subnet) | 🚧 Host half only |
-| Gamepad over Echo | 🔜 Planned |
+| LAN-direct path (skip the relay on the same subnet) | ✅ Working |
+| Gamepad over Echo (physical controllers → ViGEmBus) | ✅ Working |
+| Keyframeless loss repair (RFI → long-term reference → IDR, client acks) | ✅ Working |
+| Xbox microphone · Android HDR10 | 🔜 Next |
 
 ### Audio, both directions
 
@@ -280,7 +283,7 @@ Nova manages the [VirtualDrivers/Virtual-Display-Driver](https://github.com/Virt
 7. The Worker launches the selected app **onto the virtual display** (the VDD is primary by this point, so windows can't open on the sleeping physical panel)
 8. On stream end: full CCD topology restore, audio endpoint restore, devnode disabled again
 
-**App routing.** Apps 2 (Steam Big Picture), 3 (Xbox app), 4 (RetroArch), and 5 (Virtual Desktop) all run headless on the virtual display. App 1 (Desktop) mirrors the physical primary. `nova.toml → headless_for_all_apps = true` (the default) routes *everything* through the VDD, including App 1.
+**App routing.** Apps 2 (Steam Big Picture), 3 (Xbox app), 4 (RetroArch), and 5 (Virtual Desktop) all run headless on the virtual display. App 1 (Desktop) mirrors the physical primary. `nova.toml → headless_for_all_apps = true` (the default) keeps apps 2–4 headless; `false` restricts headless mode to App 5. **App 1 always mirrors the physical display, whatever the setting** — `app_launcher::uses_virtual_display` returns before it reads the flag — so a client that wants its own monitor must ask for App 5.
 
 **Display safety net:** `impl Drop`, console-ctrl hooks, and a dedicated `WM_ENDSESSION` monitor window all funnel into one claim-once emergency restore — physical monitors come back even on logoff, OS shutdown, or a hard crash mid-stream. Boot-time healing covers the power-loss case.
 
@@ -338,7 +341,7 @@ headless_for_all_apps = true   # route every app through the VDD (apps 2-5 are
 [audio]
 endpoint_override = ""         # friendly-name substring or endpoint ID of the
                                # device to use as the ghost sink (empty = built-in
-                               # list: Steam Streaming Speakers, VB-CABLE)
+                               # list: Steam Streaming Speakers, NVIDIA Virtual Audio)
 
 [network]
 fec_percentage = 10            # Reed-Solomon parity % (0 = disabled). 10 covers
@@ -428,9 +431,9 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 - **A phone must see the host on Wi-Fi once before it can stream over cellular.** The public endpoint travels in the mDNS record, and mDNS is local-only — so there is no way for a phone that has never been on the network to learn where to dial. Pair at home, then it works from anywhere.
 - **Zero-config WAN needs UPnP enabled on the router**, and cannot work at all behind carrier-grade NAT. Nova detects both and says which; the fallback is a forwarded port plus `advertise_url`.
 - **Cursor on the secure desktop** is blended manually on the DDA path (all shape types, SDR + HDR); minor visual differences vs. DWM compositing are possible during UAC/lock-screen interludes.
-- **Bundled Virtual Audio Driver (MTT) cannot load** under Secure Boot — it is code-signed but not Microsoft attestation-signed (device problem code 52). Steam Streaming Speakers or VB-CABLE serve as the ghost sink instead; do not work around this by disabling Secure Boot.
+- **Bundled Virtual Audio Driver (MTT) cannot load** under Secure Boot — it is code-signed but not Microsoft attestation-signed (device problem code 52). Steam Streaming Speakers or NVIDIA Virtual Audio serve as the ghost sink instead; do not work around this by disabling Secure Boot.
 - **Scheduled-task deployment** (`--install`) still works but cannot capture the secure desktop or lock screen, and does not get the Master/Worker split — the service deployment is required for those.
-- **Echo's client has no Opus packet-loss concealment.** Android's `MediaCodec` exposes no concealment entry point, so a lost audio packet is a 20 ms gap rather than an extrapolated one. Loss is reported separately from silence so the two are never confused. Software PLC is on the backlog.
+- **Echo's clients have no Opus packet-loss concealment.** Android's `MediaCodec` exposes no concealment entry point, and the Xbox renders a lost packet as silence too, so a lost audio packet is a 20 ms gap rather than an extrapolated one. Loss is reported separately from silence so the two are never confused. Software PLC is on the backlog.
 - **Echo's A/V sync costs input latency** when enabled — it works by holding video back. Off by default; leave it off while playing.
 - **Echo game audio requires a virtual sink** (Steam Streaming Speakers or NVIDIA Virtual Audio). Without one the host has no ghost sink to capture and the stream is silent. VB-CABLE is deliberately excluded from that list — it is the microphone's endpoint.
 
