@@ -37,6 +37,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "target\release\nova-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target\release\nova_shim.dll"; DestDir: "{app}"; Flags: ignoreversion
 
+; Echo signaling relay + the script that registers it and wires nova.toml.
+; Without these a reinstall leaves Echo with "no relay" (2026-10-05).
+; relay-data\ is NOT shipped: the relay mints its own identity on first run,
+; and that folder survives uninstall so the pin stays stable across reinstalls.
+Source: "target\release\nova-relay.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "install-relay.ps1"; DestDir: "{app}"; Flags: ignoreversion
+
 ; Virtual Display Driver files (adjust this path if your VDD folder is elsewhere)
 Source: "VirtualDisplayDriver\*"; DestDir: "{app}\VirtualDisplayDriver"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,VDD Control.exe,*.iss"
 
@@ -60,8 +67,20 @@ Filename: "{app}\{#MyAppExeName}"; \
 Filename: "{sys}\sc.exe"; Parameters: "start NovaService"; \
     Flags: runhidden waituntilterminated
 
+; 4. Register + start the Echo relay, then point nova.toml at it (fills in
+;    `[echo.signaling]` only when empty, and restarts the service if it did).
+;    Runs after the service so the nova.toml it waits for exists.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install-relay.ps1"" -AppDir ""{app}"""; \
+    Flags: runhidden waituntilterminated; StatusMsg: "Setting up the Echo relay..."
+
 
 [UninstallRun]
+; 0. Stop and unregister the Echo relay
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install-relay.ps1"" -AppDir ""{app}"" -Uninstall"; \
+    Flags: runhidden waituntilterminated; RunOnceId: "RemoveRelay"
+
 ; 1. Stop and remove the Nova service first
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--uninstall-service"; \
     Flags: runhidden waituntilterminated
@@ -91,6 +110,10 @@ begin
     
     // Kill any stray host process
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM nova-server.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // The relay holds nova-relay.exe open too; the setup script restarts it
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN NovaEchoRelay', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM nova-relay.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     
     Sleep(1500);
   end;
