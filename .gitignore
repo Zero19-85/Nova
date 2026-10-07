@@ -101,3 +101,5 @@ xbox/dist/
 # staging), so committing ~13 MB of DLLs and generated headers would only make
 # the tree heavier and the provenance less clear.
 xbox/EchoXbox/ffmpeg/
+# libopus, staged by `xbox/build-opus.ps1` (static /MD lib + headers).
+xbox/EchoXbox/opus/

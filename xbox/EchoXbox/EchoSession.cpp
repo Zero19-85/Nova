@@ -3,6 +3,7 @@
 #include "EchoBridge.h"
 #include "VideoDecoder.h"
 #include "GameAudio.h"
+#include "MicCapture.h"
 #include "HostDiscovery.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -330,6 +331,39 @@ std::wstring EchoSession::AudioReport() const {
     return state + counts;
 }
 
+// ── Upstream microphone ─────────────────────────────────────────────────────
+
+void EchoSession::SetMicLevel(uint32_t level) noexcept {
+    std::shared_ptr<MicCapture> released;
+    {
+        std::lock_guard<std::mutex> lk(m_micMutex);
+        if (level == 0 || !m_handle) {
+            // Released, not paused: a muted microphone should not hold the
+            // headset, the same rule Android's MicCapture.stop() states.
+            released = std::move(m_mic);
+        } else if (m_mic) {
+            m_mic->SetLevel(level);
+        } else {
+            m_mic = MicCapture::Start(m_handle, level);
+        }
+    }
+    if (released) released->Stop();
+}
+
+void EchoSession::StopMic() noexcept {
+    std::shared_ptr<MicCapture> mic;
+    {
+        std::lock_guard<std::mutex> lk(m_micMutex);
+        mic = std::move(m_mic);
+    }
+    if (mic) mic->Stop();
+}
+
+std::wstring EchoSession::MicReport() const {
+    std::lock_guard<std::mutex> lk(m_micMutex);
+    return m_mic ? m_mic->Report() : std::wstring(L"off (level 0, or no stream)");
+}
+
 void EchoSession::PumpEvents(EventSink sink) noexcept {
     std::array<char, 4096> buffer{};
     while (m_running.load(std::memory_order_acquire)) {
@@ -464,7 +498,13 @@ void EchoSession::Close() noexcept {
     // own "not a session" code rather than faulting — which is exactly what the
     // bridge guarantees for a handle torn down underneath a caller.
     const uint64_t handle = m_handle;
-    m_handle = 0;
+    {
+        // Under the mic lock, so a SetMicLevel racing this cannot open a new
+        // microphone on a handle about to be freed.
+        std::lock_guard<std::mutex> lk(m_micMutex);
+        m_handle = 0;
+    }
+    StopMic();   // before echo_close: see StopMic
     if (handle) echo_close(handle);
 
     if (m_feed.joinable()) m_feed.join();
@@ -481,7 +521,11 @@ void EchoSession::Detach() noexcept {
     // been told nothing at all, and it reaches its own detach path when the
     // tunnel goes quiet.
     const uint64_t handle = m_handle;
-    m_handle = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_micMutex);
+        m_handle = 0;
+    }
+    StopMic();   // before echo_detach: see StopMic
     if (handle) echo_detach(handle);
 
     if (m_feed.joinable()) m_feed.join();

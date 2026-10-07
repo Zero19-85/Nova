@@ -130,6 +130,7 @@ namespace winrt::EchoXbox::implementation
         // failure path.
         void LoadHdrPreference();             // UI thread
         void SaveHdrPreference(bool on);      // UI thread
+        void LoadMicPreference();             // UI thread
         /// Ask the console to switch transfer function, best-effort, and report
         /// what it actually did. BLOCKING — background thread only. Never
         /// changes `m_hdrEnabled`: a console that refuses is a console that
@@ -261,8 +262,8 @@ namespace winrt::EchoXbox::implementation
         std::wstring m_heldHostName;
         bool m_ending = false;                // an End Stream RPC is in flight
 
-        // Microphone passthrough, 0-100. Remembered here and sent nowhere; the
-        // capture path does not exist yet. See the note on OnMicLevelChanged.
+        // Microphone passthrough, 0-100; 0 = off. Persisted as `micLevel`.
+        // See the note on OnMicLevelChanged.
         uint32_t m_micLevel = 0;
 
         // What the console is really putting on the wire to the TV, read back

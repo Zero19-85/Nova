@@ -568,14 +568,9 @@
                                 <TextBlock Text="MICROPHONE PASSTHROUGH"
                                            Style="{StaticResource IonLabel}" />
                                 <StackPanel Orientation="Horizontal" Spacing="34">
-                                    <!-- A placeholder with a real value, not a
-                                         disabled control: a disabled slider
-                                         cannot take focus, so on a console it
-                                         is invisible to the only input device
-                                         there is, and the point of putting it
-                                         in now is that the layout and the
-                                         navigation order are settled before the
-                                         audio path arrives. -->
+                                    <!-- 0 = off (headset released), 50 = as
+                                         captured, 100 = +6 dB. Live; persisted.
+                                         See MainPage::OnMicLevelChanged. -->
                                     <Slider x:Name="MicSlider"
                                             Width="900"
                                             Minimum="0" Maximum="100"
@@ -593,7 +588,7 @@
                                 </StackPanel>
                                 <TextBlock Style="{StaticResource IonTelemetry}"
                                            TextWrapping="Wrap"
-                                           Text="Not connected to the microphone path yet — the level is remembered for this session and sent nowhere. The uplink exists on the bridge (echo_send_mic); nothing on this console captures into it." />
+                                           Text="Sends the headset microphone to the PC, where it arrives as a microphone for games and chat. Off releases the headset. 50% is the level as captured, 100% boosts it. Applies immediately, even mid-stream. Remembered across restarts." />
                             </StackPanel>
                         </Border>
 

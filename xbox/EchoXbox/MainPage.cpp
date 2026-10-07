@@ -167,6 +167,7 @@ namespace winrt::EchoXbox::implementation
         // Toggled handler fires during this and is swallowed by its
         // no-change guard.
         LoadHdrPreference();
+        LoadMicPreference();
         BuildOverlayChoices();
         BuildAppMenu();
         HookBackButton();
@@ -1619,23 +1620,48 @@ namespace winrt::EchoXbox::implementation
         RequestHdrWithLiveSwapChain(false, why);
     }
 
-    // The microphone level, which currently travels nowhere.
+    // Microphone passthrough level: 0 is off (the headset is released, not
+    // muted), 50 is the signal as captured, 100 is +6 dB. Applies live to a
+    // running stream -- dragging to zero mid-stream closes the microphone, and
+    // back up reopens it -- and is remembered across restarts.
     //
-    // The control is here ahead of the feature deliberately, and it is a real
-    // control rather than a disabled one: on a console a disabled control cannot
-    // take focus, so it is invisible to the only input device there is, and the
-    // point of putting it in early is to settle the layout and the navigation
-    // order before the audio path arrives. What it is NOT is a lie - the panel
-    // says in words that nothing is captured into it yet.
-    //
-    // When the capture side lands, the uplink it needs already exists on the
-    // bridge (`echo_send_mic`, one raw Opus packet per call).
+    // Default OFF, unlike HDR: a microphone that opens without being asked for
+    // is a privacy surprise, and the first open raises a consent prompt over
+    // the stream. The user turns it on knowing that.
     void MainPage::OnMicLevelChanged(IInspectable const&,
                                      Primitives::RangeBaseValueChangedEventArgs const& args)
     {
         m_micLevel = static_cast<uint32_t>(std::lround(args.NewValue()));
         MicValueText().Text(m_micLevel == 0 ? hstring(L"off")
                                             : hstring(std::to_wstring(m_micLevel) + L"%"));
+        try {
+            ApplicationData::Current().LocalSettings().Values()
+                .Insert(L"micLevel", box_value(m_micLevel));
+        } catch (...) {
+            // Costs the preference on the next launch, never this session.
+        }
+        if (m_streaming && m_session && m_session->IsOpen()) {
+            m_session->SetMicLevel(m_micLevel);
+        }
+    }
+
+    void MainPage::LoadMicPreference()
+    {
+        try {
+            auto settings = ApplicationData::Current().LocalSettings().Values();
+            if (settings.HasKey(L"micLevel")) {
+                m_micLevel = std::min<uint32_t>(
+                    unbox_value_or<uint32_t>(settings.Lookup(L"micLevel"), 0), 100);
+            }
+        } catch (...) {
+            m_micLevel = 0;
+        }
+        try {
+            // Fires OnMicLevelChanged, which sets the label and re-saves the
+            // same value; no session exists yet, so nothing opens.
+            MicSlider().Value(static_cast<double>(m_micLevel));
+        } catch (...) {
+        }
     }
 
     // ── Pair ────────────────────────────────────────────────────────────────
@@ -2467,6 +2493,11 @@ namespace winrt::EchoXbox::implementation
         HideAppDrawer();
         HideActionMenu();
         HideOverlay();                       // also turns forwarding on
+        // The microphone opens at the grant, not at connect: before the host
+        // has granted the session the bridge has no keys to seal it with, and
+        // every packet captured meanwhile would queue and arrive as one stale
+        // burst. Level 0 does nothing.
+        if (m_session && m_session->IsOpen()) m_session->SetMicLevel(m_micLevel);
     }
 
     void MainPage::LeaveStreamingUi()
@@ -2581,6 +2612,12 @@ namespace winrt::EchoXbox::implementation
                             L"   lost " + field("audio_lost") +
                             L"   underran " + field("audio_underran") +
                             L"   depth " + field("audio_depth");
+                    // Upstream. `sent` here is what the encoder produced;
+                    // the host's half is its "Microphone ..." lines in
+                    // nova-service.log.
+                    // Peak near -120 dBFS with `sent` climbing is a device
+                    // delivering silence, not a broken path.
+                    line += L"\nmic       " + m_session->MicReport();
                 }
             }
 

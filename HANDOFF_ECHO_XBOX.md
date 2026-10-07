@@ -970,7 +970,7 @@ The port is live and stable. What remains, in the order it is worth doing:
    the list in §13.9 — the accordion's feel, the drawer's focus path, and
    confirming the field really is black.
 2. ~~Downstream audio~~ — live 2026-10-07 (§15.1). ~~HDR10~~ — live (§14, §15.2).
-3. **The microphone.** The one remaining direction, and the one with the real
+3. ~~**The microphone.**~~ LIVE 2026-10-07 (§16). Was: the one remaining direction, and the one with the real
    design question: Windows ships no Opus encoder, so the codec goes in the
    bridge (an `echo_send_mic_pcm` beside `echo_send_mic`, §5). Note the FFmpeg
    build has no Opus *encoder* either -- FFmpeg's native one is experimental;
@@ -1728,3 +1728,58 @@ and each overflow evicted ONE frame and stayed full. `echo-client`'s
 to a queued keyframe, and reports one range. The host also drops a repair
 range that an IDR already superseded. Sessions after the fix open with zero
 invalidations.
+
+---
+
+## 16. The microphone (2026-10-07) -- LIVE-CONFIRMED on the console
+
+The last direction. Headset -> `AudioGraph` -> libopus -> `echo_send_mic`. The
+bridge and the host needed **no changes**: the uplink (`echo_send_mic` -> sealed
+`mic_channel` datagrams -> `nova-server/src/mic.rs` -> VB-CABLE) was already
+live for Android.
+
+### 16.1 libopus, static, in the EXE -- not `echo_send_mic_pcm` in the bridge
+
+§5 planned an `echo_send_mic_pcm` with the encoder in Rust. Not done, on
+purpose: a C codec inside the `+crt-static` bridge is the cmake-vs-crt-static
+fight `aws-lc-rs` already lost, while the exe is *already* a `/MD` Store-CRT
+binary. So `xbox\build-opus.ps1` compiles libopus 1.5.2 with `cl.exe` under
+`vcvarsall x64 uwp` into `xbox\EchoXbox\opus\opus.lib` (gitignored, like
+`ffmpeg\`), and the exe links it. The bridge ABI is unchanged and stays the same
+shape as Android's: one raw Opus packet per `echo_send_mic`.
+
+- **No CMake on this box, and none needed** -- the script reads libopus's own
+  `*_sources.mk`, so an upgrade picks up file-list changes by itself.
+- **Acceptance check:** the lib's `/DEFAULTLIB` must say `MSVCRT`, never
+  `LIBCMT`. Same rule as FFmpeg's dumpbin checks. Float build, plain C, no x86
+  RTCD -- a 24 kbps mono voice frame is sub-millisecond on Zen 2.
+- **Format is the host's**, identical to `MicCapture.kt`: 48 kHz mono, 20 ms,
+  24 kbps, `OPUS_APPLICATION_VOIP`, no DTX.
+
+### 16.2 `MicCapture.{h,cpp}`
+
+`AudioGraph` (`GameChat`, `LowestLatency`) -> device input node -> frame output
+node at the **graph's** format; each `QuantumStarted` downmixes to mono,
+linear-resamples if the graph is not 48 kHz (never expected on a console),
+applies gain, accumulates 960 samples and encodes on the graph thread.
+
+- **The handle is a raw pointer** (`EchoHandle::from_raw` reads a magic word
+  through it), so a send racing `echo_close` is a use-after-free. Every send is
+  under `m_mutex`; `Stop()` zeroes the handle under it; `EchoSession::Close` and
+  `Detach` zero `m_handle` under `m_micMutex` and call `StopMic()` **before**
+  `echo_close`/`echo_detach`. Keep that order.
+- **Opens at the grant** (`EnterStreamingUi`), not at connect -- before the grant
+  there are no keys, and captured audio would queue into one stale burst.
+- **Category: `Other` first, then `Communications`.** Communications is the chat
+  category but can trigger system ducking of other audio -- the game audio this
+  app plays. The diagnostics line names whichever answered. This is §5's open
+  question (is the headset reachable while party chat holds it?) and the first
+  hardware session answers it.
+- **The slider is real now.** 0 = off and the headset is *released*; 50 = as
+  captured; 100 = +6 dB, hard-clipped. Live mid-stream, persisted as
+  `micLevel`. Default OFF: the first open raises a consent prompt.
+- Diagnostics: `mic  capturing (Other, graph 48000 Hz x2, N-sample quantum) ...`
+  then `sent / refused / encode errors / peak dBFS / gain`. **Peak near -120
+  with `sent` climbing is a device delivering silence** (the VB-CABLE lesson),
+  not a broken path. Host side: `Microphone ready` / `Microphone released` in
+  `nova-service.log`.

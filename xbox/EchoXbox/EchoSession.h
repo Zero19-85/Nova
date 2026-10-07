@@ -10,10 +10,12 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <memory>
 
 namespace echo {
 
 class VideoDecoder;
+class MicCapture;
 struct DiscoveredHost;
 
 // Every control-plane event, as the JSON the bridge emits. Called from the pump
@@ -98,7 +100,20 @@ public:
     /// renderer opened (and if not, why) and what it has played.
     std::wstring AudioReport() const;
 
+    /// Microphone passthrough, 0-100. Zero releases the headset; anything else
+    /// opens it (if not already open) and sets the gain. UI thread only -- the
+    /// first open raises the console's consent prompt. Does nothing on a
+    /// closed session.
+    void SetMicLevel(uint32_t level) noexcept;
+    /// Upstream microphone, for the diagnostics panel.
+    std::wstring MicReport() const;
+
 private:
+    // Stops the microphone and guarantees it will never call into the bridge
+    // again. Close and Detach run this BEFORE they free the handle: the bridge
+    // validates a handle by reading through it (see MicCapture.h).
+    void StopMic() noexcept;
+
     void PumpEvents(EventSink sink) noexcept;
     void FeedFrames(VideoDecoder* decoder) noexcept;
     void RenderAudio() noexcept;
@@ -117,6 +132,9 @@ private:
     std::atomic<uint64_t> m_audioErrors{0};
     mutable std::mutex m_audioMutex;
     std::wstring m_audioState = L"not started";
+
+    mutable std::mutex m_micMutex;
+    std::shared_ptr<MicCapture> m_mic;
 };
 
 }  // namespace echo
