@@ -86,6 +86,21 @@ HdmiOutcome RequestBestHdmiMode(uint32_t width, uint32_t height) noexcept;
 // is not HDR" and "we asked wrongly" is otherwise invisible.
 bool RequestHdrMode(bool enable, std::wstring& note) noexcept;
 
+// Is the console's output ACTUALLY in HDR right now?
+//
+// Asked of `DisplayInformation::GetAdvancedColorInfo()`, which is how Kodi's
+// UWP build reports HDR status (`CWIN32Util::GetWindowsHDRStatus`), and not of
+// the HDMI mode's `IsSmpte2084Supported` flag. This is the question the HDR
+// stream gate must ask: on Xbox, a swap chain accepts a BT.2020 PQ declaration
+// even while the output is SDR (`CanPresentPq` said yes on 2026-10-07), and
+// Microsoft's docs say HDR10-to-SDR tone mapping happens "in the media
+// pipeline" -- which a swap-chain renderer does not use. So PQ sent to an SDR
+// output is shown untone-mapped: an almost entirely white picture.
+//
+// UI thread ONLY: `GetForCurrentView` throws anywhere else. `how` names the
+// kind it saw, for the diagnostics line. Never throws.
+bool ConsoleOutputIsHdr(std::wstring& how) noexcept;
+
 struct DisplayFacts {
     uint32_t panelWidth = 0;        // logical (DIP) size of the SwapChainPanel
     uint32_t panelHeight = 0;
@@ -115,6 +130,22 @@ enum class ColorSpaceState : int {
     SrgbRefused,
     SetRefused,     // the support check passed and the set still failed
     NoSwapChain3,
+};
+
+// The FIRST stage at which RenderFrame refused a picture. Every one of these
+// used to be a bare `return false`, so `drawn 0` beside a healthy `decoded`
+// could not say which of five different failures it was (live 2026-10-05:
+// 274 decoded, 0 drawn, no reason anywhere). The first one is kept rather than
+// the latest because the latest is usually a consequence of the first.
+enum class RenderFailure : int {
+    None = 0,
+    ShaderFile,     // a .cso was missing or unreadable from the package
+    ShaderCreate,   // the bytecode loaded and the device refused it
+    PipelineState,  // input layout, sampler or constant buffer
+    VideoTexture,   // our private copy target could not be created
+    PlaneViews,     // the NV12/P010 plane SRVs could not be created
+    Quad,           // the vertex buffer could not be created
+    SwapChainDesc,  // GetDesc1 on the swap chain failed
 };
 
 
@@ -173,7 +204,47 @@ public:
     }
     ID3D11Device* Device() const noexcept { return m_device.get(); }
 
+    /// Would the swap chain accept `RGB_FULL_G2084_NONE_P2020` right now?
+    ///
+    /// The gate on asking the host for HDR10. It asks the question that
+    /// actually decides whether PQ is bleached -- the same
+    /// `CheckColorSpaceSupport` that `ApplySwapChainColorSpace` (and
+    /// moonlight) run before declaring it -- rather than the HDMI mode flag,
+    /// which misreports at 119.88 Hz. A refusal here means PQ would be
+    /// presented as sRGB, so SDR is the honest stream to ask for. False with
+    /// no swap chain. A read-only DXGI query, safe from the UI thread.
+    bool CanPresentPq() const noexcept;
+
+    /// Why nothing is being drawn, if anything has said so. Empty while every
+    /// stage has succeeded. Safe from any thread.
+    std::wstring FailureReport() const;
+
+    /// The GPU device is gone -- `DXGI_ERROR_DEVICE_REMOVED`/`RESET`. Nothing
+    /// on this renderer can recover from that: its device, swap chain and
+    /// every resource are dead, and the present thread has exited. The owner
+    /// must destroy it and build a new one. Safe from any thread.
+    bool DeviceLost() const noexcept {
+        return m_deviceRemovedReason.load(std::memory_order_acquire) != 0;
+    }
+
+    /// Whether the owner should rebuild before the next stream: the device is
+    /// lost, or a stage failed before a single picture was ever drawn. The
+    /// second matters because the shader stage is deliberately sticky -- it
+    /// never retries -- so one bad load would otherwise blank every session
+    /// for the rest of the app's life.
+    bool NeedsRebuild() const noexcept {
+        return DeviceLost() ||
+               (m_blitted.load(std::memory_order_relaxed) == 0 &&
+                m_renderFailure.load(std::memory_order_relaxed) != 0);
+    }
+
 private:
+    // Record a refusal (first one wins) and check whether the device itself
+    // is what failed. Always returns false so a failing stage can
+    // `return Fail(...)`.
+    bool Fail(RenderFailure stage, HRESULT hr) noexcept;
+    void NoteDeviceRemoved(HRESULT fallback) noexcept;
+
     void PresentLoop() noexcept;
     void IdleWait() noexcept;   // 1 ms, high-resolution; never a hot spin
     bool CreateSwapChainSurfaces() noexcept;
@@ -267,6 +338,14 @@ private:
     // The last present failure, for the diagnostics panel. A silent renderer
     // thread is exactly what made this class of bug expensive to find.
     std::atomic<uint32_t> m_lastPresentHr{ 0 };
+    // See RenderFailure / FailureReport(). Render thread writes, UI reads.
+    std::atomic<int>      m_renderFailure{ 0 };
+    std::atomic<uint32_t> m_renderFailureHr{ 0 };
+    // `GetDeviceRemovedReason()` at the moment the device was found dead; 0
+    // while it is alive. This is the number that names the CAUSE (a GPU hang,
+    // a driver reset, running out of memory), where 0x887A0005 on its own
+    // only says that it happened.
+    std::atomic<uint32_t> m_deviceRemovedReason{ 0 };
     // The creation/resize flags, which must MATCH: ResizeBuffers with a
     // different flag set than the swap chain was created with fails, and it
     // fails at the moment the picture changes size.

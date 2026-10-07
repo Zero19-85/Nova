@@ -853,6 +853,35 @@ namespace winrt::EchoXbox::implementation
         return true;
     }
 
+    bool MainPage::RebuildRenderer()
+    {
+        const std::wstring why = m_renderer->FailureReport();
+        Append(hstring(L"\nrenderer    rebuilding - " +
+                       (why.empty() ? std::wstring(L"no reason recorded") : why)));
+
+        // Decoder first: it decodes on the renderer's device, and its surfaces
+        // must be gone before that device is released.
+        m_renderer->SetFrameSource(nullptr);
+        m_decoderReady = false;
+        if (m_decoder) { m_decoder->Shutdown(); m_decoder.reset(); }
+
+        // Destroying it joins the present thread (already exited if the device
+        // was lost) and releases the dead device and swap chain. The panel is
+        // handed the new swap chain by Initialize.
+        m_renderer.reset();
+        m_renderer = std::make_unique<echo::VideoRenderer>();
+        const auto facts = m_renderer->Initialize(VideoPanel());
+        if (!facts.ok) {
+            Append(hstring(L"renderer    rebuild FAILED: " + facts.note));
+            return false;
+        }
+        m_backBufferWidth = facts.backBufferWidth;
+        m_backBufferHeight = facts.backBufferHeight;
+        Append(hstring(L"renderer    rebuilt on a fresh device\n" +
+                       StartDecoder(m_backBufferWidth, m_backBufferHeight)));
+        return m_decoderReady;
+    }
+
     // ── Input ───────────────────────────────────────────────────────────────
 
     void MainPage::StartInput()
@@ -1457,17 +1486,21 @@ namespace winrt::EchoXbox::implementation
         m_hdrActive = echo::RequestHdrMode(on, note);
 
         Append(L"\nhdr         " + hstring(note));
+        // "preferred", not "requested": what the host is asked for is decided
+        // at stream start, where an HDR preference the swap chain cannot
+        // present is downgraded to SDR (see the `hdrStream` gate). The stream
+        // line says which one was actually sent.
         Append(L"\ndynamic rng " +
-               hstring(on ? L"HDR10 requested from the host - Main10 PQ"
-                          : L"SDR requested from the host - Rec.709") +
+               hstring(on ? L"HDR10 preferred - Main10 PQ"
+                          : L"SDR preferred - Rec.709") +
                hstring(m_hdrActive == on
                            ? L"  (console agrees)"
-                           : L"  (console did NOT switch - streaming anyway)"));
+                           : L"  (console did NOT switch - the stream line says what was asked for)"));
 
         // The panel line. Says both halves, because they can disagree and the
         // disagreement is the interesting case.
-        std::wstring panel = on ? L"HDR10 requested from the host"
-                                : L"SDR requested from the host";
+        std::wstring panel = on ? L"HDR10 preferred"
+                                : L"SDR preferred";
         panel += m_hdrActive ? L"  ::  console is in BT.2020 PQ"
                              : L"  ::  console is in SDR";
         if (m_hdrActive != on) {
@@ -1570,6 +1603,20 @@ namespace winrt::EchoXbox::implementation
 
     void MainPage::BeginStream()
     {
+        // A renderer whose device died, or that refused its very first
+        // picture, stays that way for the life of the app -- the renderer and
+        // decoder are built once at startup and nothing used to rebuild them.
+        // Four sessions in a row were blank for exactly that reason on
+        // 2026-10-05. Rebuild before anything below consults the renderer
+        // (the HDR gate asks its swap chain), and close the old session
+        // first, because it holds the decoder that is about to be destroyed.
+        if (m_renderer && m_renderer->NeedsRebuild()) {
+            if (m_session) m_session->Close();
+            if (!RebuildRenderer()) {
+                SetStatus(L"renderer rebuild failed - close and reopen Echo");
+                return;
+            }
+        }
         if (!m_decoderReady) { SetStatus(L"no decoder - cannot stream"); return; }
 
         std::string config = m_configOverride;
@@ -1591,17 +1638,40 @@ namespace winrt::EchoXbox::implementation
 
             const std::string res = std::to_string(m_streamWidth) + "x" +
                                     std::to_string(m_streamHeight);
+            // The preference, VETOED by the swap chain - never by `m_hdrActive`.
+            //
+            // The HDMI mode flag stays reporting-only: it misreports at
+            // 119.88 Hz, and letting it veto clamped HDR-capable sessions to
+            // Main 8 (0e5f2b5). But no veto at all is the opposite bug: a
+            // console whose output stayed SDR refuses the PQ declaration, the
+            // back buffer stays sRGB, and a Main10 PQ stream is presented as
+            // if it were Rec.709 -- bleached, with no error anywhere (live
+            // 2026-09-23). `CanPresentPq` asks the one question that decides
+            // that outcome, the same check moonlight makes before
+            // `SetColorSpace1`, so an HDR stream is requested only when it
+            // can be shown as HDR.
+            //
+            // ...and the swap chain's answer turned out NOT to be enough
+            // (2026-10-07): an Xbox accepts the PQ declaration while its HDMI
+            // output is still SDR, and nothing on this path tone-maps (that
+            // happens "in the media pipeline" per Microsoft, which Echo does
+            // not use). The picture came out almost entirely white. So the
+            // OUTPUT must be HDR too, asked the way Kodi asks it.
+            const bool canPresentPq = m_renderer && m_renderer->CanPresentPq();
+            std::wstring outputKind;
+            const bool outputIsHdr = echo::ConsoleOutputIsHdr(outputKind);
+            const bool hdrStream = m_hdrEnabled && canPresentPq && outputIsHdr;
             Append(L"stream      " + to_hstring(res) + L" @ " +
                    std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp) +
-                   (m_hdrEnabled ? L", HDR10" : L", SDR"));
-            // `m_hdrEnabled`, the PREFERENCE - never `m_hdrActive`, what the
-            // display API said it did. See the note on those two members: the
-            // enumeration this console answers with is not trustworthy enough
-            // to hold a veto over the stream format, and moonlight gives it
-            // none either.
+                   (hdrStream ? L", HDR10" : L", SDR"));
+            if (m_hdrEnabled && !hdrStream) {
+                Append(hstring(L"\nhdr         HDR10 is on, but asking for SDR so the picture is "
+                               L"not washed out: console output is " + outputKind +
+                               (canPresentPq ? L"" : L", swap chain refuses BT.2020 PQ")));
+            }
             config = echo::BuildConnectConfig(m_stateDir, host, fingerprint,
                                               res, m_streamFps, kStreamBitrate,
-                                              m_selectedApp, m_hdrEnabled);
+                                              m_selectedApp, hdrStream);
         }
 
         m_session->Close();
@@ -2403,6 +2473,13 @@ namespace winrt::EchoXbox::implementation
                 swprintf_s(code, L"  last error 0x%08X", hr);
                 line += code;
             }
+            // Which stage refused, and whether the GPU device died -- with the
+            // device's own reason. Always shown, not only on the diagnostics
+            // screen: it is the line that explains a blank stream, and it is
+            // short when present and absent when everything works.
+            if (const auto failure = m_renderer->FailureReport(); !failure.empty()) {
+                line += L"\n" + failure;
+            }
             if (showing) {
                 // What the TV is actually being driven at, which decides
                 // whether asking for 120 is useful or just twice the work.
@@ -2464,6 +2541,10 @@ namespace winrt::EchoXbox::implementation
                     why = L"Frames are arriving but the decoder produces nothing.\n"
                           L"This console cannot decode the stream it was sent.\n"
                           L"Hold Menu+View and pick a lower resolution or frame rate.";
+                } else if (m_renderer->DeviceLost()) {
+                    why = L"The console's GPU device was lost, so nothing can be drawn.\n"
+                          L"End the stream and start it again - the renderer is rebuilt\n"
+                          L"automatically. The reason is on the line below.";
                 } else {
                     why = L"Decoding, but nothing reaches the screen.\n"
                           L"The colour conversion or the present path is stuck.";

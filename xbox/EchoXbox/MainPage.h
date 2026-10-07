@@ -57,6 +57,10 @@ namespace winrt::EchoXbox::implementation
         // name itself rather than surfacing three steps later.
         Windows::Foundation::IAsyncAction StartupAsync();
         bool StartRenderer();                 // UI thread
+        // Replace a renderer that can no longer draw (device lost, or a stage
+        // that failed before the first picture) and the decoder bound to its
+        // device. UI thread; the caller closes any session first.
+        bool RebuildRenderer();
         void StartInput();                    // UI thread
         void StartDiscovery();                // UI thread
         void StartStatsTimer();
@@ -285,6 +289,13 @@ namespace winrt::EchoXbox::implementation
         // them apart for the same reason - `enableHDR` decides the stream
         // format, `SetDisplayHDR` decides the panel, and neither consults the
         // other.
+        //
+        // The preference still does not reach the host unchecked: the session
+        // request ANDs it with `VideoRenderer::CanPresentPq()` AND
+        // `echo::ConsoleOutputIsHdr()` (AdvancedColorInfo, Kodi's check),
+        // because PQ sent to a console whose output is SDR is shown
+        // untone-mapped -- bleached or near-white, with no error anywhere. The
+        // swap chain alone says yes even then (2026-10-07).
         bool m_hdrEnabled = true;
         bool m_hdrActive = false;
 

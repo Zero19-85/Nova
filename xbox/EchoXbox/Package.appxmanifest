@@ -20,6 +20,18 @@
      family exists but narrows the app to that device; Universal runs on the
      console AND on the dev box, which is the difference between debugging this
      on a PC and only ever debugging it on a TV.
+
+  4. `hevcPlayback` is NOT a Media Foundation switch, whatever its name says.
+     Microsoft's "4K video playback for UWP apps on Xbox" page: "4K and HDR10
+     video playback is supported on the Xbox One S onwards ... All these
+     capabilities are enabled using the special hevcPlayback capability", and
+     enabling it "changes the way your application is treated by the Xbox
+     operating system": 3.25 GB of memory instead of 1.25 GB, and the app no
+     longer runs beside a game. moonlight-xbox declares it; Echo did not until
+     2026-10-07, and on the same console and TV moonlight reached 4K120 HDR10
+     while Echo was offered no PQ display mode at 120 Hz and a 4K stream with
+     a copy texture lived inside the smaller memory budget. Removing this line
+     is how both of those come back.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -81,6 +93,10 @@
     <Capability Name="internetClientServer" />
     <!-- The LAN half: the direct rendezvous, and discovery if it is added. -->
     <Capability Name="privateNetworkClientServer" />
+    <!-- 4K + HDR10 display modes and the larger memory budget. See note 4.
+         Restricted, so a Store submission would need it approved; a Dev Mode
+         sideload is allowed it as-is. Must precede DeviceCapability. -->
+    <rescap:Capability Name="hevcPlayback" />
     <!-- Headset microphone, for upstream passthrough. -->
     <DeviceCapability Name="microphone" />
   </Capabilities>

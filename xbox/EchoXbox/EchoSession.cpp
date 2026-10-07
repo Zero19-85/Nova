@@ -165,7 +165,10 @@ std::string BuildConnectConfig(std::string const& identityDir,
     json += "\"res\":\"" + Escape(res) + "\",";
     json += "\"fps\":" + std::to_string(fps) + ",";
     json += "\"codec\":\"hevc\",";
-    // The user's HDR10 preference, and nothing else.
+    // The user's HDR10 preference, gated by the caller on the swap chain
+    // accepting BT.2020 PQ AND the console's output really being HDR
+    // (`echo::ConsoleOutputIsHdr`, AdvancedColorInfo) -- never on the HDMI
+    // mode's IsSmpte2084Supported flag alone, for the reason below.
     //
     // It used to be the read-back from `HdmiDisplayInformation` -- "the console
     // says it is in PQ" -- and that was wrong twice over. A Series X reports

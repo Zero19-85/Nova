@@ -3,6 +3,7 @@
 
 #include <windows.ui.xaml.media.dxinterop.h>   // ISwapChainPanelNative
 #include <winrt/Windows.Graphics.Display.Core.h>
+#include <winrt/Windows.Graphics.Display.h>        // AdvancedColorInfo
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <cmath>
@@ -413,20 +414,52 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         //
         // moonlight matches width, height, refresh and non-stereo, and nothing
         // else, for the same reason.
+        // ── The refresh twin, not the exact refresh ─────────────────────────
+        //
+        // moonlight matches refresh to 0.00001 Hz and gets away with it because
+        // it never changes the mode first: it starts from the dashboard's entry,
+        // whose PQ twin sits at the identical rate. Echo does change it --
+        // `RequestDisplayMode` takes the HIGHEST SDR refresh at the requested
+        // size, and a console can list SDR 4K at both 120.00 and 119.88 Hz with
+        // the PQ variant only at 119.88. An exact match from 120.00 then finds
+        // nothing, the speculative ask below is refused, and the panel stays
+        // at "24 bpp RGB limited" while the host sends PQ (live 2026-09-23:
+        // bleached 4K120 on the TV where moonlight streams 4K120 HDR10).
+        //
+        // So: exact first, then the NEAREST refresh within half a hertz. The
+        // window is wide enough for the 1000/1001 NTSC pairs and far too narrow
+        // to ever trade 120 Hz for 60 -- that trade is not this function's to
+        // make silently.
+        constexpr double kRefreshTwinToleranceHz = 0.5;
         HdmiDisplayMode target{ nullptr };
+        bool tookNearTwin = false;
         if (resendCurrentMode) {
             target = current;
         } else {
+            double bestDelta = kRefreshTwinToleranceHz;
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (mode.IsSmpte2084Supported() == enable &&
-                    mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
-                    mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels() &&
-                    !mode.StereoEnabled() &&
-                    std::fabs(mode.RefreshRate() - current.RefreshRate()) <= 0.00001) {
+                if (mode.IsSmpte2084Supported() != enable ||
+                    mode.ResolutionWidthInRawPixels()  != current.ResolutionWidthInRawPixels() ||
+                    mode.ResolutionHeightInRawPixels() != current.ResolutionHeightInRawPixels() ||
+                    mode.StereoEnabled()) {
+                    continue;
+                }
+                const double delta = std::fabs(mode.RefreshRate() - current.RefreshRate());
+                if (delta <= 0.00001) { target = mode; tookNearTwin = false; break; }
+                // Ties go to the higher rate: this is a latency path.
+                if (delta < bestDelta ||
+                    (delta == bestDelta && target && mode.RefreshRate() > target.RefreshRate())) {
+                    bestDelta = delta;
                     target = mode;
-                    break;
+                    tookNearTwin = true;
                 }
             }
+        }
+        if (tookNearTwin) {
+            wchar_t twin[120]{};
+            swprintf_s(twin, L"no PQ twin at exactly %.2f Hz - took the one at %.2f Hz: ",
+                       current.RefreshRate(), target.RefreshRate());
+            note += twin;
         }
 
         // ── Last resort: ask on the CURRENT mode anyway ────────────────────
@@ -540,12 +573,53 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             // is gone.
             note += L"  (enumeration said this mode had no PQ - it was wrong)";
         }
+        if (enable && !nowPq && current) {
+            // HDR wanted, SDR got: print what the console offers at this size,
+            // PQ flag included. This is the one table that separates "this
+            // console has no PQ entry at this refresh at all" (then HDR here
+            // means a lower refresh, which is a policy choice) from "it has
+            // one and we asked wrongly" (then it is a bug). Without it the two
+            // read identically, and on 2026-10-05 they were confused with each
+            // other: the refresh-twin theory was built on a guess about this
+            // list instead of on the list.
+            note += L"\n              modes at this size:";
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
+                    mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels()) {
+                    note += L"\n              " + DescribeMode(mode);
+                }
+            }
+        }
         return nowPq;
     } catch (hresult_error const& e) {
         note = std::wstring(L"HDR mode request failed: ") + e.message().c_str();
         return false;
     } catch (...) {
         note = L"HDR mode request failed";
+        return false;
+    }
+}
+
+bool ConsoleOutputIsHdr(std::wstring& how) noexcept {
+    try {
+        using winrt::Windows::Graphics::Display::AdvancedColorKind;
+        using winrt::Windows::Graphics::Display::DisplayInformation;
+        auto info = DisplayInformation::GetForCurrentView();
+        if (!info) { how = L"no DisplayInformation"; return false; }
+        auto color = info.GetAdvancedColorInfo();
+        if (!color) { how = L"no AdvancedColorInfo"; return false; }
+        switch (color.CurrentAdvancedColorKind()) {
+            case AdvancedColorKind::HighDynamicRange: how = L"HDR"; return true;
+            case AdvancedColorKind::WideColorGamut:   how = L"WCG (not HDR)"; return false;
+            case AdvancedColorKind::StandardDynamicRange: how = L"SDR"; return false;
+        }
+        how = L"unknown kind";
+        return false;
+    } catch (hresult_error const& e) {
+        how = std::wstring(L"query failed: ") + e.message().c_str();
+        return false;
+    } catch (...) {
+        how = L"query failed";
         return false;
     }
 }
@@ -841,19 +915,27 @@ bool VideoRenderer::EnsureShaderPipeline() noexcept {
     };
 
     std::vector<uint8_t> vs, ps;
-    if (!load(L"echo_video_vertex.cso", vs) || !load(L"echo_video_pixel.cso", ps)) return false;
+    if (!load(L"echo_video_vertex.cso", vs) || !load(L"echo_video_pixel.cso", ps)) {
+        return Fail(RenderFailure::ShaderFile, HRESULT_FROM_WIN32(GetLastError()));
+    }
 
-    if (FAILED(m_device->CreateVertexShader(vs.data(), vs.size(), nullptr,
-                                            m_vertexShader.put()))) return false;
-    if (FAILED(m_device->CreatePixelShader(ps.data(), ps.size(), nullptr,
-                                           m_pixelShader.put()))) return false;
+    if (const HRESULT hr = m_device->CreateVertexShader(vs.data(), vs.size(), nullptr,
+                                                        m_vertexShader.put()); FAILED(hr)) {
+        return Fail(RenderFailure::ShaderCreate, hr);
+    }
+    if (const HRESULT hr = m_device->CreatePixelShader(ps.data(), ps.size(), nullptr,
+                                                       m_pixelShader.put()); FAILED(hr)) {
+        return Fail(RenderFailure::ShaderCreate, hr);
+    }
 
     const D3D11_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    if (FAILED(m_device->CreateInputLayout(layout, 2, vs.data(), vs.size(),
-                                           m_inputLayout.put()))) return false;
+    if (const HRESULT hr = m_device->CreateInputLayout(layout, 2, vs.data(), vs.size(),
+                                                       m_inputLayout.put()); FAILED(hr)) {
+        return Fail(RenderFailure::PipelineState, hr);
+    }
 
     // LINEAR, and CLAMP on both axes. The clamp is a second line of defence
     // behind the shader chroma clamp: between them, nothing the sampler does
@@ -863,13 +945,17 @@ bool VideoRenderer::EnsureShaderPipeline() noexcept {
     samp.AddressU = samp.AddressV = samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     samp.ComparisonFunc = D3D11_COMPARISON_NEVER;
     samp.MaxLOD = D3D11_FLOAT32_MAX;
-    if (FAILED(m_device->CreateSamplerState(&samp, m_sampler.put()))) return false;
+    if (const HRESULT hr = m_device->CreateSamplerState(&samp, m_sampler.put()); FAILED(hr)) {
+        return Fail(RenderFailure::PipelineState, hr);
+    }
 
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = sizeof(CscConstants);
     cb.Usage = D3D11_USAGE_DEFAULT;          // UpdateSubresource, not a map
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    if (FAILED(m_device->CreateBuffer(&cb, nullptr, m_cscBuffer.put()))) return false;
+    if (const HRESULT hr = m_device->CreateBuffer(&cb, nullptr, m_cscBuffer.put()); FAILED(hr)) {
+        return Fail(RenderFailure::PipelineState, hr);
+    }
 
     m_shaderReady = true;
     return true;
@@ -919,8 +1005,9 @@ bool VideoRenderer::EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
         own.SampleDesc.Count = 1;
         own.Usage = D3D11_USAGE_DEFAULT;
         own.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(m_device->CreateTexture2D(&own, nullptr, m_videoTexture.put()))) {
-            return false;
+        if (const HRESULT hr = m_device->CreateTexture2D(&own, nullptr, m_videoTexture.put());
+            FAILED(hr)) {
+            return Fail(RenderFailure::VideoTexture, hr);
         }
 
         // P010 keeps its 10 bits in the HIGH bits of a 16-bit word, so an
@@ -938,11 +1025,11 @@ bool VideoRenderer::EnsurePlaneViews(ID3D11Texture2D* frame, uint32_t slice,
             srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srv.Texture2D.MostDetailedMip = 0;
             srv.Texture2D.MipLevels = 1;
-            if (FAILED(m_device->CreateShaderResourceView(m_videoTexture.get(), &srv,
-                                                          m_planeViews[0][i].put()))) {
+            if (const HRESULT hr = m_device->CreateShaderResourceView(
+                    m_videoTexture.get(), &srv, m_planeViews[0][i].put()); FAILED(hr)) {
                 m_planeViews.clear();
                 m_videoTexture = nullptr;
-                return false;
+                return Fail(RenderFailure::PlaneViews, hr);
             }
         }
         m_videoTexW = desc.Width;
@@ -1157,6 +1244,77 @@ void VideoRenderer::ApplySwapChainColorSpace(bool pq) noexcept {
     }
 }
 
+bool VideoRenderer::Fail(RenderFailure stage, HRESULT hr) noexcept {
+    int none = 0;
+    if (m_renderFailure.compare_exchange_strong(none, static_cast<int>(stage),
+                                                std::memory_order_relaxed)) {
+        m_renderFailureHr.store(static_cast<uint32_t>(hr), std::memory_order_relaxed);
+    }
+    // Most of these stages fail for one reason in practice: the device under
+    // them has already been removed. Asking costs nothing and turns "could not
+    // create a texture" into the reason that actually matters.
+    if (m_device && FAILED(m_device->GetDeviceRemovedReason())) NoteDeviceRemoved(hr);
+    return false;
+}
+
+void VideoRenderer::NoteDeviceRemoved(HRESULT fallback) noexcept {
+    HRESULT reason = m_device ? m_device->GetDeviceRemovedReason() : fallback;
+    if (SUCCEEDED(reason)) reason = fallback;          // removed, but no detail
+    if (SUCCEEDED(reason)) reason = DXGI_ERROR_DEVICE_REMOVED;
+    uint32_t expected = 0;
+    m_deviceRemovedReason.compare_exchange_strong(expected, static_cast<uint32_t>(reason),
+                                                  std::memory_order_acq_rel);
+}
+
+std::wstring VideoRenderer::FailureReport() const {
+    std::wstring out;
+    wchar_t buf[200]{};
+    if (const uint32_t removed = m_deviceRemovedReason.load(std::memory_order_acquire)) {
+        // Named, because the hex alone sends someone to a search engine, and
+        // the four answers point at completely different places.
+        const wchar_t* why = L"no further detail";
+        switch (removed) {
+            case 0x887A0006u: why = L"GPU HUNG - a command took too long and the GPU was reset"; break;
+            case 0x887A0007u: why = L"device RESET - a badly formed command"; break;
+            case 0x887A0020u: why = L"DRIVER internal error"; break;
+            case 0x887A0001u: why = L"INVALID CALL"; break;
+            case 0x8007000Eu: why = L"OUT OF MEMORY"; break;
+            case 0x887A0005u: why = L"removed, no further detail"; break;
+        }
+        swprintf_s(buf, L"GPU device lost: 0x%08X (%s) - rebuilt at the next stream start",
+                   removed, why);
+        out += buf;
+    }
+    if (const int stage = m_renderFailure.load(std::memory_order_relaxed)) {
+        const wchar_t* what = L"unknown stage";
+        switch (static_cast<RenderFailure>(stage)) {
+            case RenderFailure::ShaderFile:    what = L"shader file missing/unreadable"; break;
+            case RenderFailure::ShaderCreate:  what = L"shader rejected by the device"; break;
+            case RenderFailure::PipelineState: what = L"input layout/sampler/constant buffer"; break;
+            case RenderFailure::VideoTexture:  what = L"video copy texture"; break;
+            case RenderFailure::PlaneViews:    what = L"plane views (NV12/P010 SRVs)"; break;
+            case RenderFailure::Quad:          what = L"vertex buffer"; break;
+            case RenderFailure::SwapChainDesc: what = L"swap chain GetDesc1"; break;
+            default: break;
+        }
+        swprintf_s(buf, L"first render failure: %s (0x%08X)", what,
+                   m_renderFailureHr.load(std::memory_order_relaxed));
+        if (!out.empty()) out += L"\n";
+        out += buf;
+    }
+    return out;
+}
+
+bool VideoRenderer::CanPresentPq() const noexcept {
+    if (!m_swapChain) return false;
+    auto swapChain3 = m_swapChain.try_as<IDXGISwapChain3>();
+    if (!swapChain3) return false;
+    UINT support = 0;
+    return SUCCEEDED(swapChain3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+                                                        &support)) &&
+           (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
+}
+
 bool VideoRenderer::RenderFrame(ID3D11Texture2D* frame, uint32_t slice) noexcept {
     if (!EnsureShaderPipeline()) return false;
 
@@ -1167,12 +1325,14 @@ bool VideoRenderer::RenderFrame(ID3D11Texture2D* frame, uint32_t slice) noexcept
     if (!EnsurePlaneViews(frame, slice, desc, planes)) return false;
 
     EnsureQuad(desc);
-    if (!m_quad) return false;
+    if (!m_quad) return Fail(RenderFailure::Quad, E_FAIL);
     EnsureCscConstants(desc);
     ApplySwapChainColorSpace(m_frameColor.pq);
 
     DXGI_SWAP_CHAIN_DESC1 sc{};
-    if (FAILED(m_swapChain->GetDesc1(&sc))) return false;
+    if (const HRESULT hr = m_swapChain->GetDesc1(&sc); FAILED(hr)) {
+        return Fail(RenderFailure::SwapChainDesc, hr);
+    }
 
     ID3D11RenderTargetView* rtv = m_backBufferView.get();
     m_context->OMSetRenderTargets(1, &rtv, nullptr);
@@ -1401,7 +1561,13 @@ void VideoRenderer::PresentLoop() noexcept {
             continue;
         }
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-            break;   // the device is gone; nothing here can recover it
+            // The device is gone and nothing on THIS renderer can recover it.
+            // Record why, so the owner can say so and build a new renderer at
+            // the next stream start -- this used to end the thread silently,
+            // and every later session in the app's life was blank with only
+            // 0x887A0005 on the panel to explain it (live 2026-10-05).
+            NoteDeviceRemoved(hr);
+            break;
         }
         // Anything else: leave the last picture up and try again next pass.
         guard.unlock();

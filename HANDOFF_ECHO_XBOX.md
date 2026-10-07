@@ -1495,3 +1495,61 @@ report is quoted:
   control cannot take focus, so on a console it is invisible to the only input
   device there is, and the point of putting it in early is to settle the layout
   and the navigation order before the audio path arrives.
+
+## 14. HDR10, device loss, and the manifest line that was missing (2026-10-07)
+
+### 14.1 `hevcPlayback` is what gives an app 4K + HDR10 display modes
+
+**Symptom:** Moonlight streams 4K120 HDR10 from Nova on the same Series X and
+TV; Echo's HDR request ended `no PQ mode enumerated at this refresh - asking on
+the current mode anyway ... console refused ... [now SDR]`. Echo, Moonlight and
+Kodi all search for the HDR twin the same way (same size, refresh within
+0.00001 Hz, `IsSmpte2084Supported` flipped), so the search was not the
+difference: **Echo was being offered a different mode list.**
+
+**Cause, from Microsoft's "4K video playback for UWP apps on Xbox" page:** "4K
+and HDR10 video playback is supported on the Xbox One S onwards ... All these
+capabilities are enabled using the special `hevcPlayback` capability in the app
+manifest", and enabling it "changes the way your application is treated by the
+Xbox operating system" -- 3.25 GB of memory instead of 1.25 GB, and the app no
+longer runs beside a game. moonlight-xbox declares
+`<rescap:Capability Name="hevcPlayback" />`; Echo did not. Now it does
+(manifest note 4). It is a restricted capability: fine for a Dev Mode sideload,
+needs approval for a Store submission.
+
+**Not yet confirmed on the console.** If the HDR line still ends `[now SDR]`,
+it now prints every mode at the current size with its PQ flag -- that table is
+the next piece of evidence.
+
+### 14.2 A swap chain accepting PQ does NOT mean the output is HDR
+
+`CheckColorSpaceSupport(G2084_P2020)` reports PRESENT support on an Xbox whose
+HDMI output is SDR. Microsoft: HDR10-to-SDR tone mapping is "done in the media
+pipeline", which a swap-chain renderer does not use -- so PQ sent to an SDR
+output is shown untone-mapped: **an almost entirely white picture** (live
+2026-10-07). The stream gate in `BeginStream` therefore asks three things:
+the preference, `CanPresentPq()`, and `echo::ConsoleOutputIsHdr()`
+(`DisplayInformation::GetAdvancedColorInfo().CurrentAdvancedColorKind()`, the
+check Kodi's UWP build uses). UI thread only. Any one false asks for SDR and
+says which.
+
+### 14.3 The renderer is per APP RUN, so one device loss blanked every session
+
+`StartRenderer` and `StartDecoder` run once at launch. The present loop exits
+on `DXGI_ERROR_DEVICE_REMOVED`, and nothing rebuilt it: four sessions in a row
+read `decoded 274 drawn 0 ... last error 0x887A0005`. Every `RenderFrame`
+failure was also a bare `return false`. Now: `RenderFailure` stage + HRESULT
+and `GetDeviceRemovedReason()` land in `FailureReport()` on the panel, and
+`NeedsRebuild()` triggers `RebuildRenderer()` at the top of `BeginStream`.
+**Do not re-run `StartRenderer` for this** -- it also creates `m_session`, which
+the input bridge's sinks hold by raw pointer. The cause of the 2026-10-05
+removal is unknown; the smaller pre-`hevcPlayback` memory budget is a suspect,
+not a finding.
+
+### 14.4 Grey blocks after a repair were the HOST
+
+Not a client bug, recorded here because it looks like one: an LTR recovery left
+unheld short-term references live in NVENC, so frames after the repair
+predicted from pictures the client never decoded (FFmpeg substitutes mid-grey)
+and the client, seeing no gap, never asked again. Fixed host-side in
+`shim.cpp` `RetireReferencesNewerThanLtr`; live-confirmed on Android.
