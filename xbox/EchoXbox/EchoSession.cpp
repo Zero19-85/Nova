@@ -2,6 +2,7 @@
 #include "EchoSession.h"
 #include "EchoBridge.h"
 #include "VideoDecoder.h"
+#include "GameAudio.h"
 #include "HostDiscovery.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -248,7 +249,85 @@ bool EchoSession::Connect(std::string const& configJson, EventSink sink,
     m_running.store(true, std::memory_order_release);
     m_pump = std::thread([this, sink] { PumpEvents(sink); });
     m_feed = std::thread([this, decoder] { FeedFrames(decoder); });
+    m_audio = std::thread([this] { RenderAudio(); });
     return true;
+}
+
+// ── Downstream audio ────────────────────────────────────────────────────────
+//
+// Pull model, on the console's audio clock: keep a few 20 ms buffers queued in
+// the XAudio2 voice and, each time the device finishes one, take one step from
+// the bridge's jitter buffer. See GameAudio.h for why this is the whole design.
+void EchoSession::RenderAudio() noexcept {
+    // 60 ms ahead of the device. Enough to ride out a late wake on a busy
+    // console without the device ever running dry; small next to the jitter
+    // buffer upstream, which is where the real latency budget lives.
+    constexpr uint32_t kQueuedBuffers = 3;
+
+    m_audioDecoded = m_audioSilent = m_audioErrors = 0;
+    GameAudio audio;
+    std::wstring error;
+    if (!audio.Open(error)) {
+        std::lock_guard<std::mutex> lk(m_audioMutex);
+        m_audioState = L"OFF - " + error;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_audioMutex);
+        m_audioState = L"playing (Opus 48 kHz stereo -> XAudio2)";
+    }
+
+    std::vector<uint8_t> packet(4000);
+    int64_t meta = 0;
+    while (m_running.load(std::memory_order_acquire)) {
+        while (m_running.load(std::memory_order_acquire) && audio.Queued() < kQueuedBuffers) {
+            // Re-read every step: Close zeroes it before closing, and the
+            // bridge answers 0 with AUDIO_BAD_HANDLE -- the same contract the
+            // frame feeder relies on.
+            const int32_t code = echo_poll_audio(m_handle, packet.data(),
+                                                 static_cast<int32_t>(packet.size()), &meta);
+            if (code == AUDIO_PACKET) {
+                if (!audio.SubmitPacket(packet.data(), static_cast<size_t>(meta))) {
+                    audio.SubmitSilence();   // keep the clock running past a bad packet
+                }
+            } else if (code == AUDIO_CONCEAL || code == AUDIO_SILENCE) {
+                audio.SubmitSilence();
+            } else if (code == AUDIO_TOO_SMALL) {
+                if (meta <= 0 || meta > 64 * 1024) break;
+                packet.resize(static_cast<size_t>(meta));
+            } else if (code == AUDIO_IDLE) {
+                break;   // nothing expected; let the voice drain and look again
+            } else {
+                // AUDIO_BAD_HANDLE: the session is over.
+                m_audioDecoded = audio.Decoded();
+                m_audioSilent = audio.Silent();
+                m_audioErrors = audio.DecodeErrors();
+                std::lock_guard<std::mutex> lk(m_audioMutex);
+                m_audioState = L"stopped (session ended)";
+                return;
+            }
+        }
+        m_audioDecoded = audio.Decoded();
+        m_audioSilent = audio.Silent();
+        m_audioErrors = audio.DecodeErrors();
+        audio.WaitForBufferEnd(20);
+    }
+    std::lock_guard<std::mutex> lk(m_audioMutex);
+    m_audioState = L"stopped";
+}
+
+std::wstring EchoSession::AudioReport() const {
+    std::wstring state;
+    {
+        std::lock_guard<std::mutex> lk(m_audioMutex);
+        state = m_audioState;
+    }
+    wchar_t counts[160]{};
+    swprintf_s(counts, L"  ::  %llu decoded, %llu silent, %llu decode errors",
+               static_cast<unsigned long long>(m_audioDecoded.load()),
+               static_cast<unsigned long long>(m_audioSilent.load()),
+               static_cast<unsigned long long>(m_audioErrors.load()));
+    return state + counts;
 }
 
 void EchoSession::PumpEvents(EventSink sink) noexcept {
@@ -389,6 +468,7 @@ void EchoSession::Close() noexcept {
     if (handle) echo_close(handle);
 
     if (m_feed.joinable()) m_feed.join();
+    if (m_audio.joinable()) m_audio.join();
     if (m_pump.joinable()) m_pump.join();
 }
 
@@ -405,6 +485,7 @@ void EchoSession::Detach() noexcept {
     if (handle) echo_detach(handle);
 
     if (m_feed.joinable()) m_feed.join();
+    if (m_audio.joinable()) m_audio.join();
     if (m_pump.joinable()) m_pump.join();
 }
 

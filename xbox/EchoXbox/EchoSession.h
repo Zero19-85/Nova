@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <mutex>
 
 namespace echo {
 
@@ -93,16 +94,29 @@ public:
     /// is open. See the note on the implementation.
     std::string Stats() const noexcept;
 
+    /// Downstream game audio, one line for the diagnostics panel: whether the
+    /// renderer opened (and if not, why) and what it has played.
+    std::wstring AudioReport() const;
+
 private:
     void PumpEvents(EventSink sink) noexcept;
     void FeedFrames(VideoDecoder* decoder) noexcept;
+    void RenderAudio() noexcept;
 
     uint64_t m_handle = 0;
     std::thread m_pump;
     std::thread m_feed;
+    std::thread m_audio;
     std::atomic<bool> m_running{false};
     std::atomic<uint64_t> m_framesFed{0};
     std::atomic<uint64_t> m_idrRequests{0};
+
+    // Written by the audio thread, read by the UI's stats timer.
+    std::atomic<uint64_t> m_audioDecoded{0};
+    std::atomic<uint64_t> m_audioSilent{0};
+    std::atomic<uint64_t> m_audioErrors{0};
+    mutable std::mutex m_audioMutex;
+    std::wstring m_audioState = L"not started";
 };
 
 }  // namespace echo

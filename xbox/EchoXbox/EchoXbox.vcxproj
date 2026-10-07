@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
   Echo for Xbox — a C++/WinRT UWP application.
 
@@ -136,6 +136,7 @@
     <ClCompile Include="HevcDecoder.cpp" />
     <ClCompile Include="FfmpegHevcDecoder.cpp" />
     <ClCompile Include="EchoSession.cpp" />
+    <ClCompile Include="GameAudio.cpp" />
     <ClCompile Include="HostDiscovery.cpp" />
     <ClCompile Include="InputBridge.cpp" />
   </ItemGroup>
@@ -149,6 +150,7 @@
     <ClInclude Include="HevcDecoder.h" />
     <ClInclude Include="FfmpegHevcDecoder.h" />
     <ClInclude Include="EchoSession.h" />
+    <ClInclude Include="GameAudio.h" />
     <ClInclude Include="HostDiscovery.h" />
     <ClInclude Include="InputBridge.h" />
     <ClInclude Include="App.h">
@@ -223,6 +225,14 @@
       <DeploymentContent>true</DeploymentContent>
       <ExcludedFromBuild>false</ExcludedFromBuild>
       <Link>avutil-59.dll</Link>
+    </None>
+    <!-- avcodec imports this since the Opus decoder was enabled for game audio
+         (configure: opus_decoder_deps="swresample"). Missing from the package,
+         the app dies at launch naming itself, not the DLL. -->
+    <None Include="ffmpeg\swresample-5.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <ExcludedFromBuild>false</ExcludedFromBuild>
+      <Link>swresample-5.dll</Link>
     </None>
   </ItemGroup>
 

@@ -1,4 +1,4 @@
-﻿# build-app.ps1 - build the UWP app and produce a signed, sideloadable .msix.
+# build-app.ps1 - build the UWP app and produce a signed, sideloadable .msix.
 #
 # Run build-bridge.ps1 FIRST (this script checks, and the .vcxproj also fails
 # with a sentence rather than a wall of link errors).
@@ -153,7 +153,7 @@ try {
 # from the application directory and does not search subfolders, so one in a
 # subfolder is a package that builds, deploys, and dies at launch naming the app
 # rather than the DLL. FFmpeg joined the list on 2026-09-08.
-foreach ($required in @("echo_xbox.dll", "avcodec-61.dll", "avutil-59.dll")) {
+foreach ($required in @("echo_xbox.dll", "avcodec-61.dll", "avutil-59.dll", "swresample-5.dll")) {
     if ($names -contains $required) {
         Write-Host "  $required at package root - OK" -ForegroundColor Green
     } else {

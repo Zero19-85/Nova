@@ -790,9 +790,16 @@ namespace winrt::EchoXbox::implementation
         StartDiscovery();
         StartStatsTimer();
 
-        // 5. The transfer function, now that a swap chain is presenting. See
-        //    2b for why it moved, and RequestHdrWithLiveSwapChain for how.
-        co_await RequestHdrWithLiveSwapChain(m_hdrEnabled, L"at startup");
+        // 5. The transfer function: SDR, whatever the preference says.
+        //
+        //    HDR used to be requested here and then held for the life of the
+        //    app, so the dashboard -- an SDR interface -- was composited into a
+        //    PQ output and read visibly darker (operator, 2026-10-07). The
+        //    console is now in HDR only while a stream is running: BeginStream
+        //    engages it (RetryHdrThenStream) and the end of the stream hands it
+        //    back (RestoreSdrAfterStream). Asking for SDR here also undoes a
+        //    console left in PQ by a previous run that never got to say so.
+        co_await RequestHdrWithLiveSwapChain(false, L"at startup - the dashboard stays SDR");
     }
 
     bool MainPage::StartRenderer()
@@ -1501,23 +1508,26 @@ namespace winrt::EchoXbox::implementation
         if (!when.empty()) note = L"[" + when + L"] " + note;
 
         Append(L"\nhdr         " + hstring(note));
-        // "preferred", not "requested": what the host is asked for is decided
-        // at stream start, where an HDR preference the swap chain cannot
-        // present is downgraded to SDR (see the `hdrStream` gate). The stream
-        // line says which one was actually sent.
+        // What the CONSOLE was asked for, which is no longer the preference:
+        // the dashboard always asks for SDR and a stream asks for HDR10 when
+        // it is preferred. What the host is asked for is decided at stream
+        // start (the `hdrStream` gate); the stream line says which.
         Append(L"\ndynamic rng " +
-               hstring(on ? L"HDR10 preferred - Main10 PQ"
-                          : L"SDR preferred - Rec.709") +
+               hstring(on ? L"HDR10 requested - Main10 PQ"
+                          : L"SDR requested - Rec.709") +
                hstring(m_hdrActive == on
                            ? L"  (console agrees)"
                            : L"  (console did NOT switch - the stream line says what was asked for)"));
 
         // The panel line. Says both halves, because they can disagree and the
         // disagreement is the interesting case.
-        std::wstring panel = on ? L"HDR10 preferred"
-                                : L"SDR preferred";
+        std::wstring panel = m_hdrEnabled ? L"HDR10 for streams"
+                                          : L"SDR";
         panel += m_hdrActive ? L"  ::  console is in BT.2020 PQ"
                              : L"  ::  console is in SDR";
+        if (m_hdrEnabled && !on && !m_hdrActive) {
+            panel += L" until a stream starts";
+        }
         if (m_hdrActive != on) {
             panel += L"\n" + note;
         }
@@ -1561,20 +1571,23 @@ namespace winrt::EchoXbox::implementation
     {
         auto lifetime = get_strong();
         SetStatus(L"asking the TV for HDR10...");
+        // Owed back to SDR from here on, even if the console refuses: the
+        // swap chain was declared PQ either way.
+        m_hdrEngagedForStream = true;
         co_await RequestHdrWithLiveSwapChain(true, L"at stream start");
         BeginStream();   // m_hdrRetried is still set, so this goes straight through
     }
 
-    // Flipping the switch. Two things happen, and only one of them is visible
-    // straight away.
+    // Flipping the switch records a preference and changes nothing on screen.
     //
-    // The console is asked to switch NOW, so the user can see on their TV
-    // whether it took - that is the whole reason this is a toggle and not a
-    // buried config field. What does NOT happen is renegotiating a live
-    // stream: the host fixed its encoder at Main8 or Main10 when the session
-    // started, and Nova's own rule is that a geometry or format change under a
-    // client is the client's business to survive. So a running stream keeps
-    // the range it negotiated, and the next one picks this up.
+    // It used to switch the console NOW, so the TV showed whether it took --
+    // but that left the dashboard in HDR, which is the darkened UI this build
+    // removes. HDR now engages at stream start (BeginStream), so the toggle is
+    // tested by starting a stream. Nor is a live stream renegotiated: the host
+    // fixed its encoder at Main8 or Main10 when the session started, and a
+    // format change under a client is the client's business to survive. So a
+    // running stream keeps the range it negotiated, and the next one picks
+    // this up.
     void MainPage::OnHdrToggled(IInspectable const&, RoutedEventArgs const&)
     {
         bool on = false;
@@ -1584,13 +1597,26 @@ namespace winrt::EchoXbox::implementation
         m_hdrEnabled = on;
         SaveHdrPreference(on);
 
-        if (m_streaming) {
-            ShowToast(L"DYNAMIC RANGE   ::   applies to the next stream", L"IonAmber");
-        }
+        ShowToast(m_streaming
+                      ? L"DYNAMIC RANGE   ::   applies to the next stream"
+                      : (on ? L"HDR10   ::   engages when a stream starts"
+                            : L"SDR   ::   streams will ask for Rec.709"),
+                  L"IonAmber");
+        try {
+            HdrStateText().Text(on ? hstring(L"HDR10 for streams  ::  console stays SDR until a stream starts")
+                                   : hstring(L"SDR  ::  console is in SDR"));
+        } catch (...) {}
+    }
 
-        // The blocking display call runs on a pool thread inside; the swap
-        // chain is declared and presenting first, as moonlight's is.
-        RequestHdrWithLiveSwapChain(on, L"from the settings toggle");
+    // Hand the console back to SDR once a stream that engaged HDR is over, so
+    // the dashboard is never shown in a PQ output. Idempotent: a second call
+    // with nothing engaged does nothing, which matters because a stream can
+    // end through several of the paths below at once (leave, then `closed`).
+    void MainPage::RestoreSdrAfterStream(std::wstring const& why)
+    {
+        if (!m_hdrEngagedForStream && !m_hdrActive) return;
+        m_hdrEngagedForStream = false;
+        RequestHdrWithLiveSwapChain(false, why);
     }
 
     // The microphone level, which currently travels nowhere.
@@ -1767,6 +1793,7 @@ namespace winrt::EchoXbox::implementation
             SetStatus(L"connecting to " + hstring(hostName) + L"...");
         } else {
             SetStatus(hstring(error));
+            RestoreSdrAfterStream(L"the stream did not start - back to SDR for the dashboard");
         }
     }
 
@@ -2366,6 +2393,9 @@ namespace winrt::EchoXbox::implementation
             SetStatus(L"error: " + to_hstring(echo::JsonField(json, "message")));
             Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this]() {
                 PinPanel().Visibility(Visibility::Collapsed);
+                // An error ends this session whether or not it ever streamed,
+                // so the HDR it engaged is owed back even before `granted`.
+                RestoreSdrAfterStream(L"stream failed - back to SDR for the dashboard");
                 LeaveStreamingUi();
                 UpdateHostState();
             });
@@ -2441,6 +2471,13 @@ namespace winrt::EchoXbox::implementation
 
     void MainPage::LeaveStreamingUi()
     {
+        // The dashboard is SDR (see StartupAsync step 5). Only when a stream is
+        // genuinely over: a `closed` from a superseded session can land while
+        // the NEXT stream is connecting with HDR already engaged, and must not
+        // pull the console out from under it -- hence the open-session check.
+        if (m_streaming || !(m_session && m_session->IsOpen())) {
+            RestoreSdrAfterStream(L"stream ended - back to SDR for the dashboard");
+        }
         m_streaming = false;
         if (m_input) m_input->SetForwarding(false);
         m_overlayOpen = false;
@@ -2536,6 +2573,14 @@ namespace winrt::EchoXbox::implementation
                     line += L"\nrepair    gaps " + field("transit_loss_gaps") +
                             L"   held " + field("frames_dropped_after_loss") +
                             L"   keyframe escalations " + field("keyframe_escalations");
+                    // Game audio, both halves: what arrived (network) and what
+                    // the renderer did with it. `lost` climbing is the path;
+                    // `underran` climbing with `lost` flat is playout.
+                    line += L"\naudio     " + m_session->AudioReport();
+                    line += L"\n          arrived " + field("audio_accepted") +
+                            L"   lost " + field("audio_lost") +
+                            L"   underran " + field("audio_underran") +
+                            L"   depth " + field("audio_depth");
                 }
             }
 

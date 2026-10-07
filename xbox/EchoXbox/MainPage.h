@@ -142,6 +142,8 @@ namespace winrt::EchoXbox::implementation
         // Stream start found HDR preferred but the output not in HDR: ask once
         // more with the swap chain live, then carry on into BeginStream.
         winrt::fire_and_forget RetryHdrThenStream();
+        // Back to SDR once a stream that engaged HDR is over. UI thread.
+        void RestoreSdrAfterStream(std::wstring const& why);
         void ShowDiagnostics();               // UI thread
         void HideDiagnostics();               // UI thread
         void EnterStreamingUi();              // UI thread
@@ -307,6 +309,9 @@ namespace winrt::EchoXbox::implementation
         bool m_hdrActive = false;
         // One HDR retry per stream start (see RetryHdrThenStream). UI thread.
         bool m_hdrRetried = false;
+        // This stream put the console in HDR and owes it back to SDR when it
+        // ends -- the dashboard is never shown in PQ. UI thread.
+        bool m_hdrEngagedForStream = false;
 
         // What we ask the host to encode. Starts at the console's real output
         // size and is whatever the overlay last chose after that.

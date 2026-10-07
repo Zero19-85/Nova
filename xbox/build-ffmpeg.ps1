@@ -5,8 +5,10 @@
         .\build-ffmpeg.ps1 -VerifyOnly  # just re-run the acceptance checks
         .\build-ffmpeg.ps1 -Clean       # reconfigure from scratch
 
-    Produces avcodec/avutil DLLs that decode HEVC through D3D11VA and nothing
-    else, built against the Store CRT, linked /APPCONTAINER, and staged into
+    Produces avcodec/avutil/swresample DLLs that decode HEVC through D3D11VA,
+    and Opus for downstream game audio (FFmpeg's native decoder, which is why
+    swresample is no longer disabled: configure lists it as opus_decoder_deps),
+    and nothing else, built against the Store CRT, linked /APPCONTAINER, and staged into
     xbox\EchoXbox\ffmpeg\ ready for the vcxproj to package.
 
     ── Why this exists as a script rather than a wiki page ────────────────────
@@ -289,13 +291,13 @@ set -e
   --disable-doc \
   --disable-avdevice \
   --disable-avformat \
-  --disable-swresample \
   --disable-swscale \
   --disable-postproc \
   --disable-avfilter \
   --disable-network \
   --disable-x86asm \
   --enable-decoder=hevc \
+  --enable-decoder=opus \
   --enable-parser=hevc \
   --enable-hwaccel=hevc_d3d11va \
   --enable-hwaccel=hevc_d3d11va2 \
