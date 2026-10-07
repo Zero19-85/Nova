@@ -245,3 +245,9 @@ searched for: 3840x2160, 119.880120 Hz +/- 0.5, PQ ON, not stereo (current mode 
 Fix (`HANDOFF_ECHO_XBOX.md` §14.8): the flag is read through the ABI into an
 `unsigned char` and canonicalised; the verdict prints the raw byte as proof.
 Untested at the time of writing.
+
+## RESOLVED (2026-10-07)
+
+The `IsPq` build (flag read through the ABI as a byte) engaged 4K120 HDR10 on
+the console. Thank you for the second opinion -- your point that the entry was
+in the list all along and the search was missing it was the right one.

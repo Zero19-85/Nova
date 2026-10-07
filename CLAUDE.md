@@ -90,7 +90,47 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
-## Current Phase (2026-09-21): **INTRA REFRESH IS TIERED BY DPB DEPTH** — and
+## Current Phase (2026-10-07): **ECHO XBOX STREAMS 4K120 HDR10** — and Tier 1 finally fired, and was broken
+
+Three things landed, all live-confirmed by the operator. Full record:
+`HANDOFF_ECHO_XBOX.md` §14; the second-opinion brief is
+`HANDOFF_GEMINI_XBOX_HDR.md`. Polish and bug-zapping is next.
+
+### Host: LTR recovery must retire newer references (`b18ffad`) — THIS file's territory
+
+The first time Tier 1 fired (Xbox 4K, then the Pixel at 1080p seven times in a
+day), `ltrUseFrameBitmap` constrained only the recovery frame: NVENC kept the
+lost/withheld frames as short-term references and the next frame predicted
+from them. FFmpeg substitutes mid-grey for a missing reference (MediaCodec
+smears), the client sees contiguous frames and **never asks again**, and each
+later LTR mark snapshots the damage so no intra sweep can clean it.
+`RetireReferencesNewerThanLtr` (shim.cpp) now invalidates every DPB frame newer
+than the chosen LTR, plus the newer LTR slot, on the encode thread right before
+the recovery encode; refusal ⇒ that frame becomes an IDR. Log line:
+`[LTR] retired N newer reference(s) in A-B before recovering against frame X`.
+**Signature to recognise:** damage right after `[LTR] … repaired without a
+keyframe` followed by client SILENCE.
+
+### Installer ships the relay (`14fef21`)
+
+A full reinstall left Echo with "no relay": the relay had only ever been
+hand-deployed. `Nova.iss` now ships `nova-relay.exe` + `install-relay.ps1`,
+which registers `NovaEchoRelay` and fills `[echo.signaling] url`/pin in
+`nova.toml` **only when blank**. The relay key is deliberately not shipped.
+
+### Xbox HDR10: the console's `IsSmpte2084Supported` "true" is not byte 1
+
+Every Echo HDR search failed because the console writes a non-canonical true
+and Echo compared it with C++ `true`; Moonlight/Kodi compare two OS values and
+never see it. Found by a per-row predicate table, after `hevcPlayback`, Game
+app type, request timing and two theories from a second opinion had all been
+tried. Rule: **never compare an OS-written WinRT bool against a literal.** The
+Xbox client also now rebuilds a renderer whose GPU device was lost, and refuses
+to send HDR to a console whose output is not actually HDR.
+
+---
+
+## Previous Phase (2026-09-21): **INTRA REFRESH IS TIERED BY DPB DEPTH** — and
 the capture-slot stall finally named its culprit
 
 Two changes, both live on the dev box, both from reading logs rather than
@@ -402,8 +442,9 @@ Tunables at the top of the module: `MAX_SPEED_PX_S`, `DEADZONE`,
   high ⇒ the Master is not draining `NovaMedia`, so look at what the Master was
   doing at that instant (input-helper spawn, backend swap, session change), not
   at rate control.
-- **Tier 1 has never repaired anything**, because nothing has needed repairing
-  since Tier 0. It stays unexercised until real loss occurs.
+- ~~Tier 1 has never repaired anything~~ — **superseded 2026-10-07**: Tier 1
+  fired for real at 4K and 1080p and had a bug (grey blocks / unhealing blur);
+  fixed in `b18ffad`. See the Current Phase section.
 - **Mouse mode has never seen a physical controller.** The tests cover the toggle
   state machine and the response curve; the *feel* wants a hand on a stick.
 - **Tiers 2–3 are planned but not started**: Echo receiver reports, adaptive FEC

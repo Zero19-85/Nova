@@ -467,9 +467,9 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // to ever trade 120 Hz for 60 -- that trade is not this function's to
         // make silently.
         constexpr double kRefreshTwinToleranceHz = 0.5;
-        // A lambda because the search has to be run TWICE -- see "second
-        // look" below. It always fetches a fresh list: the whole point of the
-        // second run is that the list it gets back can differ from the first.
+        // `original` because `current` is re-read after the request; the
+        // search and the verdict table must both compare against the mode the
+        // console was in when we asked.
         const HdmiDisplayMode original = current;
         const auto findTwin = [&hdmi, &original, enable](bool& approx) -> HdmiDisplayMode {
             HdmiDisplayMode best{ nullptr };
@@ -495,32 +495,14 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             return best;
         };
 
-        // ── When the strict search misses an entry the table plainly shows ──
+        // ── The verdict table: findTwin's predicates, evaluated per mode ────
         //
-        // Live 2026-10-07: "second look after the refusal: still no PQ mode
-        // near this refresh" -- five fresh searches over a second -- printed
-        // directly above a table listing "3840x2160 @ 119.88 Hz, 30 bpp,
-        // BT2020 (PQ capable)". So the list was NOT changing; findTwin was
-        // rejecting an entry that looks like an exact match. Size, refresh and
-        // the PQ flag all print identically; the one predicate the table never
-        // showed was StereoEnabled. Rather than guess a third time:
-        //
-        //  * `findLoose` matches PQ flag + size + refresh to two decimals (the
-        //    precision the table prints) and does NOT exclude stereo;
-        //  * `verdict` prints every predicate findTwin applies, with the raw
-        //    refresh to six places, so the next table names the culprit.
-        const auto findLoose = [&hdmi, &original, enable]() -> HdmiDisplayMode {
-            const long wantCentiHz = std::lround(original.RefreshRate() * 100.0);
-            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
-                if (IsPq(mode) == enable &&
-                    mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
-                    mode.ResolutionHeightInRawPixels() == original.ResolutionHeightInRawPixels() &&
-                    std::lround(mode.RefreshRate() * 100.0) == wantCentiHz) {
-                    return mode;
-                }
-            }
-            return HdmiDisplayMode{ nullptr };
-        };
+        // Printed only when HDR was wanted and the console ended in SDR. This
+        // is what found the real bug (2026-10-07) after five builds of
+        // hypotheses: a row reading "(PQ capable) <- pq NO, size ok, stereo
+        // no, d 0.000000" named the non-canonical PQ byte (see RawPqByte) in
+        // one run. Keep it: when a search disagrees with a print of the same
+        // list, the per-predicate row is the fastest way to the truth.
         const auto verdict = [&original, enable](HdmiDisplayMode const& mode) -> std::wstring {
             const bool pqOk   = IsPq(mode) == enable;
             const bool sizeOk = mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
@@ -546,13 +528,6 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             target = current;
         } else {
             target = findTwin(tookNearTwin);
-            if (!target && enable) {
-                target = findLoose();
-                if (target) {
-                    note += L"strict search missed it, loose match found " +
-                            DescribeMode(target) + verdict(target) + L": ";
-                }
-            }
         }
         if (tookNearTwin) {
             wchar_t twin[120]{};
@@ -662,7 +637,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
         // session's dynamic range is decided from it rather than from
         // `applied`.
         current = hdmi.GetCurrentDisplayMode();
-        bool nowPq = current && IsPq(current);
+        const bool nowPq = current && IsPq(current);
         note += applied ? (L"set " + DescribeMode(target))
                         : (L"console refused " + DescribeMode(target));
         note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
@@ -672,41 +647,6 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             // confirmed rather than assumed, and it is why the 60 Hz fallback
             // is gone.
             note += L"  (enumeration said this mode had no PQ - it was wrong)";
-        }
-
-        // ── Second look: the list can change underneath us ─────────────────
-        //
-        // Live 2026-10-07, 4K120 Series X, `hevcPlayback`, app type Game: the
-        // first search found NO PQ mode at 119.88 Hz, so the speculative ask
-        // went out on the plain SDR entry ("24 bpp, RGB limited") -- which the
-        // console refused, as it always would. The mode table printed straight
-        // AFTER that refusal listed "3840x2160 @ 119.88 Hz, 30 bpp, BT2020
-        // (PQ capable) (HDR10 capable)": the exact twin the search exists to
-        // find. Same API, same console, a moment apart. Whether the refusal
-        // itself or plain time made it appear is not known; moonlight never
-        // sees the gap because it asks mid-stream, long after launch.
-        //
-        // So after a speculative refusal, fetch the list again (for up to a
-        // second) and, if the real twin is there now, ask for THAT.
-        if (enable && !nowPq && speculative) {
-            HdmiDisplayMode twin{ nullptr };
-            bool approx = false;
-            for (int look = 0; look < 5 && !twin; ++look) {
-                if (look) Sleep(250);
-                twin = findTwin(approx);
-                if (!twin) twin = findLoose();
-            }
-            if (twin) {
-                note += L"\n              second look after the refusal: the list now offers " +
-                        DescribeMode(twin) + L" - asking for that: ";
-                const bool again = ask(twin);
-                current = hdmi.GetCurrentDisplayMode();
-                nowPq = current && IsPq(current);
-                note += again ? L"set" : L"console refused it";
-                note += nowPq ? L"  [now HDR]" : L"  [now SDR]";
-            } else {
-                note += L"\n              second look after the refusal: still no PQ mode near this refresh";
-            }
         }
 
         if (enable && !nowPq && current) {

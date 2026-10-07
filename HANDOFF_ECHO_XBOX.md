@@ -1673,3 +1673,14 @@ bool from the OS against a literal.**
 Second-opinion theories ruled out by the same table: a stereo/EDID 120 Hz flag
 (stereo is `no`; and moonlight's own predicate is `StereoEnabled == false`, not
 a parity check), and 119.88 Hz floating-point drift (delta `0.000000`).
+
+### 14.9 LIVE-CONFIRMED (2026-10-07): 4K120 HDR10 on Echo/Xbox
+
+The `IsPq` build engaged HDR on the operator's Series X; the operator noticed
+it because the app's own UI went slightly darker (SDR UI composited into an
+HDR output -- expected, and a polish item, not a fault). The workarounds built
+for disproved theories were then removed: the "second look" re-fetch loop
+(up to 1 s of sleeps) and the `findLoose` fallback. Kept: `hevcPlayback`, the
+live-swap-chain request timing, the stream-start retry, the
+output-is-really-HDR gate, and the per-row verdict table (printed only when
+HDR fails -- it is what found this).
