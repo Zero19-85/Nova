@@ -1956,6 +1956,90 @@ extern "C" __declspec(dllexport) int InitEncoder(
     }
 }
 
+// ── Retire what an LTR recovery must not be followed by ─────────────────────
+//
+// `ltrUseFrameBitmap` constrains the ONE frame it is set on. It does not touch
+// the short-term references in the DPB, so the frame after the recovery is free
+// to predict from them again -- and they are exactly the pictures the client
+// never decoded: the lost ones, and the ones after the loss that Echo's
+// keyframe gate withheld from its decoder. A decoder handed a slice that names
+// a reference it does not hold does not error. FFmpeg's HEVC decoder
+// substitutes a mid-grey picture and carries on; MediaCodec smears. Either way
+// the client sees nothing it can call a loss, so it never asks again, and the
+// damage outlives every intra sweep because each new LTR mark snapshots it.
+//
+// Live 2026-10-05, the first time Tier 1 ever fired on the Xbox: RFI declined
+// 170-182 at DPB 5, the LTR path repaired frame 183 against frame 137, and the
+// picture filled with grey blocks that never cleared while the client sent no
+// further repair request for the rest of the session. The Pixel took the same
+// path seven times that day at 1080p, where intra refresh is off and nothing
+// rewrites a damaged region at all.
+//
+// So before the recovery frame is encoded, retire every reference newer than
+// the long-term picture it recovers against:
+//
+//   * the other LTR slot, when it is newer -- ArmLtrRecovery picked the newest
+//     CONFIRMED slot (or, with no acks, the oldest), so a newer one is
+//     unconfirmed by construction; its slot is cleared so no later recovery
+//     can point at a picture NVENC has dropped;
+//   * every short-term frame that can still be in the DPB.
+//
+// Retiring a frame the client does hold costs nothing: the recovery frame
+// predicts from the LTR alone, and its successors from the recovery frame.
+//
+// Runs on the encode thread, immediately before the recovery encode, so the
+// newest encoded frame is known exactly -- a frame in flight on another thread
+// cannot slip past. Returns false if NVENC refused, and the caller then sends
+// an IDR instead: the behaviour that existed before LTR, never worse.
+static bool RetireReferencesNewerThanLtr(uint32_t useBitmap) {
+    uint64_t ltrFrame = 0;
+    for (uint32_t i = 0; i < kLtrNumFrames; ++i) {
+        if ((useBitmap & (1u << i)) && g_ltrSlotFrame[i] > ltrFrame) ltrFrame = g_ltrSlotFrame[i];
+    }
+    if (ltrFrame == 0) {
+        ShimLog("[LTR] recovery slot was emptied after arming — sending an IDR instead\n");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < kLtrNumFrames; ++i) {
+        if ((useBitmap & (1u << i)) || g_ltrSlotFrame[i] <= ltrFrame) continue;
+        if (!g_nvEncoder->InvalidateRefFrame(g_ltrSlotFrame[i])) {
+            ShimLog("[LTR] could not retire newer LTR frame %llu — sending an IDR instead\n",
+                   (unsigned long long)g_ltrSlotFrame[i]);
+            return false;
+        }
+        g_ltrSlotFrame[i] = 0;
+    }
+
+    const uint64_t lastEnc = g_lastEncodedFrameIndex.load();
+    if (lastEnc <= ltrFrame) return true;   // nothing newer was ever encoded
+
+    // The DPB window: nothing older than this can still be a reference.
+    uint64_t lo = lastEnc + 1 > g_refFramesInDpb ? lastEnc + 1 - g_refFramesInDpb : 1;
+    if (lo <= ltrFrame) lo = ltrFrame + 1;
+
+    // Frames in the window that have already slid out of the DPB may be
+    // refused, and that is harmless. The NEWEST encoded frame is a reference by
+    // construction, so its retirement is the proof that this worked at all.
+    uint32_t retired = 0;
+    bool newestRetired = false;
+    for (uint64_t f = lo; f <= lastEnc; ++f) {
+        if (g_nvEncoder->InvalidateRefFrame(f)) {
+            ++retired;
+            if (f == lastEnc) newestRetired = true;
+        }
+    }
+    if (!newestRetired) {
+        ShimLog("[LTR] could not retire frame %llu ahead of the recovery — sending an IDR instead\n",
+               (unsigned long long)lastEnc);
+        return false;
+    }
+    ShimLog("[LTR] retired %u newer reference(s) in %llu-%llu before recovering against frame %llu\n",
+           retired, (unsigned long long)lo, (unsigned long long)lastEnc,
+           (unsigned long long)ltrFrame);
+    return true;
+}
+
 // ==================== ENCODE FRAME ====================
 extern "C" __declspec(dllexport) int EncodeFrame(
     void* /*encoder*/, void* d3d11_texture,
@@ -2243,7 +2327,19 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // flag, so a second read further down would always answer false — and a
     // recording whose Clusters never start on a keyframe is a recording no
     // player can seek in.
-    const bool forceIdr = g_force_idr.exchange(false);
+    bool forceIdr = g_force_idr.exchange(false);
+    // An armed LTR recovery is consumed HERE, before the IDR flags are built,
+    // because retiring the references it depends on can fail -- and a failed
+    // retirement must turn this very frame into an IDR rather than emit a
+    // recovery frame whose successors predict from pictures the client lacks.
+    uint32_t ltrUseBitmap = 0;
+    if (g_ltrActive && !forceIdr) {
+        ltrUseBitmap = g_ltrUsePending.exchange(0);
+        if (ltrUseBitmap && !RetireReferencesNewerThanLtr(ltrUseBitmap)) {
+            ltrUseBitmap = 0;
+            forceIdr     = true;
+        }
+    }
     if (forceIdr) {
         // NV_ENC_PIC_FLAG_FORCEIDR alone generates the IDR slice but does NOT
         // guarantee inline SPS/PPS/VPS headers unless the codec config set
@@ -2286,7 +2382,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
             g_ltrUsePending.store(0);
             g_ltrNextMarkIdx   = 0;
             g_ltrMarkCountdown = g_ltrMarkInterval;
-        } else if (uint32_t useBitmap = g_ltrUsePending.exchange(0)) {
+        } else if (const uint32_t useBitmap = ltrUseBitmap) {
             ltrRecoveryFrame = true;
             if (g_encoderCodec == 1) {
                 picParams.codecPicParams.hevcPicParams.ltrUseFrames     = 1;
