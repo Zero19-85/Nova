@@ -235,7 +235,7 @@ searched for: 3840x2160, 119.880120 Hz +/- 0.5, PQ ON, not stereo (current mode 
 
 - `stereo no` on every row, so the EDID/3D theory does not apply here. (Also,
   moonlight's predicate is `mode->StereoEnabled == false`,
-  `State/MoonlightClient.cpp:117` -- not a parity check.)
+  `State/MoonlightClient.cpp:119` -- not a parity check.)
 - `d 0.000000`, so there is no refresh drift.
 - `pq NO` on a row printed "(PQ capable)". The label is `if (flag)`; the
   verdict is `flag == true`. Both hold only if the OS writes a "true" byte
