@@ -140,7 +140,9 @@ fn edges() -> &'static Mutex<EdgeState> {
     EDGES.get_or_init(|| Mutex::new(EdgeState::default()))
 }
 
-/// Whether mouse mode is currently on.
+/// Whether mouse mode is currently on. Only the tests ask; the driver thread
+/// reads `ACTIVE` directly.
+#[cfg(test)]
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }

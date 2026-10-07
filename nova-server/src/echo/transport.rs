@@ -166,7 +166,7 @@ impl ActiveTunnel {
 /// `latched` is the gatherer's latched-peer cell — the address Nova's own punch
 /// most recently confirmed a path to. It is read here for one purpose: see
 /// `the incumbent is provably stale` in the contention block below.
-pub fn spawn(
+pub(crate) fn spawn(
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     rtp_sender: Arc<Mutex<crate::rtp::RtpSender>>,
     handler: Arc<rpc::Handler>,

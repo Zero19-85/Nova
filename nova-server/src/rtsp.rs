@@ -193,7 +193,7 @@ fn resp_describe(cseq: u32, is_hdr: bool) -> Vec<u8> {
     // what makes moonlight-common-c send PT_INVALIDATE_REF_FRAMES ranges for
     // loss instead of full IDR requests — without it the whole RFI path is
     // dead. Gated on the feature flag ONLY, deliberately NOT on
-    // `rfi_supported()`: this SDP is built in the Master process, which never
+    // the shim's `RfiSupported` probe: this SDP is built in the Master process, which never
     // creates an encoder, so its shim's capability probe is always false — the
     // real probe lives in the Worker. The Worker's shim still guards the actual
     // invalidation on its own probe and falls back to an IDR if unsupported, so

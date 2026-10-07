@@ -1412,7 +1412,7 @@ pub(crate) fn is_lan_peer_for_test(addr: &SocketAddr) -> bool {
     is_lan_peer(addr)
 }
 
-pub fn spawn(cfg: &EchoConfig, handler: Arc<Handler>) {
+pub(crate) fn spawn(cfg: &EchoConfig, handler: Arc<Handler>) {
     if !cfg.enabled {
         println!("🎛️  Echo RPC disabled by config");
         return;
