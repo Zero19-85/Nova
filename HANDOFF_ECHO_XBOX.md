@@ -1553,3 +1553,31 @@ unheld short-term references live in NVENC, so frames after the repair
 predicted from pictures the client never decoded (FFmpeg substitutes mid-grey)
 and the client, seeing no gap, never asked again. Fixed host-side in
 `shim.cpp` `RetireReferencesNewerThanLtr`; live-confirmed on Android.
+
+### 14.5 Result: `hevcPlayback` + Game mode were NOT enough; the request now waits for a live swap chain
+
+Live 2026-10-07 on the `hevcPlayback` build, with Echo set to **Game** in Dev
+Home: the console still refused PQ, and the stream gate correctly asked Nova
+for SDR (no white picture). Both are kept -- they are prerequisites Moonlight
+also has, not the whole answer.
+
+The remaining structural difference is **timing**. moonlight-xbox calls
+`SetDisplayHDR` from moonlight-common-c's `setHdrMode` callback
+(`State/MoonlightClient.cpp:306/356`), mid-stream, with its 10-bit swap chain
+presenting. Echo called `RequestHdrMode` at startup step 2b, before the
+renderer existed. Now:
+
+ - `VideoRenderer::PreferPq(true)` makes the no-picture background a live
+   R10G10B10A2 surface declared G2084_P2020;
+ - `RequestHdrWithLiveSwapChain` sets that, waits for 8 presents (<= 2 s), then
+   makes the blocking request on a pool thread. Startup calls it as step 5,
+   after `StartRenderer`; the Settings toggle uses it too;
+ - `BeginStream` retries once (`RetryHdrThenStream`) when HDR is preferred and
+   the output is not HDR, then builds the request;
+ - the gate accepts EITHER signal -- AdvancedColorInfo or the HDMI read-back --
+   because neither has been verified on this console;
+ - every `hdr` line is tagged `[at startup | from the settings toggle | at
+   stream start, swap chain presenting N frames as <colour space>]`.
+
+Built, not yet tested. If it still refuses, the `modes at this size:` table on
+the HDR line is the next evidence.

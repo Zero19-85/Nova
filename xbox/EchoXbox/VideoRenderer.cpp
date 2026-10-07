@@ -1501,6 +1501,11 @@ void VideoRenderer::PresentLoop() noexcept {
             // straight through. Zero is zero under either encoding, so unlike
             // the old value this one survives a later move to an _SRGB swap
             // chain unchanged.
+            // The colour space this background is presented in: PQ while an
+            // HDR request is pending or wanted (see PreferPq), sRGB otherwise.
+            // Render thread only, like every other ApplySwapChainColorSpace.
+            ApplySwapChainColorSpace(m_pqPreferred.load(std::memory_order_acquire));
+
             const float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             ID3D11RenderTargetView* rtv = m_backBufferView.get();
             m_context->OMSetRenderTargets(1, &rtv, nullptr);

@@ -215,6 +215,20 @@ public:
     /// no swap chain. A read-only DXGI query, safe from the UI thread.
     bool CanPresentPq() const noexcept;
 
+    /// Declare BT.2020 PQ on the swap chain while there is no picture yet.
+    ///
+    /// The HDR request has to be made the way moonlight-xbox makes it: its
+    /// `SetDisplayHDR` runs mid-stream, from the host's `setHdrMode` callback,
+    /// while its 10-bit swap chain is already presenting. Echo used to ask at
+    /// app startup with no swap chain at all, and the console refused PQ on
+    /// every attempt even with `hevcPlayback` and the app set to Game
+    /// (2026-10-07). With this set, the background the renderer presents
+    /// before the first frame is a live R10G10B10A2 surface declared
+    /// G2084_P2020 -- the state moonlight is in when it asks. Black is zero
+    /// under either transfer, so nothing visible changes. Decoded frames still
+    /// set their own colour space from the stream's metadata. Any thread.
+    void PreferPq(bool on) noexcept { m_pqPreferred.store(on, std::memory_order_release); }
+
     /// Why nothing is being drawn, if anything has said so. Empty while every
     /// stage has succeeded. Safe from any thread.
     std::wstring FailureReport() const;
@@ -326,6 +340,8 @@ private:
     winrt::handle m_frameLatencyWaitable;
     winrt::handle m_idleTimer;
     std::atomic<bool> m_showBackground{false};
+    // See PreferPq(). Applied by the present thread on the no-picture path.
+    std::atomic<bool> m_pqPreferred{false};
 
     // Whether DXGI offered tearing on this adapter. Checked, never assumed —
     // a composition swap chain is composited, and the compositor owns the

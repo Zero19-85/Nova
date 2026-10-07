@@ -113,6 +113,31 @@ Xbox's own settings have HDR10, 4K and 120 Hz enabled.
    session would settle it. If the console only lists PQ at 60 Hz for this
    app, the choice is HDR@60 vs SDR@120, which is the user's call.
 
+## Update — after your first reply (later on 2026-10-07)
+
+Thank you; this round tested your three points.
+
+- **Hypothesis 1 (`hevcPlayback`) and 3 (Game):** both in place, user
+  confirmed Echo set to **Game** in Dev Home. **The console still refused
+  PQ.** The new gate did its job — Nova streamed SDR instead of a white
+  picture — but neither change on its own makes the output switch. Both are
+  kept as prerequisites.
+- **Hypothesis 2 (timing) is now implemented, untested:**
+  `RequestHdrWithLiveSwapChain` declares G2084_P2020 on the swap chain the
+  renderer is already presenting (`VideoRenderer::PreferPq`), waits for 8
+  presents, then requests `Eotf2084` + 2086 metadata on a pool thread. It runs
+  after `StartRenderer` at startup, from the Settings toggle, and once more at
+  stream start (`RetryHdrThenStream`) if the output is still not HDR. Each
+  `hdr` line is tagged with which attempt it was and the swap chain's state.
+- **Not taken as established**, because nothing in the repo or the sources
+  found confirms them: that the compositor gates PQ on the presenting swap
+  chain's colour space, that the OS hides `IsSmpte2084Supported` on 120 Hz
+  modes without `hevcPlayback`, and that App/Game changes HDMI FRL bandwidth.
+  If you have a source for any of these, it would sharpen the next step.
+- **Still missing:** the `modes at this size:` table that the HDR line prints
+  on failure. That is what separates "the console never lists a PQ mode at
+  this refresh for us" from "it lists one and refuses it".
+
 ## Data to collect from the console next
 
 - The full `hdr` line from Echo's diagnostics screen, **including the new mode

@@ -134,7 +134,14 @@ namespace winrt::EchoXbox::implementation
         /// what it actually did. BLOCKING — background thread only. Never
         /// changes `m_hdrEnabled`: a console that refuses is a console that
         /// will show a flatter picture, not a reason to renegotiate the stream.
-        void ApplyHdrToDisplay(bool on);      // background thread
+        void ApplyHdrToDisplay(bool on, std::wstring const& when = {});   // background thread
+        // The HDR request made the way moonlight makes it: with the swap chain
+        // already presenting, declared PQ. UI thread on entry and on return;
+        // the blocking request itself runs on a pool thread.
+        Windows::Foundation::IAsyncAction RequestHdrWithLiveSwapChain(bool on, std::wstring when);
+        // Stream start found HDR preferred but the output not in HDR: ask once
+        // more with the swap chain live, then carry on into BeginStream.
+        winrt::fire_and_forget RetryHdrThenStream();
         void ShowDiagnostics();               // UI thread
         void HideDiagnostics();               // UI thread
         void EnterStreamingUi();              // UI thread
@@ -298,6 +305,8 @@ namespace winrt::EchoXbox::implementation
         // swap chain alone says yes even then (2026-10-07).
         bool m_hdrEnabled = true;
         bool m_hdrActive = false;
+        // One HDR retry per stream start (see RetryHdrThenStream). UI thread.
+        bool m_hdrRetried = false;
 
         // What we ask the host to encode. Starts at the console's real output
         // size and is whatever the overlay last chose after that.

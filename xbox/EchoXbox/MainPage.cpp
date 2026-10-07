@@ -748,7 +748,14 @@ namespace winrt::EchoXbox::implementation
         //     on hardware where moonlight streams HDR10. moonlight asks from
         //     `enableHDR` alone (State/MoonlightClient.cpp:267) and never
         //     consults the display at all when building its stream config.
-        ApplyHdrToDisplay(m_hdrEnabled);
+        //
+        //     And it is no longer made HERE. This step used to run before the
+        //     renderer existed, and the console refused PQ on every attempt
+        //     -- with `hevcPlayback` declared and the app set to Game
+        //     (2026-10-07). moonlight asks mid-stream, with its 10-bit swap
+        //     chain presenting. So the request moved to the end of startup
+        //     (step 5), after the swap chain is up and declared PQ. Unlike the
+        //     resolution in 2a, nothing here depends on it happening early.
 
         // 3. What we ask the HOST to encode is the console's real output size -
         //    read back from the console, not inferred from the request above and
@@ -782,6 +789,10 @@ namespace winrt::EchoXbox::implementation
         StartInput();
         StartDiscovery();
         StartStatsTimer();
+
+        // 5. The transfer function, now that a swap chain is presenting. See
+        //    2b for why it moved, and RequestHdrWithLiveSwapChain for how.
+        co_await RequestHdrWithLiveSwapChain(m_hdrEnabled, L"at startup");
     }
 
     bool MainPage::StartRenderer()
@@ -1480,10 +1491,14 @@ namespace winrt::EchoXbox::implementation
     // background thread because `RequestSetCurrentDisplayModeAsync().get()`
     // blocks, and it deliberately does NOT feed its answer back into
     // `m_hdrEnabled`: see the note on those two members.
-    void MainPage::ApplyHdrToDisplay(bool on)
+    void MainPage::ApplyHdrToDisplay(bool on, std::wstring const& when)
     {
         std::wstring note;
         m_hdrActive = echo::RequestHdrMode(on, note);
+        // WHEN it was asked, and what the swap chain was doing at the time:
+        // the timing is the hypothesis under test (2026-10-07), so every HDR
+        // line has to say which attempt it describes.
+        if (!when.empty()) note = L"[" + when + L"] " + note;
 
         Append(L"\nhdr         " + hstring(note));
         // "preferred", not "requested": what the host is asked for is decided
@@ -1506,11 +1521,48 @@ namespace winrt::EchoXbox::implementation
         if (m_hdrActive != on) {
             panel += L"\n" + note;
         }
-        Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this, panel]() {
+        // `m_hdmiNote` is read by the stats timer on the UI thread, and this
+        // now runs while that timer is live, so it is appended there too.
+        Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this, panel, note]() {
             try { HdrStateText().Text(hstring(panel)); } catch (...) {}
+            m_hdmiNote += L"\nhdr         " + note;
         });
+    }
 
-        m_hdmiNote += L"\nhdr         " + note;
+    IAsyncAction MainPage::RequestHdrWithLiveSwapChain(bool on, std::wstring when)
+    {
+        auto lifetime = get_strong();
+
+        // UI thread here. Declare PQ (or stop declaring it) on the swap chain
+        // the renderer is presenting, then let it present a few frames in that
+        // state before asking -- moonlight's swap chain has been presenting
+        // for the whole session by the time its setHdrMode callback fires.
+        if (m_renderer) m_renderer->PreferPq(on);
+        if (on && m_renderer) {
+            const uint64_t start = m_renderer->PresentedFrames();
+            for (int i = 0; i < 100; ++i) {                  // at most ~2 s
+                co_await winrt::resume_after(std::chrono::milliseconds(20));
+                co_await winrt::resume_foreground(Dispatcher());
+                if (!m_renderer || m_renderer->PresentedFrames() >= start + 8) break;
+            }
+            if (m_renderer) {
+                when += L", swap chain presenting " +
+                        std::to_wstring(m_renderer->PresentedFrames() - start) +
+                        L" frames as " + m_renderer->ColorSpaceReport();
+            }
+        }
+
+        co_await winrt::resume_background();
+        ApplyHdrToDisplay(on, when);
+        co_await winrt::resume_foreground(Dispatcher());
+    }
+
+    winrt::fire_and_forget MainPage::RetryHdrThenStream()
+    {
+        auto lifetime = get_strong();
+        SetStatus(L"asking the TV for HDR10...");
+        co_await RequestHdrWithLiveSwapChain(true, L"at stream start");
+        BeginStream();   // m_hdrRetried is still set, so this goes straight through
     }
 
     // Flipping the switch. Two things happen, and only one of them is visible
@@ -1536,11 +1588,9 @@ namespace winrt::EchoXbox::implementation
             ShowToast(L"DYNAMIC RANGE   ::   applies to the next stream", L"IonAmber");
         }
 
-        // Blocking display call - never on the UI thread.
-        auto lifetime = get_strong();
-        std::thread([this, lifetime, on]() {
-            ApplyHdrToDisplay(on);
-        }).detach();
+        // The blocking display call runs on a pool thread inside; the swap
+        // chain is declared and presenting first, as moonlight's is.
+        RequestHdrWithLiveSwapChain(on, L"from the settings toggle");
     }
 
     // The microphone level, which currently travels nowhere.
@@ -1616,7 +1666,24 @@ namespace winrt::EchoXbox::implementation
                 SetStatus(L"renderer rebuild failed - close and reopen Echo");
                 return;
             }
+            // A fresh renderer starts in sRGB; carry the preference over.
+            m_renderer->PreferPq(m_hdrEnabled);
         }
+
+        // HDR preferred but the output is not in HDR: ask once more, the way
+        // moonlight asks -- at stream start, swap chain live and declared PQ
+        // -- and only then build the request. The second pass through here
+        // finds `m_hdrRetried` set and goes straight on, so a console that
+        // still refuses costs one attempt and then an honest SDR stream.
+        if (m_hdrEnabled && !m_hdrRetried) {
+            std::wstring kind;
+            if (!echo::ConsoleOutputIsHdr(kind) && !m_hdrActive) {
+                m_hdrRetried = true;
+                RetryHdrThenStream();
+                return;
+            }
+        }
+        m_hdrRetried = false;
         if (!m_decoderReady) { SetStatus(L"no decoder - cannot stream"); return; }
 
         std::string config = m_configOverride;
@@ -1659,7 +1726,13 @@ namespace winrt::EchoXbox::implementation
             // OUTPUT must be HDR too, asked the way Kodi asks it.
             const bool canPresentPq = m_renderer && m_renderer->CanPresentPq();
             std::wstring outputKind;
-            const bool outputIsHdr = echo::ConsoleOutputIsHdr(outputKind);
+            // EITHER signal counts as HDR: AdvancedColorInfo (Kodi's check) or
+            // the HDMI mode read back after RequestHdrMode (moonlight's
+            // check). Neither has been verified against this console, and
+            // one under-reporting must not veto an output the other confirms.
+            const bool advancedColorHdr = echo::ConsoleOutputIsHdr(outputKind);
+            const bool outputIsHdr = advancedColorHdr || m_hdrActive;
+            outputKind += m_hdrActive ? L" (HDMI mode: PQ)" : L" (HDMI mode: SDR)";
             const bool hdrStream = m_hdrEnabled && canPresentPq && outputIsHdr;
             Append(L"stream      " + to_hstring(res) + L" @ " +
                    std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp) +
