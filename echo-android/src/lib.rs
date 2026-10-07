@@ -1048,6 +1048,11 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
             .get("app_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(defaults.app_id as u64) as u32,
+        // A claim about the RENDERER (see `StreamOptions::hdr`), so it is never
+        // inferred here: only a Kotlin side that declares a PQ surface may send
+        // it. Today none does, and absent means SDR -- what every Android
+        // session has always been.
+        hdr: cfg.get("hdr").and_then(|v| v.as_bool()).unwrap_or(defaults.hdr),
         // The LAN debug door is deliberately not exposed to Kotlin: the host
         // refuses that port from non-private addresses, so offering it in an app
         // would only produce confusing failures.

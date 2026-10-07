@@ -20,9 +20,11 @@
 //! to watch a perfectly complete video that is four seconds behind their
 //! controller.
 //!
-//! So the queue is small and drops the **oldest** frame when full. Dropping the
-//! newest would be simpler and is wrong: it would preserve stale frames and
-//! discard the current one, which is exactly backwards for a live stream.
+//! So the queue is small and drops the **oldest** frame when full — together
+//! with every queued P-frame that depended on it, up to the next keyframe (see
+//! [`FrameQueue::push`]). Dropping the newest would be simpler and is wrong: it
+//! would preserve stale frames and discard the current one, which is exactly
+//! backwards for a live stream.
 //!
 //! ## Dropping breaks the reference chain
 //!
@@ -285,24 +287,55 @@ impl FrameQueue {
             return;
         }
         if inner.frames.len() >= inner.capacity {
-            let dropped = inner.frames.pop_front().map(|f| f.index);
-            inner.stats.dropped_overflow += 1;
-            // The chain is broken; nothing is decodable until the host repairs
-            // it -- under an infinite GOP that only happens if we ask.
-            inner.gate.close();
-            match dropped {
-                // We know exactly which frame the decoder will never see, so
-                // ask for the cheap repair. The host answers with a type-5
-                // recovery frame, or falls back to a keyframe by itself if
-                // NVENC cannot re-point that far -- either one re-opens the
-                // gate, so this is never a way to get stuck.
-                Some(index) => {
-                    let (first, last) = inner.lost_frames.unwrap_or((index, index));
-                    inner.lost_frames = Some((first.min(index), last.max(index)));
+            // Evict the oldest frame AND every frame queued behind it up to the
+            // next keyframe. Each of those P-frames references the one before
+            // it, so once the head is gone none of them can decode -- and
+            // leaving them queued did two kinds of damage, both live on every
+            // Xbox 4K120 session start (2026-10-07, while the decoder spun up
+            // on the opening IDR):
+            //
+            //   * they were still handed to the decoder, which predicted from a
+            //     picture it never had;
+            //   * the queue stayed full, so every following push evicted the
+            //     NEXT one and reported it separately -- frames 2, 3, 4 each
+            //     arrived at the host as its own invalidation, and at a 5-frame
+            //     DPB each one cost a whole 4K keyframe.
+            //
+            // Flushing them makes one stall one loss, reported once.
+            let mut evicted: Option<(u32, u32)> = None;
+            while let Some(front) = inner.frames.front() {
+                if evicted.is_some() && front.is_keyframe() {
+                    break; // the chain restarts here; it and its successors are fine
                 }
-                // An empty queue cannot report what it lost; only a full
+                let index = inner.frames.pop_front().map(|f| f.index).unwrap_or_default();
+                inner.stats.dropped_overflow += 1;
+                evicted = Some(match evicted {
+                    Some((first, last)) => (first.min(index), last.max(index)),
+                    None => (index, index),
+                });
+            }
+            match evicted {
+                // A keyframe survived at the head: everything evicted was older
+                // than it and is superseded by it, so there is nothing to repair
+                // and the gate can stay open.
+                Some(_) if !inner.frames.is_empty() => {}
+                // The chain is broken and nothing queued can restart it. We know
+                // exactly which frames the decoder will never see, so ask for
+                // the cheap repair. The host answers with a type-5 recovery
+                // frame, or falls back to a keyframe by itself if NVENC cannot
+                // re-point that far -- either one re-opens the gate, so this is
+                // never a way to get stuck.
+                Some((first, last)) => {
+                    inner.gate.close();
+                    let (f, l) = inner.lost_frames.unwrap_or((first, last));
+                    inner.lost_frames = Some((f.min(first), l.max(last)));
+                }
+                // A zero capacity queue cannot report what it lost; only a full
                 // keyframe is guaranteed to repair an unknown gap.
-                None => inner.keyframe_wanted = true,
+                None => {
+                    inner.gate.close();
+                    inner.keyframe_wanted = true;
+                }
             }
         }
         if !inner.gate.admit(&frame) {
@@ -508,6 +541,9 @@ mod tests {
         let q = FrameQueue::new();
         assert_eq!(q.delay_ms(), 0);
         q.push(frame(1, 2, 16));
+        // It never withholds.
+        assert_eq!(q.pop_timeout(Duration::from_millis(1)).map(|f| f.index), Some(1));
+        q.push(frame(1, 2, 16));
         // Relative to CAPACITY, not a hardcoded 6. The literal was written when
         // CAPACITY was 3 and quietly stopped testing anything the moment the
         // queue was sized from a duration instead of a frame count — six frames
@@ -517,8 +553,6 @@ mod tests {
             q.push(frame(i, 1, 16));
         }
         assert!(q.stats().dropped_overflow > 0, "still a shallow drop-oldest queue");
-        // And it never withholds.
-        assert!(q.pop_timeout(Duration::from_millis(1)).is_some());
     }
 
     fn frame(index: u32, frame_type: u8, len: usize) -> DecodedFrame {
@@ -542,34 +576,38 @@ mod tests {
         assert_eq!(q.pop_timeout(Duration::from_millis(10)).unwrap().index, 2);
     }
 
+    /// The oldest frame goes, never the fresh one -- and every P-frame queued
+    /// behind it goes too, because each references the one before it and none
+    /// can decode once the head is gone. The drop re-arms the gate, so the
+    /// P-frame that caused the overflow is itself withheld.
     #[test]
-    fn a_full_queue_drops_the_oldest_frame_not_the_newest() {
+    fn an_overflow_flushes_every_frame_that_depended_on_the_evicted_one() {
         let q = FrameQueue::new();
         q.push(frame(1, 2, 4)); // keyframe opens the gate
         for i in 2..=CAPACITY as u32 {
             q.push(frame(i, 1, 4));
         }
-        // This overflows. The stale frame must go, not the fresh one — and the
-        // drop must re-arm the gate, so the P-frame that caused the overflow is
-        // itself withheld as undecodable.
         q.push(frame(99, 1, 4));
 
         let stats = q.stats();
-        assert_eq!(stats.dropped_overflow, 1);
+        assert_eq!(stats.dropped_overflow, CAPACITY as u64);
         assert_eq!(stats.dropped_waiting_keyframe, 1, "a post-drop P-frame is not decodable");
-        assert_eq!(
-            q.pop_timeout(Duration::from_millis(10)).unwrap().index,
-            2,
-            "frame 1 was the oldest and should have been evicted"
+        assert!(
+            q.pop_timeout(Duration::from_millis(10)).is_none(),
+            "nothing that predicts from the evicted frame may reach the decoder"
         );
     }
 
-    /// An overflow drop names the frame it lost, so the host can re-point a
+    /// An overflow names the frames it lost, ONCE, so the host can re-point a
     /// reference instead of coding a whole intra frame. The expensive repair
     /// must NOT also be requested -- asking for both would pay for the IDR
     /// anyway and make the cheap path pointless.
+    ///
+    /// "Once" is the regression: a decoder stalled on its opening IDR used to
+    /// cost one invalidation per arriving frame (2-2, 3-3, 4-4 at the host, and
+    /// a 4K keyframe for each), because the queue stayed full after each drop.
     #[test]
-    fn an_overflow_drop_names_the_frame_it_lost() {
+    fn an_overflow_names_everything_it_lost_in_one_request() {
         let q = FrameQueue::new();
         q.push(frame(1, 2, 4));
         for i in 2..=(CAPACITY as u32) {
@@ -577,15 +615,37 @@ mod tests {
         }
         assert_eq!(q.take_invalidation_request(), None, "nothing has been dropped yet");
 
-        q.push(frame(99, 1, 4)); // fills past capacity, evicting frame 1
-        assert_eq!(q.stats().dropped_overflow, 1);
+        q.push(frame(99, 1, 4)); // fills past capacity
+        // The decoder is still stalled and the stream keeps arriving.
+        for i in 100..110 {
+            q.push(frame(i, 1, 4));
+        }
         assert_eq!(
             q.take_invalidation_request(),
-            Some((1, 1)),
-            "the evicted frame's index is exactly what the encoder needs"
+            Some((1, CAPACITY as u32)),
+            "the evicted frames' indices are exactly what the encoder needs"
         );
         assert!(!q.take_keyframe_request(), "a named loss must not also cost an IDR");
-        assert_eq!(q.take_invalidation_request(), None, "one loss, one ask");
+        assert_eq!(q.take_invalidation_request(), None, "one stall, one ask");
+    }
+
+    /// A keyframe already queued behind the evicted frames restarts the chain,
+    /// so nothing needs repairing and the gate stays open.
+    #[test]
+    fn an_overflow_stops_at_a_queued_keyframe_and_asks_for_nothing() {
+        let q = FrameQueue::new();
+        q.push(frame(1, 2, 4));
+        q.push(frame(2, 1, 4));
+        q.push(frame(3, 2, 4)); // the host's repair IDR, already here
+        for i in 4..=(CAPACITY as u32) {
+            q.push(frame(i, 1, 4));
+        }
+        q.push(frame(99, 1, 4)); // overflows: evicts 1 and 2, keeps 3 onward
+
+        assert_eq!(q.stats().dropped_overflow, 2);
+        assert_eq!(q.take_invalidation_request(), None, "the queued keyframe repairs it");
+        assert!(!q.take_keyframe_request());
+        assert_eq!(q.pop_timeout(Duration::from_millis(10)).map(|f| f.index), Some(3));
     }
 
     /// Two drops before the receive loop's next tick must both be repaired.
@@ -606,12 +666,12 @@ mod tests {
         for i in 51..=(CAPACITY as u32 + 49) {
             q.push(frame(i, 1, 4));
         }
-        q.push(frame(99, 1, 4)); // evicts 2
+        q.push(frame(99, 1, 4)); // evicts 50 and everything behind it
 
-        assert_eq!(q.stats().dropped_overflow, 2);
+        assert_eq!(q.stats().dropped_overflow, 2 * CAPACITY as u64);
         assert_eq!(
             q.take_invalidation_request(),
-            Some((1, 2)),
+            Some((1, CAPACITY as u32 + 49)),
             "both losses must be covered by the range"
         );
     }
