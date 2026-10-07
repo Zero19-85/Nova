@@ -463,6 +463,103 @@ int FindAudioDeviceByName(const WCHAR* needle, WCHAR* out_id, int cch)
     return ret;
 }
 
+// ── Mid-stream routing questions (audio.rs's 1 Hz watchdog) ──────────────────
+//
+// The watchdog has to tell an operator's deliberate choice of output apart from
+// Windows moving the default by itself. These three answer the questions it
+// asks; none of them changes anything.
+
+// Every ACTIVE render endpoint id, '\n'-separated, into `out`. Returns the count,
+// or <0 on error / when `out` is too small.
+extern "C" __declspec(dllexport)
+int ListActiveRenderEndpoints(WCHAR* out, int cch)
+{
+    if (!out || cch <= 0) return -1;
+    out[0] = L'\0';
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDeviceCollection* coll = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (SUCCEEDED(hr)) hr = en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll);
+    UINT count = 0;
+    if (SUCCEEDED(hr)) hr = coll->GetCount(&count);
+
+    int ret = FAILED(hr) ? -2 : 0;
+    size_t used = 0;
+    for (UINT i = 0; ret >= 0 && i < count; ++i) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(coll->Item(i, &dev))) continue;
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(dev->GetId(&id)) && id) {
+            const size_t len = wcslen(id);
+            if (used + len + 2 > (size_t)cch) {
+                ret = -3;   // caller's buffer is too small; say so rather than truncate
+            } else {
+                wcscpy_s(out + used, cch - used, id);
+                used += len;
+                out[used++] = L'\n';
+                out[used]   = L'\0';
+                ++ret;
+            }
+            CoTaskMemFree(id);
+        }
+        dev->Release();
+    }
+    if (coll) coll->Release();
+    if (en)   en->Release();
+    return ret;
+}
+
+// Opens one endpoint by id. Caller releases.
+static IMMDevice* open_endpoint(const WCHAR* device_id)
+{
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)&en))) {
+        if (FAILED(en->GetDevice(device_id, &dev))) dev = nullptr;
+        en->Release();
+    }
+    return dev;
+}
+
+// 1 if the endpoint is a virtual CABLE -- VB-CABLE's "CABLE Input" / "CABLE In
+// 16ch", or VAC. Those are where the Echo microphone renders, so audio sent there
+// comes back out as the host's microphone; the watchdog never follows an operator
+// onto one. 0 = not a cable, <0 = could not tell.
+extern "C" __declspec(dllexport)
+int EndpointIsVirtualCable(const WCHAR* device_id)
+{
+    if (!device_id || !*device_id) return -1;
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+    IMMDevice* dev = open_endpoint(device_id);
+    if (!dev) return -2;
+    const bool cable = endpoint_matches(dev, L"VB-Audio Virtual Cable") ||
+                       endpoint_matches(dev, L"Virtual Audio Cable");
+    dev->Release();
+    return cable ? 1 : 0;
+}
+
+// The endpoint's friendly name ("Speakers (Realtek(R) Audio)"), for log lines a
+// person has to act on. Returns 0 on success.
+extern "C" __declspec(dllexport)
+int GetEndpointFriendlyName(const WCHAR* device_id, WCHAR* out, int cch)
+{
+    if (!device_id || !out || cch <= 0) return -1;
+    out[0] = L'\0';
+    ComScope com;
+    if (FAILED(com.hr)) return -1;
+    IMMDevice* dev = open_endpoint(device_id);
+    if (!dev) return -2;
+    const bool ok = read_string_prop(dev, PKEY_Device_FriendlyName, out, cch);
+    dev->Release();
+    return ok ? 0 : -3;
+}
+
 // Crash recovery: if Nova exited without restoring the default device
 // (killed/closed rather than a clean shutdown), startup detects that the
 // default is still the ghost sink and switches back to a real output — which

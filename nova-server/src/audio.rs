@@ -77,6 +77,42 @@ extern "C" {
     fn GetDefaultEndpointId(is_capture: i32, out_id: *mut u16, cch: i32) -> i32;
     /// Flow-aware endpoint search by friendly-name substring or exact id.
     fn FindEndpointByName(needle: *const u16, is_capture: i32, out_id: *mut u16, cch: i32) -> i32;
+    /// Every active render endpoint id, '\n'-separated. Returns the count.
+    fn ListActiveRenderEndpoints(out: *mut u16, cch: i32) -> i32;
+    /// 1 when the endpoint is a VB-CABLE / VAC cable input.
+    fn EndpointIsVirtualCable(device_id: *const u16) -> i32;
+    /// The endpoint's friendly name, for log lines. 0 on success.
+    fn GetEndpointFriendlyName(device_id: *const u16, out: *mut u16, cch: i32) -> i32;
+}
+
+/// Ids of every render endpoint that is active right now (NUL-terminated).
+/// Empty when the query fails, which the watchdog reads as "nothing is known
+/// to predate the stream" -- the conservative answer, since it keeps the sink.
+fn active_render_endpoints() -> Vec<Vec<u16>> {
+    let mut buf = vec![0u16; 64 * DEVICE_ID_CCH];
+    if unsafe { ListActiveRenderEndpoints(buf.as_mut_ptr(), buf.len() as i32) } <= 0 {
+        return Vec::new();
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    buf[..end]
+        .split(|&c| c == u16::from(b'\n'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.iter().copied().chain(std::iter::once(0)).collect())
+        .collect()
+}
+
+fn endpoint_is_virtual_cable(id: &[u16]) -> bool {
+    unsafe { EndpointIsVirtualCable(id.as_ptr()) == 1 }
+}
+
+/// "Speakers (Realtek(R) Audio)" rather than a GUID, for lines an operator reads.
+fn endpoint_name(id: &[u16]) -> String {
+    let mut out = [0u16; 256];
+    if unsafe { GetEndpointFriendlyName(id.as_ptr(), out.as_mut_ptr(), out.len() as i32) } == 0 {
+        String::from_utf16_lossy(strip_nul(&out))
+    } else {
+        String::from_utf16_lossy(strip_nul(id))
+    }
 }
 
 // ── Streaming-sink selection ──────────────────────────────────────────────────
@@ -929,16 +965,61 @@ enum SendExit {
     /// missed by the capture loop"). The caller rebinds capture to the NEW
     /// default and continues the same session.
     DeviceChanged,
+    /// The operator picked a different output while the sink was pinned (see
+    /// [`judge_drift`]). Capture stops pinning the sink and follows the default
+    /// from here on; the pre-stream endpoint still restores at session end.
+    OperatorChoseOutput(Vec<u16>),
+}
+
+/// What the watchdog does when the default output is no longer the sink.
+#[derive(Debug, PartialEq, Eq)]
+enum Drift {
+    /// Put the sink back. Carries the reason, for the log.
+    Reassert(&'static str),
+    /// Respect it: someone chose this output on purpose.
+    Follow,
+}
+
+/// Was this move of the default output the operator's, or Windows'?
+///
+/// The watchdog used to re-assert the sink on ANY drift, once a second, and
+/// that is exactly what the operator reported (2026-10-07) as "something keeps
+/// forcing Steam Streaming Speakers back" -- picking another output in the
+/// Sound settings snapped back within a second, every time. The re-assert
+/// exists for one real failure: an endpoint that APPEARS mid-stream (a display's
+/// HDMI audio enumerating seconds after the virtual display lights up) and that
+/// Windows makes the default by itself. A person choosing a device in the
+/// settings is a different event, and it can be told apart by what existed when
+/// the stream began:
+///
+///   * new since the stream started  -> Windows auto-selected an arrival; re-assert
+///   * a virtual cable (VB-CABLE)    -> re-assert, even when chosen on purpose.
+///     The Echo microphone renders into "CABLE Input", so game audio sent there
+///     comes straight back out of "CABLE Output" -- the host's microphone. This
+///     is the same rule that keeps VB-CABLE out of `kGhostSinkNames`; following
+///     the operator onto it would be that bug by another route.
+///   * anything else that predates the stream -> a deliberate choice; follow it.
+fn judge_drift(cur: &[u16], known_at_start: &[Vec<u16>], is_cable: bool) -> Drift {
+    if is_cable {
+        Drift::Reassert("a virtual cable carries the Echo microphone, so game audio there would come back as the host's microphone")
+    } else if !known_at_start.iter().any(|k| k.as_slice() == cur) {
+        Drift::Reassert("it appeared after the stream started, so Windows chose it, not you")
+    } else {
+        Drift::Follow
+    }
 }
 
 /// Where this capture is bound, for the once-per-second routing watchdog.
 enum CaptureRoute {
     /// Client-only mode: capture is pinned to the sink by id, and the sink
-    /// must REMAIN the system default for the whole stream. If the default
-    /// drifts (late device arrival, user fiddling with sound settings), the
-    /// watchdog re-asserts the sink — the "ghost orchestrator" duty. The
-    /// armed pre-stream endpoint still restores at session end.
-    PinnedSink(Vec<u16>),
+    /// stays the system default unless the operator deliberately picks
+    /// another output -- see [`judge_drift`] for how the two are told apart.
+    /// The armed pre-stream endpoint still restores at session end.
+    PinnedSink {
+        sink: Vec<u16>,
+        /// Render endpoints that were active when the stream began.
+        known_at_start: Vec<Vec<u16>>,
+    },
     /// Capturing the default endpoint: remember WHICH device that was; when
     /// the default moves, exit with `DeviceChanged` so capture rebinds to
     /// where the application audio actually went. Empty id = the initial
@@ -957,9 +1038,16 @@ fn audio_send_loop(
     // The guard triggers the claim-once endpoint restore on every exit path.
     // Engaged ONCE for the session — capture rebinds below reuse it.
     let sink_guard = SinkGuard::engage(host_audio);
+    // What "already existed" means to the watchdog -- see `judge_drift`. Taken
+    // once, after the sink swap, so an endpoint that shows up later in the
+    // session is recognisably new.
+    let known_at_start = active_render_endpoints();
+    // Pinned to the sink until the operator deliberately chooses another
+    // output; after that, capture follows the default for the rest of the stream.
+    let mut pinned = sink_guard.capture_id.clone();
 
     loop {
-        let cap = match start_capture_thread(sink_guard.capture_id.as_deref()) {
+        let cap = match start_capture_thread(pinned.as_deref()) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("🎵 Audio disabled: {}", e);
@@ -967,8 +1055,11 @@ fn audio_send_loop(
             }
         };
 
-        let route = match &sink_guard.capture_id {
-            Some(id) => CaptureRoute::PinnedSink(id.clone()),
+        let route = match &pinned {
+            Some(id) => CaptureRoute::PinnedSink {
+                sink: id.clone(),
+                known_at_start: known_at_start.clone(),
+            },
             None => {
                 let mut cur = [0u16; DEVICE_ID_CCH];
                 if unsafe { GetDefaultAudioDeviceId(cur.as_mut_ptr(), DEVICE_ID_CCH as i32) } == 0 {
@@ -992,6 +1083,19 @@ fn audio_send_loop(
 
         match exit {
             SendExit::SessionStopped => break,
+            SendExit::OperatorChoseOutput(id) => {
+                println!(
+                    "🎧 Audio: \"{}\" was chosen as the output mid-stream — following it (the \
+                     stream now captures that device; your pre-stream output is still restored \
+                     when the stream ends)",
+                    endpoint_name(&id)
+                );
+                pinned = None;
+                thread::sleep(Duration::from_millis(300));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             SendExit::DeviceChanged => {
                 println!("🎵 Audio: default output changed mid-stream — rebinding loopback capture to the new endpoint");
                 // Let the endpoint flip settle before re-querying/binding.
@@ -1057,16 +1161,24 @@ fn send_pcm_loop(
             if have_cur {
                 let cur_id = wide_id(&cur);
                 match route {
-                    CaptureRoute::PinnedSink(sink_id) if cur_id != *sink_id => {
-                        // Default drifted off the sink mid-stream (late device
-                        // arrival, sound-settings fiddling) — application audio
-                        // would fall back to host speakers and vanish from the
-                        // stream. Re-assert the sink; capture (pinned by id)
-                        // stays valid throughout.
+                    CaptureRoute::PinnedSink { sink, known_at_start } if cur_id != *sink => {
+                        // Default moved off the sink mid-stream. Whose move was
+                        // it? See judge_drift.
+                        let why = match judge_drift(&cur_id, known_at_start, endpoint_is_virtual_cable(&cur_id)) {
+                            Drift::Follow => return SendExit::OperatorChoseOutput(cur_id),
+                            Drift::Reassert(why) => why,
+                        };
+                        // Application audio would fall back to wherever the
+                        // default went and vanish from the stream. Re-assert the
+                        // sink; capture (pinned by id) stays valid throughout.
                         reasserts += 1;
-                        if unsafe { SetDefaultAudioDevice(sink_id.as_ptr()) } == 0 {
+                        if unsafe { SetDefaultAudioDevice(sink.as_ptr()) } == 0 {
                             if reasserts == 1 || reasserts % 10 == 0 {
-                                println!("🎧 Audio: default output drifted off the streaming sink — re-asserted ({} time(s))", reasserts);
+                                println!(
+                                    "🎧 Audio: default output moved to \"{}\" — put the streaming sink back \
+                                     because {why} ({reasserts} time(s))",
+                                    endpoint_name(&cur_id)
+                                );
                             }
                         } else if reasserts == 1 {
                             eprintln!("⚠️  Audio: default output drifted off the streaming sink and re-assert failed — host speakers may play");
@@ -1132,4 +1244,45 @@ fn send_pcm_loop(
     }
 
     SendExit::SessionStopped
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The operator's report (2026-10-07): picking another output in the Sound
+    /// settings mid-stream snapped back to Steam Streaming Speakers within a
+    /// second, every time. A device that was already there is a choice.
+    #[test]
+    fn choosing_an_output_that_already_existed_is_followed() {
+        let known = vec![id("speakers"), id("steam"), id("lg-hdmi")];
+        assert_eq!(judge_drift(&id("speakers"), &known, false), Drift::Follow);
+    }
+
+    /// What the re-assert was built for: an endpoint enumerating mid-stream that
+    /// Windows makes the default on its own.
+    #[test]
+    fn an_endpoint_that_appeared_mid_stream_is_overridden() {
+        let known = vec![id("speakers"), id("steam")];
+        assert!(matches!(judge_drift(&id("vdd-hdmi"), &known, false), Drift::Reassert(_)));
+    }
+
+    /// The two-list rule: VB-CABLE carries the Echo microphone, so it is never
+    /// followed, however deliberately it was chosen.
+    #[test]
+    fn a_virtual_cable_is_never_followed_even_when_it_predates_the_stream() {
+        let known = vec![id("speakers"), id("cable-input")];
+        assert!(matches!(judge_drift(&id("cable-input"), &known, true), Drift::Reassert(_)));
+    }
+
+    /// A failed snapshot must keep the sink rather than follow everything.
+    #[test]
+    fn with_no_snapshot_nothing_is_treated_as_a_choice() {
+        assert!(matches!(judge_drift(&id("speakers"), &[], false), Drift::Reassert(_)));
+    }
 }
