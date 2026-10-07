@@ -9,6 +9,7 @@
 #include <fcntl.h>    // _O_APPEND, _O_TEXT
 #include <vector>
 #include <atomic>
+#include <mutex>
 
 #include "nvEncodeAPI.h"
 #include "NvEncoderD3D11.h"
@@ -209,6 +210,37 @@ static std::atomic<uint64_t> g_lastEncodedFrameIndex{0};
 //                          decode a P-frame whose reference was re-pointed.
 static std::atomic<bool>    g_rfiConfirm{false};
 static std::atomic<bool>    g_lastFrameRecovery{false};
+
+// ── The repair queue: every repair decision is made ON THE ENCODE THREAD ──────
+//
+// Invalidation used to run on whichever thread delivered the client's request
+// (the Worker's IPC reader, or control.rs in the monolithic host) while the
+// capture thread was encoding. It widened the range to g_lastEncodedFrameIndex
+// as read AT CALL TIME -- so a frame that was mid-encode in NVENC, not yet
+// stamped into that variable, escaped the invalidation and became a reference
+// for the "recovery" frame after it. Sunshine queues invalidations onto its
+// encode thread for exactly this reason (nvenc_base / video.cpp).
+//
+// Now QueueRepair only records the range. EncodeFrame drains it before it
+// builds the picture parameters, when the newest encoded frame is known
+// exactly, and walks the whole ladder there: RFI, then LTR, then an IDR.
+//
+// Doing it here also lets the queue throw away a request that is already
+// answered. A range that ends before the most recent IDR describes damage that
+// IDR repaired -- the client simply had not seen the IDR when it asked. Live
+// 2026-10-07, every Xbox session start: the client reported frames 2, 3, 4 one
+// at a time, the first report bought an IDR at frame 10, and the next two
+// bought IDRs at frames 13 and 16 for losses frame 10 had already healed.
+static std::mutex           g_repairMutex;
+static bool                 g_repairPending = false;
+static uint64_t             g_repairFirst   = 0;
+static uint64_t             g_repairLast    = 0;
+// Wire index of the most recent IDR this encoder emitted.
+static std::atomic<uint64_t> g_lastIdrFrameIndex{0};
+// Repairs that fell all the way through to an IDR since Rust last asked. That
+// outcome -- the gap outran every cheap repair -- is the honest congestion
+// signal, and only the encode thread knows it now.
+static std::atomic<uint32_t> g_repairIdrFallbacks{0};
 
 // ── Long-term reference (LTR) frames ─────────────────────────────────────────
 //
@@ -1599,7 +1631,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
     }
     g_isHdr = is_hdr;
     // Derived from the negotiated geometry, and read by all three codec
-    // config blocks below plus InvalidateRefFrames' range check -- they must
+    // config blocks below plus InvalidateRefFramesOnEncodeThread's range check -- they must
     // never disagree, which is why it is computed exactly once, here.
     g_refFramesInDpb = dpb_depth_for_geometry(width, height, codecGuid, g_deepDpbAuthorized);
     // A shallow DPB cannot span a typical loss, so RFI's P-frame repair mostly
@@ -1896,7 +1928,12 @@ extern "C" __declspec(dllexport) int InitEncoder(
         // keeps using on-demand IDRs.
         g_nvEncoder->SetUseExternalTimeStamp(true);
         g_lastEncodedFrameIndex = 0;
-        g_rfiSupported = g_nvEncoder->GetCapabilityValue(
+        g_lastIdrFrameIndex = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_repairMutex);
+            g_repairPending = false;            // a new encoder owes no repairs
+        }
+        g_rfiSupported =g_nvEncoder->GetCapabilityValue(
                              codecGuid, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0;
         ShimLog("🧩 RFI (reference-frame invalidation) support for %s: %s (DPB holds %u ref frames at %dx%d, %s)\n",
                codec, g_rfiSupported ? "YES" : "no", g_refFramesInDpb, width, height,
@@ -2037,6 +2074,47 @@ static bool RetireReferencesNewerThanLtr(uint32_t useBitmap) {
     ShimLog("[LTR] retired %u newer reference(s) in %llu-%llu before recovering against frame %llu\n",
            retired, (unsigned long long)lo, (unsigned long long)lastEnc,
            (unsigned long long)ltrFrame);
+    return true;
+}
+
+static int InvalidateRefFramesOnEncodeThread(uint64_t first_frame, uint64_t last_frame);
+static int ArmLtrRecovery();
+
+// Walk the repair ladder for whatever the client reported since the last frame.
+// ENCODE THREAD ONLY, before the frame's picture parameters are built. Returns
+// true when the repair needs THIS frame to be an IDR.
+//
+//   * already an IDR    -- the IDR repairs everything; nothing else to do.
+//   * stale             -- the range ends before the most recent IDR, which has
+//                          already replaced every picture in it. Dropped.
+//   * straddles an IDR  -- nothing before the IDR is in the DPB any more, so
+//                          the range is clipped to start at it.
+//   * RFI, then LTR, then IDR, exactly as the callers used to do it.
+static bool DrainRepairQueue(bool alreadyIdr) {
+    uint64_t first, last;
+    {
+        std::lock_guard<std::mutex> lk(g_repairMutex);
+        if (!g_repairPending) return false;
+        g_repairPending = false;
+        first = g_repairFirst;
+        last  = g_repairLast;
+    }
+    if (alreadyIdr) {
+        ShimLog("🧩 repair %llu-%llu: this frame is already an IDR — nothing more to do\n",
+               (unsigned long long)first, (unsigned long long)last);
+        return false;
+    }
+    const uint64_t lastIdr = g_lastIdrFrameIndex.load();
+    if (lastIdr != 0 && last < lastIdr) {
+        ShimLog("🧩 repair %llu-%llu ignored — the IDR at frame %llu already replaced those pictures\n",
+               (unsigned long long)first, (unsigned long long)last, (unsigned long long)lastIdr);
+        return false;
+    }
+    if (first < lastIdr) first = lastIdr;
+
+    if (InvalidateRefFramesOnEncodeThread(first, last)) return false;
+    if (ArmLtrRecovery())                               return false;
+    g_repairIdrFallbacks.fetch_add(1);
     return true;
 }
 
@@ -2328,6 +2406,10 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     // recording whose Clusters never start on a keyframe is a recording no
     // player can seek in.
     bool forceIdr = g_force_idr.exchange(false);
+    // Client-reported loss is repaired here and nowhere else -- see
+    // g_repairMutex. Must precede the LTR consumption below: the ladder's
+    // second rung arms g_ltrUsePending for this very frame.
+    if (DrainRepairQueue(forceIdr)) forceIdr = true;
     // An armed LTR recovery is consumed HERE, before the IDR flags are built,
     // because retiring the references it depends on can fail -- and a failed
     // retirement must turn this very frame into an IDR rather than emit a
@@ -2409,6 +2491,7 @@ extern "C" __declspec(dllexport) int EncodeFrame(
     }
     g_nvEncoder->EncodeFrame(vPacket, &picParams);
     g_lastEncodedFrameIndex.store(frame_index);
+    if (forceIdr) g_lastIdrFrameIndex.store(frame_index);
     // Tie the RFI recovery marker to the frame just encoded: if an invalidation
     // landed since the last encode, THIS frame is the one that references the
     // re-pointed (older, good) frame, so the wire must mark it type 5.
@@ -2534,14 +2617,18 @@ extern "C" __declspec(dllexport) void RequestIdrFrame(void* /*encoder*/) {
 // Non-zero return = the client's [first,last] range was invalidated in the
 // DPB; the next encoded P-frame references an older good frame, so the client
 // recovers WITHOUT a full IDR (no "scanning down" repair sweep). Zero return =
-// the range can't be honoured — the caller (Rust) must force an IDR instead.
+// the range can't be honoured — the caller must try LTR, then force an IDR.
 // Mirrors Sunshine nvenc_base::invalidate_ref_frames.
-extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, uint64_t last_frame) {
+//
+// ENCODE THREAD ONLY -- called from DrainRepairQueue. See g_repairMutex for the
+// race that running it anywhere else reopens.
+static int InvalidateRefFramesOnEncodeThread(uint64_t first_frame, uint64_t last_frame) {
     if (!g_nvEncoder || !g_rfiSupported) return 0;
     if (last_frame < first_frame)        return 0;
 
     // Everything from the first lost frame up to the most recently encoded one
     // transitively depends on the lost reference, so invalidate the whole tail.
+    // Exact here: no other thread can be encoding while this one is.
     uint64_t last_encoded = g_lastEncodedFrameIndex.load();
     if (last_encoded > last_frame) last_frame = last_encoded;
 
@@ -2564,6 +2651,29 @@ extern "C" __declspec(dllexport) int InvalidateRefFrames(uint64_t first_frame, u
            (unsigned long long)first_frame, (unsigned long long)last_frame);
     g_rfiConfirm.store(true); // mark the next encoded frame as the recovery frame
     return 1;
+}
+
+// Record a client-reported loss for the encode thread to repair. Callable from
+// any thread; never touches NVENC. Two requests that land between frames are
+// merged into one range, because repairing only the later one would leave the
+// earlier gap in the DPB.
+extern "C" __declspec(dllexport) void QueueRepair(uint64_t first_frame, uint64_t last_frame) {
+    if (last_frame < first_frame) std::swap(first_frame, last_frame);
+    std::lock_guard<std::mutex> lk(g_repairMutex);
+    if (g_repairPending) {
+        if (first_frame < g_repairFirst) g_repairFirst = first_frame;
+        if (last_frame  > g_repairLast)  g_repairLast  = last_frame;
+    } else {
+        g_repairPending = true;
+        g_repairFirst   = first_frame;
+        g_repairLast    = last_frame;
+    }
+}
+
+// How many queued repairs had to become an IDR since the last call. Rust turns
+// a nonzero answer into its congestion signal.
+extern "C" __declspec(dllexport) uint32_t TakeRepairIdrFallbacks() {
+    return g_repairIdrFallbacks.exchange(0);
 }
 
 // Whether this GPU/codec supports RFI (probed at InitEncoder). Rust reads this
@@ -2694,7 +2804,9 @@ extern "C" __declspec(dllexport) int CleanupEncoder(void* /*encoder*/) {
 //   * Without one (Moonlight has no such message), pick the OLDEST live slot.
 //     It is the one most likely to have arrived, and it is deliberately the
 //     opposite choice: with no proof, age is the only evidence available.
-extern "C" __declspec(dllexport) int ArmLtrRecovery() {
+// Encode thread only, from DrainRepairQueue -- no longer exported: Rust queues
+// repairs with QueueRepair and never arms LTR itself.
+static int ArmLtrRecovery() {
     if (!g_nvEncoder || !g_ltrActive) return 0;
 
     const uint64_t acked = g_ltrAckedFrame.load();
@@ -2730,12 +2842,6 @@ extern "C" __declspec(dllexport) void NotifyLtrAcked(uint64_t frame_index) {
     while (frame_index > prev &&
            !g_ltrAckedFrame.compare_exchange_weak(prev, frame_index)) {
     }
-}
-
-// Whether long-term references are live for this session, so Rust can decide
-// between the LTR repair path and the IDR one without guessing.
-extern "C" __declspec(dllexport) int LtrActive() {
-    return g_ltrActive ? 1 : 0;
 }
 
 // Whether the frame just encoded was an LTR recovery frame.

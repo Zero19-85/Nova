@@ -456,19 +456,11 @@ fn handle_control_message(
                     match worker_link {
                         Some(link) => link.send(ControlMsg::InvalidateRefFrames { first, last }),
                         None => {
-                            // Same outcome-based rule as the Worker loop above --
-                            // mirror any change to both.
-                            // Repair ladder: RFI, then LTR, then an IDR. Each
-                            // rung costs more than the one above and each is
-                            // strictly better than the one below, so the IDR is
-                            // only ever reached when neither cheap repair has a
-                            // reference left to work with.
-                            if !crate::encoder::invalidate_ref_frames(first as u64, last as u64)
-                                && !crate::encoder::arm_ltr_recovery()
-                            {
-                                crate::encoder::request_idr_global();
-                                crate::encoder::signal_congestion_reduction();
-                            }
+                            // Same as the Worker loop -- mirror any change to both.
+                            // Repair ladder: RFI, then LTR, then an IDR, walked by
+                            // the shim on the encode thread; the fallback's
+                            // congestion signal comes from Encoder::encode_frame.
+                            crate::encoder::queue_repair(first as u64, last as u64);
                         }
                     }
                 }

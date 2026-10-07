@@ -3185,8 +3185,7 @@ pub async fn run_worker() -> Result<()> {
                                     // next P-frame recovers; fall back to an IDR if
                                     // NVENC can't honour it (range too large, etc).
                                     //
-                                    // The OUTCOME is the congestion signal, and this is
-                                    // the only place in the process that knows it. A
+                                    // The OUTCOME is the congestion signal. A
                                     // successful invalidation is a cheap repair -- a few
                                     // hundred bytes of P-frame -- and says nothing about
                                     // the link; signalling on those would collapse the
@@ -3195,21 +3194,21 @@ pub async fn run_worker() -> Result<()> {
                                     // outran the DPB, which costs a full intra frame and
                                     // IS the honest congestion indicator.
                                     //
-                                    // Signalling here rather than at the request site is
-                                    // what finally gives QoS eyes on an ECHO session:
+                                    // Signalling on the outcome rather than at the
+                                    // request site is what gives QoS eyes on an ECHO
+                                    // session:
                                     // Echo's repairs arrive over the RPC tunnel and never
                                     // touch control.rs, so every producer of this signal
                                     // lived on a path Echo does not use and dynamic
                                     // bitrate was inert for it. Both client kinds reach
                                     // this handler, so both are covered by one rule.
                                     // Repair ladder: RFI, then LTR, then an IDR
-                                    // — see the control.rs twin.
-                                    if !encoder::invalidate_ref_frames(first as u64, last as u64)
-                                        && !encoder::arm_ltr_recovery()
-                                    {
-                                        encoder::request_idr_global();
-                                        encoder::signal_congestion_reduction();
-                                    }
+                                    // — walked by the shim ON THE ENCODE THREAD
+                                    // (this reader thread used to do it, and raced
+                                    // the frame mid-encode). The fallback's
+                                    // congestion signal is now raised by
+                                    // Encoder::encode_frame, which sees the outcome.
+                                    encoder::queue_repair(first as u64, last as u64);
                                 }
                                 Some(Ok(ipc::ControlMsg::ConfigureStart(cs))) => {
                                     if cmd_tx.send(WorkerCommand::Configure(cs)).is_err() {

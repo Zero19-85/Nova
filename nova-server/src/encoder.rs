@@ -81,26 +81,18 @@ extern "C" {
     fn RequestIdrFrame(encoder: *mut c_void);
     fn ReconfigureBitrate(bitrate_kbps: i32, fps: i32) -> i32;
 
-    /// RFI: invalidate the client's `[first,last]` frame-index range in NVENC's
-    /// DPB so the next P-frame recovers without an IDR. Returns 1 on success,
-    /// 0 when the range can't be honoured (caller must force an IDR).
-    fn InvalidateRefFrames(first_frame: u64, last_frame: u64) -> i32;
-    /// RFI: whether this GPU/codec supports reference-picture invalidation
-    /// (probed at InitEncoder). 1 = supported.
-    fn RfiSupported() -> i32;
+    /// Record a client-reported lost range for the ENCODE thread to repair
+    /// (RFI, then LTR, then IDR). Never touches NVENC; callable from anywhere.
+    fn QueueRepair(first_frame: u64, last_frame: u64);
+    /// How many queued repairs fell through to an IDR since the last call.
+    fn TakeRepairIdrFallbacks() -> u32;
     /// RFI: whether the most recently encoded frame was a recovery frame (its
     /// reference was re-pointed by an invalidation). 1 = mark it wire type 5.
     fn LastFrameWasRfiRecovery() -> i32;
 
-    /// LTR: arm the next encoded frame to reference a long-term reference
-    /// instead of the frame before it. Returns 1 when one was armed, 0 when no
-    /// usable long-term reference exists (caller must force an IDR).
-    fn ArmLtrRecovery() -> i32;
     /// LTR: report the newest wire frame index the client confirmed decoding,
     /// so recovery only ever references a picture it provably holds.
     fn NotifyLtrAcked(frame_index: u64);
-    /// LTR: whether long-term references are live for this session.
-    fn LtrActive() -> i32;
     /// LTR: whether the frame just encoded was an LTR recovery frame.
     fn LastFrameWasLtrRecovery() -> i32;
 
@@ -220,18 +212,17 @@ pub fn recorder_dropped_frames() -> u64 {
 /// rather than degrading it (the frame-index bijection must hold exactly).
 pub const RFI_ENABLED: bool = true;
 
-/// Attempt reference-frame invalidation for the client-reported lost range.
-/// `true` = NVENC will recover with a P-frame; `false` = the caller must fall
-/// back to forcing an IDR. See the shim's `InvalidateRefFrames`.
-pub fn invalidate_ref_frames(first_frame: u64, last_frame: u64) -> bool {
-    unsafe { InvalidateRefFrames(first_frame, last_frame) == 1 }
-}
-
-/// Whether NVENC on this host advertises reference-picture invalidation
-/// support. Only meaningful after the first `Encoder::new()`. Gates whether
-/// Nova advertises RFI to the client (see rtsp.rs).
-pub fn rfi_supported() -> bool {
-    unsafe { RfiSupported() == 1 }
+/// Repair a client-reported lost range. Returns at once: the shim walks the
+/// repair ladder -- RFI, then LTR, then an IDR -- on the encode thread, right
+/// before the next frame, where the newest encoded frame is known exactly.
+///
+/// Deciding it here instead (the old `invalidate_ref_frames` +
+/// `arm_ltr_recovery` pair) raced the capture thread: a frame mid-encode was
+/// not yet counted, escaped the invalidation, and became a reference for the
+/// "recovery" frame. The congestion signal for a fallback IDR is raised by
+/// [`Encoder::encode_frame`], the only place that now learns the outcome.
+pub fn queue_repair(first_frame: u64, last_frame: u64) {
+    unsafe { QueueRepair(first_frame, last_frame) }
 }
 
 /// Whether the frame just returned by `encode_frame` is an RFI recovery frame,
@@ -239,19 +230,6 @@ pub fn rfi_supported() -> bool {
 /// re-pointed reference correctly. Call immediately after `encode_frame`.
 pub fn last_frame_was_rfi_recovery() -> bool {
     unsafe { LastFrameWasRfiRecovery() == 1 }
-}
-
-/// Attempt a keyframeless repair: point the next P-frame at a long-term
-/// reference the client still holds. `true` = armed, `false` = no usable
-/// long-term reference and the caller must force an IDR.
-///
-/// **Ordering matters at the call sites.** This is the second choice, not the
-/// first: reference-frame invalidation is cheaper still (it re-points within
-/// the short-term window and needs no marked frame), so the repair ladder is
-/// RFI, then LTR, then an IDR. Each rung costs more than the one above it and
-/// each is strictly better than the rung below.
-pub fn arm_ltr_recovery() -> bool {
-    unsafe { ArmLtrRecovery() == 1 }
 }
 
 /// Tell the encoder the client has decoded everything up to `frame_index`.
@@ -264,12 +242,6 @@ pub fn arm_ltr_recovery() -> bool {
 /// reference the client demonstrably has.
 pub fn notify_ltr_acked(frame_index: u64) {
     unsafe { NotifyLtrAcked(frame_index) }
-}
-
-/// Whether long-term references are live for this session. False on AV1, on a
-/// GPU that reports too few LTR slots, or when `kEnableLtr` is off in the shim.
-pub fn ltr_active() -> bool {
-    unsafe { LtrActive() == 1 }
 }
 
 /// Whether the frame just returned by `encode_frame` repaired the stream by
@@ -494,7 +466,7 @@ impl Encoder {
         unsafe {
             // T is ID3D11Texture2D — same repr(transparent) COM wrapper trick.
             let tex_ptr = std::mem::transmute_copy::<T, *mut c_void>(texture);
-            EncodeFrame(
+            let n = EncodeFrame(
                 self.handle,
                 tex_ptr,
                 self.config.width,
@@ -502,7 +474,16 @@ impl Encoder {
                 out.as_mut_ptr(),
                 out.len() as i32,
                 frame_index,
-            )
+            );
+            // A repair that outran every cheap rung cost a full intra frame,
+            // and THAT is the honest congestion indicator -- a successful RFI or
+            // LTR repair says nothing about the link (135 of them in one live
+            // session on 2026-08-23 would otherwise have collapsed the bitrate).
+            // This is the one place both capture loops share, so both get it.
+            if TakeRepairIdrFallbacks() > 0 {
+                signal_congestion_reduction();
+            }
+            n
         }
     }
 
