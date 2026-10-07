@@ -1612,3 +1612,28 @@ there, asks for that, logging `second look after the refusal: the list now
 offers ...`. `DescribeMode` also prints `(stereo)`, the one search criterion
 the table did not show. Whether the refusal or time is what populates the list
 is still unknown.
+
+### 14.7 Correction to 14.6: the list was NOT changing — the search rejects the entry
+
+On the second-look build the console printed `second look after the refusal:
+still no PQ mode near this refresh` -- five fresh searches over a second --
+directly above a table that still listed `3840x2160 @ 119.88 Hz, 30 bpp,
+BT2020 (PQ capable) (HDR10 capable)`. The table is read microseconds after the
+fifth search, so the list did not change; `findTwin` rejects an entry that
+looks like an exact match.
+
+`findTwin` checks only PQ flag, raw width/height, `StereoEnabled`, and refresh
+within 0.5 Hz -- NOT bit depth, colour space or pixel encoding (a second
+opinion suggested those; the code does not test them). Size, refresh and the
+PQ flag print identically in the table, so by elimination the suspect is
+`StereoEnabled` (the one predicate the old table did not show) or something
+not visible by reading. Now:
+
+ - `findLoose` (PQ flag + size + refresh to two decimals, stereo NOT excluded)
+   runs whenever `findTwin` comes back empty, including on the first search,
+   so the doomed speculative ask on the SDR entry is skipped if it hits;
+ - every row of the table carries findTwin's verdict --
+   `<- pq ok, size ok, stereo no, 119.880000 Hz (d 0.000000) ok => MATCH` --
+   and a `searched for:` header with the current mode's exact values.
+
+Built, untested. The verdict column will name the failing predicate.

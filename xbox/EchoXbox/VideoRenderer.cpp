@@ -463,12 +463,61 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             return best;
         };
 
+        // ── When the strict search misses an entry the table plainly shows ──
+        //
+        // Live 2026-10-07: "second look after the refusal: still no PQ mode
+        // near this refresh" -- five fresh searches over a second -- printed
+        // directly above a table listing "3840x2160 @ 119.88 Hz, 30 bpp,
+        // BT2020 (PQ capable)". So the list was NOT changing; findTwin was
+        // rejecting an entry that looks like an exact match. Size, refresh and
+        // the PQ flag all print identically; the one predicate the table never
+        // showed was StereoEnabled. Rather than guess a third time:
+        //
+        //  * `findLoose` matches PQ flag + size + refresh to two decimals (the
+        //    precision the table prints) and does NOT exclude stereo;
+        //  * `verdict` prints every predicate findTwin applies, with the raw
+        //    refresh to six places, so the next table names the culprit.
+        const auto findLoose = [&hdmi, &original, enable]() -> HdmiDisplayMode {
+            const long wantCentiHz = std::lround(original.RefreshRate() * 100.0);
+            for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
+                if (mode.IsSmpte2084Supported() == enable &&
+                    mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
+                    mode.ResolutionHeightInRawPixels() == original.ResolutionHeightInRawPixels() &&
+                    std::lround(mode.RefreshRate() * 100.0) == wantCentiHz) {
+                    return mode;
+                }
+            }
+            return HdmiDisplayMode{ nullptr };
+        };
+        const auto verdict = [&original, enable](HdmiDisplayMode const& mode) -> std::wstring {
+            const bool pqOk   = mode.IsSmpte2084Supported() == enable;
+            const bool sizeOk = mode.ResolutionWidthInRawPixels()  == original.ResolutionWidthInRawPixels() &&
+                                mode.ResolutionHeightInRawPixels() == original.ResolutionHeightInRawPixels();
+            const bool stereo = mode.StereoEnabled();
+            const double delta = std::fabs(mode.RefreshRate() - original.RefreshRate());
+            const bool hzOk   = delta <= kRefreshTwinToleranceHz;
+            wchar_t buf[220]{};
+            swprintf_s(buf, L"   <- pq %s, size %s, stereo %s, %.6f Hz (d %.6f) %s => %s",
+                       pqOk ? L"ok" : L"NO", sizeOk ? L"ok" : L"NO",
+                       stereo ? L"YES (rejected)" : L"no", mode.RefreshRate(), delta,
+                       hzOk ? L"ok" : L"NO",
+                       (pqOk && sizeOk && !stereo && hzOk) ? L"MATCH" : L"rejected");
+            return buf;
+        };
+
         HdmiDisplayMode target{ nullptr };
         bool tookNearTwin = false;
         if (resendCurrentMode) {
             target = current;
         } else {
             target = findTwin(tookNearTwin);
+            if (!target && enable) {
+                target = findLoose();
+                if (target) {
+                    note += L"strict search missed it, loose match found " +
+                            DescribeMode(target) + verdict(target) + L": ";
+                }
+            }
         }
         if (tookNearTwin) {
             wchar_t twin[120]{};
@@ -610,6 +659,7 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             for (int look = 0; look < 5 && !twin; ++look) {
                 if (look) Sleep(250);
                 twin = findTwin(approx);
+                if (!twin) twin = findLoose();
             }
             if (twin) {
                 note += L"\n              second look after the refusal: the list now offers " +
@@ -633,11 +683,20 @@ bool RequestHdrMode(bool enable, std::wstring& note) noexcept {
             // read identically, and on 2026-10-05 they were confused with each
             // other: the refresh-twin theory was built on a guess about this
             // list instead of on the list.
+            // Each row carries findTwin's verdict on it (see `verdict`), and
+            // the header says exactly what was searched for.
+            wchar_t want[200]{};
+            swprintf_s(want, L"\n              searched for: %ux%u, %.6f Hz +/- %.1f, PQ %s, not stereo"
+                             L"  (current mode stereo %s)",
+                       original.ResolutionWidthInRawPixels(), original.ResolutionHeightInRawPixels(),
+                       original.RefreshRate(), kRefreshTwinToleranceHz, enable ? L"ON" : L"OFF",
+                       original.StereoEnabled() ? L"YES" : L"no");
+            note += want;
             note += L"\n              modes at this size:";
             for (auto const& mode : hdmi.GetSupportedDisplayModes()) {
                 if (mode.ResolutionWidthInRawPixels()  == current.ResolutionWidthInRawPixels() &&
                     mode.ResolutionHeightInRawPixels() == current.ResolutionHeightInRawPixels()) {
-                    note += L"\n              " + DescribeMode(mode);
+                    note += L"\n              " + DescribeMode(mode) + verdict(mode);
                 }
             }
         }

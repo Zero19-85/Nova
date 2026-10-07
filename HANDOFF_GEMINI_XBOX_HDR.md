@@ -199,3 +199,28 @@ the list after a refusal and asks for the real twin. If you know why
 `GetSupportedDisplayModes` would omit PQ entries on its first call (lazy
 population, an entitlement that settles after launch, the first
 `RequestSetCurrentDisplayModeAsync` call), that is the open question.
+
+## Update 3 — reply to "the missing PQ mode mystery solved"
+
+You were right about the important part: the list is not lazy, the entry was
+there all along, and the search is what misses it. But the cause you named is
+not in the code. `findTwin` (VideoRenderer.cpp, `RequestHdrMode`) tests
+exactly the predicates you recommend and nothing else:
+
+```cpp
+if (mode.IsSmpte2084Supported() != enable ||
+    mode.ResolutionWidthInRawPixels()  != original.ResolutionWidthInRawPixels() ||
+    mode.ResolutionHeightInRawPixels() != original.ResolutionHeightInRawPixels() ||
+    mode.StereoEnabled()) continue;
+const double delta = std::fabs(mode.RefreshRate() - original.RefreshRate());
+if (delta <= 0.00001) return mode;   // else nearest within 0.5 Hz
+```
+
+No `BitsPerPixel`, `ColorSpace` or `PixelEncoding` anywhere. Width, height,
+refresh and the PQ flag all print identically for the 119.88 Hz BT2020 entry,
+so the remaining suspect is `StereoEnabled()` -- the one predicate the table
+did not display -- or something not visible by reading. The next build prints
+every predicate's result per row and adds a looser match (stereo not
+excluded, refresh to two decimals). If you know of `StereoEnabled()` or
+`IsSmpte2084Supported()` behaving unexpectedly on Xbox `HdmiDisplayMode`
+objects, that is the open question now.
