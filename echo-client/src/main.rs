@@ -414,9 +414,10 @@ impl Progress for ConsoleProgress {
             Event::Hello { server, protocol_version, device_name } => println!(
                 "👋 {server} says hello — protocol {protocol_version}, paired as \"{device_name}\""
             ),
-            Event::Granted { session_id, width, height, fps, codec } => println!(
-                "🎬 Session {session_id} granted — {width}x{height}@{fps} {codec} — media keyed \
-                 and inbound"
+            Event::Granted { session_id, width, height, fps, codec, hdr } => println!(
+                "🎬 Session {session_id} granted — {width}x{height}@{fps} {codec}{} — media keyed \
+                 and inbound",
+                if hdr { " HDR10" } else { "" }
             ),
             Event::Refused { reason } => println!("⛔ The host refused: {reason}"),
             Event::Warning { message } => println!("⚠️  {message}"),

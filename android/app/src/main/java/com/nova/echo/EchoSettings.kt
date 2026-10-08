@@ -25,6 +25,16 @@ data class StreamPrefs(
     val resolution: String = "1920x1080",
     val fps: Int = 60,
     /**
+     * Ask Nova for HDR10 (HEVC Main10, BT.2020 PQ).
+     *
+     * **Default ON** — the same call the Xbox client makes: a phone whose
+     * screen and decoder can show HDR10 should get it without hunting for a
+     * switch. Still only a request: it is sent only when the codec is HEVC and
+     * [VideoPlayer.Support.hdr10Refusal] finds nothing against it, and the
+     * decoder is configured from what the host GRANTS.
+     */
+    val hdr: Boolean = true,
+    /**
      * Whether the phone microphone should be forwarded to the PC.
      *
      * Persisted here as *intent*: it survives a process death, and the capture
@@ -90,6 +100,7 @@ class EchoSettings private constructor(context: Context) {
             bitrateKbps = prefs.getInt(KEY_BITRATE, d.bitrateKbps),
             resolution = prefs.getString(KEY_RES, d.resolution) ?: d.resolution,
             fps = prefs.getInt(KEY_FPS, d.fps),
+            hdr = prefs.getBoolean(KEY_HDR, d.hdr),
             micEnabled = prefs.getBoolean(KEY_MIC, d.micEnabled),
             showTelemetry = prefs.getBoolean(KEY_TELEMETRY, d.showTelemetry),
             cleanUi = prefs.getBoolean(KEY_CLEAN_UI, d.cleanUi),
@@ -160,6 +171,7 @@ class EchoSettings private constructor(context: Context) {
             .putInt(KEY_BITRATE, next.bitrateKbps)
             .putString(KEY_RES, next.resolution)
             .putInt(KEY_FPS, next.fps)
+            .putBoolean(KEY_HDR, next.hdr)
             .putBoolean(KEY_MIC, next.micEnabled)
             .putBoolean(KEY_TELEMETRY, next.showTelemetry)
             .putBoolean(KEY_CLEAN_UI, next.cleanUi)
@@ -183,6 +195,7 @@ class EchoSettings private constructor(context: Context) {
         private const val SCHEMA_VERSION = 1
         private const val KEY_RES = "pref_resolution"
         private const val KEY_FPS = "pref_fps"
+        private const val KEY_HDR = "pref_hdr"
         private const val KEY_MIC = "pref_mic"
         private const val KEY_TELEMETRY = "pref_telemetry"
         private const val KEY_CLEAN_UI = "pref_clean_ui"

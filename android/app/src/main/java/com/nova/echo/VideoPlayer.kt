@@ -1,11 +1,14 @@
 package com.nova.echo
 
+import android.content.Context
+import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
+import android.view.Display
 import android.view.Surface
 import kotlin.concurrent.thread
 
@@ -92,6 +95,14 @@ class VideoPlayer(
      */
     private val fps: Int,
     codec: String,
+    /**
+     * Whether the host GRANTED HDR10 — HEVC Main10, BT.2020, SMPTE ST 2084, full
+     * range, with mastering-display and content-light SEI on every IDR. Read
+     * from the grant, never from the request: the host declines HDR for codecs
+     * it cannot encode it in, and a PQ-configured decoder over an SDR stream
+     * shows a washed-out picture with no error anywhere.
+     */
+    private val hdr: Boolean,
     private val onError: (String) -> Unit,
 ) {
     /** Guards [codecInstance] against a surface swap racing start/stop. */
@@ -141,14 +152,15 @@ class VideoPlayer(
      * because a mismatch would mean this decoder is draining a session that no
      * longer exists, which is a wedge rather than a glitch.
      */
-    fun canCarry(handle: Long, width: Int, height: Int, fps: Int, codec: String): Boolean {
+    fun canCarry(handle: Long, width: Int, height: Int, fps: Int, codec: String, hdr: Boolean): Boolean {
         if (failed) return false
         if (synchronized(lock) { codecInstance } == null) return false
         return handle == this.handle &&
             width == this.width &&
             height == this.height &&
             fps == this.fps &&
-            mimeFor(codec) == this.mime
+            mimeFor(codec) == this.mime &&
+            hdr == this.hdr
     }
 
     fun start() {
@@ -165,7 +177,8 @@ class VideoPlayer(
         restarts = 0
         feeder = thread(name = "echo-feeder") { feedLoop(c) }
         renderer = thread(name = "echo-render") { renderLoop(c) }
-        Log.i(TAG, "decoder started: ${c.name} $mime ${width}x$height @${fps}fps")
+        Log.i(TAG, "decoder started: ${c.name} $mime ${width}x$height @${fps}fps" +
+                   if (hdr) " HDR10" else "")
     }
 
     private fun createCodec(target: Surface): MediaCodec? {
@@ -178,6 +191,26 @@ class VideoPlayer(
         format.setInteger("vdec-lowlatency", 1)
 
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+
+        // HDR10: say what the host's VUI says (shim.cpp, the HEVC HDR block) —
+        // BT.2020 primaries, PQ transfer, FULL range. The bitstream carries the
+        // same values and a conforming decoder reads them from the SPS, but
+        // these keys are what the codec reports and tags its output buffers
+        // with until it has parsed one, and a decoder that trusts the format
+        // over the VUI would otherwise tag the first frames limited-range SDR.
+        // That tag — the buffer's dataspace — is what makes SurfaceFlinger
+        // switch the panel into HDR for this layer; nothing at the window level
+        // is needed for video on a SurfaceView.
+        //
+        // No KEY_PROFILE: for a decoder it only steers codec selection, which
+        // [findHardwareDecoder] already does by inspecting profiles itself, and
+        // some decoders refuse a configure that names a profile they list only
+        // as plain Main10.
+        if (hdr) {
+            format.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+            format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
+            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
+        }
 
         // Ask for a HARDWARE decoder by name rather than taking whatever
         // `createDecoderByType` hands back.
@@ -270,13 +303,20 @@ class VideoPlayer(
         candidates.forEach { info ->
             Log.i(TAG, "  decoder candidate ${info.name}: hardware=${Support.hw(info)}, " +
                        "claims ${width}x${height}@${fps}fps=" +
-                       "${Support.claims(info, mime, width, height, fps)}")
+                       "${Support.claims(info, mime, width, height, fps)}" +
+                       if (hdr) ", main10=${Support.main10(info)}" else "")
         }
         // FILTER, not sort. An earlier version ordered candidates by whether
         // they claimed the mode and took the best one, which still selected a
         // decoder that had already answered "no" when it was the only hardware
-        // block present. `areSizeAndRateSupported` is a hard gate here.
-        candidates.filter { Support.hw(it) && Support.claims(it, mime, width, height, fps) }
+        // block present. `areSizeAndRateSupported` is a hard gate here — and
+        // for an HDR10 grant, so is a 10-bit profile: an 8-bit decoder fed
+        // Main10 fails on the first IDR, which is a black screen, not a dimmer
+        // picture.
+        candidates.filter {
+            Support.hw(it) && Support.claims(it, mime, width, height, fps) &&
+                (!hdr || Support.main10(it))
+        }
             .firstOrNull()
             ?.name
     }.getOrNull()
@@ -613,7 +653,20 @@ class VideoPlayer(
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
                 }
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    Log.i(TAG, "decoder format: ${c.outputFormat}")
+                    val f = c.outputFormat
+                    Log.i(TAG, "decoder format: $f")
+                    // The line that answers "is it really HDR": what the
+                    // decoder TAGS its output with, which is what the display
+                    // acts on. transfer=6 is ST 2084 (PQ), standard=6 BT.2020,
+                    // range=1 full; `hdr-static-info` present means it parsed
+                    // the host's mastering-display SEI.
+                    if (hdr) {
+                        fun key(k: String) = if (f.containsKey(k)) f.getInteger(k).toString() else "-"
+                        Log.i(TAG, "HDR10 output: transfer=${key(MediaFormat.KEY_COLOR_TRANSFER)} " +
+                                   "standard=${key(MediaFormat.KEY_COLOR_STANDARD)} " +
+                                   "range=${key(MediaFormat.KEY_COLOR_RANGE)} " +
+                                   "static-info=${f.containsKey(MediaFormat.KEY_HDR_STATIC_INFO)}")
+                    }
                 }
             }
         }
@@ -719,6 +772,54 @@ class VideoPlayer(
                     .videoCapabilities
                     .areSizeAndRateSupported(w, h, fps.toDouble())
             }.getOrDefault(false)
+
+        /**
+         * Whether an HEVC decoder lists a 10-bit profile. Main10HDR10 is what
+         * the host sends, but plain Main10 is accepted too: the HDR10 part is
+         * SEI metadata on a Main10 bitstream, and several decoders list only
+         * the base profile while handling the SEI perfectly well.
+         */
+        fun main10(info: MediaCodecInfo): Boolean = runCatching {
+            info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC).profileLevels.any {
+                it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 ||
+                    it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+            }
+        }.getOrDefault(false)
+
+        /**
+         * Whether this phone's built-in screen can show HDR10.
+         *
+         * Asked of the default display because that is where a SurfaceView
+         * stream is shown. API 34 moved HDR types onto the display MODE; both
+         * sources are consulted so an older release and a newer one answer the
+         * same question.
+         */
+        fun displayHdr10(context: Context): Boolean = runCatching {
+            val display = context.getSystemService(DisplayManager::class.java)
+                ?.getDisplay(Display.DEFAULT_DISPLAY) ?: return@runCatching false
+            val modeTypes = if (Build.VERSION.SDK_INT >= 34) display.mode.supportedHdrTypes else null
+            @Suppress("DEPRECATION")
+            val legacyTypes = display.hdrCapabilities?.supportedHdrTypes
+            val hdr10 = Display.HdrCapabilities.HDR_TYPE_HDR10
+            modeTypes?.contains(hdr10) == true || legacyTypes?.contains(hdr10) == true
+        }.getOrDefault(false)
+
+        /**
+         * Why HDR10 cannot be asked for at this mode, or null if it can.
+         *
+         * Checked BEFORE the request, like [bestSupported] and for the same
+         * reason: Echo has no in-band way to back out of a format, so asking
+         * for HDR a phone cannot show costs a session to learn what the display
+         * and the codec list would have said for free.
+         */
+        fun hdr10Refusal(context: Context, codec: String, width: Int, height: Int, fps: Int): String? = when {
+            !codec.equals("hevc", true) -> "HDR10 is HEVC only (this stream is $codec)"
+            !displayHdr10(context) -> "this screen does not report HDR10"
+            decoders(MediaFormat.MIMETYPE_VIDEO_HEVC).none {
+                hw(it) && main10(it) && claims(it, MediaFormat.MIMETYPE_VIDEO_HEVC, width, height, fps)
+            } -> "no hardware HEVC Main10 decoder claims ${width}x$height@${fps}fps"
+            else -> null
+        }
     }
 
     /** A decodable combination of codec and frame rate. */

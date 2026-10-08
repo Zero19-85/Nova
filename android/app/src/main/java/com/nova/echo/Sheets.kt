@@ -267,6 +267,27 @@ fun SettingsSheet(
                 style = Telemetry,
             )
 
+            SheetTitle("DYNAMIC RANGE")
+            // Re-evaluated whenever the codec or mode changes, so the line
+            // under the switch is a live answer for exactly what will be
+            // requested — the same check `connect` makes before asking.
+            val hdrRefusal = remember(prefs.codec, prefs.resolution, prefs.fps) {
+                val (w, h) = prefs.resolution.split('x').let {
+                    (it.getOrNull(0)?.toIntOrNull() ?: 1920) to (it.getOrNull(1)?.toIntOrNull() ?: 1080)
+                }
+                VideoPlayer.Support.hdr10Refusal(context, prefs.codec, w, h, prefs.fps)
+            }
+            IonSwitch(
+                label = "HDR10",
+                sub = when {
+                    !prefs.hdr -> "Off — Nova sends Rec.709 SDR."
+                    hdrRefusal == null -> "On — Nova sends HEVC Main10 in BT.2020 PQ and the " +
+                        "screen switches to HDR while the stream is up."
+                    else -> "On, but not used at this setting: $hdrRefusal. SDR is sent instead."
+                },
+                checked = prefs.hdr,
+            ) { on -> settings.edit { it.copy(hdr = on) } }
+
             HorizontalDivider(color = Edge)
 
             // ── Audio ───────────────────────────────────────────────────────

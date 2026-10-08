@@ -306,11 +306,22 @@ impl SessionRequest {
             println!("{line}");
         }
 
+        // HDR10 exists only as HEVC Main10 here: the Worker switches the encoder
+        // to P010/PQ for `Codec::Hevc` alone (lib.rs, the HDR10 gate), and the
+        // AV1 shim path is 8-bit. Granting `hdr` for anything else would tell
+        // the client to build a Main10/PQ decoder for an SDR stream -- so the
+        // grant says what will actually be encoded, and the client follows it.
+        let hdr = self.hdr && self.codec == Codec::Hevc;
+        if self.hdr && !hdr {
+            println!("🎨 Echo: HDR10 requested with {} — declined, HDR10 is HEVC Main10 only; granting SDR",
+                self.codec.as_str());
+        }
+
         Ok(StreamParams {
             width,
             height,
             fps,
-            hdr: self.hdr,
+            hdr,
             codec: self.codec,
             bitrate_kbps: budget.video_kbps,
             app_id: self.app_id,
@@ -1687,6 +1698,19 @@ mod tests {
     /// while the host permitted ~118, and the resulting loss cost ~200 repair
     /// requests per session. Both tables were retuned, but the clamp is what
     /// makes an app that was never updated harmless rather than fatal.
+    /// The grant's `hdr` is what the client builds its decoder from, so it must
+    /// say what the Worker will encode -- and the Worker encodes HDR10 for HEVC
+    /// only. A grant that said `hdr` over an SDR AV1 stream would have the client
+    /// configure a PQ decoder and show a washed-out picture with no error.
+    #[test]
+    fn hdr_is_granted_for_hevc_only() {
+        let with = |codec| SessionRequest { hdr: true, codec, ..SessionRequest::default() };
+        assert!(with(Codec::Hevc).validate(512).unwrap().hdr);
+        assert!(!with(Codec::Av1).validate(512).unwrap().hdr);
+        assert!(!with(Codec::H264).validate(512).unwrap().hdr);
+        assert!(!SessionRequest::default().validate(512).unwrap().hdr);
+    }
+
     #[test]
     fn an_oversized_request_is_clamped_to_the_resolution_ceiling() {
         let ceiling = crate::qos::resolution_ceiling(2560, 1440, 120);

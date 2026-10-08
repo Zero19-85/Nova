@@ -261,12 +261,23 @@ class EchoController private constructor(private val context: android.content.Co
                        "is not decodable by this device — asking the host for " +
                        "${effective.codec}@${effective.fps} instead")
         }
+        // HDR10 is asked for only when this phone can show it at the mode
+        // actually being requested. The refusal is logged rather than posted,
+        // like the downgrade above: the status line says "HDR10" or does not,
+        // reporting what the host granted rather than what was wanted.
+        val hdr = effective.hdr && run {
+            val (w, h) = parseResolution(effective.resolution) ?: return@run false
+            val refusal = VideoPlayer.Support.hdr10Refusal(context, effective.codec, w, h, effective.fps)
+            if (refusal != null) Log.i(TAG, "HDR10 not requested: $refusal")
+            refusal == null
+        }
         start(transportConfig(host).apply {
             put("res", effective.resolution)
             put("fps", effective.fps)
             put("codec", effective.codec)
             put("bitrate_kbps", effective.bitrateKbps)
             put("app_id", appId)
+            put("hdr", hdr)
         }.toString(), pairing = false)
     }
 
@@ -541,6 +552,10 @@ class EchoController private constructor(private val context: android.content.Co
         // requested. The decoder is configured for this cadence, so a wrong
         // value here misconfigures it rather than merely mislabelling a log.
         val fps = event.optInt("fps", 60)
+        // And the same again for dynamic range. A host that predates the field
+        // never encoded HDR, so absent is SDR.
+        val hdr = event.optBoolean("hdr", false)
+        val label = "Streaming ${width}x$height@${fps} $codec" + if (hdr) " HDR10" else ""
 
         // A grant arriving over a decoder that can carry it is a HANDOVER, not a
         // new stream: the engine rebuilt the path underneath us and the host
@@ -552,12 +567,12 @@ class EchoController private constructor(private val context: android.content.Co
         // Rebuilding instead would black the screen for the rebuild and
         // manufacture a visible fault out of a successful recovery. This branch
         // is the difference between "it froze for a second" and "it went black".
-        val carried = player?.takeIf { it.canCarry(h, width, height, fps, codec) }
+        val carried = player?.takeIf { it.canCarry(h, width, height, fps, codec, hdr) }
         if (carried != null) {
             EchoNative.nativeRequestIdr(h)
             post {
                 it.copy(
-                    status = "Streaming ${width}x$height@${fps} $codec",
+                    status = label,
                     streaming = true,
                     reconnecting = false,
                     error = null,
@@ -574,7 +589,7 @@ class EchoController private constructor(private val context: android.content.Co
         // the old one first matters: two codecs writing into one Surface is the
         // BufferQueue wedge this class exists to avoid.
         player?.stop()
-        player = VideoPlayer(h, target, width, height, fps, codec) { message ->
+        player = VideoPlayer(h, target, width, height, fps, codec, hdr) { message ->
             post { it.copy(status = "Failed", error = message) }
         }.also { it.start() }
         // Re-read the field: a surfaceCreated that landed while the decoder was
@@ -583,7 +598,7 @@ class EchoController private constructor(private val context: android.content.Co
         // Cheap, and skipped entirely when nothing changed.
         surface?.let { current -> if (current !== target) player?.setSurface(current) }
 
-        post { it.copy(status = "Streaming ${width}x$height@${fps} $codec", streaming = true) }
+        post { it.copy(status = label, streaming = true) }
 
         // The microphone starts only once a session exists. Its channel is
         // created with the handle, but nothing drains it until the host grants

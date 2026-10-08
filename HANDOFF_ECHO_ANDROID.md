@@ -680,3 +680,54 @@ Surface is alive throughout. Worth checking first:
    sender re-pin to the new peer address?
 3. Does `VideoPlayer` still hold a codec configured for the pre-swap session, and
    would `nativeRequestIdr` alone unstick it?
+
+---
+
+## HDR10 (2026-10-07) — LIVE-CONFIRMED on the Pixel 9 Pro XL
+
+HEVC Main10 / BT.2020 / PQ, the stream the host already served the Xbox.
+Three layers, each small:
+
+1. **Host (`echo/session.rs` `validate`) — the grant is now honest.** HDR10
+   exists only as HEVC Main10 (the Worker's HDR gate is `Codec::Hevc`-only; the
+   AV1 shim path is 8-bit), but the grant echoed `hdr: true` for any codec. It
+   now grants `hdr` for HEVC only and logs `🎨 Echo: HDR10 requested with … —
+   declined`. Test: `hdr_is_granted_for_hevc_only`.
+2. **`echo-client` — `Event::Granted` carries `hdr`.** The host had always put
+   it in the grant; the client dropped it, so no app could configure its decoder
+   from the answer. The JSON event now has `"hdr"`; absent = SDR (old host).
+3. **Android.**
+   - `StreamPrefs.hdr` (`pref_hdr`), **default on** like the Xbox. Settings →
+     DYNAMIC RANGE; the subtitle is a live answer from the same check `connect`
+     makes.
+   - `VideoPlayer.Support.hdr10Refusal` gates the *request*: HEVC only, the
+     default display must list `HDR_TYPE_HDR10` (Display.Mode on API 34+,
+     HdrCapabilities before), and a hardware HEVC decoder must list Main10 (or
+     Main10HDR10) and claim the size/rate. Refusals are logged
+     (`HDR10 not requested: …`), not posted.
+   - The decoder is configured from the GRANT (`event.optBoolean("hdr")`):
+     `KEY_COLOR_STANDARD=BT2020`, `KEY_COLOR_TRANSFER=ST2084`,
+     `KEY_COLOR_RANGE=FULL` — matching the shim's HEVC HDR VUI (full range, not
+     limited). No `KEY_PROFILE` (decoder selection already filters on 10-bit).
+     `canCarry` compares `hdr`, so a handover across an SDR↔HDR change rebuilds.
+   - **No window-level change.** The decoder tags its output buffers' dataspace
+     and SurfaceFlinger switches the panel to HDR for that SurfaceView layer;
+     `Window.colorMode = HDR` is for HDR *UI* rendering and is not needed.
+   - Logcat `EchoVideo`: `decoder started: … HDR10`, then on the first output
+     format `HDR10 output: transfer=6 standard=6 range=1 static-info=true`
+     (6 = ST 2084 / BT.2020). That line is what the display acts on.
+   - Status line reads `Streaming WxH@fps hevc HDR10` when the host granted it.
+
+**Live proof (2026-10-07), and how to get it again without logcat timing luck:**
+host `🎬 Echo session 2 started for "Pixel" … 1920x1080@120fps hevc/HDR10`,
+Worker `NVENC READY (hevc/HDR10/Main10 …)` + FP16 WGC capture; on the phone,
+`adb shell dumpsys SurfaceFlinger` shows the Echo SurfaceView layer at
+`dataspace=BT2020_PQ`, composited in hardware, and `dumpsys display` shows
+`hdrSdrRatio 3.5` while it is up.
+
+**"It looks a bit dark" is the HOST's SDR white level, not the phone.** A
+desktop is SDR content inside an HDR stream, encoded at the virtual display's
+SDR white level (`🔆 SDR white level … 160 nits` in nova.log). The phone's own
+SDR white at that moment was ~455 nits (whitePointNits 1600 / ratio 3.5), so
+the streamed desktop's white sat at about a third of the phone UI's. Real HDR
+game content is unaffected — it carries its own nits.
