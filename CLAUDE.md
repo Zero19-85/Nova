@@ -95,7 +95,11 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 **All live-confirmed the same evening** — host deployed, Xbox and Android
 sideloaded. Measured: the Pixel now acks (`[LTR] armed recovery … acked=1578`,
 both LTR repairs landed without a keyframe) and Xbox sessions open with zero
-invalidations. Next session: HDR10 on Android, the Xbox microphone.
+invalidations. **Both follow-ups landed later that night and are LIVE: the Xbox microphone
+(`9e76959`, libopus static in the exe, `HANDOFF_ECHO_XBOX.md` §16) and Android
+HDR10 (`45d35d7`). Host-side change in this file's territory: `echo/session.rs`
+`validate` now grants `hdr` for HEVC only -- the grant used to echo `hdr: true`
+for AV1/H.264 streams the Worker encodes SDR.**
 
 ### "Something keeps forcing Steam Streaming Speakers" — it was Nova, twice over
 
