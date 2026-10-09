@@ -758,6 +758,16 @@ async fn wait_for_retry(
 mod tests {
     use super::*;
 
+    /// The network epoch is PROCESS-GLOBAL, and the test runner is parallel: a
+    /// test that bumps it with `network_changed()` makes every other test that
+    /// captured `epoch()` misread its own state (a refusal classifies as
+    /// `NetworkChanged`; a waker reports someone else's bump). Every test that
+    /// reads or moves the epoch holds this, so they run one at a time.
+    static EPOCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn epoch_lock() -> std::sync::MutexGuard<'static, ()> {
+        EPOCH.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn liveness_is_silent_about_a_session_that_has_seen_nothing() {
         // The distinction that stops a still-connecting session being aborted by
@@ -770,6 +780,7 @@ mod tests {
 
     #[test]
     fn an_error_after_the_network_moved_is_reported_as_the_move() {
+        let _epoch = epoch_lock();
         let start = epoch();
         assert!(matches!(
             classify("relay lookup: connection refused".into(), start),
@@ -784,6 +795,7 @@ mod tests {
 
     #[test]
     fn the_epoch_only_ever_moves_forward() {
+        let _epoch = epoch_lock();
         let a = epoch();
         let b = network_changed();
         assert!(b > a);
@@ -792,6 +804,7 @@ mod tests {
 
     #[test]
     fn a_host_refusal_is_classified_apart_from_a_failure() {
+        let _epoch = epoch_lock();
         // The distinction the whole fix rests on. Both arrive as an `Err(String)`
         // from the same call; only the tag tells them apart, and getting this
         // wrong in either direction is bad — a misread failure gives up on a
@@ -827,6 +840,7 @@ mod tests {
 
     #[test]
     fn a_network_change_outranks_a_refusal() {
+        let _epoch = epoch_lock();
         // A refusal collected from an interface that has since gone away says
         // nothing about the one we now have, so it must be retried rather than
         // reported as the host's final word. Ordering inside `classify`.
@@ -884,6 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_epoch_that_moves_wakes_the_open_path_race() {
+        let _epoch = epoch_lock();
         let start = epoch();
         let waiter = tokio::spawn(async move { epoch_changed(start).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
