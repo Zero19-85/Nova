@@ -2,6 +2,13 @@ package com.nova.echo
 
 import android.content.Context
 import android.hardware.input.InputManager
+import android.os.Build
+import android.os.CombinedVibration
+import android.os.Handler
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import android.view.InputDevice
 import android.view.InputEvent
@@ -221,6 +228,234 @@ class ControllerHandler(
 
     /** Forget local state without telling the host — the session is already gone. */
     fun forget() = slots.clear()
+
+    // ── Rumble ──────────────────────────────────────────────────────────────
+    //
+    // The host sends every slot's motor speeds; this applies each slot's to the
+    // physical controller that owns that slot — the same `deviceId → slot` map
+    // the input side writes, read on the same (main) thread, so the pad a game
+    // is reading is the pad that shakes.
+    //
+    // Polled rather than pushed, for the reason the Xbox client polls: the main
+    // thread owns the slot map, so that is where the motors are driven, and a
+    // poll that lands after a controller swap simply applies to the new one.
+    // The tick runs only while a session is open ([startRumble] / [stopRumble]).
+    //
+    // Only a CHANGE reaches the vibrator. Each `vibrate()` is a binder call, and
+    // for a Bluetooth pad an output report over the air; re-sending the same
+    // speeds 100 times a second would be all cost. Staleness is not this
+    // class's problem — the native side reads all-off once the host's rumble
+    // watchdog lapses, which arrives here as an ordinary change to zero.
+
+    /** What a slot's motors were last set to, and on what. */
+    private class Driven(
+        /** The controller that owns the slot — the identity a change is judged by. */
+        val deviceId: Int,
+        /**
+         * Whether the phone, not the controller, is what is vibrating. Kept
+         * apart from [deviceId] deliberately: folding "phone" into the owner
+         * would make every tick look like a change of hands and restart the
+         * vibration 100 times a second.
+         */
+        val onPhone: Boolean,
+        /** 8-bit amplitudes — the resolution Android's vibrator API takes. */
+        val low: Int,
+        val high: Int,
+    )
+
+    private val main = Handler(Looper.getMainLooper())
+    private val speeds = IntArray(EchoNative.RUMBLE_OUT_LEN)
+    private val driven = arrayOfNulls<Driven>(EchoNative.MAX_GAMEPAD_SLOTS)
+    /** Main thread only. */
+    private var rumbling = false
+
+    /** How many times the motors were actually changed — the overlay's half. */
+    @Volatile var rumbleApplied: Long = 0
+        private set
+
+    /**
+     * The phone's own vibrator, for a controller that has no motors at all.
+     *
+     * That is the clip-on case — a phone in a Backbone-style grip, which has no
+     * rumble of its own — and there the phone IS what is in the user's hands.
+     * Slot 0 only: two motorless controllers cannot share one phone sensibly.
+     */
+    private val phone: Vibrator? = run {
+        val v = if (Build.VERSION.SDK_INT >= 31) {
+            context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+        } else {
+            context.getSystemService(Vibrator::class.java)
+        }
+        v?.takeIf { it.hasVibrator() }
+    }
+
+    private val rumbleTick = object : Runnable {
+        override fun run() {
+            if (!rumbling) return
+            // `sink()` is null with input switched off, and a stream the user
+            // is not driving should not shake their hands either.
+            val c = sink()
+            if (c != null) c.pollRumble(speeds) else speeds.fill(0)
+            for (slot in 0 until EchoNative.MAX_GAMEPAD_SLOTS) {
+                // 16-bit wire speeds → the 8-bit amplitudes Android takes. The
+                // host widened ViGEm's bytes ×257, so this is lossless.
+                applyRumble(slot, speeds[slot * 2] ushr 8, speeds[slot * 2 + 1] ushr 8)
+            }
+            main.postDelayed(this, RUMBLE_TICK_MS)
+        }
+    }
+
+    /** A session is open: start applying the host's rumble. Any thread. */
+    fun startRumble() {
+        main.post {
+            if (rumbling) return@post
+            rumbling = true
+            sessionApplied = 0
+            main.post(rumbleTick)
+        }
+    }
+
+    /** The session ended: stop the tick and every motor it started. Any thread. */
+    fun stopRumble() {
+        main.post {
+            if (rumbling && sessionApplied > 0) {
+                Log.i(TAG, "rumble: $sessionApplied change(s) applied this session")
+            }
+            rumbling = false
+            main.removeCallbacks(rumbleTick)
+            for (slot in driven.indices) {
+                driven[slot]?.let { silence(it) }
+                driven[slot] = null
+            }
+        }
+    }
+
+    private fun applyRumble(slot: Int, low: Int, high: Int) {
+        val deviceId = slots.entries.firstOrNull { it.value.slot == slot }?.key
+        val prev = driven[slot]
+        val off = low == 0 && high == 0
+        if (prev == null && off) return // nothing running, nothing to say
+        if (prev != null && prev.deviceId == deviceId && prev.low == low && prev.high == high) return
+
+        // The slot changed hands (or emptied): the controller that WAS driven
+        // must stop, or it shakes on in a hand that is no longer playing.
+        if (prev != null && prev.deviceId != deviceId) silence(prev)
+        if (deviceId == null) {
+            driven[slot] = null
+            return
+        }
+
+        val device = InputDevice.getDevice(deviceId)
+        val onPhone = when {
+            device != null && vibrateController(device, low, high) -> false
+            slot == 0 && phone != null -> {
+                vibrateSingle(phone, low, high)
+                true
+            }
+            else -> {
+                // No motors anywhere to drive. Remember the speeds anyway so
+                // the same value is not re-tried every tick.
+                driven[slot] = Driven(deviceId, onPhone = false, low, high)
+                return
+            }
+        }
+        driven[slot] = if (off) null else Driven(deviceId, onPhone, low, high)
+        rumbleApplied++
+        // Once per session: which physical thing is shaking, and how. The line
+        // to read first when "rumble does nothing" — `onPhone=true` on a pad
+        // that should have motors means Android reported none for it.
+        if (sessionApplied++ == 0L) {
+            Log.i(
+                TAG,
+                "rumble → slot $slot on ${if (onPhone) "the phone" else device?.name} " +
+                    "(low $low, high $high, ${motorSummary(device)})",
+            )
+        }
+    }
+
+    /** Applied changes since [startRumble], for the end-of-session log line. */
+    private var sessionApplied = 0L
+
+    @Suppress("DEPRECATION")
+    private fun motorSummary(device: InputDevice?): String = when {
+        device == null -> "no device"
+        Build.VERSION.SDK_INT >= 31 -> "${device.vibratorManager.vibratorIds.size} motor(s)"
+        device.vibrator.hasVibrator() -> "1 motor (pre-31 API)"
+        else -> "no motors"
+    }
+
+    /**
+     * Drive a controller's own motors. Returns `false` when it has none, so the
+     * caller can fall back to the phone.
+     *
+     * Two motors where the platform exposes them (API 31's per-device
+     * [VibratorManager]): vibrator 0 is the low-frequency/left motor and 1 the
+     * high-frequency/right, the order every mainstream pad's HID descriptor
+     * declares them in. Older APIs see one vibrator per device, which gets
+     * [vibrateSingle]'s mix of both.
+     */
+    private fun vibrateController(device: InputDevice, low: Int, high: Int): Boolean {
+        if (Build.VERSION.SDK_INT >= 31) {
+            val vm = device.vibratorManager
+            val ids = vm.vibratorIds
+            if (ids.size >= 2) {
+                if (low == 0 && high == 0) {
+                    vm.cancel()
+                    return true
+                }
+                // A new request replaces the running one, so one motor stopping
+                // while the other carries on is just a combination without it.
+                val combo = CombinedVibration.startParallel()
+                if (low > 0) combo.addVibrator(ids[0], VibrationEffect.createOneShot(RUMBLE_HOLD_MS, low))
+                if (high > 0) combo.addVibrator(ids[1], VibrationEffect.createOneShot(RUMBLE_HOLD_MS, high))
+                vm.vibrate(combo.combine())
+                return true
+            }
+            if (ids.size == 1) {
+                vibrateSingle(vm.getVibrator(ids[0]), low, high)
+                return true
+            }
+            return false
+        }
+        @Suppress("DEPRECATION")
+        val v = device.vibrator
+        if (!v.hasVibrator()) return false
+        vibrateSingle(v, low, high)
+        return true
+    }
+
+    /**
+     * Two motors onto one: 80% of the large motor plus 33% of the small one,
+     * capped — the weighting moonlight-android settled on, because the large
+     * motor carries most of what a rumble *feels* like.
+     *
+     * A vibrator without amplitude control is on/off only, so it runs at its
+     * default strength for any non-zero request.
+     */
+    private fun vibrateSingle(v: Vibrator, low: Int, high: Int) {
+        val amplitude = minOf(255, (low * 0.80 + high * 0.33).toInt())
+        if (amplitude == 0) {
+            v.cancel()
+            return
+        }
+        val strength = if (v.hasAmplitudeControl()) amplitude else VibrationEffect.DEFAULT_AMPLITUDE
+        v.vibrate(VibrationEffect.createOneShot(RUMBLE_HOLD_MS, strength))
+    }
+
+    /** Stop whatever [d] started. Tolerates a controller that has since gone. */
+    private fun silence(d: Driven) {
+        if (d.onPhone) {
+            phone?.cancel()
+            return
+        }
+        val device = InputDevice.getDevice(d.deviceId) ?: return
+        if (Build.VERSION.SDK_INT >= 31) {
+            device.vibratorManager.cancel()
+        } else {
+            @Suppress("DEPRECATION")
+            device.vibrator.cancel()
+        }
+    }
 
     // ── Slots ───────────────────────────────────────────────────────────────
 
@@ -561,6 +796,22 @@ class ControllerHandler(
 
     companion object {
         private const val TAG = "EchoPad"
+
+        /**
+         * Rumble poll period. Bounds the added latency of a rumble at one tick;
+         * the host's own repeat burst is 30 ms wide, so anything well under that
+         * catches each change on its first datagram.
+         */
+        private const val RUMBLE_TICK_MS = 10L
+
+        /**
+         * How long one vibrate request runs if nothing replaces it. Long on
+         * purpose — every change replaces it and a stop cancels it outright, and
+         * a stale effect is cut by the host-side watchdog arriving here as a
+         * change to zero. A short value would need re-issuing while a steady
+         * rumble holds, which is exactly the traffic only-on-change avoids.
+         */
+        private const val RUMBLE_HOLD_MS = 60_000L
 
         /**
          * Sentinels for the two analog triggers in a button map.

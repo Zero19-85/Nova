@@ -247,6 +247,30 @@ object EchoNative {
      */
     external fun nativePollAudio(handle: Long, buf: ByteBuffer, meta: LongArray): Int
 
+    // ── Controller rumble ───────────────────────────────────────────────────
+
+    /** Bad handle. The speeds in `out` were still zeroed. */
+    const val RUMBLE_BAD_HANDLE = -1
+    /** `out` was shorter than [RUMBLE_OUT_LEN]. Nothing was written. */
+    const val RUMBLE_BAD_ARG = -2
+    /** Size of `nativePollRumble`'s `out`: low and high for each of four slots. */
+    const val RUMBLE_OUT_LEN = 8
+
+    /**
+     * Every slot's motor speeds, as the host wants them right now.
+     *
+     * Fills [out] as `[low0, high0, low1, high1, …]`, each `0..65535`, indexed
+     * by the same slot [nativeSendGamepad] was given. `low` is the
+     * low-frequency (large, left) motor, `high` the high-frequency (small,
+     * right) one. Returns how many slots have a motor running, or a
+     * `RUMBLE_*` code.
+     *
+     * Zeros on every failure path, and all-off once the host has been silent
+     * past its rumble watchdog, so the caller can apply whatever it gets: a
+     * dead session stops the motors on its own.
+     */
+    external fun nativePollRumble(handle: Long, out: IntArray): Int
+
     /**
      * Hold video frames [delayMs] past arrival so they land with the audio.
      *

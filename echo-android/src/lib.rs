@@ -59,7 +59,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jni::objects::{JByteBuffer, JClass, JLongArray, JString};
+use jni::objects::{JByteBuffer, JClass, JIntArray, JLongArray, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 
@@ -101,6 +101,14 @@ pub const AUDIO_BAD_HANDLE: jint = -3;
 /// The packet does not fit the supplied buffer; `meta[0]` holds the size needed.
 /// Unreachable with a buffer sized to `audio_channel::MAX_PAYLOAD`.
 pub const AUDIO_TOO_SMALL: jint = -4;
+
+/// `nativePollRumble`: the handle was not a live session (speeds still zeroed).
+pub const RUMBLE_BAD_HANDLE: jint = -1;
+/// `nativePollRumble`: `out` was not an `IntArray` of at least
+/// [`RUMBLE_OUT_LEN`] elements. Nothing was written.
+pub const RUMBLE_BAD_ARG: jint = -2;
+/// Length of `nativePollRumble`'s `out`: low/high for each of the four pads.
+pub const RUMBLE_OUT_LEN: usize = nova_core::rumble_channel::PADS * 2;
 
 /// ViGEm slots the host will plug a virtual pad into, matching `MAX_PADS` in
 /// `nova-server/src/input.rs`. A snapshot for a slot at or beyond this is
@@ -144,6 +152,10 @@ struct EchoHandle {
     /// needed, and the buffer answers. A channel would invert that and make the
     /// network the clock, which is how a jitter buffer stops being one.
     audio: Arc<echo_client::audio::AudioPlayout>,
+    /// Controller rumble from the host, pulled by Kotlin's rumble tick — see
+    /// `nativePollRumble`. Held here for the reason `audio` is: the side that
+    /// owns the physical controller decides when to apply it.
+    rumble: Arc<echo_client::rumble::RumblePlayout>,
     /// The session task, so `close` can wait for it to unwind.
     ///
     /// Load-bearing: `Runtime::shutdown_timeout` only waits for *blocking*
@@ -481,8 +493,13 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeStats<'local>(
         // playout problem; the reverse is a path problem. Zeroes when no session
         // has armed the buffer, so the overlay never has to special-case it.
         let (play, net, highest) = session.audio.stats_or_zero();
+        let rumble = session.rumble.stats();
         Ok::<String, String>(
             serde_json::json!({
+                // Rumble as received. Kotlin's `applied` count is the other half.
+                "rumble_accepted": rumble.accepted,
+                "rumble_changes": rumble.changes,
+                "rumble_refused": rumble.refused,
                 // Playout side.
                 "audio_rendered": play.rendered,
                 "audio_concealed": play.concealed,
@@ -871,6 +888,60 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollAudio<'local>(
     }
 }
 
+/// Every pad's motor speeds, as the host wants them right now.
+///
+/// Fills `out` (an `IntArray` of [`RUMBLE_OUT_LEN`]) as
+/// `[low0, high0, low1, high1, low2, high2, low3, high3]`, each `0..=65535`:
+/// `low` is the low-frequency (large, left) motor, `high` the high-frequency
+/// (small, right) one. Indexed by GameStream slot — the same slot
+/// `nativeSendGamepad` was given for that controller.
+///
+/// Returns how many pads have a motor running (`0..=4`), [`RUMBLE_BAD_HANDLE`],
+/// or [`RUMBLE_BAD_ARG`]. One call for all four pads, not one per pad, because
+/// it runs on the main thread a hundred times a second.
+///
+/// **The speeds are written as zeros on a bad handle**, so Kotlin can apply
+/// whatever it gets without a special case: a handle closed underneath the tick
+/// stops the motors rather than freezing them at their last value. Staleness
+/// needs no handling either — a host that goes quiet reads as all-off once the
+/// rumble watchdog lapses (`nova_core::rumble_channel::WATCHDOG`).
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativePollRumble<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    out: JIntArray<'local>,
+) -> jint {
+    if env.get_array_length(&out).map_or(true, |n| (n as usize) < RUMBLE_OUT_LEN) {
+        return RUMBLE_BAD_ARG;
+    }
+    let mut speeds = [0 as jint; RUMBLE_OUT_LEN];
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = (unsafe { EchoHandle::from_raw(handle) }) else {
+            return RUMBLE_BAD_HANDLE;
+        };
+        let mut running = 0;
+        for (pad, motors) in session.rumble.state().iter().enumerate() {
+            speeds[pad * 2] = motors.low as jint;
+            speeds[pad * 2 + 1] = motors.high as jint;
+            if !motors.is_off() {
+                running += 1;
+            }
+        }
+        running
+    }));
+    let code = match result {
+        Ok(code) => code,
+        Err(_) => {
+            speeds = [0; RUMBLE_OUT_LEN];
+            throw(&mut env, "panic while polling rumble");
+            RUMBLE_BAD_HANDLE
+        }
+    };
+    let _ = env.set_int_array_region(&out, 0, &speeds);
+    code
+}
+
 /// Hold video frames `delayMs` past their arrival, to match audio's latency.
 ///
 /// The A/V sync engine's one control, and it moves VIDEO because video is the
@@ -1084,10 +1155,12 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let queue = Arc::new(FrameQueue::new());
     let audio = Arc::new(echo_client::audio::AudioPlayout::new());
+    let rumble = Arc::new(echo_client::rumble::RumblePlayout::new());
 
     let session = runtime.spawn({
         let queue = queue.clone();
         let audio = audio.clone();
+        let rumble = rumble.clone();
         async move {
             let mut progress = ChannelProgress(event_tx);
             let uplink =
@@ -1095,9 +1168,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
                     input: Some(input_rx),
                     mic: Some(mic_rx),
                     audio: Some(audio),
-                    // Not wired to the JNI surface yet: the host still sends
-                    // rumble, and the demultiplexer drops it.
-                    rumble: None,
+                    rumble: Some(rumble),
                     control: None,
                 };
             let outcome =
@@ -1121,6 +1192,7 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
         input: Some(input_tx),
         mic: Some(mic_tx),
         audio,
+        rumble,
         session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as jlong)
@@ -1226,6 +1298,8 @@ fn start_pairing(config_json: &str) -> Result<jlong, String> {
         // outlives a stream and lands on a pairing handle therefore renders
         // silence rather than faulting.
         audio: Arc::new(echo_client::audio::AudioPlayout::new()),
+        // Never armed: every pad reads as stopped.
+        rumble: Arc::new(echo_client::rumble::RumblePlayout::new()),
         // Pairing has nothing to say goodbye to, but sharing the handle type
         // means sharing the orderly close path.
         session: Mutex::new(Some(session)),

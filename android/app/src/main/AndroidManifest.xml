@@ -27,6 +27,12 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
+    <!-- Controller rumble from the host. An install-time permission (no prompt),
+         and required for BOTH targets: a game controller's own motors through
+         InputDevice's vibrator, and the phone's vibrator as the fallback for a
+         clip-on controller that has none. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"

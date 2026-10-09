@@ -414,6 +414,8 @@ class EchoController private constructor(private val context: android.content.Co
         }
 
         synchronized(lock) { handle = h }
+        // A streaming handle carries rumble; a pairing one never will.
+        if (!pairing) gamepads.startRumble()
         post { it.copy(connected = true) }
         // From here on the keepalive threads must survive backgrounding, and
         // that includes pairing: waiting for someone to walk to the PC and type
@@ -519,6 +521,10 @@ class EchoController private constructor(private val context: android.content.Co
                 "ended" -> post { it.copy(streaming = false) }
                 "error" -> post { it.copy(status = "Failed", error = event.optString("message")) }
                 "closed" -> {
+                    // The session is over for good, but nothing calls stop()
+                    // here — so the rumble tick has to be ended explicitly, or
+                    // it keeps waking the main thread for a session that is gone.
+                    gamepads.stopRumble()
                     // `transport` goes with the session. Leaving it set would
                     // leave a card claiming a live LAN path to a host nothing
                     // is connected to.
@@ -808,6 +814,24 @@ class EchoController private constructor(private val context: android.content.Co
         )
     }
 
+    /**
+     * Fill [out] with every slot's rumble — see [EchoNative.nativePollRumble].
+     * All zeros when no session is open or input is switched off: a stream the
+     * user is not driving should not shake their hands.
+     */
+    fun pollRumble(out: IntArray) {
+        // Under the lock for the whole call, unlike the fire-and-forget uplink:
+        // the poll is microseconds, and holding it means `stop()` cannot free
+        // the handle between the read and the native call.
+        synchronized(lock) {
+            if (handle == 0L || !inputEnabled) {
+                out.fill(0)
+                return
+            }
+            EchoNative.nativePollRumble(handle, out)
+        }
+    }
+
     /** Returns whether the key was recognised — unmapped keys must not be sent. */
     fun key(androidKeyCode: Int, down: Boolean, metaState: Int): Boolean {
         val vk = Keycodes.toWindows(androidKeyCode)
@@ -857,6 +881,8 @@ class EchoController private constructor(private val context: android.content.Co
         // not an acceptable shape for that bound.
         val strandedSession = state.reconnecting
         releaseAllInput()
+        // Motors off with the session, not a watchdog-second later.
+        gamepads.stopRumble()
         // Before the handle goes: the capture thread calls `nativeSendMic` with
         // it, and a handle freed underneath a running thread is a use-after-free
         // the magic check would only sometimes catch.
