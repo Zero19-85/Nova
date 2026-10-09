@@ -93,6 +93,9 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 - **Never re-litigate these (all live-confirmed dead ends):** host-as-SYSTEM (breaks WGC); Master-side input injection (session-local `SendInput`); a kernel-mode virtual HID driver (ViGEmBus is gamepad-only; FakerInput unmaintained; cf. the VAD attestation-signing wall).
 - **Secure-desktop flags are ON and correct:** `dda.rs DDA_SECURE_DESKTOP_ENABLED` + `input.rs SECURE_DESKTOP_INPUT_ENABLED`. The 2026-07-30 "local physical input deadlock" that once justified disabling them was a **misdiagnosis** — the user's wired mouse/keyboard never froze; only REMOTE input did, which was the UIPI swallow. Physical HID input is never affected by desktop attachment. Do not re-quarantine on that basis.
 - **Logs are per-process:** `nova-service.log` (Master), `nova.log` (Worker), `nova-input.log` (input helper). Read the right one — a Worker-side symptom is invisible in the Master's log and vice versa.
+  - `🔭` (nova.log, on change only) = capture size/format → encoder size/format + dst rect. Format codes: `0x57` BGRA8, `0xA` FP16, `0x67` NV12, `0x68` P010. `🎨` = a DDA format change on a real desktop frame and should never appear; `✅ DDA duplication active … fmt=` reports the ACTUAL format and says when DXGI declined the requested one.
+  - **Standard (non-admin) Windows accounts cannot host the elevated Worker** (`ERROR_ELEVATION_REQUIRED`); `service.rs` detects it per session and the SYSTEM Worker drives the VDD instead. If a host unexpectedly comes up as the fallback, grep `↳ interactive spawn failed` first.
+  - Before assuming a crash, check the event log: `Get-WinEvent -FilterHashtable @{LogName='System'; Id=@(41,1074,6005,6006,109)}`.
 
 ## Developer Rules for Claude
 1. **Always verify:** Before executing changes, audit the Rust `Cargo.toml` and `build.rs` to ensure no hallucinated static links are injected into the NVENC pipeline.
@@ -193,8 +196,7 @@ test-only. The host builds with zero warnings.
 ## Previous Phase (2026-10-07): **ECHO XBOX STREAMS 4K120 HDR10** — and Tier 1 finally fired, and was broken
 
 Three things landed, all live-confirmed by the operator. Full record:
-`HANDOFF_ECHO_XBOX.md` §14; the second-opinion brief is
-`HANDOFF_GEMINI_XBOX_HDR.md`. Polish and bug-zapping is next.
+`HANDOFF_ECHO_XBOX.md` §14 (the cause is §14.8). Polish and bug-zapping is next.
 
 ### Host: LTR recovery must retire newer references (`b18ffad`) — THIS file's territory
 

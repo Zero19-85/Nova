@@ -29,7 +29,7 @@ Since then the same idea has been extended past the host: a session now survives
 | Congestion control (loss-driven bitrate cut + ramp-back) | ✅ Working |
 | Audio (WASAPI loopback → Opus → RTP, AES-128-CBC) | ✅ Working |
 | Ghost audio sink + mid-session routing watchdog (follows an output you pick) | ✅ Working |
-| Mouse (absolute + raw relative), keyboard, gamepad (ViGEmBus) | ✅ Working |
+| Mouse (absolute + raw relative), keyboard, gamepad (ViGEmBus) with rumble | ✅ Working |
 | Cursor compositing (WGC native; manual blend on DDA incl. HDR) | ✅ Working |
 | Universal Virtual Display Driver (all apps, headless) | ✅ Working |
 | VDD boots dormant — physical monitors undisturbed | ✅ Working |
@@ -76,7 +76,7 @@ encoder and audio pipeline wholesale — Echo added framing, not media.
 | Reconnect into a detached session — display and desktop still there | ✅ Working |
 | Survives backgrounding, screen lock and Activity teardown | ✅ Working |
 | LAN-direct path (skip the relay on the same subnet) | ✅ Working |
-| Gamepad over Echo (physical controllers → ViGEmBus) | ✅ Working |
+| Gamepad over Echo (physical controllers → ViGEmBus), rumble back to the pad — Xbox + Android | ✅ Working |
 | Keyframeless loss repair (RFI → long-term reference → IDR, client acks) | ✅ Working |
 | Xbox microphone · Android HDR10 | 🔜 Next |
 
