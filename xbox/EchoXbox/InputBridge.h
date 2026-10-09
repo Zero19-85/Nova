@@ -78,6 +78,10 @@ public:
     // toggled silently and a user who hit it by accident just watched their
     // controller stop reaching the game.
     using ModeSink  = std::function<void(bool on)>;
+    // Asked once per pad tick for the motor speeds the host wants on `slot`
+    // (full-range u16, low = left/large, high = right/small). Answering 0/0 is
+    // how a source says "stopped" -- including when there is no session.
+    using RumbleSource = std::function<void(int32_t slot, uint16_t& low, uint16_t& high)>;
 
     ~InputBridge();
 
@@ -114,6 +118,18 @@ public:
     void SetSinks(InputSink input, PadSink pad, Gesture overlay,
                   ModeSink mouseMode = nullptr, Gesture accept = nullptr) noexcept;
 
+    // Host rumble. Applied by the pad loop to the SAME controller it forwards
+    // as slot 0 -- the pad thread is the only one that touches the physical
+    // gamepad, so the motors are driven from there and nowhere else.
+    //
+    // Only while forwarding and not in mouse mode: a parked dashboard or a pad
+    // driving a cursor is not playing the game, so it should not feel it.
+    void SetRumbleSource(RumbleSource source) noexcept;
+
+    // How many times the pad loop changed the physical motors, for the
+    // diagnostics line. Climbing with the host's rumble counters = working.
+    uint64_t RumbleApplied() const noexcept { return m_rumbleApplied.load(std::memory_order_relaxed); }
+
     // The panel's logical size, pushed from the UI thread because the input
     // thread cannot read `ActualWidth`. Absolute mouse positions are sent in
     // this space and the host maps them onto its capture rect.
@@ -147,7 +163,9 @@ private:
     Gesture   m_overlay;
     Gesture   m_accept;
     ModeSink  m_mouseModeSink;
+    RumbleSource m_rumble;
     std::mutex m_sinkLock;
+    std::atomic<uint64_t> m_rumbleApplied{ 0 };
 
     // Written by the pool thread, read by whoever calls Stop, so it is guarded.
     // `m_pointerDone` is how Stop knows the pool thread has actually left

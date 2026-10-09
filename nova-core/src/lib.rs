@@ -31,6 +31,10 @@
 //!   carries no state to strand, so it needs no redundancy, and a reordered
 //!   audio packet is still good, so it gets a sliding window rather than a
 //!   high-water mark.
+//! - [`rumble_channel`] — sealed host-to-client controller rumble. Absolute
+//!   motor state, repeated and refreshed rather than acknowledged, with a
+//!   client-side watchdog so a host that vanishes mid-rumble cannot leave a
+//!   controller shaking.
 //! - [`punch`] — UDP hole punching (simultaneous open). Symmetric by nature:
 //!   both peers run the identical algorithm, which is the mechanism itself.
 //! - [`relay`] — the signaling-relay client. Nova and Echo are *both* clients
@@ -60,4 +64,5 @@ pub mod mic_channel;
 pub mod rudp;
 pub mod punch;
 pub mod relay;
+pub mod rumble_channel;
 pub mod stun;

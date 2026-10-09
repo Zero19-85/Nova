@@ -32,6 +32,96 @@ pub fn request_peer_kick() {
     KICK_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Rumble waiting to go out on the control stream, newest per pad.
+///
+/// Coalesced rather than queued: each entry is a pad's whole motor state, so
+/// if two changes land inside one 4 ms tick only the second is worth sending —
+/// the first describes speeds the game has already replaced. Same reason the
+/// handoff to the ENet thread is a slot and not a channel as for
+/// [`KICK_REQUESTED`]: the `Host` is owned by that thread alone.
+static PENDING_RUMBLE: Mutex<[Option<(u16, u16)>; 4]> = Mutex::new([None; 4]);
+
+/// Queue a pad's motor speeds for the live Moonlight client.
+///
+/// Dropped when no Moonlight session is streaming — the control loop checks at
+/// send time, so an Echo-only session costs one slot write per change and
+/// nothing more. Pads beyond GameStream's four are ignored.
+pub fn queue_rumble(pad: u8, low: u16, high: u16) {
+    if let Some(slot) = PENDING_RUMBLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(pad as usize)
+    {
+        *slot = Some((low, high));
+    }
+}
+
+fn take_pending_rumble() -> Vec<(u16, u16, u16)> {
+    let mut slots = PENDING_RUMBLE.lock().unwrap_or_else(|e| e.into_inner());
+    slots
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(pad, slot)| slot.take().map(|(low, high)| (pad as u16, low, high)))
+        .collect()
+}
+
+/// Sunshine's `control_rumble_t` body (stream.cpp), little-endian:
+/// `[u32 unused = 0xC0FFEE][u16 controller][u16 lowfreq][u16 highfreq]`.
+///
+/// moonlight-common-c skips the first four bytes and reads the three `u16`s
+/// (ControlStream.c, `IDX_RUMBLE_DATA`), then hands them to the platform's
+/// `rumble(controllerNumber, lowFreqMotor, highFreqMotor)` callback.
+fn build_rumble_payload(pad: u16, low: u16, high: u16) -> [u8; 10] {
+    let mut p = [0u8; 10];
+    p[0..4].copy_from_slice(&0x00C0_FFEEu32.to_le_bytes());
+    p[4..6].copy_from_slice(&pad.to_le_bytes());
+    p[6..8].copy_from_slice(&low.to_le_bytes());
+    p[8..10].copy_from_slice(&high.to_le_bytes());
+    p
+}
+
+/// Send whatever rumble is pending to the CURRENT session's peer.
+///
+/// The peer is chosen by generation stamp, never "whoever is connected": during
+/// a /resume a zombie of the previous session can still hold a slot, and its
+/// rikey is not the one this payload is encrypted under.
+fn flush_rumble(
+    host: &mut enet::Host<UdpSocket>,
+    client_info: &Arc<Mutex<Option<ClientInfo>>>,
+    peer_generation: &HashMap<enet::PeerID, u64>,
+) {
+    let pending = take_pending_rumble();
+    if pending.is_empty() {
+        return;
+    }
+    // Reserve the sequence numbers under the lock, send after it drops.
+    let Some((rikey, generation, first_seq)) = client_info.lock().ok().and_then(|mut g| {
+        g.as_mut().filter(|c| c.streaming_active).map(|c| {
+            let first = c.control_out_seq;
+            c.control_out_seq = c.control_out_seq.wrapping_add(pending.len() as u32);
+            (c.rikey, c.session_generation, first)
+        })
+    }) else {
+        return; // nothing streaming over GameStream — an Echo session, or idle
+    };
+    let Some(&peer_id) = peer_generation.iter().find(|(_, g)| **g == generation).map(|(id, _)| id)
+    else {
+        return;
+    };
+    // Once per session, so nova-service.log shows rumble reached the client.
+    static LOGGED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LOGGED_GENERATION.swap(generation, std::sync::atomic::Ordering::Relaxed) != generation {
+        let (pad, low, high) = pending[0];
+        println!("📳 Control: relaying controller rumble to Moonlight session {generation} \
+            (0x010b, pad {pad}: low {low}, high {high})");
+    }
+    let peer = host.peer_mut(peer_id);
+    for (i, (pad, low, high)) in pending.into_iter().enumerate() {
+        let payload = build_rumble_payload(pad, low, high);
+        send_control_reply(peer, 0, &rikey, first_seq.wrapping_add(i as u32), PT_RUMBLE_DATA, &payload);
+    }
+}
+
 /// Moonlight's "control stream" is ENet (reliable UDP), not TCP — this is what
 /// was failing with "error 11 / check UDP 47999" after the RTSP handshake
 /// completed. We host a single-peer ENet server here; the library handles the
@@ -131,6 +221,8 @@ pub fn start_control_server(port: u16, client_info: Arc<Mutex<Option<ClientInfo>
             }
         }
 
+        flush_rumble(&mut host, &client_info, &peer_generation);
+
         std::thread::sleep(Duration::from_millis(4));
     }
 }
@@ -229,6 +321,9 @@ const PT_INPUT_DATA:            u16 = 0x0206;
 // SetDisplayHDR() → RequestSetCurrentDisplayModeAsync(Eotf2084), which
 // physically switches the TV's HDMI port into HDR10 mode.
 const PT_HDR_MODE:              u16 = 0x010e;
+// Host→client controller rumble (Sunshine packetTypes[IDX_RUMBLE_DATA], gen7).
+// Body built by `build_rumble_payload`; sent by `flush_rumble`.
+const PT_RUMBLE_DATA:           u16 = 0x010b;
 
 /// Builds the payload for a 0x010e HDR mode packet: `enabled(u8)` followed by
 /// SS_HDR_METADATA (little-endian, #pragma pack(1), Apollo stream.cpp).
@@ -730,6 +825,34 @@ mod tests {
     /// `IDR_REPAIR_RETRY` is process-global, so these tests must not run
     /// concurrently with each other.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Pinned byte-for-byte against moonlight-common-c's reader, which skips
+    /// four bytes and then reads controller, low, high as LE u16s. A swapped
+    /// pair still parses — it just drives the wrong motor — so only an explicit
+    /// layout check catches it.
+    #[test]
+    fn rumble_payload_matches_moonlights_reader() {
+        let p = build_rumble_payload(2, 0xABCD, 0x0102);
+        assert_eq!(p.len(), 10);
+        assert_eq!(&p[0..4], &[0xEE, 0xFF, 0xC0, 0x00], "Sunshine's 'useless' word, LE");
+        assert_eq!(u16::from_le_bytes([p[4], p[5]]), 2, "controller number");
+        assert_eq!(u16::from_le_bytes([p[6], p[7]]), 0xABCD, "low-frequency (large) motor");
+        assert_eq!(u16::from_le_bytes([p[8], p[9]]), 0x0102, "high-frequency (small) motor");
+    }
+
+    /// Rumble is state, so two changes inside one tick must collapse to the
+    /// newer one per pad — and never cross pads.
+    #[test]
+    fn pending_rumble_coalesces_per_pad() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = take_pending_rumble();
+        queue_rumble(0, 100, 100);
+        queue_rumble(1, 7, 8);
+        queue_rumble(0, 0, 0);
+        queue_rumble(9, 1, 1); // beyond GameStream's four pads: ignored
+        assert_eq!(take_pending_rumble(), vec![(0, 0, 0), (1, 7, 8)]);
+        assert!(take_pending_rumble().is_empty(), "taking drains the slots");
+    }
 
     fn streaming_client(generation: u64) -> Arc<Mutex<Option<ClientInfo>>> {
         Arc::new(Mutex::new(Some(ClientInfo {

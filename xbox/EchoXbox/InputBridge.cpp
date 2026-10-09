@@ -125,6 +125,11 @@ void InputBridge::SetSinks(InputSink input, PadSink pad, Gesture overlay,
     m_accept = std::move(accept);
 }
 
+void InputBridge::SetRumbleSource(RumbleSource source) noexcept {
+    std::lock_guard<std::mutex> guard(m_sinkLock);
+    m_rumble = std::move(source);
+}
+
 void InputBridge::RequestMouseMode(bool on) noexcept {
     // Just post it. The pad loop performs the transition — see the header, and
     // the mouse-mode section below for what that transition actually involves.
@@ -383,6 +388,55 @@ void InputBridge::PadLoop() noexcept {
     float accumX = 0.0f, accumY = 0.0f;
     bool leftHeld = false, rightHeld = false;
 
+    // ── Host rumble ─────────────────────────────────────────────────────────
+    //
+    // Applied here because this is the one thread that owns the physical pad,
+    // and to the same `Gamepads().GetAt(0)` that is forwarded as slot 0 — so
+    // the controller the game is reading is the controller that shakes.
+    //
+    // Only a CHANGE is written. Setting `Vibration` sends an output report to
+    // the controller, over the air for a wireless pad; doing that 250 times a
+    // second to say the same thing would be traffic on the console's busiest
+    // radio for nothing. The bridge already handles staleness (its watchdog
+    // reads as 0/0), so "unchanged" really does mean "nothing to do".
+    Gamepad rumblePad{ nullptr };
+    uint16_t rumbleLow = 0, rumbleHigh = 0;
+    const auto stopRumble = [&] {
+        if (rumblePad && (rumbleLow || rumbleHigh)) {
+            try { rumblePad.Vibration(GamepadVibration{}); } catch (...) {}
+        }
+        rumbleLow = rumbleHigh = 0;
+    };
+    const auto applyRumble = [&](Gamepad const& pad, bool wanted) {
+        uint16_t low = 0, high = 0;
+        if (wanted) {
+            RumbleSource source;
+            {
+                std::lock_guard<std::mutex> guard(m_sinkLock);
+                source = m_rumble;
+            }
+            if (source) source(0, low, high);
+        }
+        if (pad == rumblePad && low == rumbleLow && high == rumbleHigh) return;
+        // A different controller just became slot 0: stop the one that was,
+        // or it shakes on in a hand that is no longer playing.
+        if (!(pad == rumblePad)) stopRumble();
+
+        GamepadVibration vibration{};
+        vibration.LeftMotor  = static_cast<double>(low) / 65535.0;    // low-frequency
+        vibration.RightMotor = static_cast<double>(high) / 65535.0;   // high-frequency
+        try {
+            pad.Vibration(vibration);
+            m_rumbleApplied.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            // The pad vanished between the read and the write. The next tick
+            // sees a different (or no) pad and starts over.
+        }
+        rumblePad = pad;
+        rumbleLow = low;
+        rumbleHigh = high;
+    };
+
     const auto sendPad = [this](int32_t activeMask, PadState const& snapshot) {
         PadSink sink;
         {
@@ -441,11 +495,13 @@ void InputBridge::PadLoop() noexcept {
 
         PadState state{};
         bool present = false;
+        Gamepad pad{ nullptr };
         try {
             auto pads = Gamepad::Gamepads();
             if (pads.Size() > 0) {
                 present = true;
-                const auto reading = pads.GetAt(0).GetCurrentReading();
+                pad = pads.GetAt(0);
+                const auto reading = pad.GetCurrentReading();
                 state.buttons      = ToXInputButtons(reading.Buttons);
                 state.leftTrigger  = ToTrigger(reading.LeftTrigger);
                 state.rightTrigger = ToTrigger(reading.RightTrigger);
@@ -457,7 +513,19 @@ void InputBridge::PadLoop() noexcept {
         } catch (...) {
             continue;   // a pad disconnecting mid-read is not an error
         }
-        if (!present) continue;
+        if (!present) {
+            // Nothing to shake. Forget the old pad so one that reconnects is
+            // brought up to date rather than assumed to be.
+            rumblePad = nullptr;
+            rumbleLow = rumbleHigh = 0;
+            continue;
+        }
+
+        // Every tick, before any of the `continue`s below: parked and
+        // mouse-mode ticks are exactly the ones that must drive the motors to
+        // zero, so they cannot be allowed to skip this.
+        applyRumble(pad, m_forwarding.load(std::memory_order_acquire) &&
+                             !m_mouseMode.load(std::memory_order_acquire));
 
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::chrono::duration<float>(now - lastTick).count();
@@ -635,7 +703,9 @@ void InputBridge::PadLoop() noexcept {
         lastSent = now;
     }
 
-    // The thread is going away. Do not leave a direction held on the host.
+    // The thread is going away. Do not leave a direction held on the host —
+    // nor a controller shaking in the user's hands.
+    stopRumble();
     if (leftHeld)  Emit(InputEvent{ kMouseButton, kLeft, 0, 0, 0 });
     if (rightHeld) Emit(InputEvent{ kMouseButton, kRight, 0, 0, 0 });
     sendPad(0, PadState{});

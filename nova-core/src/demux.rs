@@ -79,6 +79,15 @@ pub const ECHO_AUDIO: u8 = 0xE5;
 /// audio.
 pub const ECHO_FEEDBACK: u8 = 0xE6;
 
+/// Echo controller rumble: sealed host-to-client motor state (see
+/// [`crate::rumble_channel`]).
+///
+/// Its own tag rather than a field inside [`ECHO_AUDIO`] for the reason every
+/// Echo stream has one: the client hands it to a different consumer (the
+/// platform's controller, not its audio device), and a distinct stream id stops
+/// a captured audio datagram being replayed as a motor command.
+pub const ECHO_RUMBLE: u8 = 0xE7;
+
 /// What a datagram arriving on the shared socket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -98,6 +107,8 @@ pub enum Class {
     EchoAudio,
     /// Echo client-to-host video feedback.
     EchoFeedback,
+    /// Sealed controller rumble travelling host → client.
+    EchoRumble,
     /// Anything else: Moonlight RTP, a client ping, or noise. Deliberately one
     /// bucket — Nova's existing paths already know how to tell those apart,
     /// and this classifier must not start second-guessing them.
@@ -120,6 +131,7 @@ pub fn classify(buf: &[u8]) -> Class {
         Some(&ECHO_MIC) => Class::EchoMic,
         Some(&ECHO_AUDIO) => Class::EchoAudio,
         Some(&ECHO_FEEDBACK) => Class::EchoFeedback,
+        Some(&ECHO_RUMBLE) => Class::EchoRumble,
         Some(&b) if b & 0xC0 == 0 => {
             // Leading bits say "could be STUN"; only the cookie settles it.
             // Without this check a stray datagram starting with a low byte
@@ -149,6 +161,7 @@ pub fn is_echo(buf: &[u8]) -> bool {
             | Class::EchoMic
             | Class::EchoAudio
             | Class::EchoFeedback
+            | Class::EchoRumble
     )
 }
 
@@ -162,7 +175,10 @@ mod tests {
     /// session command.
     #[test]
     fn tags_cannot_collide_with_stun_or_rtp() {
-        for tag in [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO] {
+        for tag in [
+            ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO,
+            ECHO_FEEDBACK, ECHO_RUMBLE,
+        ] {
             assert_eq!(tag & 0xC0, 0xC0, "Echo tags must live above RTP's range");
             assert_ne!(tag & 0xC0, 0x00, "…and outside STUN's");
             assert_ne!(tag & 0xC0, 0x80, "…and outside RTP version 2's");
@@ -199,6 +215,8 @@ mod tests {
         assert_eq!(classify(&[ECHO_INPUT, 0, 0]), Class::EchoInput);
         assert_eq!(classify(&[ECHO_MIC, 0, 0]), Class::EchoMic);
         assert_eq!(classify(&[ECHO_AUDIO, 0, 0]), Class::EchoAudio);
+        assert_eq!(classify(&[ECHO_RUMBLE, 0, 0]), Class::EchoRumble);
+        assert!(is_echo(&[ECHO_RUMBLE]));
 
         assert!(is_echo(&[ECHO_MIC]));
         assert!(is_echo(&[ECHO_AUDIO]));
@@ -214,7 +232,10 @@ mod tests {
     /// duplicate would silently route one stream into another's decoder.
     #[test]
     fn every_echo_tag_is_unique() {
-        let tags = [ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO];
+        let tags = [
+            ECHO_MEDIA, ECHO_CONTROL, ECHO_CONTROL_ACK, ECHO_INPUT, ECHO_MIC, ECHO_AUDIO,
+            ECHO_FEEDBACK, ECHO_RUMBLE,
+        ];
         let mut seen = tags.to_vec();
         seen.sort_unstable();
         seen.dedup();

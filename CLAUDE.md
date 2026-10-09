@@ -57,6 +57,17 @@ handoffs, and they are the authority for anything client-side:
   which hands it first refusal on every pad frame. See the Current Phase section
   for the three rules that are load-bearing (pad neutralisation on the toggle
   edges, the driver thread, sub-pixel accumulation).
+- **Controller rumble flows host → client** (2026-10-09). `input.rs` starts a
+  ViGEm notification listener per plugged pad (vigem-client feature
+  `unstable_xtarget_notification`), dedupes, and hands changes to a sink: the
+  Worker relays `ControlMsg::Rumble` (IPC tag 24) and the Master fans out to
+  Moonlight (`control::queue_rumble`, Sunshine `0x010b`) and to Echo
+  (`SessionManager::set_rumble`, sealed `0xE7` from `nova_core::rumble_channel`,
+  sent on `media_supervisor`'s 2 ms tick). **Not over the Echo control tunnel**
+  — it is client-pulled request/response and cannot carry host pushes. Every
+  datagram is the whole state; the host repeats + refreshes, the client's 1 s
+  watchdog stops orphaned motors. The monolithic `run()` installs a
+  Moonlight-only sink. Logs: `📳` in both `nova.log` and `nova-service.log`.
 
 ## Project Scope
 Nova is an ultra-low footprint, native Rust game-streaming host.

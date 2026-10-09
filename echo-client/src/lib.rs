@@ -53,4 +53,5 @@ pub mod input;
 pub mod mic;
 pub mod pairing;
 pub mod receiver;
+pub mod rumble;
 pub mod session;

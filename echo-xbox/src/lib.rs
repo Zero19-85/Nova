@@ -114,6 +114,12 @@ pub const AUDIO_BAD_HANDLE: i32 = -3;
 /// The packet does not fit the supplied buffer; `meta[0]` holds the size needed.
 pub const AUDIO_TOO_SMALL: i32 = -4;
 
+// ── Return codes for echo_poll_rumble ───────────────────────────────────────
+/// Both motors are stopped; `low` and `high` were written as 0.
+pub const RUMBLE_OFF: i32 = 0;
+/// At least one motor is running; `low` and `high` hold its speeds.
+pub const RUMBLE_ON: i32 = 1;
+
 /// ViGEm slots the host will plug a virtual pad into, matching `MAX_PADS` in
 /// `nova-server/src/input.rs`. A snapshot for a slot at or beyond this is
 /// dropped there without comment, so this side refuses it instead.
@@ -168,6 +174,10 @@ struct EchoHandle {
     /// the buffer answers. A channel would invert that and make the network the
     /// clock, which is how a jitter buffer stops being one.
     audio: Arc<echo_client::audio::AudioPlayout>,
+    /// Controller rumble from the host, polled by the pad thread — see
+    /// [`echo_poll_rumble`]. Held here for the reason `audio` is: the thread
+    /// that owns the physical controller decides when to apply it.
+    rumble: Arc<echo_client::rumble::RumblePlayout>,
     /// The session task, so `close` can wait for it to unwind.
     ///
     /// Load-bearing: `Runtime::shutdown_timeout` only waits for *blocking*
@@ -625,6 +635,54 @@ pub unsafe extern "C" fn echo_poll_audio(handle: u64, dst: *mut u8, cap: i32, me
     }
 }
 
+/// The motor speeds controller `controller_number` should be running right now.
+///
+/// Writes `low` (the low-frequency, large, LEFT motor) and `high` (the
+/// high-frequency, small, RIGHT motor) as full-range `u16`, and returns
+/// [`RUMBLE_ON`] when either is non-zero, [`RUMBLE_OFF`] when both are stopped.
+/// Those are exactly `GamepadVibration::LeftMotor` and `RightMotor` once divided
+/// by 65535.
+///
+/// Cheap and lock-light, meant to be called from the pad loop on every tick.
+/// It never reports a stale effect: before the session's grant, after it ends,
+/// and whenever the host has gone quiet past the watchdog, every pad reads as
+/// stopped. The caller applies whatever this says and needs no timer of its own.
+///
+/// The speeds are written as 0 on EVERY non-`RUMBLE_ON` path, including a bad
+/// handle, so a caller that applies them unconditionally stops the motors.
+///
+/// # Safety
+/// `low` and `high` must each be null or point at one writable `uint16_t`.
+#[no_mangle]
+pub unsafe extern "C" fn echo_poll_rumble(
+    handle: u64,
+    controller_number: i32,
+    low: *mut u16,
+    high: *mut u16,
+) -> i32 {
+    if low.is_null() || high.is_null() {
+        return ECHO_BAD_ARG;
+    }
+    *low = 0;
+    *high = 0;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let Some(session) = EchoHandle::from_raw(handle) else {
+            return ECHO_BAD_HANDLE;
+        };
+        if !(0..MAX_GAMEPAD_SLOTS).contains(&controller_number) {
+            return ECHO_BAD_ARG;
+        }
+        let motors = session.rumble.motors(controller_number as usize);
+        if motors.is_off() {
+            return RUMBLE_OFF;
+        }
+        *low = motors.low;
+        *high = motors.high;
+        RUMBLE_ON
+    }));
+    result.unwrap_or(ECHO_BAD_HANDLE)
+}
+
 /// Receive and queue statistics as JSON, for diagnostics and an on-screen
 /// overlay.
 ///
@@ -646,7 +704,14 @@ pub unsafe extern "C" fn echo_stats(handle: u64, out: *mut c_char, cap: i32) -> 
         let (play, net, highest) = session.audio.stats_or_zero();
         let (loss_gaps, dropped_after_loss, escalations) =
             echo_client::receiver::repair_stats();
+        let rumble = session.rumble.stats();
         let json = serde_json::json!({
+            // Rumble: `changes` climbing while the pad stays still means the
+            // apply side is at fault; `accepted` at zero during a rumbling game
+            // means nothing is arriving.
+            "rumble_accepted": rumble.accepted,
+            "rumble_changes": rumble.changes,
+            "rumble_refused": rumble.refused,
             // Playout side.
             "audio_rendered": play.rendered,
             "audio_concealed": play.concealed,
@@ -1147,16 +1212,19 @@ fn start_session(config_json: &str) -> Result<u64, String> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let queue = Arc::new(FrameQueue::new());
     let audio = Arc::new(echo_client::audio::AudioPlayout::new());
+    let rumble = Arc::new(echo_client::rumble::RumblePlayout::new());
 
     let session = runtime.spawn({
         let queue = queue.clone();
         let audio = audio.clone();
+        let rumble = rumble.clone();
         async move {
             let mut progress = ChannelProgress(event_tx);
             let uplink = Uplink {
                 input: Some(input_rx),
                 mic: Some(mic_rx),
                 audio: Some(audio),
+                rumble: Some(rumble),
                 control: Some(control_rx),
             };
             let outcome =
@@ -1181,6 +1249,7 @@ fn start_session(config_json: &str) -> Result<u64, String> {
         mic: Some(mic_tx),
         control: Some(control_tx),
         audio,
+        rumble,
         session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as u64)
@@ -1285,6 +1354,8 @@ fn start_pairing(config_json: &str) -> Result<u64, String> {
         // outlives a stream and lands on a pairing handle renders silence rather
         // than faulting.
         audio: Arc::new(echo_client::audio::AudioPlayout::new()),
+        // Never armed, so every pad reads as stopped.
+        rumble: Arc::new(echo_client::rumble::RumblePlayout::new()),
         session: Mutex::new(Some(session)),
     });
     Ok(Box::into_raw(handle) as u64)
@@ -1462,6 +1533,12 @@ mod tests {
                 FILL_BAD_HANDLE
             );
             assert_eq!(echo_poll_audio(0, buf.as_mut_ptr(), 16, meta.as_mut_ptr()), AUDIO_BAD_HANDLE);
+            // Rumble also ZEROES the speeds on a bad handle: the pad loop
+            // applies whatever it gets, so a stale handle must stop the motors.
+            let (mut low, mut high) = (0xFFFFu16, 0xFFFFu16);
+            assert_eq!(echo_poll_rumble(0, 0, &mut low, &mut high), ECHO_BAD_HANDLE);
+            assert_eq!((low, high), (0, 0));
+            assert_eq!(echo_poll_rumble(0, 0, std::ptr::null_mut(), &mut high), ECHO_BAD_ARG);
             assert!(!echo_send_input(0, 1, 0, 0, 0, 0));
             assert!(!echo_send_gamepad(0, 0, 1, 0, 0, 0, 0, 0, 0, 0));
             assert!(!echo_send_mic(0, buf.as_ptr(), 4));

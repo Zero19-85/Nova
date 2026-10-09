@@ -160,9 +160,139 @@ fn parse_multi_controller(payload: &[u8]) -> Option<ControllerInput> {
     })
 }
 
+// ── Rumble: the one thing that flows back out of the virtual pad ─────────────
+//
+// A game rumbles by calling `XInputSetState` on the virtual pad; ViGEmBus
+// completes a pending `IOCTL_XUSB_REQUEST_NOTIFICATION` with the new motor
+// speeds. vigem-client exposes that behind `unstable_xtarget_notification`
+// (enabled in Cargo.toml) as a blocking poll on a thread of its own, one per
+// plugged pad — started in `GamepadManager::apply` on the plug edge.
+//
+// This module only DETECTS rumble; where it goes is the sink's business. The
+// Worker installs a sink that relays it to the Master (`ControlMsg::Rumble`),
+// which owns every client connection and fans it out to Moonlight's control
+// stream and to an Echo session's sealed rumble channel. The monolithic `run()`
+// installs one that queues it straight onto its own control stream.
+
+/// One rumble report, already in GameStream's vocabulary: `pad` is the
+/// controller number the client sent its input on, and both speeds are full
+/// `u16` range (`low` = large/left motor, `high` = small/right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rumble {
+    pub pad: u8,
+    pub low: u16,
+    pub high: u16,
+}
+
+impl Rumble {
+    /// ViGEm reports XInput's speeds with only the high byte kept. Widened by
+    /// ×257 rather than `<< 8` so full speed is `0xFFFF` on the wire — a client
+    /// that scales by 65535 would otherwise never reach 100%.
+    fn from_vigem(pad: u8, large_motor: u8, small_motor: u8) -> Self {
+        Self { pad, low: large_motor as u16 * 257, high: small_motor as u16 * 257 }
+    }
+}
+
+type RumbleSink = Arc<dyn Fn(Rumble) + Send + Sync>;
+
+static RUMBLE_SINK: Mutex<Option<RumbleSink>> = Mutex::new(None);
+
+/// Where rumble reports go. Replaces any previous sink.
+///
+/// Called from the ViGEm notification threads, never from the input path, so a
+/// sink may block briefly — but it should not: a slow sink delays the next
+/// notification request, and a change that lands in that window is lost.
+pub fn set_rumble_sink(sink: impl Fn(Rumble) + Send + Sync + 'static) {
+    *RUMBLE_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(sink));
+}
+
+fn emit_rumble(rumble: Rumble) {
+    // Cloned out so the sink runs without the lock held.
+    let sink = RUMBLE_SINK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(sink) = sink {
+        sink(rumble);
+    }
+}
+
+/// Per-plug rumble bookkeeping, shared with that plug's notification thread.
+///
+/// A fresh one per plug-in rather than per slot, because the listener thread is
+/// not joined (see `PadSlot::unplug`): a callback that lands after the pad was
+/// unplugged and replugged must find `live == false` on ITS record and do
+/// nothing, rather than reporting into the new plug's state.
+struct PadRumble {
+    live: std::sync::atomic::AtomicBool,
+    /// Last speeds reported, `large << 8 | small`. Games call `XInputSetState`
+    /// every frame with unchanged values; only a change is worth a datagram.
+    last: std::sync::atomic::AtomicU16,
+    /// Changes reported during this plug, for the unplug log line.
+    changes: std::sync::atomic::AtomicU64,
+}
+
 struct PadSlot {
     target: Xbox360Wired<Arc<Client>>,
     plugged: bool,
+    rumble: Option<Arc<PadRumble>>,
+}
+
+impl PadSlot {
+    /// Start listening for this pad's rumble. Best-effort: a pad that cannot
+    /// report rumble still drives the game, so failure is logged, not fatal.
+    fn listen_for_rumble(&mut self, idx: usize) {
+        let record = Arc::new(PadRumble {
+            live: std::sync::atomic::AtomicBool::new(true),
+            last: std::sync::atomic::AtomicU16::new(0),
+            changes: std::sync::atomic::AtomicU64::new(0),
+        });
+        match self.target.request_notification() {
+            Ok(request) => {
+                let mine = record.clone();
+                // The handle is deliberately dropped. Unplugging the target
+                // aborts the pending request, which ends the thread on its own;
+                // joining it from `unplug` would put a kernel round trip — and
+                // any driver misbehaviour — on the session teardown path.
+                let _ = request.spawn_thread(move |_, n| {
+                    if !mine.live.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let packed = (n.large_motor as u16) << 8 | n.small_motor as u16;
+                    if mine.last.swap(packed, Ordering::AcqRel) == packed {
+                        return;
+                    }
+                    if mine.changes.fetch_add(1, Ordering::Relaxed) == 0 {
+                        println!(
+                            "📳 ViGEm: game is driving controller #{idx}'s motors \
+                             (large {}, small {}) — relaying rumble to the client",
+                            n.large_motor, n.small_motor
+                        );
+                    }
+                    emit_rumble(Rumble::from_vigem(idx as u8, n.large_motor, n.small_motor));
+                });
+                self.rumble = Some(record);
+            }
+            Err(e) => {
+                println!("⚠️  ViGEm: controller #{idx} cannot report rumble ({e:?}) — input still works");
+            }
+        }
+    }
+
+    /// Unplug, and make sure the client is not left rumbling a pad that no
+    /// longer exists.
+    fn unplug(&mut self, idx: usize) {
+        let _ = self.target.unplug();
+        self.plugged = false;
+        if let Some(record) = self.rumble.take() {
+            record.live.store(false, Ordering::Release);
+            let changes = record.changes.load(Ordering::Relaxed);
+            if record.last.swap(0, Ordering::AcqRel) != 0 {
+                emit_rumble(Rumble { pad: idx as u8, low: 0, high: 0 });
+            }
+            if changes > 0 {
+                println!("📳 ViGEm: controller #{idx} relayed {changes} rumble change(s) while plugged");
+            }
+        }
+        println!("🎮 ViGEm: unplugged virtual Xbox 360 controller #{}", idx);
+    }
 }
 
 struct GamepadManager {
@@ -175,6 +305,7 @@ impl GamepadManager {
         let pads = std::array::from_fn(|_| PadSlot {
             target: Xbox360Wired::new(client.clone(), TargetId::XBOX360_WIRED),
             plugged: false,
+            rumble: None,
         });
         Ok(Self { pads })
     }
@@ -192,6 +323,7 @@ impl GamepadManager {
                 Ok(()) => {
                     slot.plugged = true;
                     println!("🎮 ViGEm: plugged in virtual Xbox 360 controller #{}", idx);
+                    slot.listen_for_rumble(idx);
                 }
                 Err(e) => {
                     println!("⚠️  ViGEm: failed to plug in controller #{}: {:?}", idx, e);
@@ -199,9 +331,7 @@ impl GamepadManager {
                 }
             }
         } else if !want_active && slot.plugged {
-            let _ = slot.target.unplug();
-            slot.plugged = false;
-            println!("🎮 ViGEm: unplugged virtual Xbox 360 controller #{}", idx);
+            slot.unplug(idx);
         }
 
         if slot.plugged {
@@ -223,9 +353,7 @@ impl GamepadManager {
     fn unplug_all(&mut self) {
         for (idx, slot) in self.pads.iter_mut().enumerate() {
             if slot.plugged {
-                let _ = slot.target.unplug();
-                slot.plugged = false;
-                println!("🎮 ViGEm: unplugged virtual Xbox 360 controller #{}", idx);
+                slot.unplug(idx);
             }
         }
     }
@@ -1462,6 +1590,89 @@ mod tests {
     /// Locks the Master-side routing predicate that keeps gamepad traffic on
     /// the Worker while mouse/keyboard detours to the SYSTEM input helper (see
     /// `is_gamepad_packet`'s doc comment for why that split matters).
+    /// The whole host half of rumble, against the real driver: plug a virtual
+    /// pad through `GamepadManager`, drive its motors through XInput exactly as
+    /// a game would, and require the speeds to come out of the rumble sink.
+    ///
+    /// Finds the virtual pad's XInput index by diffing before/after the plug,
+    /// so a physical controller on this machine is never written to.
+    ///
+    ///   cargo test -p nova-server --lib vigem_rumble_reaches_the_sink_live -- --ignored --nocapture
+    #[test]
+    #[ignore = "live: needs ViGEmBus; plugs a virtual pad for a few seconds"]
+    fn vigem_rumble_reaches_the_sink_live() {
+        #[repr(C)]
+        struct Vibration {
+            left: u16,
+            right: u16,
+        }
+        #[repr(C)]
+        struct State {
+            packet: u32,
+            pad: [u8; 12],
+        }
+        #[link(name = "xinput")]
+        extern "system" {
+            fn XInputSetState(index: u32, v: *mut Vibration) -> u32;
+            fn XInputGetState(index: u32, s: *mut State) -> u32;
+        }
+        let connected = || -> Vec<u32> {
+            (0..4u32)
+                .filter(|&i| unsafe {
+                    let mut s = State { packet: 0, pad: [0; 12] };
+                    XInputGetState(i, &mut s) == 0
+                })
+                .collect()
+        };
+
+        let before = connected();
+        let (tx, rx) = std::sync::mpsc::channel();
+        set_rumble_sink(move |r| {
+            let _ = tx.send(r);
+        });
+        let mut mgr = GamepadManager::connect().expect("ViGEmBus must be installed");
+        mgr.apply(ControllerInput {
+            controller_number: 2,
+            active_gamepad_mask: 1 << 2,
+            button_flags: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+        });
+        let index = (0..40)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                connected().into_iter().find(|i| !before.contains(i))
+            })
+            .expect("the virtual pad never appeared to XInput");
+        println!("virtual pad is XInput user {index} (already present: {before:?})");
+
+        let expect = |low: u16, high: u16| {
+            let got = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("no rumble reached the sink");
+            assert_eq!(got, Rumble { pad: 2, low, high });
+        };
+        unsafe { XInputSetState(index, &mut Vibration { left: 40000, right: 12000 }) };
+        // ViGEm keeps the high byte: 40000 → 156, 12000 → 46, widened ×257.
+        expect(156 * 257, 46 * 257);
+        // The same speeds again must NOT produce a second report.
+        unsafe { XInputSetState(index, &mut Vibration { left: 40000, right: 12000 }) };
+        unsafe { XInputSetState(index, &mut Vibration { left: 0, right: 0 }) };
+        expect(0, 0);
+        drop(mgr);
+    }
+
+    #[test]
+    fn vigem_rumble_widens_to_the_full_u16_range() {
+        // Full speed must be 0xFFFF, or a client scaling by 65535 tops out at
+        // 99.6% — and `<< 8` would also make "off" and "barely on" both even.
+        assert_eq!(Rumble::from_vigem(1, 0xFF, 0), Rumble { pad: 1, low: 0xFFFF, high: 0 });
+        assert_eq!(Rumble::from_vigem(0, 0, 0x80), Rumble { pad: 0, low: 0, high: 0x8080 });
+        assert_eq!(Rumble::from_vigem(3, 0, 0), Rumble { pad: 3, low: 0, high: 0 });
+    }
+
     #[test]
     fn gamepad_packets_are_distinguished_from_kbm() {
         let mut pad = vec![0u8; 34];

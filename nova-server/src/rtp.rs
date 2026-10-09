@@ -501,7 +501,10 @@ impl RtpSender {
                 // host-side receiver for it to reach, and letting it fall
                 // through to `latest` would let a replay of our own audio
                 // nominate the sender as the video target.
-                nova_core::demux::Class::EchoMedia | nova_core::demux::Class::EchoAudio => continue,
+                // Rumble is host → client too, on exactly the same terms.
+                nova_core::demux::Class::EchoMedia
+                | nova_core::demux::Class::EchoAudio
+                | nova_core::demux::Class::EchoRumble => continue,
                 nova_core::demux::Class::Other => {}
             }
             latest = Some(addr);

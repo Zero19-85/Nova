@@ -1095,6 +1095,9 @@ fn start_session(config_json: &str) -> Result<jlong, String> {
                     input: Some(input_rx),
                     mic: Some(mic_rx),
                     audio: Some(audio),
+                    // Not wired to the JNI surface yet: the host still sends
+                    // rumble, and the demultiplexer drops it.
+                    rumble: None,
                     control: None,
                 };
             let outcome =

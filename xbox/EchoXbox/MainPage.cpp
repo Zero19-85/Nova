@@ -930,6 +930,12 @@ namespace winrt::EchoXbox::implementation
             // reaches this page: XAML consumes GamepadA for its own Accept
             // handling and never routed it here. See OnPadAccept.
             [this] { OnPadAccept(); });
+        // Host rumble, polled by the pad thread. The session pointer is the
+        // one the uplink sinks above already hold; with no stream open it
+        // answers 0/0, which is how the motors get stopped.
+        m_input->SetRumbleSource([session](int32_t slot, uint16_t& low, uint16_t& high) {
+            session->PollRumble(slot, low, high);
+        });
 
         std::wstring error;
         if (!m_input->Start(VideoPanel(), Window::Current().CoreWindow(), error)) {
@@ -2618,6 +2624,16 @@ namespace winrt::EchoXbox::implementation
                     // Peak near -120 dBFS with `sent` climbing is a device
                     // delivering silence, not a broken path.
                     line += L"\nmic       " + m_session->MicReport();
+                    // Rumble, both ends: `changes` is what the host told us,
+                    // `applied` is how often the pad loop actually moved the
+                    // motors. Changes climbing with applied flat = the apply
+                    // side; both flat during a rumbling game = nothing arriving
+                    // (check `📳` in the host's nova.log).
+                    line += L"\nrumble    arrived " + field("rumble_accepted") +
+                            L"   changes " + field("rumble_changes") +
+                            L"   refused " + field("rumble_refused") +
+                            L"   applied " +
+                            std::to_wstring(m_input ? m_input->RumbleApplied() : 0);
                 }
             }
 

@@ -405,6 +405,16 @@ pub struct EchoSession {
     /// client is being served — sharing it would punch gaps in this stream that
     /// the client reads as packet loss it never suffered.
     audio: nova_core::audio_channel::AudioSender,
+    /// This session's controller rumble: the motor state the client should be
+    /// running, and the repeat/refresh schedule for telling it so.
+    ///
+    /// Per-session for the same reason as `audio` — it owns a counter sealed
+    /// under this session's keys — and for one of its own: a session that ends
+    /// mid-rumble takes its schedule with it, so nothing keeps refreshing a
+    /// motor for a client that has gone. The client's watchdog then stops it.
+    rumble: nova_core::rumble_channel::RumbleTx,
+    /// Whether this session's first rumble has been logged.
+    rumble_logged: bool,
 }
 
 impl EchoSession {
@@ -759,6 +769,15 @@ pub struct SessionManager {
     /// `active`'s mutex is held, so it can never disagree with it for longer
     /// than one instruction.
     echo_active: std::sync::atomic::AtomicBool,
+    /// Lock-free "the live session's rumble schedule owes a datagram soon".
+    ///
+    /// [`rumble_tick`](Self::rumble_tick) runs on the Master's 2 ms media
+    /// ticker, which never stops — so, like `echo_active`, the common answer
+    /// ("nothing to send") must not cost a lock. Set by `set_rumble`, cleared
+    /// once a poll leaves nothing scheduled. A stale `true` costs one lock and
+    /// an empty poll; a stale `false` cannot happen, because it is only ever
+    /// cleared under the session lock after reading the schedule.
+    rumble_owed: std::sync::atomic::AtomicBool,
     /// Operator settings. Held here rather than read from config at the call
     /// sites so the gate stays testable without a `nova.toml`.
     policy: SessionPolicy,
@@ -778,7 +797,66 @@ impl SessionManager {
             active: Mutex::new(None),
             next_id: AtomicU64::new(1),
             echo_active: std::sync::atomic::AtomicBool::new(false),
+            rumble_owed: std::sync::atomic::AtomicBool::new(false),
             policy,
+        }
+    }
+
+    /// A game changed pad `pad`'s motors. Recorded on the live Echo session's
+    /// schedule; [`rumble_tick`](Self::rumble_tick) does the sending.
+    ///
+    /// Ignored when no Echo session holds the pipeline — a Moonlight session's
+    /// rumble goes out on its own control stream (`control::queue_rumble`), and
+    /// a detached session has no client to shake.
+    pub fn set_rumble(&self, pad: u8, low: u16, high: u16) {
+        if !self.echo_active.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        let motors = nova_core::rumble_channel::Motors { low, high };
+        if session.rumble.set(pad as usize, motors, Instant::now()) {
+            self.rumble_owed.store(true, Ordering::Release);
+            // Once per session: proof in nova-service.log that the Worker's
+            // report crossed the pipe and is going out sealed. The per-change
+            // count is on the Worker's `📳 … relayed N` line.
+            if !session.rumble_logged {
+                session.rumble_logged = true;
+                println!(
+                    "📳 Echo session {}: relaying controller rumble to \"{}\" (pad {pad}: low {low}, high {high})",
+                    session.id, session.device_name
+                );
+            }
+        }
+    }
+
+    /// The rumble datagram owed right now, with where to send it.
+    ///
+    /// Returns rather than sends, the same discipline as
+    /// [`seal_audio`](Self::seal_audio): the lock taken here is the one every
+    /// video frame's seal takes, so the socket write happens after it drops.
+    pub fn rumble_tick(&self) -> Option<(Vec<u8>, SocketAddr)> {
+        if !self.rumble_owed.load(Ordering::Acquire) || !self.echo_active.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut guard = self.active.lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            self.rumble_owed.store(false, Ordering::Release);
+            return None;
+        };
+        let polled = session.rumble.poll(Instant::now());
+        self.rumble_owed.store(session.rumble.next_due().is_some(), Ordering::Release);
+        match polled {
+            Ok(Some(datagram)) => Some((datagram, session.peer)),
+            Ok(None) => None,
+            Err(why) => {
+                // Counter exhaustion — a year of continuous rumble. Stop rather
+                // than reuse a nonce; the client's watchdog quiets the pad.
+                println!("📳 Echo rumble not sealed: {why}");
+                None
+            }
         }
     }
 
@@ -982,6 +1060,8 @@ impl SessionManager {
             mic: nova_core::mic_channel::MicReceiver::new(keys.clone()),
             feedback: nova_core::feedback_channel::FeedbackReceiver::new(keys.clone()),
             audio: nova_core::audio_channel::AudioSender::new(keys.clone()),
+            rumble: nova_core::rumble_channel::RumbleTx::new(keys.clone(), Instant::now()),
+            rumble_logged: false,
             keys,
             rikey,
             rikeyid,
@@ -2352,6 +2432,35 @@ mod tests {
 
         f.mgr.stop(&device("Xbox", 1)).unwrap();
         assert!(f.mgr.seal_audio(b"after the end").is_none());
+    }
+
+    /// Rumble reaches the client the grant was issued to, sealed under that
+    /// grant's key — and only while an Echo session holds the pipeline.
+    #[test]
+    fn rumble_is_sealed_for_the_live_session_and_nothing_else() {
+        let f = fixture(Some(peer()));
+        f.mgr.set_rumble(0, 9000, 0);
+        assert!(f.mgr.rumble_tick().is_none(), "no Echo session: Moonlight's control stream owns it");
+
+        let grant = f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
+        assert!(f.mgr.rumble_tick().is_none(), "nothing owed until a game rumbles");
+
+        f.mgr.set_rumble(0, 9000, 1234);
+        let (datagram, to) = f.mgr.rumble_tick().expect("a change is owed at once");
+        assert_eq!(to, peer());
+
+        let keys = SessionKeys::from_hex(&grant.keys_hex).unwrap();
+        let mut rx = nova_core::rumble_channel::RumbleReceiver::new(keys);
+        let state = rx.open(&datagram).unwrap().expect("fresh");
+        assert_eq!(state[0], nova_core::rumble_channel::Motors { low: 9000, high: 1234 });
+
+        // The same value again is not a change, so it owes nothing new now.
+        f.mgr.set_rumble(0, 9000, 1234);
+        assert!(f.mgr.rumble_tick().is_none(), "repeats come on the schedule, not per call");
+
+        f.mgr.stop(&device("Xbox", 1)).unwrap();
+        f.mgr.set_rumble(0, 1, 1);
+        assert!(f.mgr.rumble_tick().is_none(), "a finished session sends nothing");
     }
 
     /// The property the separate counter exists for, asserted end-to-end rather

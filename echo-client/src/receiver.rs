@@ -910,6 +910,7 @@ pub async fn demultiplex(
     media_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     control_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    rumble_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // MTU-sized: an undersized buffer makes `recv_from` FAIL on Windows
@@ -964,6 +965,12 @@ pub async fn demultiplex(
                             // price of a byte comparison.
                             Class::EchoAudio => {
                                 let _ = audio_tx.send(buf[..n].to_vec());
+                            }
+                            // Controller rumble: its own channel for the same
+                            // reasons as audio, and equally optional — a client
+                            // with no controller drops these for a byte compare.
+                            Class::EchoRumble => {
+                                let _ = rumble_tx.send(buf[..n].to_vec());
                             }
                             // The host's STUN keepalives and punch probes, plus
                             // internet noise.

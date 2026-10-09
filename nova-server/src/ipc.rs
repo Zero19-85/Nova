@@ -83,6 +83,8 @@ mod tag {
     /// Master -> Worker: the Echo client confirmed decoding up to this wire
     /// frame index, so the encoder may safely reference it (see encoder::notify_ltr_acked).
     pub const LTR_ACK: u8 = 23;
+    /// Worker -> Master: a game changed a virtual pad's motor speeds.
+    pub const RUMBLE: u8 = 24;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -299,6 +301,15 @@ pub enum ControlMsg {
     /// signal. Lossy by design: each report is an absolute watermark, so a
     /// dropped one costs freshness and nothing else.
     LtrAck { frame_index: u32 },
+    /// Worker -> Master: a game changed the motor speeds of virtual pad `pad`.
+    ///
+    /// The pads live in the Worker (ViGEm is session-bound like the rest of
+    /// input) and every client connection lives in the Master, so rumble has to
+    /// cross the pipe the opposite way to input. Sent only on a CHANGE — games
+    /// re-send identical speeds every frame, and those are filtered at the
+    /// source (`input::PadSlot::listen_for_rumble`). Speeds are GameStream's
+    /// full `u16` range: `low` = large/left motor, `high` = small/right.
+    Rumble { pad: u8, low: u16, high: u16 },
     /// Worker -> Master: PIN + device name entered on the Worker's tray
     /// dialog, forwarded into Master-side pairing's `global_pin` slot (the
     /// same handshake point the monolithic host's tray uses in-process).
@@ -550,6 +561,12 @@ impl ControlMsg {
                 write_u32(&mut out, *frame_index);
                 out
             }
+            ControlMsg::Rumble { pad, low, high } => {
+                let mut out = vec![tag::RUMBLE, *pad];
+                out.extend_from_slice(&low.to_le_bytes());
+                out.extend_from_slice(&high.to_le_bytes());
+                out
+            }
             ControlMsg::PinRelay { pin, device } => {
                 let mut out = vec![tag::PIN_RELAY];
                 write_string(&mut out, pin);
@@ -620,6 +637,14 @@ impl ControlMsg {
             tag::LTR_ACK => {
                 let at = &mut 0usize;
                 Ok(ControlMsg::LtrAck { frame_index: read_u32(rest, at)? })
+            }
+            tag::RUMBLE => {
+                let b = rest.get(..5).ok_or_else(|| invalid_data("truncated Rumble"))?;
+                Ok(ControlMsg::Rumble {
+                    pad: b[0],
+                    low: u16::from_le_bytes([b[1], b[2]]),
+                    high: u16::from_le_bytes([b[3], b[4]]),
+                })
             }
             tag::PIN_RELAY => {
                 let at = &mut 0usize;
@@ -976,6 +1001,10 @@ mod tests {
             // variant's — which is exactly what this round-trip checks.
             ControlMsg::EndSession,
             ControlMsg::ClearPaired,
+            // Rumble: the two speeds are adjacent u16s of the same type, so a
+            // transposition would decode cleanly and swap the motors.
+            ControlMsg::Rumble { pad: 3, low: 0xFFFF, high: 0x0101 },
+            ControlMsg::Rumble { pad: 0, low: 0, high: 0 },
             // Echo display command (echo_rpc.rs). The variable-length id sits
             // before four fixed fields, so a framing slip here would decode as
             // a plausible-but-wrong mode — worth pinning.

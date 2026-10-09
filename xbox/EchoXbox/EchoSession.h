@@ -71,6 +71,10 @@ public:
                      int32_t leftX, int32_t leftY,
                      int32_t rightX, int32_t rightY) noexcept;
 
+    // Host rumble for controller `slot`, as `echo_poll_rumble` reports it.
+    // Both speeds are 0 when no session is open. Pad thread, every tick.
+    bool PollRumble(int32_t slot, uint16_t& low, uint16_t& high) const noexcept;
+
     // Ask the host to re-mode the display this session is watching, live.
     // See `echo_set_display` in EchoBridge.h for what makes that safe here.
     bool SetDisplay(uint32_t width, uint32_t height, uint32_t refreshHz) noexcept;

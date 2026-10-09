@@ -1390,6 +1390,17 @@ async fn control_supervisor(
                                 nothing to end");
                         }
                     }
+                    Some(Ok(ControlMsg::Rumble { pad, low, high })) => {
+                        // Fan out to both kinds of client. Each side drops it
+                        // when it has no live session, so this needs no idea of
+                        // who is streaming: Moonlight's rumble rides its ENet
+                        // control stream, Echo's is sealed and sent from
+                        // media_supervisor's 2 ms tick (it owns the socket).
+                        control::queue_rumble(pad, low, high);
+                        if let Some(sessions) = echo_sessions.as_ref() {
+                            sessions.set_rumble(pad, low, high);
+                        }
+                    }
                     Some(Ok(ControlMsg::ClearPaired)) => {
                         // The trust store this revokes is Master-side state; see
                         // pairing::clear_all_paired for why the Worker deleting
@@ -1762,6 +1773,15 @@ async fn media_supervisor(
                 if learned_now && !video_learned {
                     video_learned = true;
                     println!("🎯 Master: learned client video target");
+                }
+                // Echo rumble rides this tick because it already owns the
+                // media socket and wakes every 2 ms, which bounds a rumble's
+                // added latency at one tick. `rumble_tick` is a single atomic
+                // load when nothing is owed — i.e. almost always.
+                if let Some((datagram, peer)) =
+                    echo_sessions.as_ref().and_then(|s| s.rumble_tick())
+                {
+                    let _ = rtp_sender.lock().unwrap().send_raw(&datagram, peer);
                 }
             }
             _ = keepalive_ticker.tick() => {
@@ -2962,6 +2982,17 @@ pub async fn run_worker() -> Result<()> {
                     return; // control thread gone — process is shutting down
                 }
             }
+        }
+    });
+
+    // Rumble: the virtual pads live here, every client connection lives in the
+    // Master. ViGEm's notification threads call this sink; an unbounded send
+    // never blocks, so a slow pipe cannot delay the next notification request
+    // (a change landing in that window would be lost).
+    input::set_rumble_sink({
+        let reply_tx = reply_tx.clone();
+        move |r| {
+            let _ = reply_tx.send(ipc::ControlMsg::Rumble { pad: r.pad, low: r.low, high: r.high });
         }
     });
 
@@ -4283,6 +4314,10 @@ pub async fn run() -> Result<()> {
         let info = client_info.clone();
         move || control::start_control_server(47999, info, None)
     });
+    // Rumble, the monolithic way: the pads and the control stream share this
+    // process, so the sink queues straight onto it. No Echo leg — Echo sessions
+    // need the Master. Mirror of the Worker's sink in run_worker.
+    input::set_rumble_sink(|r| control::queue_rumble(r.pad, r.low, r.high));
 
     // Pairing HTTP/HTTPS server (tokio task)
     tokio::spawn(crate::pairing::start_pairing_server(

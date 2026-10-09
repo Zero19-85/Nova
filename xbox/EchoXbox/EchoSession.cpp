@@ -474,6 +474,14 @@ bool EchoSession::SendGamepad(int32_t slot, int32_t activeMask, int32_t buttons,
                              rightTrigger, leftX, leftY, rightX, rightY);
 }
 
+bool EchoSession::PollRumble(int32_t slot, uint16_t& low, uint16_t& high) const noexcept {
+    low = high = 0;
+    // Same unlocked read as the uplink above, and safe for the same reason:
+    // the bridge answers a just-closed handle with "stopped", never a fault.
+    const uint64_t handle = m_handle;
+    return handle != 0 && echo_poll_rumble(handle, slot, &low, &high) == RUMBLE_ON;
+}
+
 bool EchoSession::SetDisplay(uint32_t width, uint32_t height,
                              uint32_t refreshHz) noexcept {
     const uint64_t handle = m_handle;

@@ -40,6 +40,10 @@ constexpr int32_t AUDIO_IDLE       = -2;  // nothing expected — voice may idle
 constexpr int32_t AUDIO_BAD_HANDLE = -3;
 constexpr int32_t AUDIO_TOO_SMALL  = -4;
 
+// echo_poll_rumble. Also returns ECHO_BAD_HANDLE / ECHO_BAD_ARG.
+constexpr int32_t RUMBLE_OFF       =  0;  // both motors stopped; speeds written 0
+constexpr int32_t RUMBLE_ON        =  1;  // a motor is running; speeds written
+
 // ── Diagnostics ─────────────────────────────────────────────────────────────
 
 // Why the last failing call failed. Returns bytes written, excluding the NUL.
@@ -72,6 +76,15 @@ int32_t echo_fill_buffer(uint64_t handle, uint8_t* dst, int32_t cap, int64_t* me
 
 // One step of downstream audio, on the renderer's clock. See the AUDIO_* codes.
 int32_t echo_poll_audio(uint64_t handle, uint8_t* dst, int32_t cap, int64_t* meta);
+
+// The motors controller `controller_number` (0-3) should be running NOW, as
+// full-range u16: `low` = low-frequency/large/LEFT, `high` = high-frequency/
+// small/RIGHT -- GamepadVibration's LeftMotor/RightMotor after dividing by
+// 65535. Speeds are written 0 on every path but RUMBLE_ON (bad handle
+// included), and the host's silence past a 1 s watchdog also reads as off, so
+// the pad loop can apply whatever it gets without a timer of its own.
+int32_t echo_poll_rumble(uint64_t handle, int32_t controller_number,
+                         uint16_t* low, uint16_t* high);
 
 // Receive and queue statistics as JSON, for an on-screen overlay. 1 KiB is fine.
 int32_t echo_stats(uint64_t handle, char* out, int32_t cap);

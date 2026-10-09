@@ -189,6 +189,7 @@ pub struct UplinkRelay {
     input: Option<Slot>,
     mic: Option<Slot>,
     audio: Option<Arc<crate::audio::AudioPlayout>>,
+    rumble: Option<Arc<crate::rumble::RumblePlayout>>,
     control: Option<Slot>,
 }
 
@@ -201,11 +202,12 @@ impl UplinkRelay {
     /// channel present. The tasks end when the platform's senders are dropped,
     /// which happens when the JNI handle is closed.
     pub fn spawn(source: Uplink) -> Self {
-        let Uplink { input, mic, audio, control } = source;
+        let Uplink { input, mic, audio, rumble, control } = source;
         Self {
             input: input.map(pump),
             mic: mic.map(pump),
             audio,
+            rumble,
             control: control.map(pump),
         }
     }
@@ -223,6 +225,11 @@ impl UplinkRelay {
             // polls this same handle for the life of the app, so it is shared
             // across attempts rather than rebuilt for each one.
             audio: self.audio.clone(),
+            // Shared for the same reason as audio. Each attempt re-arms it with
+            // its own grant's keys, and disarms it on the way out, so the gap
+            // between attempts reads as "motors stopped" — never as the old
+            // session's last state held through a reconnect.
+            rumble: self.rumble.clone(),
             control: self.control.as_ref().map(install),
         }
     }

@@ -460,6 +460,12 @@ pub struct Uplink {
     /// sends; the datagrams are dropped at the demultiplexer for the cost of a
     /// channel send that goes nowhere.
     pub audio: Option<std::sync::Arc<crate::audio::AudioPlayout>>,
+    /// Where controller rumble from the host is held for the platform to apply.
+    ///
+    /// Shared and polled, like `audio`: the platform's pad thread owns the
+    /// physical controller and reads this on its own clock. `None` = no
+    /// controller to shake; the datagrams are dropped at the demultiplexer.
+    pub rumble: Option<std::sync::Arc<crate::rumble::RumblePlayout>>,
     /// Commands the platform layer wants issued on the LIVE control tunnel,
     /// one JSON object per item: `{"command": "...", "params": { ... }}`.
     ///
@@ -964,12 +970,15 @@ pub async fn stream(
     let (media_tx, media_rx) = tokio::sync::mpsc::unbounded_channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rumble_tx, rumble_rx) = tokio::sync::mpsc::unbounded_channel();
     let demux_task = tokio::spawn({
         let socket = socket.clone();
         let stop_rx = stop.clone();
         async move {
-            let _ = receiver::demultiplex(&socket, peer, media_tx, control_tx, audio_tx, stop_rx)
-                .await;
+            let _ = receiver::demultiplex(
+                &socket, peer, media_tx, control_tx, audio_tx, rumble_tx, stop_rx,
+            )
+            .await;
         }
     });
 
@@ -977,7 +986,7 @@ pub async fn stream(
     // body runs in a helper and the abort happens exactly once, below.
     let outcome = stream_inner(
         identity, pin, &socket, peer, opts, sink, progress, stop, media_rx, control_rx, audio_rx,
-        uplink,
+        rumble_rx, uplink,
     )
     .await;
     demux_task.abort();
@@ -997,10 +1006,16 @@ async fn stream_inner(
     media_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    rumble_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     uplink: Uplink,
 ) -> Result<ReceiveStats, String> {
-    let Uplink { input: input_rx, mic: mic_rx, audio: playout, control: control_cmd_rx } =
-        uplink;
+    let Uplink {
+        input: input_rx,
+        mic: mic_rx,
+        audio: playout,
+        rumble,
+        control: control_cmd_rx,
+    } = uplink;
     let lan = match &opts.control {
         Some(addr) => Some(
             tokio::net::lookup_host(addr)
@@ -1101,6 +1116,28 @@ async fn stream_inner(
                         .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(10));
                     if due {
                         eprintln!("⚠️  game audio datagram refused ({refused} so far): {why}");
+                        last_notice = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        })
+    });
+
+    // Controller rumble, armed with the same keys and for the same reason as
+    // audio. A trivial task — open, keep the newest — so it shares nothing with
+    // the video loop but the demultiplexer.
+    let rumble_task = rumble.as_ref().map(|rumble| {
+        rumble.arm(keys.clone());
+        let rumble = rumble.clone();
+        let mut rumble_rx = rumble_rx;
+        tokio::spawn(async move {
+            let mut last_notice: Option<std::time::Instant> = None;
+            while let Some(datagram) = rumble_rx.recv().await {
+                if let Err(why) = rumble.accept(&datagram) {
+                    let due = last_notice
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(10));
+                    if due {
+                        eprintln!("⚠️  rumble datagram refused: {why}");
                         last_notice = Some(std::time::Instant::now());
                     }
                 }
@@ -1392,6 +1429,14 @@ async fn stream_inner(
     if let Some(p) = &playout {
         p.disarm();
     }
+    // Stop the motors now rather than a watchdog-second from now: whatever the
+    // host last said belongs to a session that is over.
+    if let Some(t) = rumble_task {
+        t.abort();
+    }
+    if let Some(r) = &rumble {
+        r.disarm();
+    }
 
     // Tell the host we are done — UNLESS this exit is a handover.
     //
@@ -1596,12 +1641,15 @@ pub async fn release(
     let (media_tx, _media_rx) = tokio::sync::mpsc::unbounded_channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (audio_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rumble_tx, _rumble_rx) = tokio::sync::mpsc::unbounded_channel();
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let demux_task = tokio::spawn({
         let socket = socket.clone();
         async move {
-            let _ = receiver::demultiplex(&socket, peer, media_tx, control_tx, audio_tx, stop_rx)
-                .await;
+            let _ = receiver::demultiplex(
+                &socket, peer, media_tx, control_tx, audio_tx, rumble_tx, stop_rx,
+            )
+            .await;
         }
     });
 

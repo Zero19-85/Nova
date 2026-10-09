@@ -41,7 +41,7 @@ audiopus = "0.2"
 clap = { version = "4", features = ["derive"] }
 # Virtual Xbox 360 controller via ViGEmBus, for split-seat gamepad passthrough
 # (input.rs). Requires the ViGEmBus driver to be installed on the host.
-vigem-client = "0.1"
+vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }
 
 # Windows DXGI + NVENC + WGC
 windows = { version = "0.58", features = [
