@@ -101,6 +101,17 @@ HDR10 (`45d35d7`). Host-side change in this file's territory: `echo/session.rs`
 `validate` now grants `hdr` for HEVC only -- the grant used to echo `hdr: true`
 for AV1/H.264 streams the Worker encodes SDR.**
 
+**`[hdr] sdr_white_nits` (2026-10-09, LIVE).** An HDR client sees the desktop
+at the VDD's "SDR content brightness", which was Windows' 80-160 nits and read
+as dark on the Pixel and the TV. `refresh_sdr_white_level` now SETS it from
+config (default **280 = slider 50**, chosen by eye on both; `nits = 80 + 4 x
+slider`; 0 = leave Windows alone) whenever the VDD is in Advanced Color, then
+reads it back -- the read-back, not the request, is what the shim converts
+with, so WGC and DDA still agree if Windows ignores it. The setter is
+`DisplayConfigSetDeviceInfo` type `0xFFFFFFEE` (undocumented, absent from
+`windows` 0.58, what Settings' slider sends). Live: `🔆 SDR content brightness
+on \\.\DISPLAY11 set to 280 nits (slider 50)` then `SDR white level … 280 nits`.
+
 ### "Something keeps forcing Steam Streaming Speakers" — it was Nova, twice over
 
 1. **The hijacker was `audio.rs`'s own 1 Hz watchdog.** In client-only mode it

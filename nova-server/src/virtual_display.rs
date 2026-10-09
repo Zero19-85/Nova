@@ -3301,6 +3301,63 @@ impl VirtualDisplay {
         None
     }
 
+    /// Push the operator's `[hdr] sdr_white_nits` onto `device_name` — the same
+    /// thing Settings' "SDR content brightness" slider does — but only while the
+    /// display is in Advanced Color, because the level means nothing to an SDR
+    /// output and "whenever HDR engages" is the contract. Returns a line for the
+    /// log, or `None` when there was nothing to do (setting is 0, or no HDR).
+    ///
+    /// The call is `DisplayConfigSetDeviceInfo` with type `0xFFFFFFEE`
+    /// (`DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL`) — undocumented and
+    /// absent from `windows` 0.58, but it is what the Settings slider itself
+    /// sends and it has been stable since 1709. The struct is the documented GET
+    /// struct plus a `finalValue` byte (1 = commit, as opposed to a live preview
+    /// while the slider is being dragged).
+    ///
+    /// Not trusted on its own word: the caller reads the level straight back
+    /// with [`query_sdr_white_level`], and THAT value is what the shim's
+    /// SDR→HDR conversion uses — so if Windows ignored the request the log says
+    /// so and capture and conversion still agree with each other.
+    pub fn apply_sdr_white_level(device_name: &str, nits: u16) -> Option<String> {
+        if nits == 0 {
+            return None;
+        }
+        let nits = nits.clamp(80, 480);
+        let (adapter_id, target_id) = Self::find_target_for_device_name(device_name).ok()?;
+        match Self::query_advanced_color_info(adapter_id, target_id) {
+            Some((_, true)) => {}
+            _ => return None, // SDR output: no SDR-in-HDR level to set
+        }
+
+        #[repr(C)]
+        struct SetSdrWhiteLevel {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            sdr_white_level: u32, // 1000 == 80 nits
+            final_value: u8,
+        }
+        let level = u32::from(nits) * 1000 / 80;
+        let req = SetSdrWhiteLevel {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(0xFFFF_FFEEu32 as i32),
+                size: std::mem::size_of::<SetSdrWhiteLevel>() as u32,
+                adapterId: adapter_id,
+                id: target_id,
+            },
+            sdr_white_level: level,
+            final_value: 1,
+        };
+        let ret = unsafe {
+            DisplayConfigSetDeviceInfo(&req.header as *const DISPLAYCONFIG_DEVICE_INFO_HEADER)
+        };
+        Some(if ret == 0 {
+            format!("🔆 SDR content brightness on {device_name} set to {nits} nits \
+                (slider {}) from [hdr] sdr_white_nits", (nits - 80) / 4)
+        } else {
+            format!("⚠️  Setting SDR content brightness on {device_name} to {nits} nits \
+                failed (error {ret}) — keeping Windows' own level")
+        })
+    }
+
     fn force_resolution(device_name: &str, width: u32, height: u32, refresh_hz: u32) {
         unsafe {
             let mut n_paths: u32 = 0;
@@ -4131,6 +4188,27 @@ this line is nonsense
     /// Leaves the desktop where it found it on success AND on the assertion
     /// failure path, because a test that fails by stranding the operator at
     /// 1024x768 is worse than no test.
+    /// Proves the undocumented SET_SDR_WHITE_LEVEL call against a REAL display
+    /// in Advanced Color, by writing back the level it already has — so the
+    /// call's success and the read-back are both exercised and nothing on
+    /// screen changes. Pass the display as NOVA_SDR_TEST_DISPLAY (default
+    /// `\\.\DISPLAY1`); it must be in HDR, or the setter rightly does nothing.
+    #[test]
+    #[ignore = "talks to a real HDR display — run explicitly"]
+    fn sdr_white_level_set_round_trips_live() {
+        let device = std::env::var("NOVA_SDR_TEST_DISPLAY")
+            .unwrap_or_else(|_| r"\\.\DISPLAY1".to_string());
+        let before = VirtualDisplay::query_sdr_white_level(&device)
+            .expect("no SDR white level readable on that display");
+        let nits = (before * 80.0).round() as u16;
+        let line = VirtualDisplay::apply_sdr_white_level(&device, nits)
+            .expect("display is not in Advanced Color, so nothing was set");
+        println!("{line}");
+        assert!(line.starts_with("🔆"), "the SET call failed: {line}");
+        let after = VirtualDisplay::query_sdr_white_level(&device).unwrap();
+        assert!((after - before).abs() < 0.02, "level moved: {before} -> {after}");
+    }
+
     #[test]
     #[ignore = "changes the real display mode for ~2s — run explicitly"]
     fn physical_mode_restore_live() {

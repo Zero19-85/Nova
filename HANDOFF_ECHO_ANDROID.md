@@ -731,3 +731,6 @@ SDR white level (`🔆 SDR white level … 160 nits` in nova.log). The phone's o
 SDR white at that moment was ~455 nits (whitePointNits 1600 / ratio 3.5), so
 the streamed desktop's white sat at about a third of the phone UI's. Real HDR
 game content is unaffected — it carries its own nits.
+**Fixed 2026-10-09:** `[hdr] sdr_white_nits` in `nova.toml` (default 280 nits =
+Windows slider 50, picked by eye on this phone and the TV) is applied to the
+virtual display whenever HDR engages. See CLAUDE.md, Current Phase.

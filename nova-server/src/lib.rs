@@ -1846,6 +1846,10 @@ fn desktop_is_secure() -> bool {
     )
 }
 
+/// `[hdr] sdr_white_nits`, set once from config by whichever loop loaded it (the
+/// Worker or the monolithic `run()`); 0 = leave Windows' own level alone.
+static SDR_WHITE_NITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Align the shim's SDR→HDR conversion with the level Windows itself uses.
 ///
 /// The display that matters is the one being ENCODED FOR — the VDD, when it is
@@ -1856,12 +1860,23 @@ fn desktop_is_secure() -> bool {
 /// the brightness jumping when the capture path switches under a UAC prompt
 /// (WGC/FP16 → DDA/BGRA8 and back).
 ///
+/// Before reading, it SETS the level from `[hdr] sdr_white_nits` when the VDD is
+/// in Advanced Color (see `VirtualDisplay::apply_sdr_white_level`) — so the
+/// level read back is the operator's, not whatever Windows last persisted.
+///
 /// Deliberately NOT the *source* display's level when no VDD is active: a
 /// display that isn't in Advanced Color reports the 80-nit default, which would
 /// render the logon screen dimmer than reference. With nothing to match, the
 /// shim's BT.2408 default (203 nits) is the right answer, so leave it alone.
 fn refresh_sdr_white_level(vd: &virtual_display::VirtualDisplay) {
     let Some(device) = vd.active_device_name() else { return };
+    // Set first, then read back: the read-back below is what the shim
+    // converts with, so capture (composited by Windows at the display's level)
+    // and conversion agree even if Windows ignored the request.
+    let target = SDR_WHITE_NITS.load(std::sync::atomic::Ordering::Relaxed) as u16;
+    if let Some(line) = virtual_display::VirtualDisplay::apply_sdr_white_level(device, target) {
+        println!("{line}");
+    }
     if let Some(level) = virtual_display::VirtualDisplay::query_sdr_white_level(device) {
         println!("🔆 SDR white level for {device}: {:.0} nits — matching the shim's \
             SDR→HDR conversion to it", level * 80.0);
@@ -2802,6 +2817,7 @@ pub async fn run_worker() -> Result<()> {
 
     let cfg = config::NovaConfig::load();
     encoder::set_hdr_metadata(cfg.hdr.max_luminance_nits, cfg.hdr.max_cll_nits, cfg.hdr.max_fall_nits);
+    SDR_WHITE_NITS.store(u32::from(cfg.hdr.sdr_white_nits), std::sync::atomic::Ordering::Relaxed);
     // Both loops, per CLAUDE.md: a setting wired only into the monolithic
     // path is dead in the deployed split, and this one decides DPB depth.
     encoder::set_deep_dpb_authorized(cfg.stream.allow_level6_dpb);
@@ -4044,6 +4060,8 @@ pub async fn run() -> Result<()> {
         cfg.hdr.max_cll_nits,
         cfg.hdr.max_fall_nits,
     );
+    // Parity with run_worker: applied to the VDD by refresh_sdr_white_level.
+    SDR_WHITE_NITS.store(u32::from(cfg.hdr.sdr_white_nits), std::sync::atomic::Ordering::Relaxed);
     // Designate the streaming sink from nova.toml (no-op when empty). Must be
     // set before any sink resolution — recover_stuck_sink already ran above
     // with the built-in list only, so re-run it here: with an override, a

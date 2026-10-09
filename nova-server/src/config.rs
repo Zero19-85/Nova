@@ -191,6 +191,17 @@ pub struct HdrConfig {
     /// HEVC SEI type 144 MaxFALL — maximum frame-average light level, in nits.
     /// Typically 100–400 nit for graded HDR content. Default 400.
     pub max_fall_nits: u16,
+    /// Where SDR white lands inside an HDR stream, in nits — the virtual
+    /// display's "SDR content brightness", applied by Nova whenever HDR engages
+    /// on it. A desktop is SDR content, so this IS the desktop's brightness on
+    /// an HDR client; real HDR game output carries its own nits and ignores it.
+    ///
+    /// Windows' slider is linear: 0 → 80 nits, 100 → 480, so `nits = 80 + 4 ×
+    /// slider`. Default **280 = slider 50**, chosen by eye on a Pixel 9 Pro XL
+    /// and the living-room TV (2026-10-09); the Windows default of 80 nits read
+    /// as distinctly dark on both. `0` leaves whatever Windows has alone.
+    /// Clamped to 80–480, the slider's own range.
+    pub sdr_white_nits: u16,
 }
 
 /// The tray's "Report an issue…".
@@ -323,7 +334,7 @@ impl Default for SignalingConfig {
 
 impl Default for HdrConfig {
     fn default() -> Self {
-        Self { max_luminance_nits: 1000, max_cll_nits: 1000, max_fall_nits: 400 }
+        Self { max_luminance_nits: 1000, max_cll_nits: 1000, max_fall_nits: 400, sdr_white_nits: 280 }
     }
 }
 
@@ -451,6 +462,10 @@ advertise_url     = ""   # relay URL to ADVERTISE, when it differs from the one
 max_luminance_nits = 1000   # panel peak brightness (HDR600=600, HDR1000=1000, HDR2000=2000)
 max_cll_nits       = 1000   # MaxCLL: brightest pixel in the stream (nit)
 max_fall_nits      = 400    # MaxFALL: max frame-average light level (nit)
+# SDR content brightness on the virtual display while HDR is on — i.e. how
+# bright the desktop is on an HDR client. Windows' slider: nits = 80 + 4 x value,
+# so 280 = slider 50. 0 = leave Windows' own setting alone. Range 80-480.
+sdr_white_nits     = 280
 
 [bugreport]
 # The tray's "Report an issue…".
@@ -523,6 +538,19 @@ impl NovaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every install predates `sdr_white_nits`, and its `[hdr]` table has the
+    /// three luminance keys only — it must still get slider 50, not Windows'
+    /// 80-nit default, or upgrading changes nothing the operator can see.
+    #[test]
+    fn sdr_white_defaults_to_slider_fifty_on_an_existing_hdr_table() {
+        let old: NovaConfig = toml::from_str(
+            "[hdr]\nmax_luminance_nits = 1000\nmax_cll_nits = 1000\nmax_fall_nits = 400\n",
+        ).unwrap();
+        assert_eq!(old.hdr.sdr_white_nits, 280);
+        let off: NovaConfig = toml::from_str("[hdr]\nsdr_white_nits = 0\n").unwrap();
+        assert_eq!(off.hdr.sdr_white_nits, 0, "0 must survive as 'leave Windows alone'");
+    }
 
     /// An install that had tuned the old name must keep its tuning across the
     /// rename — silently adopting the new default would change teardown
