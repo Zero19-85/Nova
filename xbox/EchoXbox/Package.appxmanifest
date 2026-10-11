@@ -19,7 +19,8 @@
   3. TargetDeviceFamily is `Windows.Universal`, not `Windows.Xbox`. The Xbox
      family exists but narrows the app to that device; Universal runs on the
      console AND on the dev box, which is the difference between debugging this
-     on a PC and only ever debugging it on a TV.
+     on a PC and only ever debugging it on a TV. A `Windows.Xbox` entry sits
+     BESIDE it for the Store submission: beside, never instead of.
 
   4. `hevcPlayback` is NOT a Media Foundation switch, whatever its name says.
      Microsoft's "4K video playback for UWP apps on Xbox" page: "4K and HDR10
@@ -40,20 +41,22 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap mp rescap">
 
-  <!-- Name/Publisher must match the certificate the package is signed with.
-       Visual Studio rewrites Publisher when it generates a temporary key; leave
-       it alone unless you are signing by hand. -->
+  <!-- The Partner Center reservation "Echo Stream Client" (2026-10-11).
+       Name, Publisher and PublisherDisplayName must equal Product identity
+       character for character, or the upload is refused. Publisher is ALSO the
+       subject of the sideload certificate: build-app.ps1 reads it from here,
+       so a change here needs `build-app.ps1 -NewCert` once. -->
   <Identity
-    Name="Nova.EchoXbox"
-    Publisher="CN=Nova"
+    Name="Zeroorigin1985.com.EchoStreamClient"
+    Publisher="CN=966F1B4F-E0AA-49A8-86CD-B67FF919632A"
     Version="0.1.0.0" />
 
   <mp:PhoneIdentity PhoneProductId="6f1c2a10-4e9c-4d5f-9a3f-0d4c6b7e8a01"
                     PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 
   <Properties>
-    <DisplayName>Echo</DisplayName>
-    <PublisherDisplayName>Nova</PublisherDisplayName>
+    <DisplayName>Echo Stream Client</DisplayName>
+    <PublisherDisplayName>Zero@origin1985.com</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 
@@ -63,6 +66,12 @@
     <TargetDeviceFamily Name="Windows.Universal"
                         MinVersion="10.0.17763.0"
                         MaxVersionTested="10.0.26100.0" />
+    <!-- The Store submission's console entry. The more specific family wins
+         on a device that matches both, so this is what the console reads;
+         Universal above keeps the package installable on the dev box. -->
+    <TargetDeviceFamily Name="Windows.Xbox"
+                        MinVersion="10.0.19041.0"
+                        MaxVersionTested="10.0.22621.0" />
   </Dependencies>
 
   <Resources>
@@ -74,7 +83,7 @@
                  Executable="$targetnametoken$.exe"
                  EntryPoint="EchoXbox.App">
       <uap:VisualElements
-        DisplayName="Echo"
+        DisplayName="Echo Stream Client"
         Description="Nova's native client"
         BackgroundColor="#050508"
         Square150x150Logo="Assets\Square150x150Logo.png"

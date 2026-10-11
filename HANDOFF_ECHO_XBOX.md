@@ -1783,3 +1783,48 @@ applies gain, accumulates 960 samples and encodes on the graph thread.
   with `sent` climbing is a device delivering silence** (the VB-CABLE lesson),
   not a broken path. Host side: `Microphone ready` / `Microphone released` in
   `nova-service.log`.
+
+## 17. Microsoft Store private submission (2026-10-11)
+
+Reserved in Partner Center as **Echo Stream Client**. The manifest now carries
+that identity, and `xbox/build-app.ps1` reads its certificate subject from the
+manifest's `Publisher` instead of hard-coding it.
+
+| Field | Value |
+|---|---|
+| `Identity/Name` | `Zeroorigin1985.com.EchoStreamClient` |
+| `Identity/Publisher` | `CN=966F1B4F-E0AA-49A8-86CD-B67FF919632A` |
+| `PublisherDisplayName` | `Zero@origin1985.com` |
+| `DisplayName` (both) | `Echo Stream Client` |
+
+These were re-typed from a truncated Partner Center copy. **If the upload is
+refused for an identity mismatch, compare them with Product identity
+character by character before suspecting anything else.**
+
+- **A `Windows.Xbox` TargetDeviceFamily (min 19041, tested 22621) sits beside
+  `Windows.Universal`, not in place of it.** The console reads the more
+  specific entry; the dev box still installs the package.
+- **No app-type extension in the manifest.** A
+  `foundation:Extension Category="windows.appExtension"` block was proposed and
+  **fails MakeAppx schema validation**: the root namespace allows only
+  background/update-task categories there. Under `uap3` it packs, but
+  `windows.xbox.application` is undocumented and changes nothing. On a retail
+  console, App vs Game comes from the Partner Center category.
+- **Store upload** (unsigned; Partner Center signs it):
+  `MSBuild EchoXbox\EchoXbox.vcxproj /p:Configuration=Release /p:Platform=x64
+  /p:UapAppxPackageBuildMode=StoreUpload /p:AppxBundle=Always
+  /p:AppxBundlePlatforms=x64 /p:AppxPackageSigningEnabled=false` →
+  `xbox\EchoXbox\AppPackages\EchoXbox\EchoXbox_<ver>_x64_bundle.msixupload`.
+  **Each later submission needs a higher `Version`.**
+- **The new identity is a new app on the console.** The old `Nova.EchoXbox`
+  install keeps its own container, so the Store/new-sideload build starts
+  with no pairing and no settings. **Re-pair it once.** The new sideload
+  certificate (`CN=966F…632A`) must also be uploaded with the .msix, as before.
+- **`hevcPlayback` justification** submitted in the certification notes:
+  > This application is a low-latency, self-hosted game streaming client
+  > designed for local network playback. The restricted hevcPlayback
+  > capability is strictly required to access the console's hardware decoder
+  > for HEVC (H.265) video streams at 4K resolution and 120Hz, and to process
+  > SMPTE ST 2084 (PQ) colorimetry for HDR10 output. Without direct access to
+  > this decoder, the application cannot render the 4K/HDR payload from the
+  > local host server.

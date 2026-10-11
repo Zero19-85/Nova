@@ -23,8 +23,16 @@
 # ---- Signing -------------------------------------------------------------
 #
 # The certificate SUBJECT must equal Package.appxmanifest's Publisher exactly
-# ("CN=Nova"). A mismatch is a build error late in packaging that talks about
-# the publisher rather than about the certificate.
+# (read from the manifest below). A mismatch is a build error late in packaging
+# that talks about the publisher rather than about the certificate.
+#
+# This script is for SIDELOADING. The Store upload is a separate build that is
+# never signed here -- Partner Center signs it:
+#
+#   MSBuild EchoXbox\EchoXbox.vcxproj /p:Configuration=Release /p:Platform=x64
+#     /p:UapAppxPackageBuildMode=StoreUpload /p:AppxBundle=Always
+#     /p:AppxBundlePlatforms=x64 /p:AppxPackageSigningEnabled=false
+#   -> EchoXbox\AppPackages\EchoXbox_<ver>_x64_bundle.msixupload
 #
 # The cert is self-signed, so the console must be told to trust it: upload the
 # .cer alongside the .msix in the Xbox Device Portal. `signtool verify` on this
@@ -45,7 +53,23 @@ $Config   = if ($DebugBuild) { "Debug" } else { "Release" }
 $Pfx      = Join-Path $ProjDir "EchoXbox_TemporaryKey.pfx"
 $Cer      = Join-Path $ProjDir "EchoXbox_TemporaryKey.cer"
 $CertPass = "NovaEchoDev"   # a self-signed dev key; not a secret worth hiding
-$Subject  = "CN=Nova"       # MUST match Package.appxmanifest Publisher
+
+# The subject MUST equal Package.appxmanifest's Publisher, so it is read from
+# there rather than restated: since the Store reservation (2026-10-11) that is
+# Partner Center's CN=<GUID>, and a second copy here would drift the next time
+# it changed.
+$Manifest = Join-Path $ProjDir "Package.appxmanifest"
+$Subject  = ([xml](Get-Content -Raw $Manifest)).Package.Identity.Publisher
+if (-not $Subject) { throw "No Identity/@Publisher in $Manifest" }
+
+# A .pfx made for a different publisher fails late in packaging with an error
+# about the publisher, not the certificate. Catch it here and say what to run.
+if ((Test-Path $Pfx) -and -not $NewCert) {
+    $existing = (Get-PfxData -FilePath $Pfx -Password (ConvertTo-SecureString $CertPass -Force -AsPlainText)).EndEntityCertificates[0].Subject
+    if ($existing -ne $Subject) {
+        throw "The sideload certificate is for '$existing' but the manifest's Publisher is '$Subject'. Run .\build-app.ps1 -NewCert"
+    }
+}
 
 Write-Host "=== Echo Xbox app ===" -ForegroundColor Cyan
 Write-Host "config : $Config"
