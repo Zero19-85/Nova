@@ -296,6 +296,20 @@ fn qos_ramp_step(cur: u32, target: u32) -> u32 {
 /// * **Probe slowly** — after [`Self::PROBE_INTERVAL`] parked and clean, relax the
 ///   remembered failure point 5% so a one-off blip can't cap the session's
 ///   quality forever. Deliberately ~20× slower than the ramp.
+/// * **Only clean UNDER LOAD counts** — see [`Self::note_output`]. A second in
+///   which the encoder emitted a fraction of the target carried no evidence
+///   about whether the link sustains the target.
+///
+/// ### Why "clean" must mean "clean under load" (live 2026-10-12)
+///
+/// A 4K120 Moonlight session on a near-static desktop (a game downloading)
+/// sat at 0.3–5 Mbps of real encoder output against a 42.7 Mbps CBR target.
+/// Ten such seconds read as "10s clean", so the probe walked straight back to
+/// the 47.5 Mbps that had just failed — and the next burst of motion (30–41
+/// Mbps) lost packets at exactly that rate. Three identical cycles in one
+/// session, each costing a repair keyframe, the last of which the client never
+/// recovered from. Idle time proves nothing about a link's capacity: a CBR
+/// target is a ceiling, not what goes on the wire.
 ///
 /// The `ceiling_kbps` every method takes is [`VideoBudget::video_kbps`], not the
 /// client's raw request — see this module's header for why that matters to the
@@ -311,6 +325,10 @@ pub struct QosController {
     last_event: Instant,
     /// Last upward relaxation of the target (the slow probe).
     last_probe: Instant,
+    /// One-second windows since `last_probe` was last reset in which the
+    /// encoder actually loaded the link (see [`Self::note_output`]). The probe
+    /// needs [`Self::PROBE_LOADED_SECS`] of these, not just elapsed time.
+    loaded_clean_secs: u32,
 }
 
 impl QosController {
@@ -323,6 +341,14 @@ impl QosController {
     /// genuine congestion the reduce path keeps firing and resets this clock,
     /// so it only elapses once the link is truly quiet.
     const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+    /// Loaded seconds the probe needs. Gameplay sits near its target, so a
+    /// game session earns these as fast as the clock above and nothing about
+    /// it changes; a static desktop earns none and holds at the safe target.
+    const PROBE_LOADED_SECS: u32 = 10;
+    /// A second counts as loaded when output reached this share of the applied
+    /// bitrate. Half: well above the static-desktop trickle (≤ ~12% in the
+    /// 2026-10-12 log), well below what real motion produces (60–90%).
+    const LOADED_OUTPUT_PCT: u64 = 50;
 
     fn a_past_instant() -> Instant {
         // checked_sub: Instant is QPC-since-boot on Windows, so plain
@@ -337,7 +363,38 @@ impl QosController {
 
     pub fn new() -> Self {
         let past = Self::a_past_instant();
-        Self { ceiling_seen: 0, known_bad_kbps: None, last_event: past, last_probe: past }
+        Self {
+            ceiling_seen: 0,
+            known_bad_kbps: None,
+            last_event: past,
+            last_probe: past,
+            loaded_clean_secs: 0,
+        }
+    }
+
+    /// Restart the probe's evidence: both its clock and its loaded-second count.
+    fn restart_probe_clock(&mut self) {
+        self.last_probe = Instant::now();
+        self.loaded_clean_secs = 0;
+    }
+
+    /// Feed one second of MEASURED encoder output (the `🎞 Encoder output`
+    /// figure) against the bitrate that was applied. Called from both capture
+    /// loops' 1 Hz telemetry tick. A loss report inside the window resets the
+    /// count through the reduce path, so what accumulates is clean AND loaded.
+    pub fn note_output(&mut self, output_kbps: u32, applied_kbps: u32) {
+        if applied_kbps == 0 {
+            return;
+        }
+        if output_kbps as u64 * 100 >= applied_kbps as u64 * Self::LOADED_OUTPUT_PCT {
+            self.loaded_clean_secs = self.loaded_clean_secs.saturating_add(1);
+        }
+    }
+
+    /// Has the link earned a probe above the parked target?
+    fn probe_is_earned(&self) -> bool {
+        self.last_probe.elapsed() >= Self::PROBE_INTERVAL
+            && self.loaded_clean_secs >= Self::PROBE_LOADED_SECS
     }
 
     /// Forget everything a session learned about the link. Called at each new
@@ -351,6 +408,7 @@ impl QosController {
         self.known_bad_kbps = None;
         self.last_event = Self::a_past_instant();
         self.last_probe = Self::a_past_instant();
+        self.loaded_clean_secs = 0;
     }
 
     /// What recovery is allowed to climb to: 90% of whatever failed, clamped to
@@ -420,7 +478,7 @@ impl QosController {
                 encoder::reconfigure_bitrate(reduced, fps);
                 encoder::set_stream_bitrate_kbps(reduced as i32);
                 self.last_event = Instant::now();
-                self.last_probe = Instant::now();
+                self.restart_probe_clock();
                 println!(
                     "📉 Congestion: bitrate → {} Kbps ({}% of {} ceiling) — \
                      {} Kbps failed, will hold at {} Kbps",
@@ -445,19 +503,20 @@ impl QosController {
                 encoder::reconfigure_bitrate(ramped, fps);
                 encoder::set_stream_bitrate_kbps(ramped as i32);
                 self.last_event = Instant::now();
-                self.last_probe = Instant::now();
+                self.restart_probe_clock();
                 let held = if ramped == target { " — holding here" } else { "" };
                 println!("📈 Congestion: ramped bitrate → {ramped} Kbps (+3%, target {target}){held}");
             }
-        } else if target < ceiling_kbps && self.last_probe.elapsed() >= Self::PROBE_INTERVAL {
-            // Parked at the safe target and clean for a full minute: the link
-            // may have recovered, so lift the target and let the ramp above
-            // walk up to it.
+        } else if target < ceiling_kbps && self.probe_is_earned() {
+            // Parked at the safe target and clean while actually loading the
+            // link: it may have recovered, so lift the target and let the ramp
+            // above walk up to it.
+            let loaded = self.loaded_clean_secs;
             self.relax_target(ceiling_kbps);
-            self.last_probe = Instant::now();
+            self.restart_probe_clock();
             println!(
-                "🔎 Congestion: {}s clean at {} Kbps — probing up to {} Kbps",
-                Self::PROBE_INTERVAL.as_secs(),
+                "🔎 Congestion: {}s clean under load at {} Kbps — probing up to {} Kbps",
+                loaded,
                 cur,
                 self.ramp_target(ceiling_kbps),
             );
@@ -724,6 +783,43 @@ mod tests {
         let mut qos = QosController::new();
         qos.relax_target(ceiling);
         assert_eq!(qos.ramp_target(ceiling), ceiling);
+    }
+
+    /// The live 2026-10-12 cycle: parked at 42.7 Mbps after 47.5 failed, a
+    /// near-static desktop trickling 0.3–5 Mbps must NOT earn a probe back to
+    /// the rate that failed, however long it idles. Real motion must.
+    #[test]
+    fn only_clean_seconds_under_load_earn_a_probe() {
+        let applied = 42_732u32;
+        let mut qos = QosController::new();
+        qos.note_congestion(47_488);
+        qos.last_probe = QosController::a_past_instant(); // the clock alone is satisfied
+
+        // A minute of the static desktop from the log.
+        for output in [292, 2_716, 290, 1_500, 4_253, 313].iter().cycle().take(60) {
+            qos.note_output(*output, applied);
+        }
+        assert!(!qos.probe_is_earned(), "idle time must not count as evidence");
+
+        // Just under half the target is still not load; half is.
+        qos.note_output(applied / 2 - 1, applied);
+        assert_eq!(qos.loaded_clean_secs, 0);
+        for _ in 0..QosController::PROBE_LOADED_SECS {
+            qos.note_output(applied / 2 + 1, applied);
+        }
+        assert!(qos.probe_is_earned(), "clean seconds under load must earn the probe");
+
+        // Any rate change restarts the evidence, and so does a new session.
+        qos.restart_probe_clock();
+        assert_eq!(qos.loaded_clean_secs, 0);
+        assert!(!qos.probe_is_earned());
+        qos.note_output(applied, applied);
+        qos.reset();
+        assert_eq!(qos.loaded_clean_secs, 0);
+
+        // No session yet: a zero applied rate is ignored, not a divide.
+        qos.note_output(5_000, 0);
+        assert_eq!(qos.loaded_clean_secs, 0);
     }
 
     /// A new session must NOT inherit the previous session's link memory — the

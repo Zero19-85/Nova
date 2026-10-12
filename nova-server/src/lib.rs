@@ -3656,11 +3656,17 @@ pub async fn run_worker() -> Result<()> {
                     println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
                 }
                 if client_connected {
+                    let applied_kbps = encoder::get_stream_bitrate_kbps().max(0) as u32;
+                    // Measured output, so the QoS probe only credits seconds
+                    // that actually loaded the link (QosController::note_output).
+                    let output_kbps =
+                        (enc_rate_bytes * 8 / (elapsed.as_millis() as u64).max(1)) as u32;
+                    qos.note_output(output_kbps, applied_kbps);
                     stats::sample(
                         enc_rate_frames,
                         enc_rate_bytes,
                         elapsed.as_millis() as u64,
-                        encoder::get_stream_bitrate_kbps().max(0) as u32,
+                        applied_kbps,
                     );
                 }
                 enc_rate_bytes = 0;
@@ -5261,11 +5267,17 @@ pub async fn run() -> Result<()> {
                     println!("🎞  Encoder output: {} Kbps", (enc_rate_bytes * 8) / 1000);
                 }
                 if client_connected {
+                    let applied_kbps = encoder::get_stream_bitrate_kbps().max(0) as u32;
+                    // Measured output, so the QoS probe only credits seconds
+                    // that actually loaded the link (QosController::note_output).
+                    let output_kbps =
+                        (enc_rate_bytes * 8 / (elapsed.as_millis() as u64).max(1)) as u32;
+                    qos.note_output(output_kbps, applied_kbps);
                     stats::sample(
                         enc_rate_frames,
                         enc_rate_bytes,
                         elapsed.as_millis() as u64,
-                        encoder::get_stream_bitrate_kbps().max(0) as u32,
+                        applied_kbps,
                     );
                 }
                 enc_rate_bytes = 0;
