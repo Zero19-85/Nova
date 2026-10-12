@@ -658,6 +658,7 @@ impl MediaPlane for WorkerMediaPlane {
             packet_size: params.packet_size,
             min_fec_packets: params.min_fec_packets,
             start_frame_index: 1,
+            echo_session: true,
         }));
         Ok(())
     }

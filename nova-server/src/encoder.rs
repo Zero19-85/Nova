@@ -52,6 +52,7 @@ extern "C" {
     /// InitEncoder.  BT.2020 primaries are always the standard constants.
     fn SetHdrMetadata(max_luminance_nits: u32, max_cll_nits: u32, max_fall_nits: u32);
     fn SetDeepDpbAuthorized(authorized: i32);
+    fn SetIntraRefreshAllowed(allowed: i32);
 
     /// Set the SDR white level (scRGB units, i.e. nits / 80) the SDR↔HDR
     /// conversion shaders use. See `set_sdr_white_level`.
@@ -282,6 +283,14 @@ fn reopen_shim_log() {
 /// operator assertion rather than something negotiated.
 pub fn set_deep_dpb_authorized(authorized: bool) {
     unsafe { SetDeepDpbAuthorized(authorized as i32) }
+}
+
+/// Permit the intra-refresh sweep on a shallow-DPB session. Echo sessions
+/// only: a Moonlight client requests an IDR for every loss it sees, so the
+/// sweep buys it nothing and costs a visible line crossing the picture. Read
+/// at every `InitEncoder`, so call it before the session's first re-init.
+pub fn set_intra_refresh_allowed(allowed: bool) {
+    unsafe { SetIntraRefreshAllowed(allowed as i32) }
 }
 
 pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nits: u16) {

@@ -164,6 +164,11 @@ pub struct ConfigureStart {
     /// sits at frame N blacked the stream out permanently. Master
     /// (`control_supervisor`) stamps this on every ConfigureStart it sends.
     pub start_frame_index: u32,
+    /// The session is Echo's, not a GameStream (Moonlight) client's. Decides
+    /// whether a shallow-DPB session gets the intra-refresh sweep: Echo can
+    /// carry decode damage it never reports, Moonlight asks for a keyframe on
+    /// every loss it sees — see `encoder::set_intra_refresh_allowed`.
+    pub echo_session: bool,
 }
 
 /// Worker -> Master: the ACTUAL params the encoder ended up running, once
@@ -464,6 +469,7 @@ impl ConfigureStart {
         write_u32(out, self.packet_size);
         write_u32(out, self.min_fec_packets);
         write_u32(out, self.start_frame_index);
+        out.push(self.echo_session as u8);
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Self> {
@@ -493,10 +499,13 @@ impl ConfigureStart {
         let packet_size = read_u32(bytes, at)?;
         let min_fec_packets = read_u32(bytes, at)?;
         let start_frame_index = read_u32(bytes, at)?;
+        let echo_session = *bytes.get(*at).ok_or_else(|| invalid_data("truncated ConfigureStart"))? != 0;
+        *at += 1;
         Ok(ConfigureStart {
             width, height, fps, codec, hdr_confirmed, bitrate_kbps, app_id, launch_app,
             device_name, rikey, rikeyid, host_audio, audio_encryption,
             audio_packet_duration_ms, packet_size, min_fec_packets, start_frame_index,
+            echo_session,
         })
     }
 }
@@ -1053,6 +1062,25 @@ mod tests {
         ] {
             let decoded = ControlMsg::decode(&msg.encode()).expect("decode");
             assert_eq!(decoded, msg);
+        }
+    }
+
+    /// `echo_session` decides whether a 4K session gets the intra-refresh
+    /// sweep, so losing it on the pipe would quietly paint the sweep's line on
+    /// every Moonlight session. Both values must survive, and every other field
+    /// with them.
+    #[test]
+    fn configure_start_round_trips_both_client_kinds() {
+        for echo_session in [false, true] {
+            let cs = ConfigureStart {
+                width: 3840, height: 2160, fps: 120, codec: WireCodec::Hevc,
+                hdr_confirmed: true, bitrate_kbps: 47_488, app_id: 5, launch_app: true,
+                device_name: "X".to_string(), rikey: [7; 16], rikeyid: 42,
+                host_audio: false, audio_encryption: true, audio_packet_duration_ms: 5,
+                packet_size: 1392, min_fec_packets: 2, start_frame_index: 1, echo_session,
+            };
+            let msg = ControlMsg::ConfigureStart(cs);
+            assert_eq!(ControlMsg::decode(&msg.encode()).unwrap(), msg);
         }
     }
 

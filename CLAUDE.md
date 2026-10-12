@@ -104,6 +104,27 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
+## 2026-10-12: **KEYFRAME STORMS + THE SWEEP LINE** (branch `fix/moonlight-keyframe-storm`, built + tested, NOT yet deployed)
+
+Diagnosed from a 3.5 h Moonlight/Xbox 4K120 HEVC/HDR10 session. Two faults, one fix each:
+
+- **Keyframe storm.** ~8 min after the pad went idle the client asked for an
+  IDR on *every frame* (120/s) for ~1.5 h — 245,089 IDRs vs 170 P-frames.
+  moonlight-xbox returns `DR_NEED_IDR` whenever FFmpeg rejects a packet, so a
+  wedged decoder (console/TV idling its display) turns each keyframe into the
+  next request. Every request was also charged as congestion → the bitrate
+  walked to the **1 Mbps floor**, and the per-request log lines rotated the
+  16 MB Master log every ~11 min, erasing how the storm began. Fix
+  (`control.rs` `idr_storm_gate` / `tick_idr_storm`): ≥10 mid-stream requests
+  in 1 s = storm → keyframes throttled to 4/s (deferred, never dropped), at
+  most 3 bitrate cuts per storm, one log line at start / every 30 s / at end.
+  Warmup and single repairs are untouched.
+- **The line travelling down the picture** was the intra-refresh sweep, ON for
+  every shallow-DPB (4K) session since 2026-09-21. That decision came from an
+  *Echo* artefact; Moonlight requests an IDR on every loss and the repair
+  retry covers a lost one. `ConfigureStart.echo_session` (new IPC byte) →
+  `SetIntraRefreshAllowed` → sweep only for Echo. `[IR]` logs the reason.
+
 ## Current Phase (2026-10-07, evening): **AUDIO TO THE TV, SDR DASHBOARD, ONE REPAIR PER STALL**
 
 **All live-confirmed the same evening** — host deployed, Xbox and Android

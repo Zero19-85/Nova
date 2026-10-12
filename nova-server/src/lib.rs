@@ -446,6 +446,7 @@ fn negotiated_to_configure_start(n: &session_negotiate::NegotiatedParams) -> ipc
         // last-sent index + 1) on every ConfigureStart it puts on the pipe,
         // including this initial one. See ipc::ConfigureStart::start_frame_index.
         start_frame_index: 1,
+        echo_session: false, // negotiated over RTSP: a GameStream client
     }
 }
 
@@ -982,6 +983,8 @@ async fn session_watcher(
         // placed at the top of the poll so a frozen client is served before
         // anything below can return early. See `control::tick_idr_repair_retry`.
         control::tick_idr_repair_retry(&client_info, &repair_link);
+        // Serve a keyframe a storm deferred, and close a storm gone quiet.
+        control::tick_idr_storm(&client_info, &repair_link);
 
         // ── Encode suspension (gated OFF — see ENCODE_SUPPRESSION_ENABLED) ──
         //
@@ -1911,6 +1914,8 @@ fn apply_configure_start(
     enc: &mut Encoder,
     cfg: &config::NovaConfig,
 ) -> std::result::Result<ipc::WorkerConfigured, String> {
+    // Before anything below can re-init the encoder: InitEncoder reads it.
+    encoder::set_intra_refresh_allowed(cs.echo_session);
     let codec = match cs.codec {
         ipc::WireCodec::H264 => encoder::Codec::H264,
         ipc::WireCodec::Hevc => encoder::Codec::Hevc,

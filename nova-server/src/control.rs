@@ -241,6 +241,225 @@ fn signal_congestion(worker_link: &Option<WorkerLink>) {
     }
 }
 
+/// Ask whoever owns the encoder for a keyframe on the next frame.
+fn send_idr(worker_link: &Option<WorkerLink>) {
+    match worker_link {
+        Some(link) => link.send(ControlMsg::RequestIdr),
+        None => crate::encoder::request_idr_global(),
+    }
+}
+
+// ─── Keyframe storms ─────────────────────────────────────────────────────────
+//
+// **The failure this exists to stop** (live 2026-10-12, Moonlight/Xbox at
+// 4K120 HEVC/HDR10): ~65 minutes into a session, minutes after the player put
+// the pad down, the client began requesting an IDR on EVERY frame — 120 a
+// second — and kept it up for about an hour and a half. 245,089 IDRs against
+// 170 P-frames in the Worker log. Every one of those requests was also charged
+// as congestion, so the 2 s reduce cooldown walked the bitrate down 20% at a
+// time to the 1 Mbps floor, and the player came back to a picture that took
+// minutes to climb back. The per-request log lines filled the 16 MB Master log
+// every ~11 minutes, rotating away the record of how the storm began.
+//
+// It was not the link. moonlight-xbox returns DR_NEED_IDR whenever FFmpeg
+// rejects a packet (FFmpegDecoder.cpp SubmitDecodeUnit), so a decoder that has
+// wedged — the console or TV idling its display is the usual trigger — turns
+// every keyframe it is sent into the next request. Keyframes cannot fix it and
+// cutting the bitrate cannot fix it; it ended by itself when the player
+// returned.
+//
+// A storm can ALSO be a link losing nearly everything, where cutting IS the
+// answer. So the first `STORM_MAX_CUTS` cuts still happen, spaced past qos's
+// own 2 s reduce cooldown so each one counts — a link that was the problem
+// recovers on those. A storm that outlives them is not the link, and the
+// bitrate holds there instead of sliding to the floor.
+//
+// Keyframes are throttled to one per `STORM_IDR_INTERVAL` — deferred, never
+// dropped: a request that lands inside the interval is served by
+// `tick_idr_storm` when it elapses, so the client is never left waiting on a
+// keyframe nobody will send. Only mid-stream requests count toward a storm;
+// the warmup burst at the start of a session is left exactly as it was.
+
+/// Requests within one second that make a storm. A genuine repair is 1–3.
+const STORM_ENTER_PER_SEC: u32 = 10;
+/// At most four keyframes a second while a storm lasts.
+const STORM_IDR_INTERVAL: Duration = Duration::from_millis(250);
+/// A storm is over after this long without a request.
+const STORM_QUIET: Duration = Duration::from_secs(2);
+/// Bitrate cuts a storm may cause. 3 × 20% leaves ~51% of the ceiling.
+const STORM_MAX_CUTS: u32 = 3;
+/// Spacing between storm cuts — past qos's 2 s REDUCE_COOLDOWN, inside
+/// which a signal is swallowed and would be counted without having cut.
+const STORM_CUT_INTERVAL: Duration = Duration::from_millis(2500);
+/// How often a long storm says it is still going.
+const STORM_HEARTBEAT: Duration = Duration::from_secs(30);
+
+struct IdrStorm {
+    generation: u64,
+    /// Start of the one-second counting window, and the requests in it.
+    window_start: Instant,
+    window_count: u32,
+    /// `Some(start)` while a storm is in progress.
+    active_since: Option<Instant>,
+    requests: u64,
+    keyframes: u64,
+    cuts: u32,
+    last_cut: Option<Instant>,
+    last_request: Instant,
+    last_forwarded: Option<Instant>,
+    last_heartbeat: Instant,
+    /// A request arrived inside `STORM_IDR_INTERVAL` and is still owed a keyframe.
+    deferred: bool,
+}
+
+static IDR_STORM: Mutex<Option<IdrStorm>> = Mutex::new(None);
+
+/// What to do with one client IDR request.
+#[derive(Debug, PartialEq, Eq)]
+struct IdrGate {
+    forward: bool,
+    congestion: bool,
+    arm_retry: bool,
+    log: bool,
+}
+
+/// Classify one client IDR request. `mid_stream` is
+/// [`idr_request_is_congestion`]'s verdict. `can_defer` is false in the
+/// monolithic deployment, which has no `tick_idr_storm` to serve a deferred
+/// request — there every request is forwarded, and only the cuts are capped.
+fn idr_storm_gate(generation: u64, mid_stream: bool, can_defer: bool) -> IdrGate {
+    idr_storm_gate_at(generation, mid_stream, can_defer, Instant::now())
+}
+
+fn idr_storm_gate_at(generation: u64, mid_stream: bool, can_defer: bool, now: Instant) -> IdrGate {
+    let normal = IdrGate { forward: true, congestion: mid_stream, arm_retry: mid_stream, log: true };
+    let Ok(mut slot) = IDR_STORM.lock() else {
+        return normal; // poisoned — fall back to the unthrottled behaviour
+    };
+    if slot.as_ref().map(|s| s.generation) != Some(generation) {
+        *slot = Some(IdrStorm {
+            generation,
+            window_start: now,
+            window_count: 0,
+            active_since: None,
+            requests: 0,
+            keyframes: 0,
+            cuts: 0,
+            last_cut: None,
+            last_request: now,
+            last_forwarded: None,
+            last_heartbeat: now,
+            deferred: false,
+        });
+    }
+    let s = slot.as_mut().expect("just filled");
+    s.last_request = now;
+
+    if !mid_stream {
+        // Warmup or pre-PLAY: never part of a storm, always served at once.
+        s.last_forwarded = Some(now);
+        return IdrGate { forward: true, congestion: false, arm_retry: false, log: true };
+    }
+
+    if now.duration_since(s.window_start) >= Duration::from_secs(1) {
+        s.window_start = now;
+        s.window_count = 0;
+    }
+    s.window_count += 1;
+
+    if s.active_since.is_none() {
+        if s.window_count < STORM_ENTER_PER_SEC {
+            s.last_forwarded = Some(now);
+            if normal.congestion {
+                s.last_cut = Some(now);
+            }
+            return normal;
+        }
+        s.active_since = Some(now);
+        s.requests = 0;
+        s.keyframes = 0;
+        s.cuts = 0;
+        s.last_heartbeat = now;
+        println!(
+            "⚠️  Control: keyframe storm — the client has asked for {} keyframes in the last second. \
+             A client whose decoder keeps rejecting what it is sent (moonlight-xbox does this when the \
+             console or TV idles its display) asks on every frame. Serving at most one keyframe per {} ms \
+             and at most {} bitrate cuts until it stops; per-request logging paused.",
+            s.window_count,
+            STORM_IDR_INTERVAL.as_millis(),
+            STORM_MAX_CUTS,
+        );
+    }
+
+    s.requests += 1;
+    let forward = !can_defer
+        || s.last_forwarded.map_or(true, |t| now.duration_since(t) >= STORM_IDR_INTERVAL);
+    if forward {
+        s.last_forwarded = Some(now);
+        s.keyframes += 1;
+        s.deferred = false;
+    } else {
+        s.deferred = true;
+    }
+    let congestion = s.cuts < STORM_MAX_CUTS
+        && s.last_cut.map_or(true, |t| now.duration_since(t) >= STORM_CUT_INTERVAL);
+    if congestion {
+        s.cuts += 1;
+        s.last_cut = Some(now);
+    }
+    // No repair retry inside a storm: the client is still asking on its own.
+    IdrGate { forward, congestion, arm_retry: false, log: false }
+}
+
+/// Serve a deferred storm keyframe, report a long storm, and close one that
+/// has gone quiet. Called from the Master's `session_watcher` 50 ms poll,
+/// beside [`tick_idr_repair_retry`].
+pub fn tick_idr_storm(
+    client_info: &Arc<Mutex<Option<ClientInfo>>>,
+    worker_link: &Option<WorkerLink>,
+) {
+    let (generation, streaming) = client_info
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|i| (i.session_generation, i.streaming_active)))
+        .unwrap_or((0, false));
+    let Ok(mut slot) = IDR_STORM.lock() else { return };
+    let Some(s) = slot.as_mut() else { return };
+    if !streaming || s.generation != generation {
+        *slot = None; // the session that stormed is over
+        return;
+    }
+    let now = Instant::now();
+    if s.deferred && s.last_forwarded.map_or(true, |t| now.duration_since(t) >= STORM_IDR_INTERVAL) {
+        s.deferred = false;
+        s.last_forwarded = Some(now);
+        s.keyframes += 1;
+        send_idr(worker_link);
+    }
+    let Some(since) = s.active_since else { return };
+    if now.duration_since(s.last_request) >= STORM_QUIET {
+        println!(
+            "✅ Control: keyframe storm over after {:.0}s — {} requests answered with {} keyframes, \
+             {} bitrate cut(s)",
+            since.elapsed().as_secs_f64(),
+            s.requests,
+            s.keyframes,
+            s.cuts,
+        );
+        s.active_since = None;
+        s.window_count = 0;
+    } else if now.duration_since(s.last_heartbeat) >= STORM_HEARTBEAT {
+        s.last_heartbeat = now;
+        println!(
+            "⚠️  Control: keyframe storm continues ({:.0}s, {} requests, {} keyframes, {} cut(s))",
+            since.elapsed().as_secs_f64(),
+            s.requests,
+            s.keyframes,
+            s.cuts,
+        );
+    }
+}
+
 /// `(session_generation, first IDR request of that session)` — see
 /// [`idr_request_is_congestion`].
 static IDR_SIGNAL_STATE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
@@ -516,17 +735,26 @@ fn handle_control_message(
             }
         }
         PT_REQUEST_IDR_FRAME => {
-            println!("🎮 Control: client requested IDR frame");
-            match worker_link {
-                Some(link) => link.send(ControlMsg::RequestIdr),
-                None => crate::encoder::request_idr_global(),
-            }
             // A repair request means unrecoverable loss — throttle too. See
             // idr_request_is_congestion for why this is load-bearing and why
             // the session's first request doesn't count.
-            if idr_request_is_congestion(client_info) {
+            let mid_stream = idr_request_is_congestion(client_info);
+            let gate = idr_storm_gate(
+                current_session_generation(client_info),
+                mid_stream,
+                worker_link.is_some(),
+            );
+            if gate.log {
+                println!("🎮 Control: client requested IDR frame");
+            }
+            if gate.forward {
+                send_idr(worker_link);
+            }
+            if gate.congestion {
                 println!("🎮 Control: IDR repair request mid-stream — signalling bitrate reduction");
                 signal_congestion(worker_link);
+            }
+            if gate.arm_retry {
                 arm_idr_repair_retry(client_info);
             }
         }
@@ -940,5 +1168,88 @@ mod tests {
         tick_idr_repair_retry(&client, &link);
         assert!(rx.try_recv().is_err(), "repair fired at a stopped stream");
         assert!(IDR_REPAIR_RETRY.lock().unwrap().is_none());
+    }
+
+    /// Feed `secs` seconds of requests at `per_sec` through the gate and tally
+    /// what it decided. Synthetic clock, so no test waits in real time.
+    fn storm_tally(generation: u64, per_sec: u32, secs: u32, can_defer: bool) -> (u32, u32, Vec<IdrGate>) {
+        let t0 = Instant::now();
+        let step = Duration::from_secs(1) / per_sec;
+        let (mut forwarded, mut cuts, mut gates) = (0, 0, Vec::new());
+        for i in 0..per_sec * secs {
+            let g = idr_storm_gate_at(generation, true, can_defer, t0 + step * i);
+            forwarded += g.forward as u32;
+            cuts += g.congestion as u32;
+            gates.push(g);
+        }
+        (forwarded, cuts, gates)
+    }
+
+    /// An ordinary mid-stream repair — one request — is untouched by the storm
+    /// gate: served, charged as congestion, insured by the repair retry.
+    #[test]
+    fn a_single_repair_request_is_handled_exactly_as_before() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let g = idr_storm_gate_at(21, true, true, Instant::now());
+        assert_eq!(g, IdrGate { forward: true, congestion: true, arm_retry: true, log: true });
+    }
+
+    /// The 2026-10-12 storm: 120 requests a second for a minute. Keyframes
+    /// must be throttled to ~4/s and the bitrate cut at most STORM_MAX_CUTS
+    /// times after the storm is recognised — not walked to the floor.
+    #[test]
+    fn a_keyframe_storm_is_throttled_and_cannot_walk_the_bitrate_to_the_floor() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (forwarded, cuts, gates) = storm_tally(22, 120, 60, true);
+        let pre_storm = STORM_ENTER_PER_SEC - 1;
+        // Pre-storm requests are served normally; after that ~4/s.
+        assert!(forwarded <= pre_storm + 4 * 60 + 1, "{forwarded} keyframes in a minute");
+        assert!(forwarded >= 4 * 60 - 4, "storm starved the client: {forwarded} keyframes");
+        assert!(cuts <= pre_storm + STORM_MAX_CUTS, "{cuts} bitrate cuts");
+        assert!(gates.iter().skip(pre_storm as usize).all(|g| !g.arm_retry && !g.log));
+    }
+
+    /// The monolithic deployment has no tick to serve a deferred keyframe, so
+    /// it must forward every request — only the cuts are capped there.
+    #[test]
+    fn without_a_tick_every_storm_request_is_still_served() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (forwarded, cuts, _) = storm_tally(23, 120, 10, false);
+        assert_eq!(forwarded, 1200);
+        assert!(cuts <= STORM_ENTER_PER_SEC - 1 + STORM_MAX_CUTS);
+    }
+
+    /// The warmup burst is never a storm, however dense: every request is
+    /// served at once and none is charged as congestion.
+    #[test]
+    fn the_warmup_burst_is_never_a_storm() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let t0 = Instant::now();
+        for i in 0..40u32 {
+            let g = idr_storm_gate_at(24, false, true, t0 + Duration::from_millis(5) * i);
+            assert!(g.forward && !g.congestion && !g.arm_retry);
+        }
+        assert!(IDR_STORM.lock().unwrap().as_ref().unwrap().active_since.is_none());
+    }
+
+    /// A request deferred inside the throttle interval is served by the tick
+    /// once the interval passes — a storm that ends on a deferred request must
+    /// not leave the client waiting on a keyframe nobody sends.
+    #[test]
+    fn a_deferred_storm_keyframe_is_served_by_the_tick() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (link, mut rx) = WorkerLink::new();
+        let link = Some(link);
+        let client = streaming_client(25);
+        // Enter the storm, ending on a deferred request.
+        let t0 = Instant::now() - Duration::from_secs(1);
+        for i in 0..STORM_ENTER_PER_SEC + 1 {
+            idr_storm_gate_at(25, true, true, t0 + Duration::from_millis(1) * i);
+        }
+        assert!(IDR_STORM.lock().unwrap().as_ref().unwrap().deferred);
+        // A second has passed in real time relative to t0: the tick serves it.
+        tick_idr_storm(&client, &link);
+        assert!(matches!(rx.try_recv(), Ok(ControlMsg::RequestIdr)));
+        assert!(!IDR_STORM.lock().unwrap().as_ref().unwrap().deferred);
     }
 }

@@ -370,6 +370,17 @@ static const uint32_t kShallowDpbForIntraRefresh = 8;
 // InitEncoder; read by the three codec config blocks and the [IR] log line.
 static bool g_intraRefreshActive = false;
 
+// 2026-10-12: the sweep is an Echo-only safety net. The 2026-09-21 artefact
+// was an Echo session, whose client could hold damage it never reported.
+// Moonlight cannot: moonlight-common-c requests an IDR for every frame it
+// fails to reassemble or decode, and the Master re-sends an unconfirmed
+// repair keyframe (control.rs IDR_REPAIR_RETRY_DELAYS) -- the configuration
+// that ran 4K Moonlight before the sweep came back. What the sweep DID do to
+// a 4K120 Moonlight/Xbox session was paint a visible line travelling down the
+// picture every ~2.5 s. Default false (GameStream-safe, and all the monolithic
+// run() ever serves); the Worker sets it per session from ConfigureStart.
+static bool g_intraRefreshAllowed = false;
+
 // How many frames' worth of bits the CBR rate controller may hold in its VBV.
 //
 // This was 1 -- the tightest possible setting, chosen for latency: a frame can
@@ -1639,7 +1650,8 @@ extern "C" __declspec(dllexport) int InitEncoder(
     // expensive frame in the stream and one this client rarely asks for. Give
     // those sessions the rolling sweep back as a passive floor. See the
     // kIntraRefreshPeriod block for the measurement that brought it back.
-    g_intraRefreshActive = (g_refFramesInDpb <= kShallowDpbForIntraRefresh);
+    g_intraRefreshActive = g_intraRefreshAllowed
+                        && (g_refFramesInDpb <= kShallowDpbForIntraRefresh);
 
     ShimLog("🔧 Initializing NVENC (%s%s @ %dx%d, %d Kbps, %d fps)...\n",
            codec, is_hdr ? "/HDR10" : "", width, height, bitrate_kbps, fps);
@@ -1945,15 +1957,17 @@ extern "C" __declspec(dllexport) int InitEncoder(
         // assuming. The capability is reported per codec GUID.
         const bool irSupported = g_nvEncoder->GetCapabilityValue(
                                      codecGuid, NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0;
+        const bool shallowDpb = g_refFramesInDpb <= kShallowDpbForIntraRefresh;
         ShimLog("[IR] Intra refresh for %s: cap=%s, requested=%s (period=%u, sweep=%u frames) "
                 "- DPB %u is the %s tier, so the rolling sweep is %s\n",
                codec, irSupported ? "YES" : "no",
                g_intraRefreshActive ? "ON" : "OFF",
                kIntraRefreshPeriod, kIntraRefreshCnt,
                g_refFramesInDpb,
-               g_intraRefreshActive ? "shallow" : "deep",
+               shallowDpb ? "shallow" : "deep",
                g_intraRefreshActive ? "the repair path of last resort"
-                                    : "not needed (RFI repairs with a P-frame)");
+               : shallowDpb ? "off for this GameStream client (it requests an IDR on every loss)"
+                            : "not needed (RFI repairs with a P-frame)");
         if (g_intraRefreshActive && !irSupported) {
             ShimLog("[IR] WARNING: intra refresh requested but UNSUPPORTED for %s on this GPU "
                     "- this codec has no repair path for lost packets.\n", codec);
@@ -2695,6 +2709,10 @@ extern "C" __declspec(dllexport) uint32_t TakeRepairIdrFallbacks() {
 // input and the tier logic below does not change at all.
 extern "C" __declspec(dllexport) void SetDeepDpbAuthorized(int authorized) {
     g_deepDpbAuthorized = (authorized != 0);
+}
+
+extern "C" __declspec(dllexport) void SetIntraRefreshAllowed(int allowed) {
+    g_intraRefreshAllowed = (allowed != 0);
 }
 
 extern "C" __declspec(dllexport) int RfiSupported() {
