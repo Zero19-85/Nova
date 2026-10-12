@@ -85,6 +85,8 @@ mod tag {
     pub const LTR_ACK: u8 = 23;
     /// Worker -> Master: a game changed a virtual pad's motor speeds.
     pub const RUMBLE: u8 = 24;
+    /// Master -> Worker: a keyframe storm began / ended (control.rs).
+    pub const KEYFRAME_STORM: u8 = 25;
     pub const VIDEO_FRAME: u8 = 10;
     pub const AUDIO_FRAME: u8 = 11;
 }
@@ -315,6 +317,11 @@ pub enum ControlMsg {
     /// source (`input::PadSlot::listen_for_rumble`). Speeds are GameStream's
     /// full `u16` range: `low` = large/left motor, `high` = small/right.
     Rumble { pad: u8, low: u16, high: u16 },
+    /// Master -> Worker: the client began (`true`) or stopped (`false`)
+    /// requesting a keyframe on every frame. Bracketing the storm lets QoS
+    /// restore the bitrate the storm's cuts took, in one step, when it ends —
+    /// see `QosController::tick`.
+    KeyframeStorm { active: bool },
     /// Worker -> Master: PIN + device name entered on the Worker's tray
     /// dialog, forwarded into Master-side pairing's `global_pin` slot (the
     /// same handshake point the monolithic host's tray uses in-process).
@@ -576,6 +583,7 @@ impl ControlMsg {
                 out.extend_from_slice(&high.to_le_bytes());
                 out
             }
+            ControlMsg::KeyframeStorm { active } => vec![tag::KEYFRAME_STORM, *active as u8],
             ControlMsg::PinRelay { pin, device } => {
                 let mut out = vec![tag::PIN_RELAY];
                 write_string(&mut out, pin);
@@ -655,6 +663,9 @@ impl ControlMsg {
                     high: u16::from_le_bytes([b[3], b[4]]),
                 })
             }
+            tag::KEYFRAME_STORM => Ok(ControlMsg::KeyframeStorm {
+                active: *rest.first().ok_or_else(|| invalid_data("truncated KeyframeStorm"))? != 0,
+            }),
             tag::PIN_RELAY => {
                 let at = &mut 0usize;
                 let pin = read_string(rest, at)?;
@@ -1014,6 +1025,10 @@ mod tests {
             // transposition would decode cleanly and swap the motors.
             ControlMsg::Rumble { pad: 3, low: 0xFFFF, high: 0x0101 },
             ControlMsg::Rumble { pad: 0, low: 0, high: 0 },
+            // Both edges of a storm: a lost `false` would leave QoS waiting
+            // to restore a bitrate forever.
+            ControlMsg::KeyframeStorm { active: true },
+            ControlMsg::KeyframeStorm { active: false },
             // Echo display command (echo_rpc.rs). The variable-length id sits
             // before four fixed fields, so a framing slip here would decode as
             // a plausible-but-wrong mode — worth pinning.

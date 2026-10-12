@@ -11,6 +11,7 @@
 #   .\deploy.ps1 -SkipBuild     # deploy whatever is already in target\release
 #   .\deploy.ps1 -Watch         # ...then follow nova.log for the new markers
 #   .\deploy.ps1 -Rollback      # restore the most recent backup and restart
+#   .\deploy.ps1 -KeepBackups 5 # keep more (or fewer) backup pairs; default 3
 #
 # Nova is three processes from one binary (Master service / Worker / input
 # helper). Stopping the service brings all of them down; the script waits for
@@ -20,7 +21,9 @@
 param(
     [switch]$SkipBuild,
     [switch]$Watch,
-    [switch]$Rollback
+    [switch]$Rollback,
+    [ValidateRange(1, 50)]
+    [int]$KeepBackups = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,6 +40,17 @@ function Write-Step($msg)  { Write-Host "  $msg" }
 function Write-Ok($msg)    { Write-Host "  [OK] $msg"   -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 function Write-Bad($msg)   { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
+
+# Backup stamps (yyyyMMdd-HHmmss), newest first. Ordered by the stamp in the
+# NAME, never LastWriteTime: Copy-Item preserves the source's timestamp, so a
+# backup's LastWriteTime is when that binary was BUILT, not when it was saved.
+function Get-BackupStamps {
+    @(Get-ChildItem -Path $InstallDir -File |
+        ForEach-Object {
+            if ($_.Name -match '^(nova-server\.exe|nova_shim\.dll)\.hotpatch-(\d{8}-\d{6})$') { $Matches[2] }
+        } |
+        Sort-Object -Unique -Descending)
+}
 
 Write-Host ""
 Write-Host "=== Nova hot-patch deploy ===" -ForegroundColor Cyan
@@ -98,22 +112,21 @@ function Stop-Nova {
 
 # -- Rollback ----------------------------------------------------------------
 if ($Rollback) {
-    $backups = @(Get-ChildItem -Path $InstallDir -Filter "nova-server.exe.hotpatch-*" |
-                 Sort-Object LastWriteTime -Descending)
-    if ($backups.Count -eq 0) {
+    $stamps = Get-BackupStamps
+    if ($stamps.Count -eq 0) {
         Write-Bad "No hot-patch backup found in $InstallDir"
         exit 1
     }
-    $b      = $backups[0]
-    $bStamp = $b.Name -replace "^nova-server\.exe\.hotpatch-", ""
+    $bStamp = $stamps[0]
+    $bExe   = Join-Path $InstallDir "nova-server.exe.hotpatch-$bStamp"
     $bDll   = Join-Path $InstallDir "nova_shim.dll.hotpatch-$bStamp"
-    Write-Step "Rolling back to $($b.Name)"
-    if (-not (Test-Path $bDll)) {
-        Write-Bad "Matching DLL backup missing: $bDll - refusing a half rollback"
+    Write-Step "Rolling back to the backup taken $bStamp"
+    if (-not ((Test-Path $bExe) -and (Test-Path $bDll))) {
+        Write-Bad "Backup $bStamp is not a complete exe + dll pair - refusing a half rollback"
         exit 1
     }
     Stop-Nova
-    Copy-Item $b.FullName $DstExe -Force
+    Copy-Item $bExe       $DstExe -Force
     Copy-Item $bDll       $DstDll -Force
     Write-Ok "Restored exe + dll from $bStamp"
     Start-Service -Name $ServiceName
@@ -183,6 +196,24 @@ if (-not ($okExe -and $okDll)) {
 }
 Write-Ok "Copied and hash-verified (exe + dll)"
 
+# -- Prune old backups -------------------------------------------------------
+# Only now, with the new pair verified: a deploy that fails above keeps every
+# fallback it had. Pruned by stamp, so an exe and its dll always go together.
+$stamps = Get-BackupStamps
+if ($stamps.Count -gt $KeepBackups) {
+    $doomed = $stamps[$KeepBackups..($stamps.Count - 1)]
+    foreach ($s in $doomed) {
+        foreach ($n in @("nova-server.exe.hotpatch-$s", "nova_shim.dll.hotpatch-$s")) {
+            $p = Join-Path $InstallDir $n
+            if (Test-Path $p) {
+                try { Remove-Item $p -Force -ErrorAction Stop }
+                catch { Write-Warn2 "Could not remove old backup $n : $($_.Exception.Message)" }
+            }
+        }
+    }
+    Write-Ok "Pruned $($doomed.Count) old backup pair(s); kept the newest $KeepBackups"
+}
+
 # -- Start -------------------------------------------------------------------
 Start-Service -Name $ServiceName
 try {
@@ -197,25 +228,22 @@ $logPath = Join-Path $InstallDir "nova.log"
 
 Write-Host ""
 Write-Host "=== Deployed. What to look for ===" -ForegroundColor Cyan
-Write-Host "  These markers are written when an ENCODER is created, which happens on"
-Write-Host "  the next stream start - not at service start. Start an AV1 stream, then:"
+$svcLogPath = Join-Path $InstallDir "nova-service.log"
+Write-Host "  [IR] is written when an ENCODER is created - on the next stream start,"
+Write-Host "  not at service start. Start a 4K Moonlight stream, then:"
 Write-Host ""
-Write-Host "    Select-String -Path '$logPath' -Pattern '\[IR\]|\[AV1\]|\[X\]'"
+Write-Host "    Select-String -Path '$logPath' -Pattern '\[IR\]'"
 Write-Host ""
-Write-Host "  Expect, once per session:"
-Write-Host "    [IR]  Intra refresh for av1: cap=YES, requested=ON (period=300, sweep=299)"
-Write-Host "    [AV1] tiles: numTileColumns=.. numTileRows=.. customTileConfig=0 at WxH"
+Write-Host "  Expect, for Moonlight (an Echo 4K session still says requested=ON):"
+Write-Host "    [IR] ... requested=OFF ... off for this GameStream client"
 Write-Host ""
-Write-Host "  Watch for, and hope never to see:"
-Write-Host "    [IR]  WARNING: intra refresh requested but UNSUPPORTED for av1"
-Write-Host "    [X]   EncodeFrame TRUNCATED frame N ..."
-Write-Host ""
-Write-Host "  And the loss half of the diagnosis, in the same log:"
-Write-Host "    Select-String -Path '$logPath' -Pattern 'socket buffer full'"
+Write-Host "  Keyframe storms (Master log) and the restore that follows (Worker log):"
+Write-Host "    Select-String -Path '$svcLogPath' -Pattern 'keyframe storm'"
+Write-Host "    Select-String -Path '$logPath' -Pattern 'bitrate restored'"
 
 if ($Watch) {
     Write-Host ""
     Write-Host "Following nova.log (Ctrl+C to stop)..." -ForegroundColor Cyan
     Get-Content $logPath -Tail 0 -Wait |
-        Select-String -Pattern '\[IR\]|\[AV1\]|\[X\]|NVENC READY|socket buffer full|requested a keyframe'
+        Select-String -Pattern '\[IR\]|\[AV1\]|\[X\]|NVENC READY|socket buffer full|requested a keyframe|bitrate restored'
 }

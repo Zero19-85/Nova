@@ -42,6 +42,26 @@ pub fn take_congestion_bitrate() -> Option<u32> {
     if v >= 0 { Some(v as u32) } else { None }
 }
 
+// KEYFRAME_STORM_EVENT: the latest storm edge the Master reported (1 = began,
+// 0 = ended, -1 = none pending). Latest wins: a storm that began and ended
+// between two QoS ticks reads as "ended", which QoS ignores without a
+// snapshot — nothing was cut that it would need to give back.
+static KEYFRAME_STORM_EVENT: AtomicI32 = AtomicI32::new(-1);
+
+/// The Master's control thread (via `ControlMsg::KeyframeStorm`, or directly
+/// in the monolithic deployment) reports a storm edge.
+pub fn note_keyframe_storm(active: bool) {
+    KEYFRAME_STORM_EVENT.store(active as i32, Ordering::Relaxed);
+}
+
+/// QoS claims the pending storm edge, if any.
+pub fn take_keyframe_storm_event() -> Option<bool> {
+    match KEYFRAME_STORM_EVENT.swap(-1, Ordering::Relaxed) {
+        -1 => None,
+        v => Some(v != 0),
+    }
+}
+
 extern "C" {
     /// Tell the C++ shim where to write its log output.  Must be called before
     /// any other shim function so that D3D11/NVENC init errors are captured.

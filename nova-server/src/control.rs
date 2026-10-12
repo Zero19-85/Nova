@@ -241,6 +241,15 @@ fn signal_congestion(worker_link: &Option<WorkerLink>) {
     }
 }
 
+/// Tell QoS a storm began or ended — see `QosController::tick` for what it
+/// does with the pair.
+fn signal_storm(worker_link: &Option<WorkerLink>, active: bool) {
+    match worker_link {
+        Some(link) => link.send(ControlMsg::KeyframeStorm { active }),
+        None => crate::encoder::note_keyframe_storm(active),
+    }
+}
+
 /// Ask whoever owns the encoder for a keyframe on the next frame.
 fn send_idr(worker_link: &Option<WorkerLink>) {
     match worker_link {
@@ -321,6 +330,8 @@ struct IdrGate {
     congestion: bool,
     arm_retry: bool,
     log: bool,
+    /// This request is the one that made the storm.
+    storm_began: bool,
 }
 
 /// Classify one client IDR request. `mid_stream` is
@@ -332,7 +343,7 @@ fn idr_storm_gate(generation: u64, mid_stream: bool, can_defer: bool) -> IdrGate
 }
 
 fn idr_storm_gate_at(generation: u64, mid_stream: bool, can_defer: bool, now: Instant) -> IdrGate {
-    let normal = IdrGate { forward: true, congestion: mid_stream, arm_retry: mid_stream, log: true };
+    let normal = IdrGate { forward: true, congestion: mid_stream, arm_retry: mid_stream, log: true, storm_began: false };
     let Ok(mut slot) = IDR_STORM.lock() else {
         return normal; // poisoned — fall back to the unthrottled behaviour
     };
@@ -358,7 +369,7 @@ fn idr_storm_gate_at(generation: u64, mid_stream: bool, can_defer: bool, now: In
     if !mid_stream {
         // Warmup or pre-PLAY: never part of a storm, always served at once.
         s.last_forwarded = Some(now);
-        return IdrGate { forward: true, congestion: false, arm_retry: false, log: true };
+        return IdrGate { forward: true, congestion: false, arm_retry: false, log: true, storm_began: false };
     }
 
     if now.duration_since(s.window_start) >= Duration::from_secs(1) {
@@ -367,7 +378,8 @@ fn idr_storm_gate_at(generation: u64, mid_stream: bool, can_defer: bool, now: In
     }
     s.window_count += 1;
 
-    if s.active_since.is_none() {
+    let storm_began = s.active_since.is_none();
+    if storm_began {
         if s.window_count < STORM_ENTER_PER_SEC {
             s.last_forwarded = Some(now);
             if normal.congestion {
@@ -408,7 +420,7 @@ fn idr_storm_gate_at(generation: u64, mid_stream: bool, can_defer: bool, now: In
         s.last_cut = Some(now);
     }
     // No repair retry inside a storm: the client is still asking on its own.
-    IdrGate { forward, congestion, arm_retry: false, log: false }
+    IdrGate { forward, congestion, arm_retry: false, log: false, storm_began }
 }
 
 /// Serve a deferred storm keyframe, report a long storm, and close one that
@@ -448,6 +460,7 @@ pub fn tick_idr_storm(
         );
         s.active_since = None;
         s.window_count = 0;
+        signal_storm(worker_link, false);
     } else if now.duration_since(s.last_heartbeat) >= STORM_HEARTBEAT {
         s.last_heartbeat = now;
         println!(
@@ -746,6 +759,9 @@ fn handle_control_message(
             );
             if gate.log {
                 println!("🎮 Control: client requested IDR frame");
+            }
+            if gate.storm_began {
+                signal_storm(worker_link, true);
             }
             if gate.forward {
                 send_idr(worker_link);
@@ -1191,7 +1207,7 @@ mod tests {
     fn a_single_repair_request_is_handled_exactly_as_before() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let g = idr_storm_gate_at(21, true, true, Instant::now());
-        assert_eq!(g, IdrGate { forward: true, congestion: true, arm_retry: true, log: true });
+        assert_eq!(g, IdrGate { forward: true, congestion: true, arm_retry: true, log: true, storm_began: false });
     }
 
     /// The 2026-10-12 storm: 120 requests a second for a minute. Keyframes
@@ -1207,6 +1223,7 @@ mod tests {
         assert!(forwarded >= 4 * 60 - 4, "storm starved the client: {forwarded} keyframes");
         assert!(cuts <= pre_storm + STORM_MAX_CUTS, "{cuts} bitrate cuts");
         assert!(gates.iter().skip(pre_storm as usize).all(|g| !g.arm_retry && !g.log));
+        assert_eq!(gates.iter().filter(|g| g.storm_began).count(), 1, "QoS hears one start");
     }
 
     /// The monolithic deployment has no tick to serve a deferred keyframe, so

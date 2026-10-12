@@ -3232,6 +3232,7 @@ pub async fn run_worker() -> Result<()> {
                                     encoder::notify_ltr_acked(frame_index as u64)
                                 }
                                 Some(Ok(ipc::ControlMsg::CongestionReduce)) => encoder::signal_congestion_reduction(),
+                                Some(Ok(ipc::ControlMsg::KeyframeStorm { active })) => encoder::note_keyframe_storm(active),
                                 Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last })) => {
                                     // RFI recovery: invalidate the lost range so the
                                     // next P-frame recovers; fall back to an IDR if

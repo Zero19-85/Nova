@@ -118,7 +118,16 @@ Diagnosed from a 3.5 h Moonlight/Xbox 4K120 HEVC/HDR10 session. Two faults, one 
   (`control.rs` `idr_storm_gate` / `tick_idr_storm`): ≥10 mid-stream requests
   in 1 s = storm → keyframes throttled to 4/s (deferred, never dropped), at
   most 3 bitrate cuts per storm, one log line at start / every 30 s / at end.
-  Warmup and single repairs are untouched.
+  Warmup and single repairs are untouched. The Master brackets each storm
+  with `ControlMsg::KeyframeStorm { active }` (IPC tag 25); QoS snapshots the
+  bitrate + failure memory at the start (reaching back ≤4 s past the opening
+  request's ordinary cut) and **restores both in one step** when it ends —
+  `⏫ Congestion: keyframe storm over — bitrate restored` in `nova.log`.
+- **Scripts:** `build.ps1` runs on Windows PowerShell 5.1 (it used a ternary,
+  non-ASCII text, and splatted `--release` one character at a time).
+  `deploy.ps1` keeps the newest 3 backup pairs (`-KeepBackups N`), pruning
+  only after the new pair is hash-verified, and `-Rollback` now orders by the
+  stamp in the name (Copy-Item preserves LastWriteTime = build time).
 - **The line travelling down the picture** was the intra-refresh sweep, ON for
   every shallow-DPB (4K) session since 2026-09-21. That decision came from an
   *Echo* artefact; Moonlight requests an IDR on every loss and the repair

@@ -329,6 +329,14 @@ pub struct QosController {
     /// encoder actually loaded the link (see [`Self::note_output`]). The probe
     /// needs [`Self::PROBE_LOADED_SECS`] of these, not just elapsed time.
     loaded_clean_secs: u32,
+    /// The most recent reduction: when, and the `(applied, known_bad)` it
+    /// replaced. A storm is only recognised after ~10 requests, and the first
+    /// of those is already charged as an ordinary repair — this lets the storm
+    /// snapshot reach back past that cut.
+    before_last_cut: Option<(Instant, u32, Option<u32>)>,
+    /// `(applied, known_bad)` from just before a keyframe storm, restored in
+    /// one step when it ends. See [`Self::on_keyframe_storm`].
+    storm_snapshot: Option<(u32, Option<u32>)>,
 }
 
 impl QosController {
@@ -349,6 +357,9 @@ impl QosController {
     /// bitrate. Half: well above the static-desktop trickle (≤ ~12% in the
     /// 2026-10-12 log), well below what real motion produces (60–90%).
     const LOADED_OUTPUT_PCT: u64 = 50;
+    /// How far before a storm's start a reduction still counts as the storm's
+    /// own: the pre-storm second of requests plus the 2 s reduce cooldown.
+    const STORM_LOOKBACK: Duration = Duration::from_secs(4);
 
     fn a_past_instant() -> Instant {
         // checked_sub: Instant is QPC-since-boot on Windows, so plain
@@ -369,6 +380,8 @@ impl QosController {
             last_event: past,
             last_probe: past,
             loaded_clean_secs: 0,
+            before_last_cut: None,
+            storm_snapshot: None,
         }
     }
 
@@ -409,6 +422,42 @@ impl QosController {
         self.last_event = Self::a_past_instant();
         self.last_probe = Self::a_past_instant();
         self.loaded_clean_secs = 0;
+        self.before_last_cut = None;
+        self.storm_snapshot = None;
+    }
+
+    /// A keyframe storm began or ended (`encoder::take_keyframe_storm_event`).
+    ///
+    /// **Began:** remember the bitrate and failure memory from before the
+    /// storm — reaching back past a reduction made in the last
+    /// [`Self::STORM_LOOKBACK`], which was the storm's opening request charged
+    /// as an ordinary repair.
+    ///
+    /// **Ended:** put both back in one step. The ramp would otherwise climb
+    /// +3% a second toward a target the storm's cuts ratcheted down, and the
+    /// probe would take minutes more to lift it — the player returns to a
+    /// soft picture for no reason, because a storm that outlived its cuts was
+    /// never the link (control.rs, "Keyframe storms"). If it WAS the link, the
+    /// next loss report cuts again exactly as it would have anyway.
+    ///
+    /// Returns `Some((restored, from))` when the bitrate was raised.
+    fn on_keyframe_storm(&mut self, active: bool, applied: u32, ceiling_kbps: u32) -> Option<(u32, u32)> {
+        if active {
+            self.storm_snapshot = Some(match self.before_last_cut {
+                Some((at, before, bad)) if at.elapsed() <= Self::STORM_LOOKBACK => (before, bad),
+                _ => (applied, self.known_bad_kbps),
+            });
+            return None;
+        }
+        let (before, bad) = self.storm_snapshot.take()?;
+        self.known_bad_kbps = bad;
+        let restored = before.min(ceiling_kbps);
+        if applied == 0 || restored <= applied {
+            return None;
+        }
+        self.last_event = Instant::now();
+        self.restart_probe_clock();
+        Some((restored, applied))
     }
 
     /// What recovery is allowed to climb to: 90% of whatever failed, clamped to
@@ -471,9 +520,23 @@ impl QosController {
             self.known_bad_kbps = None;
         }
 
+        if let Some(active) = encoder::take_keyframe_storm_event() {
+            let applied = encoder::get_stream_bitrate_kbps().max(0) as u32;
+            if let Some((restored, from)) = self.on_keyframe_storm(active, applied, ceiling_kbps) {
+                encoder::reconfigure_bitrate(restored, fps);
+                encoder::set_stream_bitrate_kbps(restored as i32);
+                println!(
+                    "⏫ Congestion: keyframe storm over — bitrate restored to {restored} Kbps \
+                     in one step (was {from} Kbps)"
+                );
+                return;
+            }
+        }
+
         if let Some(reduced) = encoder::take_congestion_bitrate() {
             if self.last_event.elapsed() >= Self::REDUCE_COOLDOWN {
                 let applied = encoder::get_stream_bitrate_kbps().max(0) as u32;
+                self.before_last_cut = Some((Instant::now(), applied, self.known_bad_kbps));
                 self.note_congestion(applied);
                 encoder::reconfigure_bitrate(reduced, fps);
                 encoder::set_stream_bitrate_kbps(reduced as i32);
@@ -749,6 +812,60 @@ mod tests {
         let before = qos.ramp_target(ceiling);
         qos.note_congestion(0);
         assert_eq!(qos.ramp_target(ceiling), before);
+    }
+
+    /// The 2026-10-12 storm, replayed: the opening request cut 47.5 → 38 Mbps
+    /// as an ordinary repair, the storm cut twice more, and when it ends the
+    /// session must be back at 47.5 Mbps with no failure on record — in one
+    /// step, not a +3%-a-second ramp under a ratcheted target.
+    #[test]
+    fn a_storm_ending_restores_the_pre_storm_bitrate_in_one_step() {
+        let ceiling = 47_488u32;
+        let mut qos = QosController::new();
+        // The opening request's ordinary cut, a moment before the storm.
+        qos.before_last_cut = Some((Instant::now(), 47_488, None));
+        qos.note_congestion(47_488);
+        assert_eq!(qos.on_keyframe_storm(true, 37_990, ceiling), None);
+        qos.note_congestion(37_990);
+        qos.note_congestion(30_392);
+        assert!(qos.ramp_target(ceiling) < 30_000, "the storm's cuts ratcheted the target");
+
+        assert_eq!(qos.on_keyframe_storm(false, 24_314, ceiling), Some((47_488, 24_314)));
+        assert_eq!(qos.ramp_target(ceiling), ceiling, "the storm's failures were forgotten");
+        assert!(qos.storm_snapshot.is_none(), "a snapshot restores once");
+    }
+
+    /// A failure that predates the storm is the link's, not the storm's — it
+    /// must survive the restore, and so must a reduction too old to be the
+    /// storm's opening request.
+    #[test]
+    fn a_storm_restore_keeps_what_was_known_before_it() {
+        let ceiling = 47_488u32;
+        let mut qos = QosController::new();
+        qos.note_congestion(40_000); // an earlier, genuine loss
+        qos.before_last_cut = Some((
+            Instant::now().checked_sub(Duration::from_secs(60)).unwrap(),
+            47_488,
+            None,
+        ));
+        assert_eq!(qos.on_keyframe_storm(true, 36_000, ceiling), None);
+        qos.note_congestion(28_800);
+        assert_eq!(qos.on_keyframe_storm(false, 23_040, ceiling), Some((36_000, 23_040)));
+        assert_eq!(qos.known_bad_kbps, Some(40_000));
+    }
+
+    /// No snapshot, nothing to give back; and a restore never lowers the
+    /// bitrate or exceeds the ceiling.
+    #[test]
+    fn a_storm_restore_only_ever_raises_within_the_ceiling() {
+        let mut qos = QosController::new();
+        assert_eq!(qos.on_keyframe_storm(false, 10_000, 47_488), None, "end without a start");
+
+        qos.on_keyframe_storm(true, 20_000, 47_488);
+        assert_eq!(qos.on_keyframe_storm(false, 25_000, 47_488), None, "already above the snapshot");
+
+        qos.on_keyframe_storm(true, 60_000, 90_000);
+        assert_eq!(qos.on_keyframe_storm(false, 5_000, 47_488), Some((47_488, 5_000)));
     }
 
     /// The probe must let a recovered link climb back in BOUNDED time from any
