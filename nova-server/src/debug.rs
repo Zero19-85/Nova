@@ -1,23 +1,44 @@
 /// Nova file logger.
 ///
 /// Strategy:
-///   Rust side  — `SetStdHandle(STD_OUTPUT/ERROR_HANDLE, log_file)` redirects
-///                ALL subsequent `println!` / `eprintln!` in the entire process
-///                to the log file.  Zero changes to existing call sites needed.
+///   Rust side  — `SetStdHandle(STD_OUTPUT/ERROR_HANDLE, ..)` redirects ALL
+///                subsequent `println!` / `eprintln!` in the entire process.
+///                Zero changes to existing call sites needed.
+///
+///                The handle is NOT the log file. It is the write end of an
+///                in-process pipe: `nova-log-drain` empties the pipe into a
+///                bounded memory backlog, and `nova-log-writer` is the only
+///                thread that ever touches the file. **No log line can block
+///                the thread that printed it on the disk.** That matters because
+///                `println!` runs on the hot path — `📊 RTP/s` inside the
+///                Master's send thread, `🎞 Encoder output` in the Worker's
+///                capture loop — and Windows throttles EVERY buffered writer on
+///                the machine while dirty cache pages exceed its threshold.
+///                Measured live 2026-10-14 during a 1.2 Gbps game download onto
+///                an SSD that had run out of fast cache: ~20 s with every cached
+///                write blocked, every ~40 s, and Nova's NIC output at 0.00 MB/s
+///                for each of them — the stream froze inside a log line.
 ///
 ///   C shim side — The CRT's FILE* descriptors are independent of the Win32
 ///                 handle table, so `printf()` does NOT follow `SetStdHandle`.
-///                 `InitShimLog` passes the log path to `shim.cpp` which opens
-///                 the file itself, `_dup2`s the CRT stdout/stderr, and falls
-///                 back to `WriteFile` for all `ShimLog()` calls.
+///                 `InitShimLogHandle` hands `shim.cpp` the same pipe, and it
+///                 `_dup2`s the CRT stdout/stderr onto it. (`InitShimLog` with a
+///                 path — the shim opening the file itself — is the fallback
+///                 when the pipe could not be built.)
 ///
 /// Log location: `{exe_dir}\nova.log`  (same directory as the executable).
 /// In a Windows Service the SCM sets CWD = System32, so a relative path would
 /// silently write (or fail) there.  Anchoring to the exe directory keeps the
 /// log next to the binary regardless of how the process was started.
 
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -26,6 +47,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 
 // ── Log path ─────────────────────────────────────────────────────────────────
 
@@ -187,6 +209,242 @@ fn spawn_rotation_watchdog(path: PathBuf, initial: HANDLE) {
         .ok();
 }
 
+// ── Non-blocking sink ────────────────────────────────────────────────────────
+
+/// Log output held in memory while the file write is stalled. Nova logs a few
+/// hundred bytes a second while streaming, so this covers hours of stall — it
+/// exists to bound a pathological case (a stuck volume plus a log storm), not
+/// because the ~20 s throttling windows come anywhere near it.
+const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
+/// Pipe buffer. Only has to absorb what arrives between two reads by
+/// `nova-log-drain`, which does no I/O of its own besides that read.
+const PIPE_BUFFER_BYTES: u32 = 1024 * 1024;
+
+struct Backlog {
+    chunks:  VecDeque<Vec<u8>>,
+    bytes:   usize,
+    /// Bytes refused because the backlog was full; reported by the writer.
+    dropped: u64,
+    /// The writer has taken a batch and not finished writing it.
+    writing: bool,
+}
+
+struct LogSink {
+    // HANDLEs as integers: kernel handle-table values are process-wide, and a
+    // raw-pointer HANDLE is neither Send nor Sync.
+    pipe_read:  isize,
+    pipe_write: isize,
+    backlog:    Mutex<Backlog>,
+    ready:      Condvar,
+    /// Both threads are running. Until then nothing may be told to write into
+    /// the pipe — an undrained pipe blocks its writers once full.
+    active:     AtomicBool,
+}
+
+static SINK: OnceLock<LogSink> = OnceLock::new();
+
+impl LogSink {
+    fn lock(&self) -> MutexGuard<'_, Backlog> {
+        // A panic while holding this lock must not take logging down with it.
+        self.backlog.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+fn active_sink() -> Option<&'static LogSink> {
+    SINK.get().filter(|s| s.active.load(Ordering::Acquire))
+}
+
+/// The write end of the log pipe, for the C++ shim (`InitShimLogHandle`).
+/// `None` when the logger fell back to writing the file directly.
+pub fn log_sink_handle() -> Option<HANDLE> {
+    active_sink().map(|s| HANDLE(s.pipe_write as *mut core::ffi::c_void))
+}
+
+fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    // FILE_SHARE_DELETE is what lets rotation rename the live file; READ and
+    // WRITE keep `tail -f` and a second Nova process from ever being refused.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .open(path)
+}
+
+/// Build the pipe, start both threads, and only then point stdout/stderr at
+/// it. Returns `false` (leaving stdout untouched) if any step fails, so the
+/// caller can fall back to the old direct-to-file redirect.
+fn start_sink(path: PathBuf, file: std::fs::File) -> bool {
+    let mut read = HANDLE::default();
+    let mut write = HANDLE::default();
+    if unsafe { CreatePipe(&mut read, &mut write, None, PIPE_BUFFER_BYTES) }.is_err() {
+        return false;
+    }
+    let sink = LogSink {
+        pipe_read:  read.0 as isize,
+        pipe_write: write.0 as isize,
+        backlog:    Mutex::new(Backlog { chunks: VecDeque::new(), bytes: 0, dropped: 0, writing: false }),
+        ready:      Condvar::new(),
+        active:     AtomicBool::new(false),
+    };
+    if SINK.set(sink).is_err() {
+        unsafe {
+            let _ = CloseHandle(read);
+            let _ = CloseHandle(write);
+        }
+        return active_sink().is_some();
+    }
+    let sink = SINK.get().expect("just set");
+
+    let writer = std::thread::Builder::new()
+        .name("nova-log-writer".into())
+        .spawn(move || writer_loop(sink, path, file));
+    if writer.is_err() {
+        return false;
+    }
+    let drain = std::thread::Builder::new()
+        .name("nova-log-drain".into())
+        .spawn(move || drain_loop(sink));
+    if drain.is_err() {
+        return false;
+    }
+
+    sink.active.store(true, Ordering::Release);
+    unsafe {
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, write);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, write);
+    }
+    install_panic_flush();
+    true
+}
+
+/// Empties the pipe into the backlog as fast as lines arrive. Does no file I/O,
+/// which is the whole point: while the writer is stuck behind the disk, this
+/// thread keeps the pipe empty, so `println!` never waits.
+fn drain_loop(sink: &'static LogSink) {
+    // Wrapping the handle in a `File` is just a synchronous `ReadFile`.
+    // ManuallyDrop: this must never close the handle `flush_log` peeks at.
+    let mut pipe = std::mem::ManuallyDrop::new(unsafe {
+        std::fs::File::from_raw_handle(sink.pipe_read as *mut core::ffi::c_void)
+    });
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match pipe.read(&mut buf) {
+            Ok(0) => continue, // a zero-length write, not end of stream
+            Ok(n) => n,
+            Err(_) => return,  // every write end is gone — the process is exiting
+        };
+        {
+            let mut b = sink.lock();
+            if b.bytes + n > MAX_BACKLOG_BYTES {
+                b.dropped += n as u64;
+            } else {
+                b.bytes += n;
+                b.chunks.push_back(buf[..n].to_vec());
+            }
+        }
+        sink.ready.notify_one();
+    }
+}
+
+/// The only thread that writes the log file — and so the only one a stalled
+/// disk can stop. Also owns rotation, which needs no `SetStdHandle` dance now
+/// that nothing else holds the file.
+fn writer_loop(sink: &'static LogSink, path: PathBuf, mut file: std::fs::File) {
+    let mut last_rotate_check = Instant::now();
+    loop {
+        let (batch, dropped) = {
+            let mut b = sink.lock();
+            while b.chunks.is_empty() && b.dropped == 0 {
+                let wait = ROTATE_CHECK.saturating_sub(last_rotate_check.elapsed());
+                if wait.is_zero() {
+                    break;
+                }
+                b = sink.ready.wait_timeout(b, wait).unwrap_or_else(|p| p.into_inner()).0;
+            }
+            let batch: Vec<Vec<u8>> = b.chunks.drain(..).collect();
+            b.bytes = 0;
+            let dropped = std::mem::take(&mut b.dropped);
+            b.writing = !batch.is_empty() || dropped > 0;
+            (batch, dropped)
+        };
+
+        for chunk in &batch {
+            let _ = file.write_all(chunk);
+        }
+        if dropped > 0 {
+            let _ = writeln!(file,
+                "⚠️  Logger: {dropped} byte(s) of log output discarded — the log file \
+                 stalled for longer than a {} MB backlog could cover",
+                MAX_BACKLOG_BYTES / (1024 * 1024));
+        }
+        sink.lock().writing = false;
+
+        if last_rotate_check.elapsed() >= ROTATE_CHECK {
+            last_rotate_check = Instant::now();
+            if oversized(&path) {
+                rotate(&path);
+                // Keep the old handle if the reopen fails — logging into a
+                // renamed file beats not logging at all.
+                if let Ok(fresh) = open_log_file(&path) {
+                    file = fresh;
+                    let _ = writeln!(file, "🗂️  Log rotated at {} (cap {} MB, keeping {} generation(s))",
+                        timestamp(), MAX_LOG_BYTES / (1024 * 1024), KEPT_GENERATIONS);
+                }
+            }
+        }
+    }
+}
+
+/// Wait (bounded) until everything printed so far has reached the file.
+///
+/// Needed on the way OUT of the process: `process::exit` kills the logger
+/// threads where they stand, and the last lines before an exit or a panic are
+/// precisely the ones worth keeping. Two consecutive idle readings, because the
+/// drain thread can hold a chunk it has read but not yet queued.
+pub fn flush_log(timeout: Duration) {
+    let Some(sink) = active_sink() else { return };
+    let read = HANDLE(sink.pipe_read as *mut core::ffi::c_void);
+    let deadline = Instant::now() + timeout;
+    let mut idle_readings = 0;
+    while Instant::now() < deadline {
+        let mut in_pipe = 0u32;
+        if unsafe { PeekNamedPipe(read, None, 0, None, Some(&mut in_pipe), None) }.is_err() {
+            return;
+        }
+        let idle = {
+            let b = sink.lock();
+            b.chunks.is_empty() && b.dropped == 0 && !b.writing
+        };
+        if in_pipe == 0 && idle {
+            idle_readings += 1;
+            if idle_readings >= 2 {
+                return;
+            }
+        } else {
+            idle_readings = 0;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`flush_log`], then exit. Use instead of `std::process::exit` anywhere the
+/// logger may be running.
+pub fn exit(code: i32) -> ! {
+    flush_log(Duration::from_secs(2));
+    std::process::exit(code)
+}
+
+/// A panic message goes to stderr — the pipe — and the process may be gone
+/// before the writer gets to it. Flush after the default hook has printed.
+fn install_panic_flush() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        flush_log(Duration::from_secs(2));
+    }));
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Call ONCE, as the very first line of `run()` / `service_main()`, BEFORE
@@ -211,6 +469,12 @@ pub fn init_input_helper_logger() {
 }
 
 fn init_logger_to(path: PathBuf) {
+    // A process initialises its logger once; `run()` re-calling it after the
+    // binary already has is a no-op rather than a second pipe and writer.
+    if active_sink().is_some() {
+        return;
+    }
+
     // Ensure parent directory exists (it should — exe is already there).
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -227,23 +491,39 @@ fn init_logger_to(path: PathBuf) {
     // WRITE means opening can never sharing-violation just because another Nova
     // process (service ↔ host, or a lingering instance) still has it open — the
     // open always succeeds so a process is never left silently logless.
-    match open_and_redirect(&path) {
-        Some(h) => {
-            // From this point on, println! writes to the log file.
-            println!();
-            println!("══════════════════════════════════════════════════════════");
-            println!("  Nova  started at {}", timestamp());
-            println!("  Log   {}", path.display());
-            println!("  PID   {}", std::process::id());
-            println!("  Cap   {} MB, {} rotated generation(s) kept",
-                MAX_LOG_BYTES / (1024 * 1024), KEPT_GENERATIONS);
-            println!("══════════════════════════════════════════════════════════");
-            spawn_rotation_watchdog(path, h);
+    let via_pipe = match open_log_file(&path) {
+        Ok(file) => start_sink(path.clone(), file),
+        Err(e) => {
+            eprintln!("[Nova] WARNING: cannot open log file {}: {:?}", path.display(), e);
+            false
         }
-        None => {
-            eprintln!("[Nova] Service output will not be captured.");
+    };
+    if !via_pipe {
+        // Fallback: the pre-2026-10-14 direct redirect. Every log line is then
+        // a synchronous file write again — correct, just not stall-proof.
+        match open_and_redirect(&path) {
+            Some(h) => spawn_rotation_watchdog(path.clone(), h),
+            None => {
+                eprintln!("[Nova] Service output will not be captured.");
+                return;
+            }
         }
     }
+
+    // From this point on, println! writes to the log.
+    println!();
+    println!("══════════════════════════════════════════════════════════");
+    println!("  Nova  started at {}", timestamp());
+    println!("  Log   {}", path.display());
+    println!("  PID   {}", std::process::id());
+    println!("  Cap   {} MB, {} rotated generation(s) kept",
+        MAX_LOG_BYTES / (1024 * 1024), KEPT_GENERATIONS);
+    println!("  Mode  {}", if via_pipe {
+        "non-blocking (pipe → nova-log-writer)"
+    } else {
+        "DIRECT — log writes can stall the stream"
+    });
+    println!("══════════════════════════════════════════════════════════");
 }
 
 // ── DLL path probe ────────────────────────────────────────────────────────────

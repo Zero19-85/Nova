@@ -127,6 +127,50 @@ extern "C" __declspec(dllexport) void InitShimLog(const wchar_t* log_path) {
         GetCurrentProcessId(), WTSGetActiveConsoleSessionId());
 }
 
+// Called from Rust (encoder.rs::init_shim_log) INSTEAD of InitShimLog when the
+// Rust logger is running its non-blocking sink: `sink` is the write end of the
+// in-process pipe that debug.rs drains on its own threads. ShimLog runs on the
+// encode thread, and a direct WriteFile to nova.log blocks for as long as
+// Windows throttles cached writes — measured at ~20 s at a time during a
+// 1.2 Gbps game download (2026-10-14). A pipe write returns at once.
+//
+// No SetStdHandle here: Rust already pointed stdout/stderr at the same pipe,
+// and nothing here needs reopening when the log rotates.
+extern "C" __declspec(dllexport) void InitShimLogHandle(HANDLE sink) {
+    if (!sink || sink == INVALID_HANDLE_VALUE) return;
+
+    // Own a duplicate so the shim's lifetime is independent of Rust's handle.
+    HANDLE mine = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), sink, GetCurrentProcess(), &mine,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    g_logFile = mine;
+
+    // CRT fd 1 / fd 2 onto the pipe as well, for the SDK wrapper's printf.
+    // Same duplicate-first rule as InitShimLog; no _O_APPEND — a pipe has no
+    // end to seek to.
+    HANDLE crtHandle = INVALID_HANDLE_VALUE;
+    if (DuplicateHandle(GetCurrentProcess(), mine,
+                        GetCurrentProcess(), &crtHandle,
+                        0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        int fd = _open_osfhandle((intptr_t)crtHandle, _O_TEXT);
+        if (fd >= 0) {
+            _dup2(fd, 1);
+            _dup2(fd, 2);
+            _close(fd);
+            setvbuf(stdout, nullptr, _IONBF, 0);
+            setvbuf(stderr, nullptr, _IONBF, 0);
+        } else {
+            CloseHandle(crtHandle);
+        }
+    }
+
+    ShimLog("[Shim] InitShimLogHandle: logging via the non-blocking log pipe");
+    ShimLog("[Shim] nova_shim.dll loaded in PID %lu  Session %lu",
+        GetCurrentProcessId(), WTSGetActiveConsoleSessionId());
+}
+
 // ==================== VIDEO PROCESSOR GLOBALS ====================
 static ID3D11VideoDevice*              g_videoDevice   = nullptr;
 static ID3D11VideoContext*             g_videoContext  = nullptr;

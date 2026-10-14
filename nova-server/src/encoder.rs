@@ -67,6 +67,11 @@ extern "C" {
     /// any other shim function so that D3D11/NVENC init errors are captured.
     fn InitShimLog(log_path: *const u16);
 
+    /// Point the shim's log at an already-open handle — the write end of the
+    /// Rust logger's pipe (see `debug.rs`), so shim lines written on the encode
+    /// thread never wait on the disk. Replaces `InitShimLog` when available.
+    fn InitShimLogHandle(sink: *mut core::ffi::c_void);
+
     /// Override the HDR10 HEVC SEI luminance parameters (type 137 MDCV + type 144
     /// CLL/FALL).  Call once after loading nova.toml, before the first
     /// InitEncoder.  BT.2020 primaries are always the standard constants.
@@ -277,6 +282,12 @@ pub fn last_frame_was_ltr_recovery() -> bool {
 /// `ShimLog()` writes to the same `nova.log` as the Rust side.  Call this
 /// immediately after `debug::init_debug_logger()`, before `Encoder::new()`.
 pub fn init_shim_log(log_path_wide: *const u16) {
+    // Preferred: share the Rust logger's pipe. Nothing to reopen on rotation —
+    // the shim never holds the file — so no hook is registered.
+    if let Some(sink) = crate::debug::log_sink_handle() {
+        unsafe { InitShimLogHandle(sink.0); }
+        return;
+    }
     unsafe { InitShimLog(log_path_wide); }
     // The shim's handle is a CRT descriptor, which `SetStdHandle` does not
     // reach — so after a log rotation it would keep writing into the file that

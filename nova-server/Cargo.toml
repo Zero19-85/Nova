@@ -88,6 +88,10 @@ windows = { version = "0.58", features = [
     # File logger: CreateFileW for the log file, SetStdHandle to redirect println!
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # CreatePipe / PeekNamedPipe — println! goes into an in-process pipe that a
+    # logger thread drains, so a stalled disk can never block a frame (debug.rs).
+    # Bindings only, kernel32 is already linked.
+    "Win32_System_Pipes",
     # Desktop-switch detection (Phase 15.1b, capture/desktop_switch.rs):
     # SetWinEventHook/UnhookWinEvent for EVENT_SYSTEM_DESKTOPSWITCH…
     "Win32_UI_Accessibility",

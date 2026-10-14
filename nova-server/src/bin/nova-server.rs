@@ -85,10 +85,10 @@ fn main() {
             nova_server::debug::init_debug_logger();
             println!("=== Nova Install ===");
             match install_task() {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => nova_server::debug::exit(0),
                 Err(e) => {
                     println!("❌ Install failed: {}", e);
-                    std::process::exit(1);
+                    nova_server::debug::exit(1);
                 }
             }
         }
@@ -97,10 +97,10 @@ fn main() {
             nova_server::debug::init_debug_logger();
             println!("=== Nova Uninstall ===");
             match uninstall_task() {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => nova_server::debug::exit(0),
                 Err(e) => {
                     println!("❌ Uninstall failed: {}", e);
-                    std::process::exit(1);
+                    nova_server::debug::exit(1);
                 }
             }
         }
@@ -143,7 +143,7 @@ fn main() {
                     1
                 }
             };
-            std::process::exit(code);
+            nova_server::debug::exit(code);
         }
 
         // ── SYSTEM launcher service (Phase 15.2c) ─────────────────────────────
@@ -158,9 +158,9 @@ fn main() {
             nova_server::debug::init_service_logger();
             if let Err(e) = nova_server::service::run_service_dispatcher() {
                 println!("❌ Service dispatcher failed: {e}");
-                std::process::exit(1);
+                nova_server::debug::exit(1);
             }
-            std::process::exit(0);
+            nova_server::debug::exit(0);
         }
 
         Some("--install-service") => {
@@ -178,10 +178,10 @@ fn main() {
                 let _ = uninstall_task();
             };
             match nova_server::service::install_service(&exe, remove_task) {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => nova_server::debug::exit(0),
                 Err(e) => {
                     println!("❌ Service install failed: {e}");
-                    std::process::exit(1);
+                    nova_server::debug::exit(1);
                 }
             }
         }
@@ -190,10 +190,10 @@ fn main() {
             nova_server::debug::init_debug_logger();
             println!("=== Nova Service Uninstall ===");
             match nova_server::service::uninstall_service() {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => nova_server::debug::exit(0),
                 Err(e) => {
                     println!("❌ Service uninstall failed: {e}");
-                    std::process::exit(1);
+                    nova_server::debug::exit(1);
                 }
             }
         }
@@ -231,13 +231,13 @@ fn main() {
 fn run_host() -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     match rt.block_on(nova_server::run()) {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => nova_server::debug::exit(0),
         Err(e) => {
             // run() returns Err when a critical resource is unavailable (no GPU,
             // no display, WGC unsupported, etc.). Log to nova.log (stdout is
             // already redirected there) and exit 1 — a clean failure, not a panic.
             println!("❌ Nova exited with error: {e:?}");
-            std::process::exit(1);
+            nova_server::debug::exit(1);
         }
     }
 }
@@ -254,10 +254,10 @@ fn run_input_helper() -> ! {
         .build()
         .expect("tokio current-thread runtime");
     match rt.block_on(nova_server::run_input_helper()) {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => nova_server::debug::exit(0),
         Err(e) => {
             println!("❌ Nova input helper exited with error: {e:?}");
-            std::process::exit(1);
+            nova_server::debug::exit(1);
         }
     }
 }
@@ -267,10 +267,10 @@ fn run_input_helper() -> ! {
 fn run_worker() -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     match rt.block_on(nova_server::run_worker()) {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => nova_server::debug::exit(0),
         Err(e) => {
             println!("❌ Nova worker exited with error: {e:?}");
-            std::process::exit(1);
+            nova_server::debug::exit(1);
         }
     }
 }
