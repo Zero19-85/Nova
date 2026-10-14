@@ -68,7 +68,7 @@ const PACE_BATCH_PACKETS: usize = 10;
 /// behind (link saturated / pacing budget exceeded for several consecutive
 /// frames), `send_frame` refuses the frame and the caller must request an IDR
 /// (a silently dropped frame would break the P-frame reference chain).
-const MAX_FRAMES_IN_FLIGHT: usize = 3;
+pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// How long one datagram may wait for socket-buffer space before it is
 /// dropped.

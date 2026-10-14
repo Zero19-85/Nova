@@ -1509,6 +1509,91 @@ async fn control_supervisor(
     }
 }
 
+/// No further drop for this long ends a send-backlog episode and prints its
+/// summary.
+const SEND_DROP_QUIET: Duration = Duration::from_secs(2);
+/// How often a long episode says it is still going — the keyframe storm's
+/// heartbeat cadence.
+const SEND_DROP_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Frames the Master discarded because `RtpSender`'s send thread was
+/// [`rtp::MAX_FRAMES_IN_FLIGHT`] frames behind.
+///
+/// These used to vanish without a trace: `send_frame` returned `false`, the
+/// frame was dropped, and the only evidence was the client asking for a
+/// keyframe for no reason the host log could explain. A dropped P-frame breaks
+/// the reference chain exactly like a lost packet, so an unexplained run of
+/// client IDR requests is the symptom to check this against.
+///
+/// Logged like a keyframe storm — one line when an episode starts, a heartbeat
+/// every [`SEND_DROP_HEARTBEAT`], a summary once [`SEND_DROP_QUIET`] passes
+/// with no further drop — so a send thread that stays behind cannot flood the
+/// log (which, until 2026-10-14, was itself able to stall the send thread).
+#[derive(Default)]
+struct SendDropLog {
+    /// `Some(start)` while an episode is in progress.
+    since: Option<Instant>,
+    dropped: u64,
+    keyframes: u64,
+    first: u32,
+    last: u32,
+    last_drop: Option<Instant>,
+    last_report: Option<Instant>,
+}
+
+impl SendDropLog {
+    /// Record one dropped frame. Returns the line to log when it opens an episode.
+    fn on_drop_at(&mut self, frame_index: u32, is_idr: bool, now: Instant) -> Option<String> {
+        self.dropped += 1;
+        if is_idr {
+            self.keyframes += 1;
+        }
+        self.last = frame_index;
+        self.last_drop = Some(now);
+        if self.since.is_some() {
+            return None;
+        }
+        self.since = Some(now);
+        self.first = frame_index;
+        self.last_report = Some(now);
+        Some(format!(
+            "⚠️  Master: RTP send thread is {} frames behind — dropped frame {frame_index} ({}); \
+             the client loses its reference chain until a keyframe",
+            rtp::MAX_FRAMES_IN_FLIGHT,
+            if is_idr { "a KEYFRAME" } else { "P-frame" },
+        ))
+    }
+
+    /// Called once a second. Returns a heartbeat or the closing summary.
+    fn tick_at(&mut self, now: Instant) -> Option<String> {
+        let since = self.since?;
+        let last_drop = self.last_drop.unwrap_or(since);
+        if now.duration_since(last_drop) >= SEND_DROP_QUIET {
+            let line = format!(
+                "✅ Master: RTP send backlog cleared — {} frame(s) dropped over {:.1}s \
+                 (frames {}–{}, {} keyframe(s))",
+                self.dropped,
+                last_drop.duration_since(since).as_secs_f64(),
+                self.first,
+                self.last,
+                self.keyframes,
+            );
+            *self = Self::default();
+            return Some(line);
+        }
+        if now.duration_since(self.last_report.unwrap_or(since)) >= SEND_DROP_HEARTBEAT {
+            self.last_report = Some(now);
+            return Some(format!(
+                "⚠️  Master: RTP send thread still behind ({:.0}s, {} frame(s) dropped, latest {})",
+                now.duration_since(since).as_secs_f64(),
+                self.dropped,
+                self.last,
+            ));
+        }
+        None
+    }
+}
+
 /// Dedicated per-pipe reader — the media-pipe counterpart of
 /// `control_reader_loop`; see its doc comment for why `recv_media`'s
 /// `read_exact`-based framing must never be raced inside `tokio::select!`
@@ -1614,6 +1699,7 @@ async fn media_supervisor(
     // every packet, and at 50 packets a second an unthrottled log line is an
     // amplifier rather than a diagnostic.
     let mut audio_send_failed_at: Option<Instant> = None;
+    let mut send_drops = SendDropLog::default();
     loop {
         tokio::select! {
             maybe_pipe = pipe_rx.recv() => {
@@ -1706,12 +1792,14 @@ async fn media_supervisor(
                                 // reject.
                                 last_idr = Some((frame_index, data));
                             }
+                        } else if let Some(line) = send_drops.on_drop_at(frame_index, is_idr, Instant::now()) {
+                            // Send-thread queue saturated. The client's own
+                            // loss-triggered IDR request recovers; no encoder
+                            // handle here to re-request from without another
+                            // IPC round trip. But never silently — see
+                            // SendDropLog.
+                            println!("{line}");
                         }
-                        // else: send-thread queue saturated (rare/transient) —
-                        // the client's own loss-triggered IDR request recovers;
-                        // no direct encoder handle to re-request from here
-                        // without another IPC round trip, deliberately not
-                        // built in this pass.
                     }
                     Some(Ok(ipc::MediaMsg::AudioFrame { data })) => {
                         // No video_learned-style gate needed — AudioTxState's
@@ -1788,6 +1876,9 @@ async fn media_supervisor(
                 }
             }
             _ = keepalive_ticker.tick() => {
+                if let Some(line) = send_drops.tick_at(Instant::now()) {
+                    println!("{line}");
+                }
                 // Fires whenever a real frame hasn't landed in over a
                 // second, regardless of whether a pipe happens to be
                 // connected right now — see last_frame_at's doc comment. An
@@ -5551,6 +5642,43 @@ mod tests {
 
     /// A fresh static episode gets its own full convergence window: motion
     /// resets `timeout_streak`, and the throttle has to reset with it.
+    #[test]
+    fn a_send_drop_episode_logs_once_then_summarises() {
+        let t0 = Instant::now();
+        let mut log = SendDropLog::default();
+        assert!(log.on_drop_at(100, false, t0).is_some(), "the first drop must be visible");
+        for (i, idx) in (101..110u32).enumerate() {
+            assert!(
+                log.on_drop_at(idx, idx == 105, t0 + Duration::from_millis(10 * i as u64)).is_none(),
+                "every drop after the first is counted, not logged",
+            );
+        }
+        assert!(log.tick_at(t0 + Duration::from_secs(1)).is_none(), "still inside the quiet window");
+
+        let summary = log.tick_at(t0 + Duration::from_secs(3)).expect("episode must close");
+        assert!(summary.contains("10 frame(s)"), "{summary}");
+        assert!(summary.contains("100–109"), "{summary}");
+        assert!(summary.contains("1 keyframe(s)"), "{summary}");
+        assert!(log.tick_at(t0 + Duration::from_secs(4)).is_none(), "nothing left to report");
+
+        // The next drop opens a fresh episode, so it is visible again.
+        assert!(log.on_drop_at(500, false, t0 + Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn a_long_send_drop_episode_heartbeats_instead_of_flooding() {
+        let t0 = Instant::now();
+        let mut log = SendDropLog::default();
+        let mut lines = 0;
+        // One drop a second for 65 s, ticked every second: never quiet.
+        for s in 0..65u64 {
+            let now = t0 + Duration::from_secs(s);
+            lines += log.on_drop_at(s as u32, false, now).is_some() as u32;
+            lines += log.tick_at(now + Duration::from_millis(500)).is_some() as u32;
+        }
+        assert_eq!(lines, 3, "start + two 30 s heartbeats, nothing per drop");
+    }
+
     #[test]
     fn motion_restores_full_rate_for_the_next_static_episode() {
         let mut last = None;
