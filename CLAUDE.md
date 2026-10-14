@@ -104,6 +104,42 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
+## 2026-10-14: **A LOG LINE FROZE THE STREAM** — non-blocking logger (live-verified)
+
+Moonlight/Xbox 4K120 froze ~20 s at a time, every ~40 s, while the EA app
+downloaded a game at ~1.2 Gbps. CPU, NIC, NVENC and LAN ping were all fine.
+**Cause, measured:** the download outran the SSD (ADATA LEGEND 860 out of fast
+cache: 40–75 MB/s, queue ~10), `\Cache\Dirty Pages` crossed the dirty-page
+threshold, and Windows **throttled every buffered file write on the machine**
+until the lazy writer caught up. Nova's `println!` was a synchronous `WriteFile`
+to the log from the hot path — `📊 RTP/s` inside the Master's RTP send thread,
+`🎞 Encoder output` in the Worker loop, `ShimLog` on the encode thread — so the
+NIC sent **0.00 MB/s** for every window.
+
+- **`debug.rs`:** stdout/stderr → an anonymous pipe → `nova-log-drain`
+  (memory backlog, 8 MB cap, overflow counted and reported) → `nova-log-writer`,
+  the only thread that touches the file; it also owns rotation. The banner says
+  `Mode  non-blocking (pipe → nova-log-writer)`; `DIRECT` means the fallback
+  (pipe creation failed) and log writes can stall the stream again.
+- **`shim.cpp InitShimLogHandle`:** the shim writes into the same pipe instead
+  of opening `nova.log` itself (`InitShimLog(path)` remains the fallback).
+- **Exit/panic flush:** `process::exit` kills the logger threads, so the binary
+  exits via `debug::exit` and a panic hook calls `flush_log` (bounded, 2 s).
+  **New exits must use `debug::exit`**, or their last lines are lost.
+- **Silent frame drops are now logged:** when `RtpSender::send_frame` refuses a
+  frame (send thread `MAX_FRAMES_IN_FLIGHT` behind), the Master used to drop it
+  with no trace. `SendDropLog` logs `⚠️ Master: RTP send thread is 3 frames
+  behind` once, a heartbeat every 30 s, and `✅ … backlog cleared — N frame(s)
+  dropped` at the end. Check for it when the client asks for keyframes with no
+  visible reason.
+- Verified live: during the same throttle windows Nova kept sending ~0.48 MB/s,
+  and the Xbox made 0 keyframe requests in 161 s (previously 2–5 per minute).
+
+**Signature to recognise:** a multi-second hole in the per-second lines of
+BOTH logs with no `⏱️ Capture slot stalled`. **Diagnose with an in-memory
+sampler** (Get-Counter into a list, print at the end): any tool that writes a
+file while it samples freezes too and hides the evidence.
+
 ## 2026-10-12: **KEYFRAME STORMS + THE SWEEP LINE** (branch `fix/moonlight-keyframe-storm`, built + tested, NOT yet deployed)
 
 Diagnosed from a 3.5 h Moonlight/Xbox 4K120 HEVC/HDR10 session. Two faults, one fix each:
