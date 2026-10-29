@@ -7,9 +7,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+// ::IInspectable, the base of the Xbox extended-memory interface below.
+#include <inspectable.h>
 // quiet_NaN, which is how a FrameworkElement's Height says "Auto".
 #include <limits>
+#include <mutex>
 #include <string>
 // std::thread, for the one blocking display call that must not run on the UI
 // thread: RequestSetCurrentDisplayModeAsync().get() waits on the console.
@@ -41,6 +45,108 @@ namespace winrt::EchoXbox::implementation
         // ApplyChromeScale.
         constexpr double kDesignWidth  = 3840.0;
         constexpr double kDesignHeight = 2160.0;
+
+        // ── Memory, measured on the console ─────────────────────────────────
+        //
+        // Microsoft's "4K video playback for UWP apps on Xbox" page: an app
+        // gets 1.25 GB, or 3.25 GB with `hevcPlayback`, and on Series X|S the
+        // GRAPHICS partition is accounted separately ("extended memory"). This
+        // decoder's surfaces are graphics memory - 25 of them at 3840x2176 P010
+        // (FFmpeg's 1 + 16 for HEVC, plus extra_hw_frames 8), ~24 MiB each - so
+        // whether they count against the 1.25 GB is the whole question, and
+        // only the console can answer it.
+        //
+        // The extended-info interface is the one that page publishes; it is
+        // documented as working only for apps WITH hevcPlayback, so without it
+        // the graphics half reads "n/a" and MemoryManager is the measurement.
+        struct ExtendedMemoryInfo {
+            uint64_t appMemoryUsage;
+            uint64_t appMemoryLimit;
+            uint64_t extendedMemoryUsage;
+            uint64_t extendedMemoryLimit;
+        };
+        struct __declspec(uuid("dd36a017-b640-45f7-a023-1615cf098923"))
+        IApplicationResourcesStatics2 : ::IInspectable {
+            virtual HRESULT __stdcall GetExtendedMemoryInfo(ExtendedMemoryInfo* info) = 0;
+        };
+
+        // Resolved once. Absent on a PC, and possibly on a console without the
+        // capability; either way the answer does not change within a run.
+        com_ptr<IApplicationResourcesStatics2> const& XboxAppResources() noexcept {
+            static const com_ptr<IApplicationResourcesStatics2> resources = []() noexcept {
+                try {
+                    return get_activation_factory<Windows::Foundation::IInspectable>(
+                               L"Windows.Xbox.ApplicationModel.ApplicationResources")
+                        .try_as<IApplicationResourcesStatics2>();
+                } catch (...) {
+                    return com_ptr<IApplicationResourcesStatics2>{};
+                }
+            }();
+            return resources;
+        }
+
+        // Sampled on a thread-pool timer, never on the UI tick: the queries are
+        // OS calls of unknown cost on a console, and the 1 s stats tick only
+        // formats what was last read. The decode and present threads never
+        // touch any of this. Process-wide statics, so the timer has no page
+        // lifetime to outlive -- it runs for the life of the app.
+        //
+        // (Measured 2026-10-15, so nobody re-suspects it: the 0.1.1.0
+        // `dropped overflow` hitches were spaced ~100 FRAMES apart, sometimes
+        // twice in one second, which a 1 s timer cannot produce. They are a
+        // throughput sawtooth, not this.)
+        struct MemorySample {
+            std::atomic<uint64_t> usage{ 0 }, peak{ 0 }, limit{ 0 };
+            std::atomic<uint64_t> graphics{ 0 }, graphicsPeak{ 0 }, graphicsLimit{ 0 };
+            std::atomic<bool> appValid{ false }, graphicsValid{ false };
+        };
+        MemorySample g_memory;
+
+        void SampleMemory() noexcept {
+            try {
+                const uint64_t usage = MemoryManager::AppMemoryUsage();
+                g_memory.usage = usage;
+                g_memory.limit = MemoryManager::AppMemoryUsageLimit();
+                if (usage > g_memory.peak) g_memory.peak = usage;
+                g_memory.appValid = true;
+            } catch (...) {
+            }
+            ExtendedMemoryInfo info{};
+            if (auto const& resources = XboxAppResources();
+                resources && SUCCEEDED(resources->GetExtendedMemoryInfo(&info))) {
+                g_memory.graphics = info.extendedMemoryUsage;
+                g_memory.graphicsLimit = info.extendedMemoryLimit;
+                if (info.extendedMemoryUsage > g_memory.graphicsPeak)
+                    g_memory.graphicsPeak = info.extendedMemoryUsage;
+                g_memory.graphicsValid = true;
+            }
+        }
+
+        void StartMemorySampler() noexcept {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                try {
+                    static auto timer = Windows::System::Threading::ThreadPoolTimer::CreatePeriodicTimer(
+                        [](auto&&) { SampleMemory(); }, std::chrono::seconds(1));
+                } catch (...) {
+                    // No sampler means the line reads "n/a", never a failed page.
+                }
+            });
+        }
+
+        std::wstring MemoryReport() {
+            constexpr uint64_t kMiB = 1024 * 1024;
+            const auto mb = [](uint64_t bytes) { return std::to_wstring(bytes / kMiB); };
+            std::wstring out = g_memory.appValid
+                ? L"app " + mb(g_memory.usage) + L" MB   peak " + mb(g_memory.peak) +
+                      L" MB   limit " + mb(g_memory.limit) + L" MB"
+                : std::wstring(L"app n/a");
+            out += g_memory.graphicsValid
+                ? L"   ::   graphics " + mb(g_memory.graphics) + L" MB   peak " +
+                      mb(g_memory.graphicsPeak) + L" MB   limit " + mb(g_memory.graphicsLimit) + L" MB"
+                : std::wstring(L"   ::   graphics partition n/a");
+            return out;
+        }
 
         // ── The decode ceiling is GONE ──────────────────────────────────────
         //
@@ -171,6 +277,7 @@ namespace winrt::EchoXbox::implementation
         BuildOverlayChoices();
         BuildAppMenu();
         HookBackButton();
+        HookLifecycle();
         HookGestures();
         StartupAsync();
     }
@@ -638,6 +745,18 @@ namespace winrt::EchoXbox::implementation
                 manager.BackRequested(m_backToken);
             }
             m_backToken = {};
+        }
+        if (m_suspendingToken.value) {
+            Application::Current().Suspending(m_suspendingToken);
+            m_suspendingToken = {};
+        }
+        if (m_resumingToken.value) {
+            Application::Current().Resuming(m_resumingToken);
+            m_resumingToken = {};
+        }
+        if (m_displayHeld) {
+            try { m_displayRequest.RequestRelease(); } catch (...) {}
+            m_displayHeld = false;
         }
 
         // A running DispatcherTimer keeps firing into a lambda that captured
@@ -2499,15 +2618,21 @@ namespace winrt::EchoXbox::implementation
         HideAppDrawer();
         HideActionMenu();
         HideOverlay();                       // also turns forwarding on
+        // §18.3 timings describe THIS stream, not every stream since launch.
+        if (m_renderer) m_renderer->ResetTiming();
         // The microphone opens at the grant, not at connect: before the host
         // has granted the session the bridge has no keys to seal it with, and
         // every packet captured meanwhile would queue and arrive as one stale
         // burst. Level 0 does nothing.
         if (m_session && m_session->IsOpen()) m_session->SetMicLevel(m_micLevel);
+        HoldDisplayAwake(true);
     }
 
     void MainPage::LeaveStreamingUi()
     {
+        // First, so no early exit added below can leave the console held awake
+        // over a dashboard.
+        HoldDisplayAwake(false);
         // The dashboard is SDR (see StartupAsync step 5). Only when a stream is
         // genuinely over: a `closed` from a superseded session can land while
         // the NEXT stream is connecting with HDR already engaged, and must not
@@ -2525,6 +2650,59 @@ namespace winrt::EchoXbox::implementation
         FocusHostList();
     }
 
+    // ── Keeping the console awake while a stream runs ───────────────────────
+    //
+    // A console judges whether anyone is there from ITS OWN input: the pad, the
+    // media remote. A keyboard and mouse that reach the PC through VirtualHere
+    // (or are plugged into the PC directly) never pass through the console, so
+    // after a few minutes with the pad on the table it dims the app and raises
+    // its idle overlay over a stream somebody is actively playing. Nothing in
+    // Echo idles on a quiet pad - the dim is the console's own timer, and a
+    // DisplayRequest is how a video app tells it someone is watching.
+    //
+    // Held only while a stream is live, never on the dashboard: a console left
+    // on the host list should dim like any other app.
+    //
+    // DisplayRequest is a counter, and RequestRelease on a count of zero
+    // throws. `m_displayHeld` keeps this side at 0 or 1, so a second `granted`
+    // or a Leave without an Enter (an `error` before the grant) is a no-op, not
+    // an unbalanced call. A failed call leaves the flag where it was, so the
+    // next transition tries again.
+    void MainPage::HoldDisplayAwake(bool on)
+    {
+        if (on == m_displayHeld) return;
+        try {
+            if (!m_displayRequest) m_displayRequest = Windows::System::Display::DisplayRequest();
+            if (on) m_displayRequest.RequestActive();
+            else    m_displayRequest.RequestRelease();
+            m_displayHeld = on;
+            Append(on ? L"display     held awake for the stream"
+                      : L"display     released - the console may dim again");
+        } catch (hresult_error const& e) {
+            Append(L"display     request failed: " + e.message());
+        }
+    }
+
+    // The OS drops an app's display requests when it leaves the foreground and
+    // restores them when it returns, so this is not what makes a suspend safe.
+    // It keeps OUR count honest across one: released going out, re-taken coming
+    // back only if the stream is still live - a session that died while we were
+    // suspended arrives as `error`/`closed`, and LeaveStreamingUi releases.
+    //
+    // Either event may be raised off the UI thread, and every DisplayRequest
+    // call here belongs on it.
+    void MainPage::HookLifecycle()
+    {
+        const auto onUi = [this](auto action) {
+            if (Dispatcher().HasThreadAccess()) action();
+            else Dispatcher().RunAsync(CoreDispatcherPriority::High, action);
+        };
+        m_suspendingToken = Application::Current().Suspending(
+            [this, onUi](auto&&, auto&&) { onUi([this] { HoldDisplayAwake(false); }); });
+        m_resumingToken = Application::Current().Resuming(
+            [this, onUi](auto&&, auto&&) { onUi([this] { HoldDisplayAwake(m_streaming); }); });
+    }
+
     void MainPage::StartStatsTimer()
     {
         // Each number is a different stage, so the FIRST zero names the culprit:
@@ -2535,6 +2713,7 @@ namespace winrt::EchoXbox::implementation
         // regardless so that opening the diagnostics screen shows the current
         // numbers at once - a diagnostic that shows nothing when you first ask
         // for it is indistinguishable from one that is broken.
+        StartMemorySampler();
         m_statsTimer = DispatcherTimer();
         m_statsTimer.Interval(std::chrono::seconds(1));
         m_statsTimer.Tick([this](auto&&...) {
@@ -2572,6 +2751,20 @@ namespace winrt::EchoXbox::implementation
                 const auto detail = m_decoder->ErrorDetail();
                 if (!detail.empty()) line += L"\n  " + detail;
             }
+
+            // §18.3: where the 4K120 time goes, per stage. Counts are per
+            // bucket in ms since the stream (or decoder) started; the two
+            // figures at the end are the worst this second and this session.
+            // A pile in 14-20 / 20-35 on `submit` is FFmpeg sleeping on a busy
+            // decoder (StageTimer.h); on `lock` it is the present thread
+            // holding the decoder; on `wait` / `present` it is the compositor.
+            line += L"\ntiming      buckets in ms, worst now / session";
+            if (m_decoder) {
+                if (const auto timing = m_decoder->TimingReport(); !timing.empty()) {
+                    line += L"\n" + timing;
+                }
+            }
+            line += L"\n" + m_renderer->TimingReport();
 
             // ── The receive path, from the shared core ──────────────────────
             //
@@ -2636,6 +2829,11 @@ namespace winrt::EchoXbox::implementation
                             std::to_wstring(m_input ? m_input->RumbleApplied() : 0);
                 }
             }
+
+            // Peak against limit is what decides whether the app needs the
+            // 3.25 GB `hevcPlayback` budget. Read it after a 4K120 HDR stream
+            // has run for a while, not at the dashboard.
+            line += L"\nmemory    " + MemoryReport();
 
             line += L"\npresented " + std::to_wstring(m_renderer->PresentedFrames()) +
                     L"   sync " + std::to_wstring(m_renderer->SyncInterval());

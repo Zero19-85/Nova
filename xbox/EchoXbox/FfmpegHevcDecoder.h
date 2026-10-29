@@ -41,6 +41,7 @@
 #include <mutex>
 #include <string>
 
+#include "StageTimer.h"
 #include "VideoDecoder.h"
 
 struct AVCodecContext;
@@ -82,8 +83,20 @@ public:
     // The breakdown, because the sum says something is wrong and only this
     // says WHICH of four quite different things it is.
     std::wstring ErrorDetail() const noexcept override;
+    std::wstring TimingReport() noexcept override {
+        return m_lockWait.Report(L"lock    ") + L"\n" +
+               m_send.Report(L"submit  ") + L"\n" +
+               m_receive.Report(L"receive ");
+    }
 
 private:
+    // §18.3: decode thread waiting for m_lock (held by the present thread's
+    // TryGetFrame), the send itself (where FFmpeg's E_PENDING sleep would
+    // show), and the present thread's drain.
+    echo::StageTimer m_lockWait;
+    echo::StageTimer m_send;
+    echo::StageTimer m_receive;
+
     // Bounded so a decoder that answers "ready" forever cannot wedge the
     // present thread; whatever is left is dropped on the next pass.
     static constexpr int kMaxDrain = 32;

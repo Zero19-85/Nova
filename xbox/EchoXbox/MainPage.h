@@ -150,6 +150,13 @@ namespace winrt::EchoXbox::implementation
         void EnterStreamingUi();              // UI thread
         void LeaveStreamingUi();              // UI thread
 
+        // ── Keeping the console awake ──────────────────────────────────────
+        //
+        // Held for exactly as long as a stream is live. See the note on the
+        // definition for why the console needs telling at all.
+        void HoldDisplayAwake(bool on);       // UI thread
+        void HookLifecycle();                 // UI thread, once
+
         // ── Two-step teardown ───────────────────────────────────────────────
         //
         // `DetachStream` walks away and lets the host hold its display for the
@@ -327,6 +334,16 @@ namespace winrt::EchoXbox::implementation
         // Revoked in the destructor: SystemNavigationManager is a per-view
         // singleton that outlives this page, and the handler captures `this`.
         event_token m_backToken{};
+
+        // Built on first use. `m_displayHeld` is this side's half of the
+        // DisplayRequest counter and is only ever 0 or 1: RequestRelease on a
+        // count of zero throws, so every call goes through HoldDisplayAwake.
+        Windows::System::Display::DisplayRequest m_displayRequest{ nullptr };
+        bool m_displayHeld = false;
+        // Application events, revoked in the destructor for the same reason as
+        // m_backToken: the Application outlives the page.
+        event_token m_suspendingToken{};
+        event_token m_resumingToken{};
 
         // The stats line is built every tick whether or not the panel is
         // showing, so opening it can fill it immediately rather than leaving a

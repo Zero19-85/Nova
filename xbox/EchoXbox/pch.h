@@ -35,6 +35,9 @@
 #include <winrt/Windows.UI.Xaml.Input.h>
 // VirtualKey — GamepadA and GamepadMenu specifically.
 #include <winrt/Windows.System.h>
+#include <winrt/Windows.System.Threading.h>
+// DisplayRequest: keeps the console from dimming a stream it cannot see input for.
+#include <winrt/Windows.System.Display.h>
 // The toast's accent bar and the dashboard's identity rule are Rectangles, and
 // MainPage.g.h projects them — without this the generated header does not
 // compile, and the error names the generated file rather than this omission.

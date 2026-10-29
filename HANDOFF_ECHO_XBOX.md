@@ -1828,3 +1828,182 @@ character by character before suspecting anything else.**
   > SMPTE ST 2084 (PQ) colorimetry for HDR10 output. Without direct access to
   > this decoder, the application cannot render the 4K/HDR payload from the
   > local host server.
+
+## 18. `hevcPlayback` removed after a 10.6.3 rejection (2026-10-15) — console test OWED
+
+Certification rejected 0.1.0.0 under Policy 10.6.3 (restricted capability
+without an adequate justification). The justification in §17 was also
+**factually wrong**: the capability does not grant access to the hardware
+decoder. Echo decodes with FFmpeg/D3D11VA, and it streamed 4K HEVC on
+2026-09-07, before the capability existed. Microsoft has also said publicly
+(Q&A, 2022) that 4K playback is "only supported for select managed partners",
+so approval was never likely.
+
+**Why removing it should be safe, and what is still unproven.** The capability
+went in as the first theory for the HDR refusal (§14.1). §14.8 found the real
+cause, and that same bool bug also explains the pre-capability symptom ("no PQ
+mode at 120 Hz"). So the evidence that the capability was needed for HDR is
+contaminated, but it has never been tested without it. **0.1.1.0 is that test.**
+
+**Memory, estimated from the code (not yet measured):**
+
+| Allocation | Size at 4K Main10 |
+|---|---|
+| FFmpeg D3D11VA pool: 1 + 16 (HEVC) + `extra_hw_frames` 8 = 25 × 3840×2176 P010 | ~600 MiB |
+| `VideoRenderer` plane-copy texture (1 × P010) | ~24 MiB |
+| Swap chain, 2 × 3840×2160 R10G10B10A2 | ~63 MiB |
+| XAML/WinRT, FFmpeg + bridge DLLs, heap, frame buffers | ~100–200 MiB (guess) |
+| **Total** | **~0.8–0.9 GB** |
+
+It fits under 1.25 GB, but with only ~350 MB to spare, so "comfortably" is
+not the right word. Microsoft's page accounts Series X|S graphics memory in a
+separate "extended" partition. If D3D surfaces count there rather than against
+the 1.25 GB, the headroom is much larger. Only the console can say which.
+**The lever if it is tight:** `extra_hw_frames` 8 → 2 frees ~145 MiB. It was
+raised to 8 while chasing decay that turned out to be the host's LTR bug
+(§14.4). The +16 is FFmpeg's generic DPB allowance (Nova's 4K DPB is 5);
+trimming it needs a custom `hw_frames_ctx`.
+
+**New `memory` line on the diagnostics panel:** `app N MB peak N MB limit N MB
+:: graphics …`. `MemoryManager::AppMemoryUsage/Limit`, plus the Xbox
+`IApplicationResourcesStatics2::GetExtendedMemoryInfo` graphics partition from
+Microsoft's 4K page. That interface is documented for apps WITH
+`hevcPlayback`, so `graphics partition n/a` on 0.1.1.0 is expected, not a fault.
+The `limit` should read ~1280 MB. If it reads ~3328, the capability is still
+in the installed build.
+
+**Test procedure (0.1.1.0 sideload):**
+1. Uninstall the old build first: same identity, and a higher version installs
+   over it, but a clean install proves the manifest.
+2. Stream 4K120 HEVC HDR10 for 10+ min, including a busy scene.
+3. Pass = the `hdr` line engages PQ (not `[now SDR]`), the picture is HDR, no
+   `0x887A0005`, and `memory` peak stays well below limit.
+4. If HDR fails: the per-row verdict table prints. Every row `pq NO` would
+   mean the console now withholds PQ modes, so the capability IS load-bearing.
+   That outcome needs a different conversation with certification, not a
+   re-justification.
+
+**Store:** `EchoXbox_0.1.1.0_x64_bundle.msixupload`, zero restricted
+capabilities. Delete the §17 justification from the certification notes.
+
+### 18.1 First console run of 0.1.1.0 (2026-10-15): SDR + periodic blocks, NOT yet attributable
+
+Host evidence (`nova-service.log`, `nova.log`):
+- **The Xbox asked for SDR in both sessions.** The start line had no `/HDR10`
+  (`validate` grants HDR for every HEVC request), and the Worker encoded
+  `is_hdr=0`, NV12. So the client's own stream gate decided the output was
+  not HDR. The reason is on its diagnostics screen (`hdr` line + mode
+  table); the client never writes its log to a file.
+- **The blocks are client stalls, not network loss.** Session 2 had a
+  `invalidated frames N-(N+5)` about every 100 frames during motion. That is
+  always 6 frames, i.e. the full 50 ms FrameQueue at 120 fps being flushed on
+  overflow, on a LAN-direct path at 1–2 MB/s. The decode/present path stalled
+  ≥50 ms roughly once a second.
+- **Confounder: the app type.** The log shows a fresh pairing, so this was a
+  clean install, and a clean install resets the Dev Home app type to **App**.
+  The 2026-10-07 HDR success ran as **Game**. Per Microsoft's resource page,
+  Apps get a ~45% GPU share and 1 GB; Games get the full GPU and 5 GB. Either
+  the missing capability or the App type could explain both symptoms.
+  **Next run: set Echo to Game in Dev Home, keep 0.1.1.0, and photograph the
+  diagnostics screen (`hdr`, `hdmi`, `memory` lines).**
+
+### 18.2 Second run (2026-10-15): the capability IS what withholds HDR
+
+Diagnostics screen, 0.1.1.0, running as **Game** (`memory ... limit 5120 MB`,
+which is the Game budget, so the app-type confounder in 18.1 is ruled out):
+
+```
+3840x2160 @ 59.94 Hz, 24 bpp, RGB limited  <- pq NO (raw 0x00) ... => rejected
+3840x2160 @ 119.88 Hz, 24 bpp, RGB limited <- pq NO (raw 0x00) ... ok => rejected
+```
+
+Those are the ONLY two modes offered at 4K. With `hevcPlayback` (14.6, same
+console and TV) the list also had `30 bpp BT709` and `30 bpp BT2020 (PQ
+capable)` at both 59.94 and 119.88 Hz. Without it, the console hides every
+10-bit and PQ mode from the app. `raw 0x00` is a canonical false, so this is
+not the 14.8 bool bug. It is platform policy, not the hardware: the same
+console and TV do 4K120 HDR10 for moonlight-xbox, which declares the capability.
+
+Other readings: `memory app 686 MB peak 686 MB` on an SDR stream (NV12
+surfaces are half the size of P010, so HDR would add roughly 300 MB if the
+pool is counted here). That is under the 1280 MB App budget either way.
+`dropped overflow 252`, `worst 51 ms`: the 6-frame stalls from 18.1 persist
+even as a Game with the full GPU, so they are a separate issue and not
+explained by the app type or memory.
+
+### 18.3 0.1.2.0: `hevcPlayback` restored; the hitch is a throughput sawtooth
+
+`hevcPlayback` is back (Version 0.1.2.0, sideload zip + Store msixupload)
+pending reconsideration with the 18.2 mode-list evidence.
+
+**The 0.1.1.0 hitch was not the memory telemetry.** Host-side spacing of the
+6-frame `invalidated frames` reports: ~100 FRAMES apart (70–108), and about
+one in five landed in the same second as the previous one. A 1 s
+DispatcherTimer cannot fire twice in a second, and the telemetry ran on the UI
+thread, which neither the decode thread (`FeedFrames`) nor the present thread
+(`PresentLoop`) waits on. The shape is a sawtooth: the client sustains
+slightly under 120 fps, a 6-frame backlog builds over ~100 frames, the 50 ms
+FrameQueue overflows (`worst 51 ms`) and is flushed. Telemetry still moved to
+a thread-pool sampler (`StartMemorySampler`), so the UI tick only formats
+atomics.
+
+**Open: what costs that ~5% of throughput.** 0.1.0.0 felt smooth and ran HDR
+(P010, more work than 0.1.1.0's NV12). The only client difference is the
+capability, and no other client code changed. So `hevcPlayback` may also change
+how the OS schedules the app, which Microsoft does not document. 0.1.2.0
+tests this: if `dropped overflow` stays near 0 at 4K120, the capability is
+load-bearing for frame pacing too, and that belongs in the reconsideration.
+If it persists, look at the client's decode/present pacing instead (`dropped`
+was 19% of decoded on 0.1.1.0).
+
+## 19. 0.1.3.0: the console dimmed a stream it could not see input for (2026-10-28) — console test OWED
+
+**Symptom.** With keyboard/mouse reaching the PC via VirtualHere (or plugged
+into the PC), the Xbox pad sits untouched. After a few minutes the console
+dims Echo and raises its idle overlay until the pad is bumped.
+
+**Cause.** The console judges presence from ITS OWN input only. Nothing in
+Echo idles on a quiet pad. Audited: `VideoRenderer::IdleWait` is a 1 ms
+present-loop wait, the pad keep-alive only paces what is sent to the host, and
+`NoVideoPanel` shows only while `drawn == 0`. No DisplayRequest existed
+anywhere in the client.
+
+**Fix (`MainPage.cpp`).** `HoldDisplayAwake(bool)` owns a lazily built
+`Windows::System::Display::DisplayRequest`. `EnterStreamingUi` takes it and
+`LeaveStreamingUi` releases it, which covers every exit (detach, End Stream,
+`error`, `closed`). `m_displayHeld` keeps this side's count at 0 or 1, because
+`RequestRelease` on zero throws. `HookLifecycle` releases on `Suspending` and
+re-takes on `Resuming` only if `m_streaming`. The destructor releases. It is
+held during streams only, so the dashboard still dims like any app. The log
+shows `display     held awake for the stream` / `released`.
+
+**Test.** Stream with VirtualHere input, leave the pad alone well past the
+console's dim timeout. Pass = no dim, no idle overlay. If the overlay still
+appears, it is not governed by DisplayRequest, and that is the next question.
+
+Packages: `dist\EchoXbox-sideload-EchoXbox_0.1.3.0_x64.zip`,
+`AppPackages\EchoXbox\EchoXbox_0.1.3.0_x64_bundle.msixupload`
+(`hevcPlayback` still declared, as in 0.1.2.0).
+
+## 20. §18.3 timing hooks (2026-10-29, built into 0.1.3.0, NOT yet run on the console)
+
+**The suspect.** When the D3D11 hardware decoder is busy, FFmpeg retries
+`DecoderBeginFrame` on `E_PENDING` with `av_usleep(2000)`
+(`libavcodec/dxva2.c`), and an MSVC build implements that as `Sleep(2)`
+(`libavutil/time.c`). Nothing in this app raises the timer resolution (the
+renderer deliberately avoids `timeBeginPeriod`), so each retry can sleep a full
+~15.6 ms tick. Three of those is the 50 ms queue, which matches the 6-frame
+overflows and `worst 51 ms`. Unproven until measured.
+
+**What was added (diagnostics panel only, no behaviour change):**
+`StageTimer.h` (lock-free histogram: `<2 / 2-8 / 8-14 / 14-20 / 20-35 / 35+`
+ms, worst this second / this session). Decoder: `lock` (decode thread waiting
+for `m_lock`), `submit` (`avcodec_send_packet` incl. the EAGAIN retry),
+`receive` (TryGetFrame's drain). Renderer: `pull`, `draw`, `wait` (frame-latency
+waitable), `present`. Renderer timers reset at each stream start.
+
+**How to read it.** `submit` piling into 14-20 and 20-35 = the FFmpeg sleep;
+fix = `timeBeginPeriod(1)` while streaming (check UWP availability), else
+rebuild FFmpeg with a high-resolution wait. `lock` large = present thread
+holding the decoder. `wait`/`present` large = compositor pacing. A smooth
+`submit` tail under 8 ms = the sleep theory is wrong; look at the others.

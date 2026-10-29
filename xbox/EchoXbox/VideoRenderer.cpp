@@ -1527,8 +1527,15 @@ void VideoRenderer::PresentLoop() noexcept {
             if (m_frameSource) {
                 com_ptr<ID3D11Texture2D> frame;
                 uint32_t subresource = 0;
-                if (m_frameSource(frame, subresource) && frame) {
+                const auto pullStart = std::chrono::steady_clock::now();
+                const bool pulled = m_frameSource(frame, subresource) && frame;
+                const auto pullEnd = std::chrono::steady_clock::now();
+                if (pulled) {
+                    // Timed only when a picture came back: an empty poll is the
+                    // idle path and would bury the samples that matter.
+                    m_pullTime.Add(pullEnd - pullStart);
                     drew = RenderFrame(frame.get(), subresource);
+                    m_drawTime.Add(std::chrono::steady_clock::now() - pullEnd);
                     if (drew) m_blitted.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -1613,6 +1620,7 @@ void VideoRenderer::PresentLoop() noexcept {
         // and the loop cannot spin. The 100 ms cap keeps a stalled compositor
         // from making this thread unkillable.
         if (m_frameLatencyWaitable) {
+            echo::ScopedStage timing(m_waitTime);
             WaitForSingleObjectEx(m_frameLatencyWaitable.get(), 100, FALSE);
         }
         if (!m_running.load(std::memory_order_acquire)) break;
@@ -1624,7 +1632,9 @@ void VideoRenderer::PresentLoop() noexcept {
         const UINT interval = m_syncInterval.load(std::memory_order_relaxed);
         const UINT flags =
             (m_tearingSupported && interval == 0) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        const auto presentStart = std::chrono::steady_clock::now();
         const HRESULT hr = m_swapChain->Present1(interval, flags, &params);
+        m_presentTime.Add(std::chrono::steady_clock::now() - presentStart);
         if (SUCCEEDED(hr)) {
             m_presented.fetch_add(1, std::memory_order_relaxed);
             continue;

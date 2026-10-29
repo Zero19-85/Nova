@@ -223,7 +223,9 @@ bool FfmpegHevcDecoder::Submit(const uint8_t* data, uint32_t length, bool keyfra
                                bool discontinuity, int64_t pts100ns) noexcept {
     if (!m_started || !data || length == 0) return false;
 
+    const auto lockStart = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> guard(m_lock);
+    m_lockWait.Add(std::chrono::steady_clock::now() - lockStart);
     if (!m_ctx) return false;
 
     // ── `discontinuity` deliberately does NOTHING here ──────────────────────
@@ -270,6 +272,7 @@ bool FfmpegHevcDecoder::Submit(const uint8_t* data, uint32_t length, bool keyfra
     m_packet->dts = pts100ns;
     if (keyframe) m_packet->flags |= AV_PKT_FLAG_KEY;
 
+    const auto sendStart = std::chrono::steady_clock::now();
     int rc = avcodec_send_packet(m_ctx, m_packet);
     if (rc == AVERROR(EAGAIN)) {
         // The decoder is full because nobody drained it fast enough.
@@ -284,6 +287,7 @@ bool FfmpegHevcDecoder::Submit(const uint8_t* data, uint32_t length, bool keyfra
         DrainAndDiscard();
         rc = avcodec_send_packet(m_ctx, m_packet);
     }
+    m_send.Add(std::chrono::steady_clock::now() - sendStart);
 
     // ── A frame that never reached the decoder is a hole, and it is SILENT ──
     //
@@ -312,6 +316,7 @@ bool FfmpegHevcDecoder::TryGetFrame(com_ptr<ID3D11Texture2D>& texture,
 
     std::lock_guard<std::mutex> guard(m_lock);
     if (!m_ctx || !m_current) return false;
+    echo::ScopedStage timing(m_receive);
 
     // Whatever the renderer had is finished with by now — it blits before it
     // asks again. Releasing here rather than at the end of the last call is

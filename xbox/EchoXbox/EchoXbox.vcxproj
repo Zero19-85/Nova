@@ -150,6 +150,7 @@
     <ClInclude Include="EchoBridge.h" />
     <ClInclude Include="GamepadInput.h" />
     <ClInclude Include="VideoRenderer.h" />
+    <ClInclude Include="StageTimer.h" />
     <ClInclude Include="VideoDecoder.h" />
     <ClInclude Include="HevcDecoder.h" />
     <ClInclude Include="FfmpegHevcDecoder.h" />

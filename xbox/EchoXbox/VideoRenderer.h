@@ -23,6 +23,8 @@
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 #include <winrt/base.h>
+
+#include "StageTimer.h"
 #include <winrt/Windows.UI.Xaml.Controls.h>
 
 #include "VideoDecoder.h"   // FrameColor
@@ -184,6 +186,18 @@ public:
 
     uint64_t PresentedFrames() const noexcept { return m_presented.load(std::memory_order_relaxed); }
     uint64_t BlittedFrames()   const noexcept { return m_blitted.load(std::memory_order_relaxed); }
+
+    // §18.3 per-stage timing of the present loop (StageTimer.h). Reading
+    // clears the "worst this second" figures; ResetTiming starts a session.
+    std::wstring TimingReport() noexcept {
+        return m_pullTime.Report(L"pull    ") + L"\n" +
+               m_drawTime.Report(L"draw    ") + L"\n" +
+               m_waitTime.Report(L"wait    ") + L"\n" +
+               m_presentTime.Report(L"present ");
+    }
+    void ResetTiming() noexcept {
+        m_pullTime.Reset(); m_drawTime.Reset(); m_waitTime.Reset(); m_presentTime.Reset();
+    }
     uint32_t SyncInterval()    const noexcept { return m_syncInterval.load(std::memory_order_relaxed); }
     uint32_t LastPresentError() const noexcept { return m_lastPresentHr.load(std::memory_order_relaxed); }
     /// What the compositor was told is in the back buffer, and whether it
@@ -382,6 +396,14 @@ private:
     std::atomic<bool>     m_running{false};
     std::atomic<uint64_t> m_presented{0};
     std::atomic<uint64_t> m_blitted{0};
+
+    // §18.3: pull = m_frameSource (the decoder's TryGetFrame, incl. its
+    // lock), draw = RenderFrame, wait = the frame-latency waitable, present
+    // = Present1. Written on the present thread only.
+    echo::StageTimer m_pullTime;
+    echo::StageTimer m_drawTime;
+    echo::StageTimer m_waitTime;
+    echo::StageTimer m_presentTime;
 
     std::mutex m_lock;
     std::atomic<bool> m_resizePending{false};

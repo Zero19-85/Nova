@@ -102,6 +102,10 @@ public:
     /// Which kind of error, in words. Empty when the implementation has no
     /// breakdown to offer.
     virtual std::wstring ErrorDetail() const noexcept { return {}; }
+
+    /// Per-stage timing histograms, one line per stage (StageTimer.h, §18.3).
+    /// Not const: reading clears the "worst this second" figure.
+    virtual std::wstring TimingReport() noexcept { return {}; }
 };
 
 }  // namespace echo

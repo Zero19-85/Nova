@@ -22,17 +22,19 @@
      on a PC and only ever debugging it on a TV. A `Windows.Xbox` entry sits
      BESIDE it for the Store submission: beside, never instead of.
 
-  4. `hevcPlayback` is NOT a Media Foundation switch, whatever its name says.
-     Microsoft's "4K video playback for UWP apps on Xbox" page: "4K and HDR10
-     video playback is supported on the Xbox One S onwards ... All these
-     capabilities are enabled using the special hevcPlayback capability", and
-     enabling it "changes the way your application is treated by the Xbox
-     operating system": 3.25 GB of memory instead of 1.25 GB, and the app no
-     longer runs beside a game. moonlight-xbox declares it; Echo did not until
-     2026-10-07, and on the same console and TV moonlight reached 4K120 HDR10
-     while Echo was offered no PQ display mode at 120 Hz and a 4K stream with
-     a copy texture lived inside the smaller memory budget. Removing this line
-     is how both of those come back.
+  4. `hevcPlayback` is what makes the console OFFER HDR10 display modes, and
+     that is the only reason it is here. MEASURED 2026-10-15 on the same
+     Series X and TV, running as Game in both cases: without it,
+     HdmiDisplayInformation::GetSupportedDisplayModes listed only
+     `3840x2160 @ 59.94/119.88 Hz, 24 bpp, RGB limited`, PQ raw 0x00, with no
+     10-bit and no PQ entries at all. With it, the same call also listed
+     `30 bpp BT2020 (PQ capable)` at both rates (HANDOFF_ECHO_XBOX.md 14.6,
+     18.2). It does NOT gate the decoder (Echo uses FFmpeg/D3D11VA into a
+     swap chain), and memory is not the reason either: 686 MB peak measured,
+     under the 1.25 GB a plain app gets. Store certification rejected it
+     once under Policy 10.6.3 (2026-10-15); it is back pending
+     reconsideration with that measured evidence. Removing it costs HDR10,
+     not 4K.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -49,7 +51,7 @@
   <Identity
     Name="Zeroorigin1985.com.EchoStreamClient"
     Publisher="CN=966F1B4F-E0AA-49A8-86CD-B67FF919632A"
-    Version="0.1.0.0" />
+    Version="0.1.3.0" />
 
   <mp:PhoneIdentity PhoneProductId="6f1c2a10-4e9c-4d5f-9a3f-0d4c6b7e8a01"
                     PhonePublisherId="00000000-0000-0000-0000-000000000000" />
@@ -102,9 +104,8 @@
     <Capability Name="internetClientServer" />
     <!-- The LAN half: the direct rendezvous, and discovery if it is added. -->
     <Capability Name="privateNetworkClientServer" />
-    <!-- 4K + HDR10 display modes and the larger memory budget. See note 4.
-         Restricted, so a Store submission would need it approved; a Dev Mode
-         sideload is allowed it as-is. Must precede DeviceCapability. -->
+    <!-- HDR10 display modes. See note 4. Restricted: a Store build needs it
+         approved. Must precede DeviceCapability. -->
     <rescap:Capability Name="hevcPlayback" />
     <!-- Headset microphone, for upstream passthrough. -->
     <DeviceCapability Name="microphone" />
