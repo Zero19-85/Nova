@@ -537,7 +537,7 @@ pub trait MediaPlane: Send + Sync + 'static {
     /// Best-effort by construction: the Worker falls back to an IDR when
     /// NVENC cannot honour the range (gap >= DPB depth), so a caller never
     /// has to decide that for itself.
-    fn invalidate_ref_frames(&self, first: u32, last: u32);
+    fn invalidate_ref_frames(&self, first: u32, last: u32, local: bool);
 
     /// Report the newest wire frame index the client's decoder accepted.
     ///
@@ -674,12 +674,12 @@ impl MediaPlane for WorkerMediaPlane {
         self.worker_link.send(ControlMsg::RequestIdr);
     }
 
-    fn invalidate_ref_frames(&self, first: u32, last: u32) {
+    fn invalidate_ref_frames(&self, first: u32, last: u32, local: bool) {
         // The identical message the GameStream control path sends for
         // PT_INVALIDATE_REF_FRAMES, so Echo's repair meets the shim at the
         // same place Moonlight's does -- including the IDR fallback the
         // Worker applies when NVENC refuses the range.
-        self.worker_link.send(ControlMsg::InvalidateRefFrames { first, last });
+        self.worker_link.send(ControlMsg::InvalidateRefFrames { first, last, local });
     }
 
     fn ltr_acked(&self, frame_index: u32) {
@@ -1497,6 +1497,7 @@ impl SessionManager {
         device: &EchoIdentity,
         first: u32,
         last: u32,
+        local: bool,
     ) -> Result<u64, HandoffError> {
         if first == 0 || last < first {
             return Err(HandoffError::BadRequest(format!(
@@ -1510,7 +1511,7 @@ impl SessionManager {
         if session.device_fingerprint != device.fingerprint {
             return Err(HandoffError::NotTheOwner);
         }
-        self.plane.invalidate_ref_frames(first, last);
+        self.plane.invalidate_ref_frames(first, last, local);
         Ok(session.id)
     }
 
@@ -1587,7 +1588,7 @@ mod tests {
         fn request_idr(&self) {
             *self.idrs.lock().unwrap() += 1;
         }
-        fn invalidate_ref_frames(&self, first: u32, last: u32) {
+        fn invalidate_ref_frames(&self, first: u32, last: u32, _local: bool) {
             self.invalidations.lock().unwrap().push((first, last));
         }
         fn ltr_acked(&self, _frame_index: u32) {}
@@ -1829,7 +1830,7 @@ mod tests {
         let f = fixture(Some(peer()));
 
         assert_eq!(
-            f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12),
+            f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12, false),
             Err(HandoffError::NotTheOwner),
             "no session exists, so nobody owns one"
         );
@@ -1837,7 +1838,7 @@ mod tests {
         f.mgr.start(&device("Xbox", 1), SessionRequest::default()).unwrap();
 
         assert_eq!(
-            f.mgr.invalidate_ref_frames(&device("Pixel", 2), 10, 12),
+            f.mgr.invalidate_ref_frames(&device("Pixel", 2), 10, 12, false),
             Err(HandoffError::NotTheOwner)
         );
         assert!(
@@ -1845,7 +1846,7 @@ mod tests {
             "an authenticated stranger must not be able to corrupt the owner's stream"
         );
 
-        assert!(f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12).is_ok());
+        assert!(f.mgr.invalidate_ref_frames(&device("Xbox", 1), 10, 12, false).is_ok());
         assert_eq!(*f.plane.invalidations.lock().unwrap(), vec![(10, 12)]);
     }
 
@@ -1862,7 +1863,7 @@ mod tests {
         for (first, last) in [(0u32, 5u32), (9, 4)] {
             assert!(
                 matches!(
-                    f.mgr.invalidate_ref_frames(&owner, first, last),
+                    f.mgr.invalidate_ref_frames(&owner, first, last, false),
                     Err(HandoffError::BadRequest(_))
                 ),
                 "{first}-{last} should be refused"
@@ -1871,7 +1872,7 @@ mod tests {
         assert!(f.plane.invalidations.lock().unwrap().is_empty());
 
         // The degenerate-but-valid single-frame range still goes through.
-        assert!(f.mgr.invalidate_ref_frames(&owner, 7, 7).is_ok());
+        assert!(f.mgr.invalidate_ref_frames(&owner, 7, 7, false).is_ok());
         assert_eq!(*f.plane.invalidations.lock().unwrap(), vec![(7, 7)]);
     }
 

@@ -298,7 +298,10 @@ pub enum ControlMsg {
     /// wire frame-index range. The Worker asks NVENC to invalidate those
     /// references so the next P-frame recovers without an IDR; on failure it
     /// falls back to forcing an IDR. See encoder::invalidate_ref_frames.
-    InvalidateRefFrames { first: u32, last: u32 },
+    /// `local`: an Echo client's own queue overflowed (`cause: "overflow"`),
+    /// so a fallback IDR is not charged as congestion. Always false for
+    /// GameStream.
+    InvalidateRefFrames { first: u32, last: u32, local: bool },
     /// Master -> Worker: the Echo client reported the newest wire frame index
     /// its decoder accepted.
     ///
@@ -566,10 +569,11 @@ impl ControlMsg {
             }
             ControlMsg::RequestIdr => vec![tag::REQUEST_IDR],
             ControlMsg::CongestionReduce => vec![tag::CONGESTION_REDUCE],
-            ControlMsg::InvalidateRefFrames { first, last } => {
+            ControlMsg::InvalidateRefFrames { first, last, local } => {
                 let mut out = vec![tag::INVALIDATE_REF_FRAMES];
                 write_u32(&mut out, *first);
                 write_u32(&mut out, *last);
+                out.push(*local as u8);
                 out
             }
             ControlMsg::LtrAck { frame_index } => {
@@ -649,7 +653,9 @@ impl ControlMsg {
                 let at = &mut 0usize;
                 let first = read_u32(rest, at)?;
                 let last = read_u32(rest, at)?;
-                Ok(ControlMsg::InvalidateRefFrames { first, last })
+                // Absent = an older peer = charged, which is what it always was.
+                let local = rest.get(*at).is_some_and(|&b| b != 0);
+                Ok(ControlMsg::InvalidateRefFrames { first, last, local })
             }
             tag::LTR_ACK => {
                 let at = &mut 0usize;
@@ -1097,6 +1103,22 @@ mod tests {
             let msg = ControlMsg::ConfigureStart(cs);
             assert_eq!(ControlMsg::decode(&msg.encode()).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn invalidate_ref_frames_carries_the_overflow_flag() {
+        for local in [false, true] {
+            let msg = ControlMsg::InvalidateRefFrames { first: 7, last: 12, local };
+            assert_eq!(ControlMsg::decode(&msg.encode()).unwrap(), msg);
+        }
+        // A peer that predates the flag sends no trailing byte; that must
+        // read as charged, which is what every repair was before.
+        let mut old = ControlMsg::InvalidateRefFrames { first: 7, last: 12, local: true }.encode();
+        old.pop();
+        assert_eq!(
+            ControlMsg::decode(&old).unwrap(),
+            ControlMsg::InvalidateRefFrames { first: 7, last: 12, local: false },
+        );
     }
 
     #[test]

@@ -279,6 +279,12 @@ static std::mutex           g_repairMutex;
 static bool                 g_repairPending = false;
 static uint64_t             g_repairFirst   = 0;
 static uint64_t             g_repairLast    = 0;
+// Whether the pending range may be charged as congestion if it falls back to
+// an IDR. False only when every request merged into it was a client-side
+// queue overflow (an Echo `cause: "overflow"`): that gap says the CLIENT fell
+// behind, not the link. Charging it walked a 4K120 Xbox session from 39.5 to
+// ~5 Mbps on 2026-10-29 over a healthy LAN.
+static bool                 g_repairCharged = false;
 // Wire index of the most recent IDR this encoder emitted.
 static std::atomic<uint64_t> g_lastIdrFrameIndex{0};
 // Repairs that fell all the way through to an IDR since Rust last asked. That
@@ -480,6 +486,15 @@ static const bool kEnableFillerData = false;
 // ArmLtrRecovery() always answers "no reference available" so every caller
 // falls back to the IDR path it used before.
 static const bool kEnableLtr = true;
+
+// The per-session half of that switch. The Worker clears it for Echo sessions
+// unless `[echo] long_term_refs` asks otherwise: 2026-10-28, an Xbox Echo
+// session decoded with no loss and no decode error yet showed minutes-old
+// pictures in wrong colours, and each LTR re-mark carried the damage forward
+// until a keyframe cleared it. Off also restores numRefL0 = 1, so the session
+// runs exactly the reference structure it had before LTR landed (7b8d25a).
+// Default true: GameStream sessions, and all the monolithic run() serves.
+static bool g_ltrAllowed = true;
 // Persisted encoder configuration so ReconfigureBitrate() can rebuild
 // NV_ENC_RECONFIGURE_PARAMS from the exact params the encoder was created
 // with (only rate-control fields changed).
@@ -1799,7 +1814,10 @@ extern "C" __declspec(dllexport) int InitEncoder(
                                     codecGuid, NV_ENC_CAPS_NUM_MAX_LTR_FRAMES);
         g_ltrSupported = ltrCodec && maxLtr >= kLtrNumFrames
                       && g_refFramesInDpb > kLtrNumFrames;
-        g_ltrActive    = kEnableLtr && g_ltrSupported;
+        g_ltrActive    = kEnableLtr && g_ltrAllowed && g_ltrSupported;
+        // Two L0 references arrived WITH LTR; without it, one, as before.
+        const NV_ENC_NUM_REF_FRAMES numRefL0 =
+            g_ltrActive ? NV_ENC_NUM_REF_FRAMES_2 : NV_ENC_NUM_REF_FRAMES_1;
         // Reset per session: a new encoder has an empty DPB, so every slot is
         // empty and the first mark should happen promptly rather than a full
         // interval away.
@@ -1812,9 +1830,11 @@ extern "C" __declspec(dllexport) int InitEncoder(
         g_ltrUsePending.store(0);
         g_lastFrameLtrRecovery.store(false);
         ShimLog("[LTR] Long-term references for %s: cap=%u slot(s), requested=%s, active=%s "
-               "(%u LTR of %u DPB slots, mark every %u frames)\n",
-               codec, maxLtr, kEnableLtr ? "ON" : "OFF", g_ltrActive ? "YES" : "no",
-               kLtrNumFrames, g_refFramesInDpb, g_ltrMarkInterval);
+               "(%u LTR of %u DPB slots, mark every %u frames, numRefL0=%u)\n",
+               codec, maxLtr,
+               !kEnableLtr ? "OFF" : (g_ltrAllowed ? "ON" : "OFF for this session"),
+               g_ltrActive ? "YES" : "no",
+               kLtrNumFrames, g_refFramesInDpb, g_ltrMarkInterval, g_ltrActive ? 2u : 1u);
         if (codecGuid == NV_ENC_CODEC_H264_GUID) {
             encodeConfig.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
             auto& h264 = encodeConfig.encodeCodecConfig.h264Config;
@@ -1826,14 +1846,15 @@ extern "C" __declspec(dllexport) int InitEncoder(
             // Deep DPB for reference-frame invalidation and for the long-term
             // references below, which are held inside this same budget.
             h264.maxNumRefFrames   = g_refFramesInDpb;
-            // Two references, not one. Every P-frame used to key off exactly the
+            // Two references, not one, whenever LTR is active (`numRefL0`
+            // above; one otherwise). Every P-frame used to key off exactly the
             // frame before it, which is the most fragile arrangement possible:
             // lose that one frame and nothing else in the DPB can stand in --
             // which is also why reference invalidation kept collapsing into an
             // IDR. This does NOT change the DPB (maxNumRefFrames is untouched),
             // so the level the stream conforms to is unchanged; it only widens
             // what a single frame is allowed to reference.
-            h264.numRefL0          = NV_ENC_NUM_REF_FRAMES_2;
+            h264.numRefL0          = numRefL0;
             if (g_ltrActive) {
                 h264.enableLTR    = 1;
                 h264.ltrNumFrames = kLtrNumFrames;
@@ -1867,7 +1888,7 @@ extern "C" __declspec(dllexport) int InitEncoder(
             hevc.sliceModeData        = 1;
             hevc.maxNumRefFramesInDPB = g_refFramesInDpb;
             // See the H.264 arm: two references instead of one, DPB unchanged.
-            hevc.numRefL0             = NV_ENC_NUM_REF_FRAMES_2;
+            hevc.numRefL0             = numRefL0;
             if (g_ltrActive) {
                 hevc.enableLTR    = 1;
                 hevc.ltrNumFrames = kLtrNumFrames;
@@ -2150,12 +2171,14 @@ static int ArmLtrRecovery();
 //   * RFI, then LTR, then IDR, exactly as the callers used to do it.
 static bool DrainRepairQueue(bool alreadyIdr) {
     uint64_t first, last;
+    bool charged;
     {
         std::lock_guard<std::mutex> lk(g_repairMutex);
         if (!g_repairPending) return false;
         g_repairPending = false;
-        first = g_repairFirst;
-        last  = g_repairLast;
+        first   = g_repairFirst;
+        last    = g_repairLast;
+        charged = g_repairCharged;
     }
     if (alreadyIdr) {
         ShimLog("🧩 repair %llu-%llu: this frame is already an IDR — nothing more to do\n",
@@ -2172,7 +2195,7 @@ static bool DrainRepairQueue(bool alreadyIdr) {
 
     if (InvalidateRefFramesOnEncodeThread(first, last)) return false;
     if (ArmLtrRecovery())                               return false;
-    g_repairIdrFallbacks.fetch_add(1);
+    if (charged) g_repairIdrFallbacks.fetch_add(1);
     return true;
 }
 
@@ -2714,17 +2737,21 @@ static int InvalidateRefFramesOnEncodeThread(uint64_t first_frame, uint64_t last
 // Record a client-reported loss for the encode thread to repair. Callable from
 // any thread; never touches NVENC. Two requests that land between frames are
 // merged into one range, because repairing only the later one would leave the
-// earlier gap in the DPB.
-extern "C" __declspec(dllexport) void QueueRepair(uint64_t first_frame, uint64_t last_frame) {
+// earlier gap in the DPB. `charge` = 0 for a client-side queue overflow; a
+// merged range is charged if any part of it was (see g_repairCharged).
+extern "C" __declspec(dllexport) void QueueRepair(uint64_t first_frame, uint64_t last_frame,
+                                                  int charge) {
     if (last_frame < first_frame) std::swap(first_frame, last_frame);
     std::lock_guard<std::mutex> lk(g_repairMutex);
     if (g_repairPending) {
         if (first_frame < g_repairFirst) g_repairFirst = first_frame;
         if (last_frame  > g_repairLast)  g_repairLast  = last_frame;
+        g_repairCharged = g_repairCharged || (charge != 0);
     } else {
         g_repairPending = true;
         g_repairFirst   = first_frame;
         g_repairLast    = last_frame;
+        g_repairCharged = (charge != 0);
     }
 }
 
@@ -2757,6 +2784,10 @@ extern "C" __declspec(dllexport) void SetDeepDpbAuthorized(int authorized) {
 
 extern "C" __declspec(dllexport) void SetIntraRefreshAllowed(int allowed) {
     g_intraRefreshAllowed = (allowed != 0);
+}
+
+extern "C" __declspec(dllexport) void SetLtrAllowed(int allowed) {
+    g_ltrAllowed = (allowed != 0);
 }
 
 extern "C" __declspec(dllexport) int RfiSupported() {

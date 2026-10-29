@@ -104,6 +104,57 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
+## 2026-10-28: **SILENT XBOX DRIFT — LTR off for Echo; still-screen keyframe built** (deployed, test RUNNING)
+
+A 4K120 HDR10 Echo/Xbox session showed grey/white/tan blocks and minutes-old
+pictures in wrong colours that the intra sweep could not clean, over ~1.1M
+frames with **zero loss reports, zero decoder errors, zero host repairs**. The
+keyframe forced by tray *Start Recording* cleared everything at once. Prime
+suspect: the console's D3D11VA decoder mis-resolving long-term references
+(numRefL0=2 lets ordinary P-frames predict from an LTR, and each re-mark every
+60 frames carries the damage on). Three `[echo]` flags in `nova.toml`, Echo
+sessions only, applied per session in `apply_configure_start`:
+
+- `long_term_refs` (default **false**) → shim `SetLtrAllowed`; off also
+  restores `numRefL0 = 1`, i.e. the pre-`7b8d25a` reference structure.
+  Moonlight is unchanged. Cost: an Echo loss at 4K repairs by IDR, not LTR.
+- `still_keyframe` (default **false** until the LTR test has run alone) →
+  `StillKeyframe` in `run_worker`: one IDR after the picture is still 1 s,
+  only if content changed since the last IDR, ≥10 s after any IDR. Log `🧊`.
+- `intra_refresh` (default true) → gates `set_intra_refresh_allowed`.
+
+Log line per session: `🧪 Echo integrity: …`. **Test order:** multi-hour
+Echo sessions with LTR off and no still keyframe; blotches never appearing
+convicts LTR. Then `still_keyframe = true` as the permanent net. Only then
+consider `intra_refresh = false`.
+
+**2026-10-29: LTR-off result = zero blotches. `still_keyframe` now defaults to
+true.** Same day, a "pulsing" 4K120 Xbox session: the console's 50 ms
+FrameQueue overflowed ~1/s under full 120 fps load (6-frame
+`invalidated` ranges; §18.3 in the Xbox handoff), each one a forced IDR
+(6 ≥ DPB 5), and every fallback IDR was charged as congestion — bitrate
+39.5 → ~5 Mbps over a healthy LAN, so each repair IDR was a 25 KB smear.
+Fix: echo-client labels a range made only of local overflow
+(`RepairRequest::Invalidate { local }` → RPC `cause: "overflow"`), carried
+through `ControlMsg::InvalidateRefFrames { local }` (trailing byte; absent =
+charged) to shim `QueueRepair(…, charge)`, whose fallback no longer counts
+toward `TakeRepairIdrFallbacks`. Any transit loss merged into the range
+keeps it charged. Log: `invalidated frames N-M (client queue overflow —
+bitrate untouched)`. The overflow itself is still the open §18.3 item.
+
+**2026-10-29: scheduling priority (`src/priority.rs`, deployed + verified).**
+A launching game (Rockstar launcher) starved Nova on a still desktop: one
+encode 103 ms, Worker→Master pipe blocked 204 ms, the RTP send thread dropped
+106 frames over 7.4 s, client RTT 10→104 ms. Nova ran at NORMAL on CPU and
+GPU. Now (Sunshine parity): `raise_gpu_priority` in `create_d3d11_device` —
+`D3DKMTSetProcessSchedulingPriorityClass` **HIGH, never REALTIME** (NVIDIA +
+HAGS can freeze the encoder at REALTIME; resolved from gdi32 at runtime) and
+`IDXGIDevice::SetGPUThreadPriority(7)`; `set_streaming(live)` = HIGH CPU
+priority class while streaming, NORMAL otherwise, polled from `run_worker`,
+monolithic `run()` and the Master's `session_watcher`. Logs: `🚀 GPU
+priority: process high, capture/encode thread 7`, `🚀 CPU priority class →
+HIGH (stream live)`.
+
 ## 2026-10-14: **A LOG LINE FROZE THE STREAM** — non-blocking logger (live-verified)
 
 Moonlight/Xbox 4K120 froze ~20 s at a time, every ~40 s, while the EA app

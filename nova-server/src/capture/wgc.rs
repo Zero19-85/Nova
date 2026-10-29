@@ -424,7 +424,11 @@ impl WgcCapturer {
                 );
                 e
             })?;
-            Ok(device.unwrap())
+            let device = device.unwrap();
+            // Capture and encode share this device for the process's life, so
+            // this is where a launching game must not be able to starve them.
+            crate::priority::raise_gpu_priority(&device);
+            Ok(device)
         }
     }
 

@@ -78,6 +78,7 @@ extern "C" {
     fn SetHdrMetadata(max_luminance_nits: u32, max_cll_nits: u32, max_fall_nits: u32);
     fn SetDeepDpbAuthorized(authorized: i32);
     fn SetIntraRefreshAllowed(allowed: i32);
+    fn SetLtrAllowed(allowed: i32);
 
     /// Set the SDR white level (scRGB units, i.e. nits / 80) the SDR↔HDR
     /// conversion shaders use. See `set_sdr_white_level`.
@@ -109,7 +110,7 @@ extern "C" {
 
     /// Record a client-reported lost range for the ENCODE thread to repair
     /// (RFI, then LTR, then IDR). Never touches NVENC; callable from anywhere.
-    fn QueueRepair(first_frame: u64, last_frame: u64);
+    fn QueueRepair(first_frame: u64, last_frame: u64, charge: i32);
     /// How many queued repairs fell through to an IDR since the last call.
     fn TakeRepairIdrFallbacks() -> u32;
     /// RFI: whether the most recently encoded frame was a recovery frame (its
@@ -247,8 +248,11 @@ pub const RFI_ENABLED: bool = true;
 /// not yet counted, escaped the invalidation, and became a reference for the
 /// "recovery" frame. The congestion signal for a fallback IDR is raised by
 /// [`Encoder::encode_frame`], the only place that now learns the outcome.
-pub fn queue_repair(first_frame: u64, last_frame: u64) {
-    unsafe { QueueRepair(first_frame, last_frame) }
+///
+/// `local` = the client's own queue overflowed; nothing was lost on the link.
+/// It is repaired the same way but never charged as congestion.
+pub fn queue_repair(first_frame: u64, last_frame: u64, local: bool) {
+    unsafe { QueueRepair(first_frame, last_frame, (!local) as i32) }
 }
 
 /// Whether the frame just returned by `encode_frame` is an RFI recovery frame,
@@ -322,6 +326,14 @@ pub fn set_deep_dpb_authorized(authorized: bool) {
 /// at every `InitEncoder`, so call it before the session's first re-init.
 pub fn set_intra_refresh_allowed(allowed: bool) {
     unsafe { SetIntraRefreshAllowed(allowed as i32) }
+}
+
+/// Permit long-term references (and the second L0 reference that came with
+/// them) for this session. Cleared for Echo sessions unless `[echo]
+/// long_term_refs` is set -- see that field. Read at every `InitEncoder`, like
+/// [`set_intra_refresh_allowed`].
+pub fn set_ltr_allowed(allowed: bool) {
+    unsafe { SetLtrAllowed(allowed as i32) }
 }
 
 pub fn set_hdr_metadata(max_luminance_nits: u16, max_cll_nits: u16, max_fall_nits: u16) {

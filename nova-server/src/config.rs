@@ -242,6 +242,18 @@ pub struct EchoConfig {
     pub port: u16,
     /// WAN signaling relay — see [`SignalingConfig`]. Absent = LAN only.
     pub signaling: SignalingConfig,
+    /// Long-term references (Tier 1 LTR) on Echo sessions. Off by default
+    /// since 2026-10-28: an Xbox session showed minutes-old pictures in wrong
+    /// colours with no loss and no decode error, and the LTR re-mark every
+    /// 60 frames carried the damage forward until a keyframe cleared it.
+    /// Moonlight sessions are unaffected by this flag.
+    pub long_term_refs: bool,
+    /// Send one keyframe when an Echo picture goes still, so a client whose
+    /// references drifted silently is reset where it cannot be seen. On by
+    /// default since 2026-10-29, once LTR-off had run alone with no blotches.
+    pub still_keyframe: bool,
+    /// The rolling intra-refresh sweep on shallow-DPB (4K) Echo sessions.
+    pub intra_refresh: bool,
 }
 
 /// Signaling relay used for zero-config WAN connections (`echo::signaling`).
@@ -317,7 +329,14 @@ impl Default for BugReportConfig {
 
 impl Default for EchoConfig {
     fn default() -> Self {
-        Self { enabled: true, port: 48011, signaling: SignalingConfig::default() }
+        Self {
+            enabled: true,
+            port: 48011,
+            signaling: SignalingConfig::default(),
+            long_term_refs: false,
+            still_keyframe: true,
+            intra_refresh: true,
+        }
     }
 }
 
@@ -441,6 +460,10 @@ upnp = true             # Ask the router to forward Nova's WAN ports, so Echo
 # and "Clear Paired Devices" revokes this port too. No shared secret to manage.
 enabled = true
 port    = 48011
+# Echo picture-integrity switches (Moonlight sessions ignore all three).
+long_term_refs = false  # LTR references; on = keyframeless loss repair, but see config.rs
+still_keyframe = true   # one keyframe when the picture goes still: resets silent client drift
+intra_refresh  = true   # the rolling repair sweep on 4K sessions (the moving line)
 
 [echo.signaling]
 # Zero-config WAN connections. Leave url empty for LAN-only operation — Nova

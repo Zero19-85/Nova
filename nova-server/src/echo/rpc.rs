@@ -1178,11 +1178,16 @@ impl Handler {
         if first > u32::MAX as u64 || last > u32::MAX as u64 {
             return RpcResponse::err(id, E_BAD_REQUEST, "frame index out of range");
         }
-        match mgr.invalidate_ref_frames(identity, first as u32, last as u32) {
+        // `cause: "overflow"` = the client's own queue dropped these, nothing
+        // was lost on the link. Repaired identically, but never charged as
+        // congestion. Absent (older clients, and all transit loss) = charged.
+        let local = params.get("cause").and_then(|v| v.as_str()) == Some("overflow");
+        match mgr.invalidate_ref_frames(identity, first as u32, last as u32, local) {
             Ok(session_id) => {
                 println!(
-                    "🧩 Echo: \"{}\" invalidated frames {first}-{last}",
-                    identity.device_name
+                    "🧩 Echo: \"{}\" invalidated frames {first}-{last}{}",
+                    identity.device_name,
+                    if local { " (client queue overflow — bitrate untouched)" } else { "" }
                 );
                 RpcResponse::ok(
                     id,

@@ -491,7 +491,14 @@ pub enum RepairRequest {
     /// and code the next frame against an older reference. The host falls
     /// back to a keyframe on its own if it cannot honour the range, so this
     /// is always safe to ask for.
-    Invalidate { first: u32, last: u32 },
+    ///
+    /// `local` is true when every frame in the range was dropped by THIS
+    /// client's own queue overflowing, and none was lost in transit. The host
+    /// repairs either kind the same way, but only transit loss says anything
+    /// about the link: charging a local overflow as congestion walked a 4K120
+    /// Xbox session from 39.5 to ~5 Mbps on 2026-10-29 with a healthy LAN, and
+    /// every repair keyframe after that was a 25 KB smear.
+    Invalidate { first: u32, last: u32, local: bool },
 }
 
 /// Shortest spacing between repair requests.
@@ -592,6 +599,10 @@ pub fn reset_repair_stats() {
 struct RepairOutbox {
     keyframe: bool,
     range: Option<(u32, u32)>,
+    /// Whether any part of `range` was lost in transit rather than dropped by
+    /// the local queue. One transit loss makes the whole merged range a
+    /// network signal -- see `RepairRequest::Invalidate::local`.
+    transit: bool,
     last_sent: Option<std::time::Instant>,
 }
 
@@ -600,7 +611,18 @@ impl RepairOutbox {
         self.keyframe = true;
     }
 
+    /// Frames the network lost.
     fn note_range(&mut self, first: u32, last: u32) {
+        self.transit = true;
+        self.widen(first, last);
+    }
+
+    /// Frames this client's own queue dropped on overflow.
+    fn note_overflow(&mut self, first: u32, last: u32) {
+        self.widen(first, last);
+    }
+
+    fn widen(&mut self, first: u32, last: u32) {
         self.range = Some(match self.range {
             Some((f, l)) => (f.min(first), l.max(last)),
             None => (first, last),
@@ -628,10 +650,11 @@ impl RepairOutbox {
             RepairRequest::Keyframe
         } else {
             let (first, last) = self.range.expect("checked above");
-            RepairRequest::Invalidate { first, last }
+            RepairRequest::Invalidate { first, last, local: !self.transit }
         };
         self.keyframe = false;
         self.range = None;
+        self.transit = false;
         self.last_sent = Some(std::time::Instant::now());
         if let Some(tx) = tx {
             let _ = tx.send(repair);
@@ -787,7 +810,7 @@ pub async fn run_receiver(
                     outbox.note_keyframe();
                 }
                 if let Some((first, last)) = sink.take_invalidation_request() {
-                    outbox.note_range(first, last);
+                    outbox.note_overflow(first, last);
                 }
                 outbox.flush(repair_tx.as_ref());
             }
@@ -877,7 +900,7 @@ pub async fn run_receiver(
                                 outbox.note_keyframe();
                             }
                             if let Some((first, last)) = sink.take_invalidation_request() {
-                                outbox.note_range(first, last);
+                                outbox.note_overflow(first, last);
                             }
                             outbox.flush(repair_tx.as_ref());
                         }
@@ -1195,7 +1218,7 @@ mod tests {
         outbox.flush(Some(&tx));
         assert_eq!(
             rx.try_recv().ok(),
-            Some(RepairRequest::Invalidate { first: 10, last: 12 }),
+            Some(RepairRequest::Invalidate { first: 10, last: 12, local: false }),
             "the first loss goes out immediately"
         );
 
@@ -1211,8 +1234,43 @@ mod tests {
         outbox.flush(Some(&tx));
         assert_eq!(
             rx.try_recv().ok(),
-            Some(RepairRequest::Invalidate { first: 20, last: 31 }),
+            Some(RepairRequest::Invalidate { first: 20, last: 31, local: false }),
             "everything held back must still be covered"
+        );
+    }
+
+    /// A range the local queue dropped is labelled local, so the host repairs
+    /// it without charging the link -- but one transit loss merged into it
+    /// makes the whole request a network signal again.
+    #[test]
+    fn overflow_ranges_are_local_until_transit_loss_joins_them() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut outbox = RepairOutbox::default();
+
+        outbox.note_overflow(40, 45);
+        outbox.flush(Some(&tx));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RepairRequest::Invalidate { first: 40, last: 45, local: true }),
+        );
+
+        std::thread::sleep(REPAIR_MIN_INTERVAL);
+        outbox.note_overflow(50, 55);
+        outbox.note_range(56, 56);
+        outbox.flush(Some(&tx));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RepairRequest::Invalidate { first: 50, last: 56, local: false }),
+            "real loss inside the range must still reach QoS"
+        );
+
+        // The label resets with the request it belonged to.
+        std::thread::sleep(REPAIR_MIN_INTERVAL);
+        outbox.note_overflow(60, 65);
+        outbox.flush(Some(&tx));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(RepairRequest::Invalidate { first: 60, last: 65, local: true }),
         );
     }
 
@@ -1526,7 +1584,7 @@ mod tests {
              repair may reopen the gate"
         );
         assert!(
-            repairs.contains(&RepairRequest::Invalidate { first: 3, last: 4 }),
+            repairs.contains(&RepairRequest::Invalidate { first: 3, last: 4, local: false }),
             "the gap must be named so the host can repair it with a P-frame; \
              got {repairs:?}"
         );

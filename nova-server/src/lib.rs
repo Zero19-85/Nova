@@ -27,6 +27,7 @@ mod pairing;
 /// Bitrate policy: the per-session budget (resolution cap + audio reservation)
 /// and the closed-loop congestion controller that runs underneath it. Both
 /// capture loops share the controller; both negotiators share the budget.
+mod priority;
 mod qos;
 mod recording;
 mod rtp;
@@ -977,6 +978,10 @@ async fn session_watcher(
     let repair_link = Some(worker_link.clone());
     loop {
         poll.tick().await;
+
+        // HIGH CPU priority while anything is streaming: the RTP send thread
+        // lives here and starved behind a launching game (priority.rs).
+        priority::set_streaming(session_is_live(&client_info, echo_sessions.as_ref()));
 
         // Re-send an unconfirmed mid-stream repair keyframe. Cheap (an
         // `Instant` compare against an empty slot in the common case) and
@@ -2005,8 +2010,21 @@ fn apply_configure_start(
     enc: &mut Encoder,
     cfg: &config::NovaConfig,
 ) -> std::result::Result<ipc::WorkerConfigured, String> {
-    // Before anything below can re-init the encoder: InitEncoder reads it.
-    encoder::set_intra_refresh_allowed(cs.echo_session);
+    // Before anything below can re-init the encoder: InitEncoder reads these.
+    encoder::set_intra_refresh_allowed(cs.echo_session && cfg.echo.intra_refresh);
+    encoder::set_ltr_allowed(!cs.echo_session || cfg.echo.long_term_refs);
+    STILL_KEYFRAME_SESSION.store(
+        cs.echo_session && cfg.echo.still_keyframe,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if cs.echo_session {
+        println!(
+            "🧪 Echo integrity: long-term refs {}, still-screen keyframe {}, intra-refresh sweep {}",
+            if cfg.echo.long_term_refs { "ON" } else { "off" },
+            if cfg.echo.still_keyframe { "ON" } else { "off" },
+            if cfg.echo.intra_refresh { "allowed" } else { "off" },
+        );
+    }
     let codec = match cs.codec {
         ipc::WireCodec::H264 => encoder::Codec::H264,
         ipc::WireCodec::Hevc => encoder::Codec::Hevc,
@@ -2549,6 +2567,68 @@ fn static_duplicate_is_due(streak: u32, last_sent: &mut Option<Instant>) -> bool
         *last_sent = Some(Instant::now());
     }
     due
+}
+
+/// Set per session by `apply_configure_start`: an Echo session with `[echo]
+/// still_keyframe` on. Read by the Worker's capture loop.
+static STILL_KEYFRAME_SESSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One keyframe when an Echo picture goes still.
+///
+/// **Why** (2026-10-28, Xbox Echo, 4K120 HEVC HDR10): ~1.1 million frames with
+/// no keyframe, no loss reported and no decode error, yet the client showed
+/// grey/white/tan blocks and minutes-old pictures in wrong colours. A hardware
+/// decoder that drifts from the encoder's references raises nothing anywhere,
+/// and the intra-refresh sweep cannot outrun damage that inter-prediction keeps
+/// copying behind it. The keyframe that `Start Recording` forced cleared all of
+/// it at once.
+///
+/// **Why only on a still screen:** that is where drift is most visible (nothing
+/// moves to repaint it) and where a keyframe is invisible (the picture it
+/// carries is the one already showing). Once per still period, after content
+/// changed, and never within `MIN_GAP` of the last keyframe of any kind, so
+/// typing with pauses cannot turn into a keyframe per second.
+struct StillKeyframe {
+    last_change: Instant,
+    dirty: bool,
+    last_idr: Option<Instant>,
+}
+
+impl StillKeyframe {
+    const STILL_FOR: Duration = Duration::from_secs(1);
+    const MIN_GAP: Duration = Duration::from_secs(10);
+
+    fn new(now: Instant) -> Self {
+        Self { last_change: now, dirty: false, last_idr: None }
+    }
+
+    /// A real captured frame: the picture changed.
+    fn content_changed(&mut self, now: Instant) {
+        self.last_change = now;
+        self.dirty = true;
+    }
+
+    /// Any keyframe that actually went out, whoever asked for it.
+    fn idr_sent(&mut self, now: Instant) {
+        self.last_idr = Some(now);
+        self.dirty = false;
+    }
+
+    /// True once per still period; the caller then requests the keyframe.
+    fn take_due(&mut self, now: Instant) -> bool {
+        if !self.dirty || now.saturating_duration_since(self.last_change) < Self::STILL_FOR {
+            return false;
+        }
+        if self.last_idr.is_some_and(|t| now.saturating_duration_since(t) < Self::MIN_GAP) {
+            return false;
+        }
+        // Cleared now rather than when the IDR emerges: the next duplicate
+        // slot can be up to 200 ms away, and asking every slot until then
+        // would only repeat the log line.
+        self.dirty = false;
+        true
+    }
 }
 
 /// Commands the dedicated `nova-worker-control` thread (see `run_worker`)
@@ -3324,7 +3404,7 @@ pub async fn run_worker() -> Result<()> {
                                 }
                                 Some(Ok(ipc::ControlMsg::CongestionReduce)) => encoder::signal_congestion_reduction(),
                                 Some(Ok(ipc::ControlMsg::KeyframeStorm { active })) => encoder::note_keyframe_storm(active),
-                                Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last })) => {
+                                Some(Ok(ipc::ControlMsg::InvalidateRefFrames { first, last, local })) => {
                                     // RFI recovery: invalidate the lost range so the
                                     // next P-frame recovers; fall back to an IDR if
                                     // NVENC can't honour it (range too large, etc).
@@ -3352,7 +3432,10 @@ pub async fn run_worker() -> Result<()> {
                                     // the frame mid-encode). The fallback's
                                     // congestion signal is now raised by
                                     // Encoder::encode_frame, which sees the outcome.
-                                    encoder::queue_repair(first as u64, last as u64);
+                                    // Except for an Echo client's own queue
+                                    // overflow (`local`): repaired the same, never
+                                    // charged -- the client fell behind, not the link.
+                                    encoder::queue_repair(first as u64, last as u64, local);
                                 }
                                 Some(Ok(ipc::ControlMsg::ConfigureStart(cs))) => {
                                     if cmd_tx.send(WorkerCommand::Configure(cs)).is_err() {
@@ -3458,6 +3541,8 @@ pub async fn run_worker() -> Result<()> {
     let mut last_static_log: Option<Instant> = None;
     // When the last static-scene duplicate went out — see static_duplicate_is_due.
     let mut last_static_dup: Option<Instant> = None;
+    // Echo's still-screen keyframe — see StillKeyframe.
+    let mut still_keyframe = StillKeyframe::new(Instant::now());
     // Dynamic-bitrate controller (see QosController): remembers the rate that
     // failed and holds recovery at 90% of it instead of climbing back to the
     // ceiling, which is what produced the 12-second freeze sawtooth.
@@ -3833,6 +3918,8 @@ pub async fn run_worker() -> Result<()> {
             }
         }
 
+        // HIGH CPU priority while a client is connected (priority.rs).
+        priority::set_streaming(client_connected);
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;
         match capturer.try_get_frame() {
             Some(texture) => {
@@ -3848,6 +3935,7 @@ pub async fn run_worker() -> Result<()> {
                 // that never got the check.
                 if client_connected {
                     texture_to_encode = Some(texture);
+                    still_keyframe.content_changed(Instant::now());
                 }
             }
             None => {
@@ -3884,6 +3972,20 @@ pub async fn run_worker() -> Result<()> {
                     && static_duplicate_is_due(timeout_streak, &mut last_static_dup)
                 {
                     texture_to_encode = capturer.cached_texture().cloned();
+                }
+                // Echo's still-screen keyframe, on this slot rather than the
+                // next keep-alive duplicate: the throttle above may have just
+                // declined it, and the keyframe should not wait 200 ms for it.
+                if client_connected
+                    && STILL_KEYFRAME_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+                    && still_keyframe.take_due(Instant::now())
+                {
+                    println!("🧊 Echo: picture still for {} s — keyframe to reset any silent \
+                        client-side reference drift", StillKeyframe::STILL_FOR.as_secs());
+                    enc.request_idr();
+                    if texture_to_encode.is_none() {
+                        texture_to_encode = capturer.cached_texture().cloned();
+                    }
                 }
             }
         }
@@ -3947,6 +4049,9 @@ pub async fn run_worker() -> Result<()> {
                         }).await {
                             Ok(()) => {
                                 first_idr_sent = true;
+                                if is_idr {
+                                    still_keyframe.idr_sent(Instant::now());
+                                }
                                 if frames_encoded <= 10 || is_idr {
                                     println!("[ENC] frame={} size={} bytes ({})", frames_encoded, packet_size, if is_idr { "IDR" } else { "P" });
                                 }
@@ -5422,6 +5527,7 @@ pub async fn run() -> Result<()> {
         // Texture to feed the encoder this iteration — either a freshly captured
         // WGC frame, or (when the desktop is unchanged) a re-submission of the
         // last cached frame to keep the stream alive on a static desktop.
+        priority::set_streaming(client_connected); // mirrors run_worker (priority.rs)
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;
 
         // WGC cursor note: `IsCursorCaptureEnabled(true)` is set on the
@@ -5610,6 +5716,44 @@ mod tests {
 
     /// The static-scene throttle must refine first and economise second. Getting
     /// this backwards is Phase 11's static blur, which Phase 16.2 had to undo.
+    /// One keyframe per still period, after a change, never inside MIN_GAP of
+    /// another keyframe — the three rules that keep it invisible and cheap.
+    #[test]
+    fn still_keyframe_fires_once_per_still_period() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut s = StillKeyframe::new(t0);
+
+        // Nothing has changed since the session began: nothing to reset.
+        assert!(!s.take_due(at(5_000)));
+
+        // Content changes, then goes still: due only after STILL_FOR.
+        s.content_changed(at(5_000));
+        assert!(!s.take_due(at(5_900)), "fired before the picture had been still 1 s");
+        assert!(s.take_due(at(6_000)));
+        // ...and only once for that still period.
+        assert!(!s.take_due(at(9_000)), "fired twice in one still period");
+
+        // The keyframe goes out; a new change soon after is held off by MIN_GAP.
+        s.idr_sent(at(6_100));
+        s.content_changed(at(8_000));
+        assert!(!s.take_due(at(10_000)), "fired within 10 s of the last keyframe");
+        // Still dirty, so it fires as soon as the gap has passed.
+        assert!(s.take_due(at(16_100)));
+    }
+
+    /// A repair or session-start keyframe also satisfies the still-screen one:
+    /// the client's references were reset either way.
+    #[test]
+    fn any_keyframe_satisfies_the_still_keyframe() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut s = StillKeyframe::new(t0);
+        s.content_changed(at(1_000));
+        s.idr_sent(at(1_500)); // e.g. a repair keyframe
+        assert!(!s.take_due(at(30_000)), "re-sent a keyframe nothing had changed since");
+    }
+
     #[test]
     fn a_static_scene_is_refined_at_full_rate_before_it_is_throttled() {
         let mut last = None;

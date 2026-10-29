@@ -793,13 +793,13 @@ fn handle_control_message(
                 (true, Some((first, last))) => {
                     println!("🎮 Control: ref-frame invalidation {first}-{last} → RFI recovery");
                     match worker_link {
-                        Some(link) => link.send(ControlMsg::InvalidateRefFrames { first, last }),
+                        Some(link) => link.send(ControlMsg::InvalidateRefFrames { first, last, local: false }),
                         None => {
                             // Same as the Worker loop -- mirror any change to both.
                             // Repair ladder: RFI, then LTR, then an IDR, walked by
                             // the shim on the encode thread; the fallback's
                             // congestion signal comes from Encoder::encode_frame.
-                            crate::encoder::queue_repair(first as u64, last as u64);
+                            crate::encoder::queue_repair(first as u64, last as u64, false);
                         }
                     }
                 }

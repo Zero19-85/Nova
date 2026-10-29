@@ -1162,7 +1162,7 @@ async fn stream_inner(
                     crate::receiver::RepairRequest::Keyframe => {
                         ("request_idr", serde_json::Map::new())
                     }
-                    crate::receiver::RepairRequest::Invalidate { first, last } => {
+                    crate::receiver::RepairRequest::Invalidate { first, last, local } => {
                         // The host answers this with a type-5 recovery frame
                         // when NVENC can honour it and a plain keyframe when
                         // it cannot, so the client needs no fallback of its
@@ -1170,6 +1170,12 @@ async fn stream_inner(
                         let mut p = serde_json::Map::new();
                         p.insert("first".into(), first.into());
                         p.insert("last".into(), last.into());
+                        // Only when true, so a request reads exactly as it did
+                        // before for transit loss, and an older host simply
+                        // ignores a key it does not know.
+                        if local {
+                            p.insert("cause".into(), "overflow".into());
+                        }
                         ("invalidate_ref_frames", p)
                     }
                 };

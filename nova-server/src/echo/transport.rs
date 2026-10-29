@@ -564,7 +564,7 @@ mod tests {
         }
         fn end(&self, _mode: crate::echo::session::EndMode) {}
         fn request_idr(&self) {}
-        fn invalidate_ref_frames(&self, _first: u32, _last: u32) {}
+        fn invalidate_ref_frames(&self, _first: u32, _last: u32, _local: bool) {}
         fn ltr_acked(&self, _frame_index: u32) {}
         fn inject_input(&self, _packet: Vec<u8>) {}
     }
