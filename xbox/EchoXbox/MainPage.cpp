@@ -39,7 +39,54 @@ namespace winrt::EchoXbox::implementation
         constexpr uint32_t kDesiredWidth  = 3840;
         constexpr uint32_t kDesiredHeight = 2160;
 
-        constexpr uint32_t kStreamBitrate = 40000;   // the host budget caps this
+        // ── The bitrate a mode starts at ────────────────────────────────────
+        //
+        // The same table and the same arithmetic as Echo Android's
+        // `EchoSettings.recommendedBitrateKbps`, so a console and a phone asking
+        // for the same mode open with the same bid. Both track the host's
+        // anchors in `qos::resolution_ceiling` and land just under them: 4K120
+        // comes out at 84 Mbps against a host ceiling of 84,090 Kbps. Tune the
+        // three tables together, never one alone.
+        //
+        // This used to be a flat 40 Mbps for every mode, which starved 4K120
+        // (the encoder sat at its budget ~99% of gameplay, 2026-10-29) and
+        // over-asked at 1080p60, whose ceiling is 18.
+        constexpr uint32_t kMinBitrateMbps = 10;
+        constexpr uint32_t kMaxBitrateMbps = 100;
+        struct BitrateTier { uint64_t pixels; double mbps; };
+        constexpr std::array<BitrateTier, 4> kBitrateTiers{{
+            {   921'600, 10.0 },    // 1280x720   -> 16 Mbps at 120 fps
+            { 2'073'600, 18.0 },    // 1920x1080  -> 30 Mbps at 120 fps
+            { 3'686'400, 30.0 },    // 2560x1440  -> 50 Mbps at 120 fps
+            { 8'294'400, 50.0 },    // 3840x2160  -> 84 Mbps at 120 fps
+        }};
+        // Sub-linear, the host's exponent: consecutive frames are more alike
+        // the closer together they are, so 120 fps needs ~1.68x, not 2x.
+        constexpr double kFpsExponent = 0.75;
+
+        uint32_t BitrateForMode(uint32_t width, uint32_t height, uint32_t fps)
+        {
+            const uint64_t pixels = (width && height) ? uint64_t(width) * height : 2'073'600;
+            double base = kBitrateTiers.back().mbps;
+            if (pixels <= kBitrateTiers.front().pixels) {
+                base = kBitrateTiers.front().mbps;
+            } else {
+                for (size_t i = 0; i + 1 < kBitrateTiers.size(); ++i) {
+                    auto const& lo = kBitrateTiers[i];
+                    auto const& hi = kBitrateTiers[i + 1];
+                    if (pixels <= hi.pixels) {
+                        const double t = double(pixels - lo.pixels) / double(hi.pixels - lo.pixels);
+                        base = lo.mbps + t * (hi.mbps - lo.mbps);
+                        break;
+                    }
+                }
+            }
+            const double scaled = base * std::pow(double(fps ? fps : 60) / 60.0, kFpsExponent);
+            // Truncated, as Kotlin's toInt() does, so both clients agree to the Mbps.
+            const auto mbps = std::clamp<uint32_t>(static_cast<uint32_t>(scaled),
+                                                   kMinBitrateMbps, kMaxBitrateMbps);
+            return mbps * 1000;
+        }
 
         // The space every panel in MainPage.xaml is authored in. See
         // ApplyChromeScale.
@@ -212,10 +259,13 @@ namespace winrt::EchoXbox::implementation
         constexpr auto kDoubleTap = std::chrono::milliseconds(400);
 
         struct ModeChoice { uint32_t width; uint32_t height; wchar_t const* label; };
-        constexpr std::array<ModeChoice, 3> kModes{{
+        // The same four Echo Android offers. Every mode is selectable at both
+        // frame rates; the panel rate advises (ApplyStreamMode) but never vetoes.
+        constexpr std::array<ModeChoice, 4> kModes{{
             { 3840, 2160, L"4K" },
             { 2560, 1440, L"1440p" },
             { 1920, 1080, L"1080p" },
+            { 1280,  720, L"720p" },
         }};
         constexpr std::array<uint32_t, 2> kFrameRates{ 60, 120 };
 
@@ -275,6 +325,8 @@ namespace winrt::EchoXbox::implementation
         LoadHdrPreference();
         LoadMicPreference();
         BuildOverlayChoices();
+        // After the buttons exist, so the stored mode can light them up.
+        LoadStreamPreference();
         BuildAppMenu();
         HookBackButton();
         HookLifecycle();
@@ -892,11 +944,18 @@ namespace winrt::EchoXbox::implementation
             m_outputWidth = hdmi.width;
             m_outputHeight = hdmi.height;
             m_outputHz = static_cast<uint32_t>(hdmi.refreshHz + 0.5);
-            m_streamWidth = hdmi.width;
-            m_streamHeight = hdmi.height;
-            m_streamFps = StreamFpsFor(m_outputHz);
-            wchar_t line[160]{};
-            swprintf_s(line, L"output      %ux%u @ %.0f Hz - asking the host for this",
+            // Only the DEFAULT. A mode the user picked in Settings is kept --
+            // re-deriving it from the TV on every launch is exactly how a
+            // chosen 1080p120 would silently come back as 4K60.
+            if (!m_streamModeStored) {
+                m_streamWidth = hdmi.width;
+                m_streamHeight = hdmi.height;
+                m_streamFps = StreamFpsFor(m_outputHz);
+            }
+            wchar_t line[200]{};
+            swprintf_s(line, m_streamModeStored
+                                 ? L"output      %ux%u @ %.0f Hz - stream mode is the saved choice"
+                                 : L"output      %ux%u @ %.0f Hz - asking the host for this",
                        hdmi.width, hdmi.height, hdmi.refreshHz);
             Append(hstring(line));
         } else {
@@ -906,6 +965,10 @@ namespace winrt::EchoXbox::implementation
         // 4. Renderer, decoder, input, discovery.
         co_await winrt::resume_foreground(Dispatcher());
         if (!StartRenderer()) co_return;
+        // The default mode is only known now (HDMI read-back, or the swap
+        // chain on a PC), so the Settings card is brought up to date here.
+        RefreshStreamQualityUi();
+        Append(L"quality     " + hstring(DescribeStreamQuality()));
         StartInput();
         StartDiscovery();
         StartStatsTimer();
@@ -939,7 +1002,7 @@ namespace winrt::EchoXbox::implementation
         // Only a fallback. The console's HDMI output decides the stream size
         // (see StartupAsync); this covers a PC, where there is no HDMI mode to
         // read and the window really is the screen.
-        if (m_outputWidth == 0 && m_outputHeight == 0 &&
+        if (m_outputWidth == 0 && m_outputHeight == 0 && !m_streamModeStored &&
             facts.backBufferWidth > 0 && facts.backBufferHeight > 0) {
             m_streamWidth  = facts.backBufferWidth;
             m_streamHeight = facts.backBufferHeight;
@@ -1911,16 +1974,19 @@ namespace winrt::EchoXbox::implementation
             const bool outputIsHdr = advancedColorHdr || m_hdrActive;
             outputKind += m_hdrActive ? L" (HDMI mode: PQ)" : L" (HDMI mode: SDR)";
             const bool hdrStream = m_hdrEnabled && canPresentPq && outputIsHdr;
+            const uint32_t bitrateKbps = TargetBitrateKbps();
             Append(L"stream      " + to_hstring(res) + L" @ " +
                    std::to_wstring(m_streamFps) + L", app " + std::to_wstring(m_selectedApp) +
-                   (hdrStream ? L", HDR10" : L", SDR"));
+                   (hdrStream ? L", HDR10" : L", SDR") + L", " +
+                   std::to_wstring(bitrateKbps / 1000) + L" Mbps" +
+                   (m_bitrateOverrideKbps ? L" (manual)" : L" (auto)"));
             if (m_hdrEnabled && !hdrStream) {
                 Append(hstring(L"\nhdr         HDR10 is on, but asking for SDR so the picture is "
                                L"not washed out: console output is " + outputKind +
                                (canPresentPq ? L"" : L", swap chain refuses BT.2020 PQ")));
             }
             config = echo::BuildConnectConfig(m_stateDir, host, fingerprint,
-                                              res, m_streamFps, kStreamBitrate,
+                                              res, m_streamFps, bitrateKbps,
                                               m_selectedApp, hdrStream);
         }
 
@@ -2118,22 +2184,186 @@ namespace winrt::EchoXbox::implementation
         // would keep it when `RefreshModeButtons` swaps in IonActiveButton and
         // the selected state would come out subtly different from the rest.
         // Everything visual comes from the style.
+        //
+        // Two copies of each row: the overlay's re-modes a live stream, the
+        // Settings card's only records the choice for the next one ("nothing
+        // on this screen starts or stops a session"). Both write the same
+        // preference, so they can never disagree about what is selected.
         for (auto const& mode : kModes) {
-            Button button;
-            button.Content(box_value(hstring(mode.label)));
-            button.Style(IonStyle(L"IonButton"));
             const uint32_t w = mode.width, h = mode.height;
-            button.Click([this, w, h](auto&&...) { ApplyStreamMode(w, h, m_streamFps); });
-            ResolutionRow().Children().Append(button);
+            Button live;
+            live.Content(box_value(hstring(mode.label)));
+            live.Style(IonStyle(L"IonButton"));
+            live.Click([this, w, h](auto&&...) { ApplyStreamMode(w, h, m_streamFps); });
+            ResolutionRow().Children().Append(live);
+
+            Button saved;
+            saved.Content(box_value(hstring(mode.label)));
+            saved.Style(IonStyle(L"IonButton"));
+            saved.Click([this, w, h](auto&&...) { SelectStreamMode(w, h, m_streamFps); });
+            SettingsResolutionRow().Children().Append(saved);
         }
         for (uint32_t fps : kFrameRates) {
-            Button button;
-            button.Content(box_value(to_hstring(fps) + L" fps"));
-            button.Style(IonStyle(L"IonButton"));
-            button.Click([this, fps](auto&&...) {
+            Button live;
+            live.Content(box_value(to_hstring(fps) + L" fps"));
+            live.Style(IonStyle(L"IonButton"));
+            live.Click([this, fps](auto&&...) {
                 ApplyStreamMode(m_streamWidth, m_streamHeight, fps);
             });
-            FrameRateRow().Children().Append(button);
+            FrameRateRow().Children().Append(live);
+
+            Button saved;
+            saved.Content(box_value(to_hstring(fps) + L" fps"));
+            saved.Style(IonStyle(L"IonButton"));
+            saved.Click([this, fps](auto&&...) {
+                SelectStreamMode(m_streamWidth, m_streamHeight, fps);
+            });
+            SettingsFrameRateRow().Children().Append(saved);
+        }
+    }
+
+    // ── Stream quality: mode + bitrate ──────────────────────────────────────
+    //
+    // Echo Android's model, kept deliberately identical so the two clients
+    // behave the same way:
+    //
+    //   * Picking a resolution or a frame rate SNAPS the bitrate to that
+    //     mode's recommended figure, discarding any manual value. A bitrate
+    //     chosen for 1080p60 is rarely right for 4K120, and re-overriding is
+    //     one push of the stick from a sensible starting point.
+    //   * Moving the slider afterwards is an override, and it sticks -- across
+    //     restarts -- until the next mode change.
+    //
+    // Stored as "follow the preset" (no `bitrateKbps` key) rather than as the
+    // recommended number itself, so a later retune of the table reaches an
+    // untouched install without the schema migration Android had to grow.
+    //
+    // Still an opening bid: Nova caps it at the mode's ceiling and keeps 512
+    // Kbps for audio, and the `granted` event reports what it settled on.
+    uint32_t MainPage::RecommendedBitrateKbps() const
+    {
+        return BitrateForMode(m_streamWidth, m_streamHeight, m_streamFps);
+    }
+
+    uint32_t MainPage::TargetBitrateKbps() const
+    {
+        return m_bitrateOverrideKbps ? m_bitrateOverrideKbps : RecommendedBitrateKbps();
+    }
+
+    std::wstring MainPage::DescribeStreamQuality() const
+    {
+        const uint32_t recommended = RecommendedBitrateKbps() / 1000;
+        std::wstring out = std::to_wstring(m_streamWidth) + L"x" + std::to_wstring(m_streamHeight) +
+                           L" @ " + std::to_wstring(m_streamFps) + L" fps, " +
+                           std::to_wstring(TargetBitrateKbps() / 1000) + L" Mbps";
+        out += m_bitrateOverrideKbps
+            ? L"  ::  MANUAL (auto would be " + std::to_wstring(recommended) + L")"
+            : std::wstring(L"  ::  AUTO");
+        if (!m_streamModeStored) out += L"  ::  mode follows the TV";
+        return out;
+    }
+
+    void MainPage::SelectStreamMode(uint32_t width, uint32_t height, uint32_t fps)
+    {
+        m_streamWidth = width;
+        m_streamHeight = height;
+        m_streamFps = fps;
+        m_streamModeStored = true;
+        m_bitrateOverrideKbps = 0;           // the snap -- see the note above
+        SaveStreamPreference();
+        RefreshStreamQualityUi();
+    }
+
+    void MainPage::LoadStreamPreference()
+    {
+        try {
+            auto settings = ApplicationData::Current().LocalSettings().Values();
+            if (settings.HasKey(L"streamWidth") && settings.HasKey(L"streamHeight") &&
+                settings.HasKey(L"streamFps")) {
+                const auto w = unbox_value_or<uint32_t>(settings.Lookup(L"streamWidth"), 0);
+                const auto h = unbox_value_or<uint32_t>(settings.Lookup(L"streamHeight"), 0);
+                const auto fps = unbox_value_or<uint32_t>(settings.Lookup(L"streamFps"), 0);
+                // Only a mode this build still offers. Anything else is a value
+                // from a different build or a damaged store, and the TV-derived
+                // default beats a stream at a size no button can select.
+                const bool known =
+                    std::any_of(kModes.begin(), kModes.end(),
+                                [&](ModeChoice const& m) { return m.width == w && m.height == h; }) &&
+                    std::find(kFrameRates.begin(), kFrameRates.end(), fps) != kFrameRates.end();
+                if (known) {
+                    m_streamWidth = w;
+                    m_streamHeight = h;
+                    m_streamFps = fps;
+                    m_streamModeStored = true;
+                }
+            }
+            if (settings.HasKey(L"bitrateKbps")) {
+                const auto kbps = unbox_value_or<uint32_t>(settings.Lookup(L"bitrateKbps"), 0);
+                if (kbps >= kMinBitrateMbps * 1000 && kbps <= kMaxBitrateMbps * 1000) {
+                    m_bitrateOverrideKbps = kbps;
+                }
+            }
+        } catch (...) {
+            // Unreadable settings cost the preference, never the launch.
+            m_streamModeStored = false;
+            m_bitrateOverrideKbps = 0;
+        }
+        RefreshStreamQualityUi();
+    }
+
+    void MainPage::SaveStreamPreference()
+    {
+        try {
+            auto settings = ApplicationData::Current().LocalSettings().Values();
+            if (m_streamModeStored) {
+                settings.Insert(L"streamWidth", box_value(m_streamWidth));
+                settings.Insert(L"streamHeight", box_value(m_streamHeight));
+                settings.Insert(L"streamFps", box_value(m_streamFps));
+            }
+            if (m_bitrateOverrideKbps) {
+                settings.Insert(L"bitrateKbps", box_value(m_bitrateOverrideKbps));
+            } else if (settings.HasKey(L"bitrateKbps")) {
+                settings.Remove(L"bitrateKbps");
+            }
+        } catch (...) {
+            // Costs the preference on the next launch, never this session.
+        }
+    }
+
+    void MainPage::OnBitrateChanged(IInspectable const&,
+                                    Primitives::RangeBaseValueChangedEventArgs const& args)
+    {
+        // Programmatic moves (a mode snap, the load) are not the user choosing.
+        if (m_syncingBitrateSlider) return;
+        const uint32_t kbps = static_cast<uint32_t>(std::lround(args.NewValue())) * 1000;
+        // Dragged back onto the recommendation = following the preset again,
+        // so the next mode change is free to move it.
+        m_bitrateOverrideKbps = (kbps == RecommendedBitrateKbps()) ? 0 : kbps;
+        SaveStreamPreference();
+        RefreshStreamQualityUi();
+    }
+
+    void MainPage::RefreshStreamQualityUi()
+    {
+        RefreshModeButtons();
+        const uint32_t target = TargetBitrateKbps();
+        try {
+            m_syncingBitrateSlider = true;
+            if (std::lround(BitrateSlider().Value()) != static_cast<long>(target / 1000)) {
+                BitrateSlider().Value(static_cast<double>(target / 1000));
+            }
+            m_syncingBitrateSlider = false;
+            BitrateValueText().Text(hstring(std::to_wstring(target / 1000) + L" Mbps"));
+            const bool manual = m_bitrateOverrideKbps != 0;
+            BitrateModeText().Text(manual
+                ? hstring(L"MANUAL  ::  auto for this mode is " +
+                          std::to_wstring(RecommendedBitrateKbps() / 1000) + L" Mbps")
+                : hstring(L"AUTO  ::  recommended for " + std::to_wstring(m_streamWidth) + L"x" +
+                          std::to_wstring(m_streamHeight) + L" @ " +
+                          std::to_wstring(m_streamFps) + L" fps"));
+            BitrateModeText().Foreground(IonBrush(manual ? L"IonAmber" : L"IonBlue"));
+        } catch (...) {
+            m_syncingBitrateSlider = false;
         }
     }
 
@@ -2161,20 +2391,27 @@ namespace winrt::EchoXbox::implementation
                    L" Hz - the console will decode every frame and show half of them");
         }
 
-        m_streamWidth = width;
-        m_streamHeight = height;
-        m_streamFps = fps;
+        // Recorded (and the bitrate snapped) before any of the early returns
+        // below: the highlight must move even when the mode was only saved for
+        // next time, and even when the host refused to re-mode. It reflects
+        // what this client will ask for -- and the same choice Settings shows.
+        SelectStreamMode(width, height, fps);
 
-        // Before any of the early returns below: the highlight must move even
-        // when the mode was only saved for next time, and even when the host
-        // refused to re-mode. It reflects what this client will ask for.
-        RefreshModeButtons();
-
+        const std::wstring bitrate = std::to_wstring(TargetBitrateKbps() / 1000) + L" Mbps";
         if (!m_streaming || !m_session) {
             OverlaySubtitle().Text(L"saved - the next stream starts at " +
-                                   to_hstring(width) + L"x" + to_hstring(height));
+                                   to_hstring(width) + L"x" + to_hstring(height) + L" @ " +
+                                   to_hstring(fps) + L" fps, " + hstring(bitrate));
             return;
         }
+
+        // A live re-mode moves the DISPLAY only. The host's encoder keeps the
+        // frame rate and bitrate budget `start_session` negotiated (the Worker's
+        // SetDisplayMode arm rebuilds NVENC at the new size with the old rate),
+        // so the snapped bitrate is the next stream's opening bid and the log
+        // says so rather than letting the overlay imply otherwise.
+        Append(L"quality     " + hstring(bitrate) +
+               L" saved - bitrate and encoder frame rate take effect from the next stream");
 
         // Live. The host re-modes its virtual display in place and rebuilds its
         // encoder; the new geometry reaches this decoder as a stream change,
@@ -2343,20 +2580,26 @@ namespace winrt::EchoXbox::implementation
     // could tell you what you *could* pick and never what you *had*.
     void MainPage::RefreshModeButtons()
     {
-        auto resolutions = ResolutionRow().Children();
-        for (uint32_t i = 0; i < resolutions.Size() && i < kModes.size(); ++i) {
-            if (auto button = resolutions.GetAt(i).try_as<Button>()) {
-                const bool active = kModes[i].width == m_streamWidth &&
-                                    kModes[i].height == m_streamHeight;
-                button.Style(IonStyle(active ? L"IonActiveButton" : L"IonButton"));
+        // The overlay's rows and the Settings card's rows describe the same
+        // choice, so they are lit from the same state.
+        for (auto row : { ResolutionRow(), SettingsResolutionRow() }) {
+            auto resolutions = row.Children();
+            for (uint32_t i = 0; i < resolutions.Size() && i < kModes.size(); ++i) {
+                if (auto button = resolutions.GetAt(i).try_as<Button>()) {
+                    const bool active = kModes[i].width == m_streamWidth &&
+                                        kModes[i].height == m_streamHeight;
+                    button.Style(IonStyle(active ? L"IonActiveButton" : L"IonButton"));
+                }
             }
         }
 
-        auto rates = FrameRateRow().Children();
-        for (uint32_t i = 0; i < rates.Size() && i < kFrameRates.size(); ++i) {
-            if (auto button = rates.GetAt(i).try_as<Button>()) {
-                button.Style(IonStyle(kFrameRates[i] == m_streamFps ? L"IonActiveButton"
-                                                                    : L"IonButton"));
+        for (auto row : { FrameRateRow(), SettingsFrameRateRow() }) {
+            auto rates = row.Children();
+            for (uint32_t i = 0; i < rates.Size() && i < kFrameRates.size(); ++i) {
+                if (auto button = rates.GetAt(i).try_as<Button>()) {
+                    button.Style(IonStyle(kFrameRates[i] == m_streamFps ? L"IonActiveButton"
+                                                                        : L"IonButton"));
+                }
             }
         }
     }
@@ -2597,6 +2840,19 @@ namespace winrt::EchoXbox::implementation
         // grant; the UI switches then rather than on the first frame, so a
         // stream that connects but never decodes is still visibly distinct
         // from one that never connected.
+        if (type == "granted") {
+            // What Nova SETTLED on, which is what NVENC and QoS run at: the
+            // bid capped at the mode's ceiling, less the audio reservation.
+            // Said beside the bid so a clamp is visible from the sofa.
+            const auto kbps = echo::JsonField(json, "bitrate_kbps");
+            if (!kbps.empty() && kbps != "0") {
+                Append(L"granted     " + to_hstring(echo::JsonField(json, "width")) + L"x" +
+                       to_hstring(echo::JsonField(json, "height")) + L" @ " +
+                       to_hstring(echo::JsonField(json, "fps")) + L" fps, video budget " +
+                       to_hstring(kbps) + L" Kbps (asked " +
+                       std::to_wstring(TargetBitrateKbps()) + L")");
+            }
+        }
         if (type == "streaming" || type == "granted") {
             Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this]() {
                 EnterStreamingUi();

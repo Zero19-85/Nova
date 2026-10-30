@@ -36,6 +36,8 @@ namespace winrt::EchoXbox::implementation
         void OnHdrToggled(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
         void OnMicLevelChanged(IInspectable const&,
                                Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const&);
+        void OnBitrateChanged(IInspectable const&,
+                              Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const&);
         void OnRescanClick(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
 
         void OnDiagnosticsClick(IInspectable const&, Windows::UI::Xaml::RoutedEventArgs const&);
@@ -179,6 +181,19 @@ namespace winrt::EchoXbox::implementation
         void RefreshOverlayState();           // UI thread
         void RefreshModeButtons();            // UI thread
         void ApplyStreamMode(uint32_t width, uint32_t height, uint32_t fps);
+
+        // Stream quality: the mode and the bitrate bid, Echo Android's model.
+        // A mode change snaps the bitrate to the mode's recommendation; the
+        // slider then overrides it until the next mode change. Persisted in
+        // LocalSettings as streamWidth/streamHeight/streamFps and, only while
+        // overridden, bitrateKbps. See the note in the .cpp.
+        void SelectStreamMode(uint32_t width, uint32_t height, uint32_t fps);   // UI thread
+        void LoadStreamPreference();          // UI thread, once
+        void SaveStreamPreference();          // UI thread
+        void RefreshStreamQualityUi();        // UI thread
+        uint32_t RecommendedBitrateKbps() const;
+        uint32_t TargetBitrateKbps() const;   // what start_session asks for
+        std::wstring DescribeStreamQuality() const;
 
         // Mouse mode is owned by the pad thread; these are the two ends of the
         // conversation with it. The button asks, the sink reports.
@@ -326,6 +341,18 @@ namespace winrt::EchoXbox::implementation
         uint32_t m_streamWidth = 1920;
         uint32_t m_streamHeight = 1080;
         uint32_t m_streamFps = 60;
+        // True once a mode came from the user (Settings or the overlay), now or
+        // in an earlier run. Until then the mode follows the TV's output.
+        bool m_streamModeStored = false;
+        // The slider's manual value in Kbps; 0 = follow the mode's
+        // recommendation. Cleared by every mode change.
+        uint32_t m_bitrateOverrideKbps = 0;
+        // Set while code moves the slider, so the move is not read as a user
+        // override. Starts TRUE: the XAML `Value` can raise ValueChanged inside
+        // InitializeComponent, before LoadStreamPreference, and treating that
+        // as a user move would overwrite the stored override with the default.
+        // The first RefreshStreamQualityUi clears it.
+        bool m_syncingBitrateSlider = true;
 
         // True while a pairing session is open, so the `paired` event knows to
         // hand straight off to a stream instead of just reporting success.

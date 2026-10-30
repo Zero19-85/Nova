@@ -151,7 +151,19 @@ pub enum Event {
     /// `hdr` is what the host GRANTED, not what was asked for: a client must
     /// configure its decoder (Main10, BT.2020, PQ) from this, because the host
     /// declines HDR for codecs it cannot encode it in and says so here.
-    Granted { session_id: u64, width: u64, height: u64, fps: u64, codec: String, hdr: bool },
+    ///
+    /// `bitrate_kbps` is the VIDEO budget the host settled on (the request
+    /// capped at the mode's ceiling, less the audio reservation), i.e. what
+    /// NVENC was actually configured to. 0 = the host did not say.
+    Granted {
+        session_id: u64,
+        width: u64,
+        height: u64,
+        fps: u64,
+        codec: String,
+        hdr: bool,
+        bitrate_kbps: u64,
+    },
     /// The host declined — most often the anti-hijack gate doing its job while
     /// somebody else is streaming. An expected answer, not a failure.
     ///
@@ -245,7 +257,7 @@ impl Event {
                 "protocol_version": protocol_version,
                 "device_name": device_name,
             }),
-            Event::Granted { session_id, width, height, fps, codec, hdr } => json!({
+            Event::Granted { session_id, width, height, fps, codec, hdr, bitrate_kbps } => json!({
                 "type": "granted",
                 "session_id": session_id,
                 "width": width,
@@ -253,6 +265,7 @@ impl Event {
                 "fps": fps,
                 "codec": codec,
                 "hdr": hdr,
+                "bitrate_kbps": bitrate_kbps,
             }),
             Event::Refused { reason } => json!({"type": "refused", "reason": reason}),
             Event::Warning { message } => json!({"type": "warning", "message": message}),
@@ -1085,6 +1098,7 @@ async fn stream_inner(
         codec: control::field_str(&grant, "codec").unwrap_or("?").to_string(),
         // Absent means SDR: a host that predates the field never encoded HDR.
         hdr: grant.get("hdr").and_then(|v| v.as_bool()).unwrap_or(false),
+        bitrate_kbps: control::field_u64(&grant, "bitrate_kbps").unwrap_or(0),
     });
 
     // Downstream game audio gets its OWN task, off the video path entirely.

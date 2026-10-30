@@ -2007,3 +2007,48 @@ fix = `timeBeginPeriod(1)` while streaming (check UWP availability), else
 rebuild FFmpeg with a high-resolution wait. `lock` large = present thread
 holding the decoder. `wait`/`present` large = compositor pacing. A smooth
 `submit` tail under 8 ms = the sleep theory is wrong; look at the others.
+
+## 21. Stream quality: resolution/fps presets + bitrate slider (2026-10-30, built into 0.1.3.0, console test OWED)
+
+**Why.** Every Xbox session asked for a flat `kStreamBitrate = 40000`, so
+4K120 ran at 39,488 Kbps (the encoder sat at its budget ~99% of gameplay)
+while 1080p60 over-asked against an 18 Mbps ceiling. The host was never the
+limit: `qos::resolution_ceiling` allows 84,090 Kbps at 4K120.
+
+**What.** Echo Android's model, ported verbatim (`MainPage.cpp`
+`BitrateForMode`): tiers 720p 10 / 1080p 18 / 1440p 30 / 4K 50 Mbps at 60 fps,
+x(fps/60)^0.75, truncated to whole Mbps, clamped 10-100. Defaults:
+
+| mode | 60 fps | 120 fps |
+|---|---|---|
+| 4K | 50 | 84 |
+| 1440p | 30 | 50 |
+| 1080p | 18 | 30 |
+| 720p | 10 | 16 |
+
+- **Settings → STREAM QUALITY**: resolution row (4K/1440p/1080p/720p), frame
+  rate row (60/120), bitrate slider 10-100 Mbps (A engages, left/right 1 Mbps,
+  B releases) with an AUTO / MANUAL readout. Saves for the NEXT stream only.
+- **A mode change snaps the bitrate** (clears the override); the slider then
+  overrides until the next mode change. Dragging back onto the recommendation
+  counts as AUTO again.
+- **Persisted** in LocalSettings: `streamWidth`/`streamHeight`/`streamFps`
+  once the user picks a mode (until then the mode follows the TV, as before),
+  and `bitrateKbps` only while overridden — so a future retune of the table
+  reaches untouched installs with no schema migration.
+- **The overlay's rows** write the same preference. A live overlay change
+  still re-modes the host display, but the host's `SetDisplayMode` arm keeps
+  the encoder fps and bitrate `start_session` negotiated — so the new bitrate
+  (and a frame-rate change, at the encoder) land at the next stream. The log
+  says so (`quality … take effect from the next stream`). Re-budgeting a live
+  session would need fps+bitrate on `set_display` → IPC → Worker; not done.
+- **echo-client `Event::Granted` now carries `bitrate_kbps`** (the host's
+  settled video budget, already in the grant). The Xbox logs
+  `granted     3840x2160 @ 120 fps, video budget 83488 Kbps (asked 84000)`.
+
+**Test.** Fresh 0.1.3.0: Settings shows 4K / 120 / 84 Mbps AUTO on a 4K120 TV.
+Start a stream; `nova-service.log` must read `🎚️ Video budget: 84000 Kbps
+requested → 83488 Kbps, 512 Kbps reserved for audio`. Then pick 1080p60 (slider
+snaps to 18), drag to 40 (MANUAL), restart the app: 1080p60 / 40 MANUAL
+survives. Watch §18.3 (`dropped overflow`) at 84 Mbps — bigger frames are more
+decode work per frame, and that queue was already the 4K120 weak point.

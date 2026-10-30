@@ -514,8 +514,73 @@
                                 VerticalAlignment="Center" />
                     </Grid>
 
-                    <StackPanel Grid.Row="1" Spacing="30" MaxWidth="2000"
+                    <!-- Scrolls only if the cards outgrow the screen; the
+                         focus rect brings whatever it lands on into view. -->
+                    <ScrollViewer Grid.Row="1"
+                                  VerticalScrollBarVisibility="Hidden"
+                                  HorizontalScrollMode="Disabled"
+                                  IsTabStop="False">
+                    <StackPanel Spacing="30" MaxWidth="2000"
                                 HorizontalAlignment="Left">
+                        <!-- Stream quality. Echo Android's model: picking a
+                             resolution or frame rate snaps the bitrate to that
+                             mode's recommendation (the same table, tuned
+                             against the host's ceiling); the slider then
+                             overrides it until the next mode change. All of it
+                             persisted, all of it the NEXT stream's opening
+                             bid. Rows are filled by BuildOverlayChoices. -->
+                        <Border Style="{StaticResource IonCard}">
+                            <StackPanel Spacing="14">
+                                <TextBlock Text="STREAM QUALITY"
+                                           Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="34">
+                                    <TextBlock Text="RESOLUTION" Width="300"
+                                               Style="{StaticResource IonTelemetry}"
+                                               VerticalAlignment="Center" />
+                                    <StackPanel x:Name="SettingsResolutionRow"
+                                                Orientation="Horizontal" Spacing="16" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="34">
+                                    <TextBlock Text="FRAME RATE" Width="300"
+                                               Style="{StaticResource IonTelemetry}"
+                                               VerticalAlignment="Center" />
+                                    <StackPanel x:Name="SettingsFrameRateRow"
+                                                Orientation="Horizontal" Spacing="16" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="34">
+                                    <TextBlock Text="BITRATE" Width="300"
+                                               Style="{StaticResource IonTelemetry}"
+                                               VerticalAlignment="Center" />
+                                    <!-- 10-100 Mbps, one stop per Mbps (A to
+                                         engage, left/right to move, B to let
+                                         go). See MainPage::OnBitrateChanged. -->
+                                    <Slider x:Name="BitrateSlider"
+                                            Width="900"
+                                            Minimum="10" Maximum="100"
+                                            StepFrequency="1"
+                                            SmallChange="1"
+                                            LargeChange="10"
+                                            TickFrequency="10"
+                                            Value="18"
+                                            IsFocusEngagementEnabled="True"
+                                            ValueChanged="OnBitrateChanged"
+                                            VerticalAlignment="Center" />
+                                    <TextBlock x:Name="BitrateValueText"
+                                               Text=""
+                                               Style="{StaticResource IonTelemetry}"
+                                               Foreground="{StaticResource IonBlue}"
+                                               VerticalAlignment="Center" />
+                                </StackPanel>
+                                <TextBlock x:Name="BitrateModeText"
+                                           Text=""
+                                           Style="{StaticResource IonTelemetry}"
+                                           Foreground="{StaticResource IonBlue}" />
+                                <TextBlock Style="{StaticResource IonTelemetry}"
+                                           TextWrapping="Wrap"
+                                           Text="The bitrate is set automatically from the resolution and frame rate, and re-set whenever either changes. Move the slider to override it. Applies to the next stream and is remembered across restarts. Nova still caps it at what the mode can use (84 Mbps at 4K120) and keeps a sliver for audio." />
+                            </StackPanel>
+                        </Border>
+
                         <!-- Dynamic range. A PREFERENCE, and the only thing
                              that decides what the session asks the host to
                              encode.
@@ -620,6 +685,7 @@
                             </StackPanel>
                         </Border>
                     </StackPanel>
+                    </ScrollViewer>
                 </Grid>
             </Grid>
 
