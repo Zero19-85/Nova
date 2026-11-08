@@ -35,6 +35,18 @@
 // therefore happens under m_mutex, and Stop() zeroes the handle under the same
 // mutex. Once Stop() returns, no packet can reach the bridge -- which is why
 // EchoSession stops the microphone BEFORE it closes the handle, never after.
+//
+// ── The headset comes and goes ─────────────────────────────────────────────
+//
+// The headset is plugged into the CONTROLLER, so it disappears whenever the pad
+// powers off. An AudioGraph is bound to one device for life: losing it raises
+// UnrecoverableErrorOccurred and the graph is dead for good, so the old code --
+// one graph per stream -- left the microphone silent until the stream was
+// restarted, however soon the pad came back. Now a lost device drops the graph,
+// and a new one is built when the default capture device changes (the pad
+// reconnecting) or, as a backstop, on a 3 s retry while no headset is present.
+// The host needs nothing for this: its renderer idles on silence and restarts
+// from whatever packet arrives next (nova-server/src/mic.rs).
 #pragma once
 
 #include <atomic>
@@ -45,6 +57,7 @@
 #include <vector>
 
 #include <winrt/Windows.Media.Audio.h>
+#include <winrt/Windows.System.Threading.h>
 
 struct OpusEncoder;
 
@@ -79,6 +92,11 @@ public:
 
 private:
     winrt::fire_and_forget OpenAsync();
+    // Detach and close the current graph (and its encoder), keeping the
+    // session handle: the next OpenAsync builds a fresh one.
+    void DropGraph() noexcept;
+    // The headset went away, or never arrived: say so and keep trying.
+    void WaitForDevice(std::wstring why);
     void OnQuantum() noexcept;
     void Consume(const float* samples, uint32_t frames, uint32_t channels) noexcept;
     void EncodeAndSend(const float* pcm) noexcept;
@@ -97,7 +115,16 @@ private:
     winrt::Windows::Media::Audio::AudioGraph m_graph{ nullptr };
     winrt::Windows::Media::Audio::AudioFrameOutputNode m_output{ nullptr };
     winrt::event_token m_quantumToken{};
+    winrt::event_token m_lostToken{};          // the graph's UnrecoverableErrorOccurred
     OpusEncoder* m_encoder = nullptr;
+    bool m_opening = false;                    // an OpenAsync is in flight
+    bool m_openedOnce = false;                 // later successes are rebuilds
+    winrt::Windows::System::Threading::ThreadPoolTimer m_retry{ nullptr };
+    winrt::event_token m_deviceToken{};        // MediaDevice::DefaultAudioCaptureDeviceChanged
+
+    // The UI thread, captured at Start: the first open may raise the consent
+    // prompt, and a reopen begins on a pool thread but must open from here.
+    winrt::apartment_context m_ui;
 
     // Graph thread only.
     uint32_t m_graphRate = kRate;
@@ -117,6 +144,7 @@ private:
     std::atomic<uint64_t> m_bytes{0};
     std::atomic<uint64_t> m_refused{0};       // echo_send_mic said false
     std::atomic<uint64_t> m_encodeErrors{0};
+    std::atomic<uint64_t> m_reopens{0};       // graphs rebuilt after a lost headset
     std::atomic<int32_t>  m_peakDbfs{-120};   // loudest sample, last ~1 s
     mutable std::mutex m_stateMutex;
     std::wstring m_state = L"opening";

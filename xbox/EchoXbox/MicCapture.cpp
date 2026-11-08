@@ -4,6 +4,7 @@
 
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Capture.h>
+#include <winrt/Windows.Media.Devices.h>
 #include <winrt/Windows.Media.MediaProperties.h>
 #include <winrt/Windows.Media.Render.h>
 
@@ -21,8 +22,19 @@ using namespace winrt::Windows::Media::Audio;
 using namespace winrt::Windows::Media::Capture;
 using namespace winrt::Windows::Media::MediaProperties;
 using namespace winrt::Windows::Media::Render;
+using namespace winrt::Windows::Media::Devices;
+using namespace winrt::Windows::System::Threading;
 
 namespace {
+
+const wchar_t* LostReason(AudioGraphUnrecoverableError e) {
+    switch (e) {
+    case AudioGraphUnrecoverableError::AudioDeviceLost: return L"the headset went away";
+    case AudioGraphUnrecoverableError::AudioSessionDisconnected: return L"audio session disconnected";
+    case AudioGraphUnrecoverableError::UnknownFailure: return L"unknown audio failure";
+    default: return L"audio graph stopped";
+    }
+}
 
 // The classic-COM view of an AudioBuffer's bytes. Declared here rather than
 // pulled from <MemoryBuffer.h> because that header's ABI namespace collides
@@ -58,6 +70,22 @@ namespace echo {
 
 std::shared_ptr<MicCapture> MicCapture::Start(uint64_t handle, uint32_t level) {
     auto mic = std::make_shared<MicCapture>(handle, level);
+    // The pad reconnecting is what makes its headset the default capture
+    // device again. A change to ANY default rebuilds the graph: the old one is
+    // either dead (the headset left) or bound to whatever stood in for it.
+    try {
+        mic->m_deviceToken = MediaDevice::DefaultAudioCaptureDeviceChanged(
+            [weak = std::weak_ptr<MicCapture>(mic)](auto&&, DefaultAudioCaptureDeviceChangedEventArgs const& args) {
+                if (args.Role() != AudioDeviceRole::Default) return;
+                if (auto self = weak.lock()) {
+                    self->DropGraph();
+                    self->SetState(L"default microphone changed - reopening");
+                    self->OpenAsync();
+                }
+            });
+    } catch (...) {
+        // No notification: the retry timer alone brings the headset back.
+    }
     mic->OpenAsync();
     return mic;
 }
@@ -88,10 +116,26 @@ void MicCapture::SetState(std::wstring state) {
 // rather than leaked.
 fire_and_forget MicCapture::OpenAsync() {
     auto self = shared_from_this();
+    // One open at a time, and none while a graph is live: the device-change
+    // event and the retry timer can both ask at once.
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_stopped || m_graph || m_opening) co_return;
+        m_opening = true;
+    }
+    struct OpeningDone {
+        MicCapture* mic;
+        ~OpeningDone() {
+            std::lock_guard<std::mutex> lk(mic->m_mutex);
+            mic->m_opening = false;
+        }
+    } openingDone{ this };
+
     // The first microphone access raises the consent prompt, which belongs to
-    // the UI thread. Start() is called there; come back to it for the call
-    // that triggers the prompt.
-    apartment_context ui;
+    // the UI thread. Start() captured it; a reopen starts on a pool thread and
+    // comes back to it for the call that could prompt.
+    apartment_context ui = m_ui;
+    co_await ui;
 
     AudioGraph graph{ nullptr };
     try {
@@ -99,7 +143,7 @@ fire_and_forget MicCapture::OpenAsync() {
         settings.QuantumSizeSelectionMode(QuantumSizeSelectionMode::LowestLatency);
         auto created = co_await AudioGraph::CreateAsync(settings);
         if (created.Status() != AudioGraphCreationStatus::Success) {
-            SetState(std::wstring(L"OFF - audio graph: ") + GraphStatus(created.Status()));
+            WaitForDevice(std::wstring(L"audio graph: ") + GraphStatus(created.Status()));
             co_return;
         }
         graph = created.Graph();
@@ -128,7 +172,14 @@ fire_and_forget MicCapture::OpenAsync() {
         }
         if (!input) {
             graph.Close();
-            SetState(L"OFF - " + lastRefusal);
+            // Denied is the user's answer and stays an answer. Anything else
+            // is most often "no headset right now" -- the pad is off -- so
+            // keep looking rather than leaving the session deaf.
+            if (lastRefusal == NodeStatus(AudioDeviceNodeCreationStatus::AccessDenied)) {
+                SetState(L"OFF - " + lastRefusal);
+            } else {
+                WaitForDevice(lastRefusal);
+            }
             co_return;
         }
 
@@ -165,9 +216,33 @@ fire_and_forget MicCapture::OpenAsync() {
             m_encoder = encoder;
             m_graph = graph;
             m_output = output;
+            // Graph-thread state belongs to the graph it was built from; a
+            // rebuilt graph starts clean. No graph thread is running here.
+            m_pending.clear();
+            m_resamplePos = 0.0;
+            m_resamplePrev = 0.0f;
             m_quantumToken = graph.QuantumStarted([weak = weak_from_this()](auto&&, auto&&) {
                 if (auto mic = weak.lock()) mic->OnQuantum();
             });
+            // The headset leaving kills this graph for good. Torn down on a
+            // pool thread, not inside the graph's own event.
+            m_lostToken = graph.UnrecoverableErrorOccurred(
+                [weak = weak_from_this()](AudioGraph const&,
+                                          AudioGraphUnrecoverableErrorOccurredEventArgs const& args) {
+                    const std::wstring why = LostReason(args.Error());
+                    ThreadPool::RunAsync([weak, why](auto&&) {
+                        if (auto mic = weak.lock()) {
+                            mic->DropGraph();
+                            mic->WaitForDevice(why);
+                        }
+                    });
+                });
+            if (m_retry) {
+                m_retry.Cancel();
+                m_retry = nullptr;
+            }
+            if (m_openedOnce) m_reopens.fetch_add(1, std::memory_order_relaxed);
+            m_openedOnce = true;
             graph.Start();
         }
 
@@ -183,16 +258,16 @@ fire_and_forget MicCapture::OpenAsync() {
         }
         wchar_t code[32]{};
         swprintf_s(code, L"0x%08X ", static_cast<uint32_t>(e.code()));
-        SetState(std::wstring(L"OFF - ") + code + e.message().c_str());
+        // Most often the device vanishing mid-open (the pad switching off);
+        // a retry costs one attempt every few seconds and recovers that case.
+        WaitForDevice(std::wstring(code) + e.message().c_str());
     } catch (...) {
-        SetState(L"OFF - unexpected exception while opening");
+        WaitForDevice(L"unexpected exception while opening");
     }
 }
 
 void MicCapture::Stop() noexcept {
-    AudioGraph graph{ nullptr };
-    winrt::event_token token{};
-    OpusEncoder* encoder = nullptr;
+    ThreadPoolTimer retry{ nullptr };
     {
         // After this block no send can start: OnQuantum checks m_stopped
         // under the same mutex, and an in-flight one holds it until done.
@@ -200,24 +275,59 @@ void MicCapture::Stop() noexcept {
         if (m_stopped) return;
         m_stopped = true;
         m_handle = 0;
+        retry = std::exchange(m_retry, nullptr);
+    }
+    if (retry) retry.Cancel();
+    try {
+        if (m_deviceToken) MediaDevice::DefaultAudioCaptureDeviceChanged(m_deviceToken);
+    } catch (...) {
+    }
+    DropGraph();
+    std::lock_guard<std::mutex> lk(m_stateMutex);
+    if (m_state.rfind(L"OFF", 0) != 0) m_state = L"stopped";
+}
+
+void MicCapture::DropGraph() noexcept {
+    AudioGraph graph{ nullptr };
+    winrt::event_token quantum{}, lost{};
+    OpusEncoder* encoder = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
         graph = std::exchange(m_graph, nullptr);
-        m_output = nullptr;
-        token = m_quantumToken;
+        m_output = nullptr;                 // OnQuantum stops here, under the lock
+        quantum = m_quantumToken;
+        lost = m_lostToken;
         encoder = std::exchange(m_encoder, nullptr);
     }
     // Outside the lock: closing a graph may wait for its thread, and that
-    // thread may be waiting on the lock to find m_stopped.
+    // thread may be waiting on the lock to find m_output gone.
     if (graph) {
         try {
-            graph.QuantumStarted(token);
+            graph.QuantumStarted(quantum);
+            graph.UnrecoverableErrorOccurred(lost);
             graph.Stop();
             graph.Close();
         } catch (...) {
         }
     }
     if (encoder) opus_encoder_destroy(encoder);
-    std::lock_guard<std::mutex> lk(m_stateMutex);
-    if (m_state.rfind(L"OFF", 0) != 0) m_state = L"stopped";
+}
+
+void MicCapture::WaitForDevice(std::wstring why) {
+    SetState(L"waiting for a headset - " + why);
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if (m_stopped || m_retry) return;
+    try {
+        // A backstop for the device-change event, which nothing promises the
+        // console raises for a controller's headset. Each tick is one cheap
+        // open attempt that bails out at once if a graph already exists.
+        m_retry = ThreadPoolTimer::CreatePeriodicTimer(
+            [weak = weak_from_this()](auto&&) {
+                if (auto mic = weak.lock()) mic->OpenAsync();
+            },
+            std::chrono::seconds(3));
+    } catch (...) {
+    }
 }
 
 // ── The graph thread ────────────────────────────────────────────────────────
@@ -325,14 +435,15 @@ std::wstring MicCapture::Report() const {
         std::lock_guard<std::mutex> lk(m_stateMutex);
         state = m_state;
     }
-    wchar_t counts[200]{};
-    swprintf_s(counts, L"\n          sent %llu (%llu KB)   refused %llu   encode errors %llu   peak %d dBFS   gain %.2fx",
+    wchar_t counts[240]{};
+    swprintf_s(counts, L"\n          sent %llu (%llu KB)   refused %llu   encode errors %llu   peak %d dBFS   gain %.2fx   reopened %llu",
                static_cast<unsigned long long>(m_packets.load()),
                static_cast<unsigned long long>(m_bytes.load() / 1024),
                static_cast<unsigned long long>(m_refused.load()),
                static_cast<unsigned long long>(m_encodeErrors.load()),
                m_peakDbfs.load(),
-               static_cast<double>(m_gain.load()));
+               static_cast<double>(m_gain.load()),
+               static_cast<unsigned long long>(m_reopens.load()));
     return state + counts;
 }
 

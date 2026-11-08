@@ -1816,12 +1816,37 @@ namespace winrt::EchoXbox::implementation
     // Default OFF, unlike HDR: a microphone that opens without being asked for
     // is a privacy surprise, and the first open raises a consent prompt over
     // the stream. The user turns it on knowing that.
+    //
+    // Two sliders drive it -- Settings and the in-stream overlay -- and both
+    // land here, so they are the same setting shown twice, never two settings.
     void MainPage::OnMicLevelChanged(IInspectable const&,
                                      Primitives::RangeBaseValueChangedEventArgs const& args)
     {
-        m_micLevel = static_cast<uint32_t>(std::lround(args.NewValue()));
-        MicValueText().Text(m_micLevel == 0 ? hstring(L"off")
-                                            : hstring(std::to_wstring(m_micLevel) + L"%"));
+        ApplyMicLevel(static_cast<uint32_t>(std::lround(args.NewValue())));
+    }
+
+    void MainPage::ApplyMicLevel(uint32_t level)
+    {
+        level = std::min<uint32_t>(level, 100);
+        const bool changed = level != m_micLevel;
+        m_micLevel = level;
+
+        const hstring label = level == 0 ? hstring(L"off")
+                                         : hstring(std::to_wstring(level) + L"%");
+        try {
+            MicValueText().Text(label);
+            OverlayMicValueText().Text(label);
+            // Moving the other slider re-enters here with `changed` false, so
+            // the sync costs one label update, not a second save or a reopen.
+            for (auto slider : { MicSlider(), OverlayMicSlider() }) {
+                if (std::lround(slider.Value()) != static_cast<long>(level)) {
+                    slider.Value(static_cast<double>(level));
+                }
+            }
+        } catch (...) {
+        }
+        if (!changed) return;
+
         try {
             ApplicationData::Current().LocalSettings().Values()
                 .Insert(L"micLevel", box_value(m_micLevel));
@@ -1844,12 +1869,9 @@ namespace winrt::EchoXbox::implementation
         } catch (...) {
             m_micLevel = 0;
         }
-        try {
-            // Fires OnMicLevelChanged, which sets the label and re-saves the
-            // same value; no session exists yet, so nothing opens.
-            MicSlider().Value(static_cast<double>(m_micLevel));
-        } catch (...) {
-        }
+        // Already the current level, so this only brings both sliders and
+        // their labels to it -- no re-save, and no session exists to open.
+        ApplyMicLevel(m_micLevel);
     }
 
     // ── Pair ────────────────────────────────────────────────────────────────

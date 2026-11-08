@@ -51,7 +51,7 @@
   <Identity
     Name="Zeroorigin1985.com.EchoStreamClient"
     Publisher="CN=966F1B4F-E0AA-49A8-86CD-B67FF919632A"
-    Version="0.1.3.0" />
+    Version="0.1.3.1" />
 
   <mp:PhoneIdentity PhoneProductId="6f1c2a10-4e9c-4d5f-9a3f-0d4c6b7e8a01"
                     PhonePublisherId="00000000-0000-0000-0000-000000000000" />

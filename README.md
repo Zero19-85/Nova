@@ -78,7 +78,8 @@ encoder and audio pipeline wholesale — Echo added framing, not media.
 | LAN-direct path (skip the relay on the same subnet) | ✅ Working |
 | Gamepad over Echo (physical controllers → ViGEmBus), rumble back to the pad — Xbox + Android | ✅ Working |
 | Keyframeless loss repair (RFI → long-term reference → IDR, client acks) | ✅ Working |
-| Xbox microphone · Android HDR10 | 🔜 Next |
+| Xbox microphone (controller headset, reconnects with the pad) · Android HDR10 | ✅ Working |
+| Xbox stream quality presets (4K/1440p/1080p/720p × 60/120) + bitrate slider | ✅ Working |
 
 ### Audio, both directions
 
@@ -90,6 +91,29 @@ channel because an Echo client listens on nothing but its punched path.
 The two are kept apart by construction: the microphone renders into VB-CABLE,
 and the game-audio ghost sink resolver refuses to select it. Pointing both at
 one cable would feed the game back to the remote user as their own microphone.
+
+**Microphone setup — VB-CABLE.** Microphone passthrough is built on
+[VB-Audio Virtual Cable](https://vb-audio.com/Cable/) by VB-Audio Software
+(donationware — thank you, VB-Audio). Install it on the host PC; Echo's
+microphone then appears in Windows as **"CABLE Output"**, ready for games,
+Discord and anything else that takes a microphone. Leave the game-audio side
+alone: Nova sends game audio through Steam Streaming Speakers (or NVIDIA
+Virtual Audio) on purpose, for the reason above.
+
+On the Xbox the headset plugs into the controller. The microphone level
+(0 = off, 50 = as captured, 100 = +6 dB) is on the Settings screen and on the
+in-stream overlay (hold Menu + View), and the microphone reconnects on its own
+if the controller is switched off and back on mid-stream.
+
+### USB peripherals over the network — VirtualHere
+
+Nova and Echo work well alongside [VirtualHere](https://www.virtualhere.com/),
+which shares USB devices over the network. Use it to pass a keyboard, mouse,
+wheel, flight stick or wireless dongle from the couch straight to the PC while
+the stream runs; the devices appear to Windows as if they were plugged in
+locally, independent of Echo's own input channel. Echo keeps the console
+awake for the whole stream, so a session driven entirely by VirtualHere
+devices with the Xbox pad left untouched does not dim.
 
 ### A/V sync
 
@@ -419,6 +443,8 @@ VirtualDisplayDriver\← VDD package (bundled by installer)
 - **VDD:** Bundled in installer (`VDD.Control.25.7.23`) — no manual install needed
 - **Gamepad passthrough:** [ViGEmBus](https://github.com/ViGEm/ViGEmBus) (optional — Nova offers to install it on first run)
 - **Audio routing:** Steam Streaming Speakers or another virtual audio device (optional — falls back to host speakers)
+- **Echo microphone passthrough:** [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (optional — only needed to use a client's microphone on the PC)
+- **USB over the network:** [VirtualHere](https://www.virtualhere.com/) (optional, third-party — works alongside Nova and Echo)
 
 ---
 

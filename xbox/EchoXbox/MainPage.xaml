@@ -434,6 +434,30 @@
                                 </StackPanel>
                             </StackPanel>
 
+                            <!-- The same setting as Settings' MicSlider, mid-game:
+                                 0 releases the headset, 50 is as captured, 100 is
+                                 +6 dB. Live and persisted; both sliders go
+                                 through MainPage::ApplyMicLevel. -->
+                            <StackPanel Spacing="12">
+                                <TextBlock Text="MICROPHONE" Style="{StaticResource IonLabel}" />
+                                <StackPanel Orientation="Horizontal" Spacing="22">
+                                    <Slider x:Name="OverlayMicSlider"
+                                            Width="900"
+                                            Minimum="0" Maximum="100"
+                                            StepFrequency="5"
+                                            TickFrequency="25"
+                                            Value="0"
+                                            IsFocusEngagementEnabled="True"
+                                            ValueChanged="OnMicLevelChanged"
+                                            VerticalAlignment="Center" />
+                                    <TextBlock x:Name="OverlayMicValueText"
+                                               Text="off"
+                                               Style="{StaticResource IonTelemetry}"
+                                               Foreground="{StaticResource IonBlue}"
+                                               VerticalAlignment="Center" />
+                                </StackPanel>
+                            </StackPanel>
+
                             <StackPanel Orientation="Horizontal" Spacing="18" Margin="0,10,0,0">
                                 <Button x:Name="ResumeButton" Content="Back to the stream"
                                         Style="{StaticResource IonPrimaryButton}"

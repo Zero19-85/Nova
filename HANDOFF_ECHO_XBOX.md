@@ -2052,3 +2052,38 @@ requested → 83488 Kbps, 512 Kbps reserved for audio`. Then pick 1080p60 (slide
 snaps to 18), drag to 40 (MANUAL), restart the app: 1080p60 / 40 MANUAL
 survives. Watch §18.3 (`dropped overflow`) at 84 Mbps — bigger frames are more
 decode work per frame, and that queue was already the 4K120 weak point.
+
+## 22. Microphone dies when the controller powers off; mic slider in the overlay (2026-11-08, 0.1.3.1, console test OWED)
+
+**Symptom.** Headset on the controller; pad turns off and back on mid-stream;
+the mic stays dead until the stream is restarted.
+
+**Cause.** `MicCapture` built ONE AudioGraph per stream. The headset leaving
+raises `UnrecoverableErrorOccurred` (AudioDeviceLost) and a graph never
+recovers from that; nothing listened, so the dead graph sat there until the
+next stream built a new `MicCapture`.
+
+**Fix (`MicCapture.cpp`).** The lost event drops the graph (on a pool
+thread) and enters "waiting for a headset". A new graph is built on
+`MediaDevice::DefaultAudioCaptureDeviceChanged` (role Default) and, as a
+backstop, by a 3 s retry timer while no headset is present. "No microphone"
+at the first open now waits too (pad off when the stream started);
+AccessDenied stays OFF. Graph-thread state resets per graph. Diagnostics:
+`mic` line reads `waiting for a headset - …` and counts `reopened N`.
+Host unchanged: `mic.rs` idles on silence and restarts from the next packet.
+
+**Test.** Stream with the mic on, switch the pad off ~10 s, back on. Pass =
+voice reaches the PC within a few seconds of the pad reconnecting, and the
+diagnostics `mic` line shows `reopened 1`.
+
+**Overlay mic slider (same build).** The in-stream overlay (hold Menu+View)
+gained a MICROPHONE slider beside CONTROLLER. It and Settings' `MicSlider`
+share `OnMicLevelChanged` → `ApplyMicLevel`, which updates both labels,
+moves the other slider (re-entry is a no-op), and only on a real change
+saves `micLevel` and calls `EchoSession::SetMicLevel` -- so 0 releases the
+headset and anything above reopens it, live.
+
+**Version.** 0.1.3.0 is submitted to the Store; 0.1.3.1 is the working
+version until the next submission. Packages:
+`dist\EchoXbox-sideload-EchoXbox_0.1.3.1_x64.zip`,
+`AppPackages\EchoXbox\EchoXbox_0.1.3.1_x64_bundle.msixupload`.

@@ -133,6 +133,7 @@ namespace winrt::EchoXbox::implementation
         void LoadHdrPreference();             // UI thread
         void SaveHdrPreference(bool on);      // UI thread
         void LoadMicPreference();             // UI thread
+        void ApplyMicLevel(uint32_t level);   // UI thread; both mic sliders end here
         /// Ask the console to switch transfer function, best-effort, and report
         /// what it actually did. BLOCKING — background thread only. Never
         /// changes `m_hdrEnabled`: a console that refuses is a console that
