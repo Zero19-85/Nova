@@ -2053,7 +2053,7 @@ snaps to 18), drag to 40 (MANUAL), restart the app: 1080p60 / 40 MANUAL
 survives. Watch §18.3 (`dropped overflow`) at 84 Mbps — bigger frames are more
 decode work per frame, and that queue was already the 4K120 weak point.
 
-## 22. Microphone dies when the controller powers off; mic slider in the overlay (2026-11-08, 0.1.3.1, console test OWED)
+## 22. Microphone dies when the controller powers off; mic slider in the overlay (2026-11-08, 0.1.4.0, console test OWED)
 
 **Symptom.** Headset on the controller; pad turns off and back on mid-stream;
 the mic stays dead until the stream is restarted.
@@ -2083,12 +2083,15 @@ moves the other slider (re-entry is a no-op), and only on a real change
 saves `micLevel` and calls `EchoSession::SetMicLevel` -- so 0 releases the
 headset and anything above reopens it, live.
 
-**Version.** 0.1.3.0 is submitted to the Store; 0.1.3.1 is the working
-version until the next submission. Packages:
-`dist\EchoXbox-sideload-EchoXbox_0.1.3.1_x64.zip`,
-`AppPackages\EchoXbox\EchoXbox_0.1.3.1_x64_bundle.msixupload`.
+**Version.** 0.1.3.0 is submitted to the Store; 0.1.4.0 is the working
+version until the next submission. **The Store rejects any revision other
+than 0** ("Apps are not allowed to have a Version with a revision number other
+than zero", Partner Center 2026-11-09, against 0.1.3.1) — so a working version
+bumps the THIRD field, never the fourth. Packages:
+`dist\EchoXbox-sideload-EchoXbox_0.1.4.0_x64.zip`,
+`AppPackages\EchoXbox\EchoXbox_0.1.4.0_x64_bundle.msixupload`.
 
-## 23. Wake-on-LAN from an OFFLINE card (2026-11-09, 0.1.3.1, console test OWED)
+## 23. Wake-on-LAN from an OFFLINE card (2026-11-09, 0.1.4.0, console test OWED)
 
 **What.** A sleeping or shut-down PC used to vanish from the host list —
 nothing to press. Now every paired host in `hosts.json` that mDNS cannot see
