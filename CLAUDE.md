@@ -148,6 +148,14 @@ MAC with the host card and send the magic packet (limited + /24 subnet
 broadcast, UDP 9 and 7, 3 bursts) from an OFFLINE card — Xbox
 `HANDOFF_ECHO_XBOX.md` §23.
 
+**Rule learned the hard way: never `Command::output()` in the Master.** It
+waits for EOF on the child's stdout/stderr pipes, those handles are
+inheritable, and the service spawns Workers with handle inheritance ON (that is
+how the SYSTEM token reaches them) — a Worker spawned at the same moment keeps
+the pipe open, and `output()` returns only when that Worker exits. The first
+WoL check's verdict surfaced at the next service stop. Use `.status()` with
+`Stdio::null()` and pass results through a file (as `wol.rs` does).
+
 ## 2026-10-28: **SILENT XBOX DRIFT — LTR off for Echo; still-screen keyframe built** (deployed, test RUNNING)
 
 A 4K120 HDR10 Echo/Xbox session showed grey/white/tan blocks and minutes-old

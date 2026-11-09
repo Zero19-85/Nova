@@ -135,6 +135,15 @@ fn carries(a: &IP_ADAPTER_ADDRESSES_LH, target: std::net::Ipv4Addr) -> bool {
 pub fn ensure_wake_armed(adapter: &LanAdapter) {
     // Single-quoted PowerShell literals; a quote inside a name is doubled.
     let q = |s: &str| s.replace('\'', "''");
+    // The verdict comes back through a FILE, not a pipe. `Command::output()`
+    // waits for EOF on the child's stdout/stderr pipes, and those handles are
+    // inheritable: the Master spawns its Worker at the same moment, with
+    // handle inheritance on (that is how the SYSTEM token reaches it), so the
+    // Worker held the pipe open and this verdict only arrived when the Worker
+    // exited — at the next service stop (measured 2026-11-09). Waiting on the
+    // process alone has no such dependency.
+    let report_path = std::env::temp_dir().join(format!("nova-wol-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&report_path);
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 $name = '{alias}'; $desc = '{desc}'
@@ -160,9 +169,10 @@ try {{
   $fs = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled).HiberbootEnabled
   $out += "fast-startup=$fs"
 }} catch {{}}
-$out -join ' '"#,
+Set-Content -LiteralPath '{report}' -Value ($out -join ' ') -Encoding UTF8"#,
         alias = q(&adapter.alias),
         desc = q(&adapter.description),
+        report = q(&report_path.to_string_lossy()),
     );
 
     use std::os::windows::process::CommandExt;
@@ -175,16 +185,17 @@ $out -join ' '"#,
     let encoded = base64_utf16le(&script);
     let result = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .output();
+        .status();
     match result {
-        Ok(out) => {
-            let mut report = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if report.is_empty() {
-                // Say what went wrong rather than logging an empty verdict.
-                let err = String::from_utf8_lossy(&out.stderr);
-                report = format!("check produced no answer: {}", err.lines().next().unwrap_or("(no stderr)"));
-            }
+        Ok(status) => {
+            let report = std::fs::read_to_string(&report_path)
+                .map(|s| s.trim_start_matches('\u{feff}').trim().to_string())
+                .unwrap_or_else(|_| format!("check produced no answer (exit {status})"));
+            let _ = std::fs::remove_file(&report_path);
             println!(
                 "⏰ Wake-on-LAN: {} ({}, {}) — {report}",
                 adapter.alias, adapter.mac, adapter.description
