@@ -51,6 +51,7 @@ mod touch;
 mod upnp;
 pub mod tray;
 mod virtual_display;
+mod wol;
 
 use clap::Parser;
 // Trait for the capture manager's per-frame surface (width()/height()/origin()/
@@ -553,6 +554,23 @@ pub async fn start_master_network() -> MasterHandles {
                 );
                 return;
             };
+            // The real MAC, from the adapter carrying this address (wol.rs),
+            // and the NIC armed to wake on it. Only the Master arms: it is
+            // the process every boot starts, and it runs as SYSTEM.
+            let server_mac = match wol::resolve_for_ip(&ip) {
+                Some(adapter) => {
+                    let mac = adapter.mac.clone();
+                    std::thread::Builder::new()
+                        .name("nova-wol-arm".into())
+                        .spawn(move || wol::ensure_wake_armed(&adapter))
+                        .ok();
+                    mac
+                }
+                None => {
+                    println!("⚠️  Wake-on-LAN: no adapter carries {ip} — publishing no wake MAC");
+                    server_mac
+                }
+            };
             match ServiceInfo::new(
                 "_nvstream._tcp.local.",
                 "Nova",
@@ -568,7 +586,7 @@ pub async fn start_master_network() -> MasterHandles {
             ) {
                 Ok(svc) => {
                     let _ = mdns.register(svc);
-                    println!("📡 mDNS broadcaster started for Nova (Master) on {ip}");
+                    println!("📡 mDNS broadcaster started for Nova (Master) on {ip} (wake MAC {server_mac})");
                 }
                 Err(e) => println!("❌ mDNS: could not build the _nvstream record: {e}"),
             }
@@ -1962,6 +1980,16 @@ fn desktop_is_secure() -> bool {
     matches!(
         capture::desktop_switch::current_input_desktop(),
         InputDesktop::Secure | InputDesktop::ScreenSaver
+    )
+}
+
+/// The interactive desktop is POSITIVELY known to have input — unlike
+/// `!desktop_is_secure()`, `Unknown` does not count. For one-shot work that
+/// fails with error 5 anywhere else.
+fn interactive_desktop_confirmed() -> bool {
+    matches!(
+        capture::desktop_switch::current_input_desktop(),
+        capture::desktop_switch::InputDesktop::Default
     )
 }
 
@@ -3918,6 +3946,14 @@ pub async fn run_worker() -> Result<()> {
             }
         }
 
+        // A boot on the sign-in screen parked a leftover VDD but could not
+        // repair the layout (SetDisplayConfig is error 5 there). Finish it the
+        // moment someone signs in — positively the interactive desktop, not
+        // merely "not known to be secure", or the repair burns its one try.
+        if !client_connected && vd.boot_heal_pending() && interactive_desktop_confirmed() {
+            vd.finish_deferred_boot_heal();
+        }
+
         // HIGH CPU priority while a client is connected (priority.rs).
         priority::set_streaming(client_connected);
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;
@@ -4539,7 +4575,12 @@ pub async fn run() -> Result<()> {
         global_pin.clone(),
     ));
 
-    // mDNS — Sunshine-compatible service record
+    // mDNS — Sunshine-compatible service record. Real wake MAC as in the
+    // Master (wol.rs); the monolithic path does not arm the NIC — the service
+    // does that on every boot.
+    let wake_mac = wol::resolve_for_ip(&local_ip)
+        .map(|a| a.mac)
+        .unwrap_or_else(|| server_mac.to_string());
     let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
     let svc = ServiceInfo::new(
         "_nvstream._tcp.local.",
@@ -4550,7 +4591,7 @@ pub async fn run() -> Result<()> {
         &[
             ("txtvers", "1"),
             ("port",     "47989"),
-            ("mac",      server_mac),
+            ("mac",      wake_mac.as_str()),
             ("uniqueid", server_id),
         ][..],
     )
@@ -5527,6 +5568,10 @@ pub async fn run() -> Result<()> {
         // Texture to feed the encoder this iteration — either a freshly captured
         // WGC frame, or (when the desktop is unchanged) a re-submission of the
         // last cached frame to keep the stream alive on a static desktop.
+        // Mirrors run_worker: finish a boot-time VDD repair the sign-in screen blocked.
+        if !client_connected && vd.boot_heal_pending() && interactive_desktop_confirmed() {
+            vd.finish_deferred_boot_heal();
+        }
         priority::set_streaming(client_connected); // mirrors run_worker (priority.rs)
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;
 

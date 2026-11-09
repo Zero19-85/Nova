@@ -542,6 +542,12 @@ pub struct VirtualDisplay {
     /// auto-teardown a suspended VDD after `[stream] idle_teardown_secs` of no
     /// reconnect — closing the "ghost monitor left running indefinitely" gap.
     suspended_since: Option<Instant>,
+    /// The boot found the VDD left enabled on the sign-in screen, where
+    /// SetDisplayConfig is refused (error 5) for every identity. The device was
+    /// parked (a PnP operation, which IS allowed there), but the physical mode
+    /// and the CCD database still need the interactive desktop. The Worker
+    /// loop calls [`Self::finish_deferred_boot_heal`] once it is back.
+    boot_heal_pending: bool,
 }
 
 impl VirtualDisplay {
@@ -568,6 +574,7 @@ impl VirtualDisplay {
             active_device_name: None,
             active_resolution: None,
             suspended_since: None,
+            boot_heal_pending: false,
         }
     }
 
@@ -1552,6 +1559,46 @@ impl VirtualDisplay {
             Err(e)    => println!("⚠️  Could not patch HDRPlus in vdd_settings.xml: {e}"),
         }
 
+        // ── Never enable the VDD on the sign-in screen ──────────────────────
+        //
+        // Enabling the devnode makes Windows re-apply the CCD database entry
+        // for the {physical + VDD} display set — and that entry is the
+        // HEADLESS one whenever a stream's teardown could not overwrite it
+        // (a shutdown mid-stream reaches teardown on Windows' secure
+        // shutdown desktop, where the restore fails with error 5). On the
+        // sign-in screen the repair cannot run either: SetDisplayConfig is
+        // refused there for every identity. The result was the logon screen
+        // drawn on an invisible 4K virtual monitor, the physical monitor
+        // black, and nobody able to sign in locally to fix it (live
+        // 2026-11-09; the same error-5 boot appears in the log since
+        // 2026-10-16, invisible whenever someone signed in quickly enough
+        // for a post-login Worker to heal it).
+        //
+        // The cycle's only other job is refreshing MttVDD's mode table from
+        // vdd_settings.xml, and every stream's activation enables the devnode
+        // from cold anyway, which reads the XML. So on the secure desktop the
+        // cycle is simply not done.
+        if Self::input_desktop_is_secure() {
+            println!("🕶️  Sign-in screen is up — skipping the boot VDD cycle (enabling it here lets \
+                Windows restore a saved headless layout that cannot be undone until someone signs in)");
+            if self.is_enabled() {
+                // Left enabled: power was cut or the host died mid-stream. A
+                // device disable is PnP, not SetDisplayConfig, so it IS
+                // allowed here — and removing the only active display makes
+                // Windows fall back to the physical one.
+                println!("🩹 VDD devnode is enabled with nobody signed in — parking it so Windows \
+                    falls back to the physical display");
+                let parked = self.park_devnode("sign-in screen at boot");
+                // Mode and database repair need the interactive desktop.
+                self.boot_heal_pending = true;
+                if !parked {
+                    println!("⚠️  Could not park the VDD on the sign-in screen — it will be healed \
+                        as soon as someone signs in (or a stream starts and ends)");
+                }
+            }
+            return Ok(None);
+        }
+
         // The devnode enable/isolate/disable dance below is a REAL, visible
         // topology change (the physical monitor gets briefly displaced and
         // restored) — fine once per boot, but the service's SYSTEM-fallback
@@ -1586,22 +1633,7 @@ impl VirtualDisplay {
             if self.is_enabled() {
                 println!("🩹 VDD devnode was left enabled by a previous host — restoring the \
                     physical display topology before capture starts");
-                let orphan = Self::wait_for_virtual_display_device_name();
-                Self::isolate_virtual_display_at_boot(orphan.as_deref());
-                self.set_enabled(false).unwrap_or_else(|e| {
-                    println!("⚠️  Could not park the orphaned VDD devnode (non-fatal): {e}")
-                });
-                match Self::cleanup_phantom_monitors() {
-                    Ok(0) => {}
-                    Ok(n) => println!("🧹 Removed {n} phantom virtual-monitor devnode(s)"),
-                    Err(e) => println!("⚠️  Phantom-monitor sweep: {e}"),
-                }
-                // The heal above re-lights the physical output with
-                // SDC_TOPOLOGY_EXTEND, which picks its own mode — the same
-                // "Windows guesses" path as the teardown. The dead Worker never
-                // got to restore the mode, so this Worker does it, from the
-                // baseline that Worker persisted.
-                self.reassert_physical_baseline("orphaned-VDD heal");
+                self.heal_orphaned_devnode("orphaned-VDD heal");
             }
             return Ok(None);
         }
@@ -1635,9 +1667,12 @@ impl VirtualDisplay {
         //
         // Intentionally runs AFTER isolate_virtual_display_at_boot so the CCD
         // database is consistent ("VDD inactive") before the devnode disappears.
-        self.set_enabled(false)
-            .unwrap_or_else(|e| println!("⚠️  Could not hardware-disable VDD at boot (non-fatal): {e}"));
-        println!("🕶️  Root\\MttVDD devnode hardware-disabled at boot — will enable on client connect only");
+        if self.park_devnode("boot cycle") {
+            println!("🕶️  Root\\MttVDD devnode hardware-disabled at boot — will enable on client connect only");
+        } else {
+            println!("⚠️  Root\\MttVDD devnode is STILL ENABLED after the boot cycle — the next \
+                Worker start or stream teardown will retry");
+        }
 
         // Sweep phantom VDD monitor devnodes left by the boot cycle above and
         // by any sessions that never reached deactivate_after_stream (crash,
@@ -1660,6 +1695,80 @@ impl VirtualDisplay {
         // lib.rs passes this to WgcCapturer::new_excluding(None) so the WGC
         // capturer binds the physical primary with no VDD exclusion needed.
         Ok(None)
+    }
+
+    /// True while the sign-in / lock / UAC (Winlogon) desktop has input —
+    /// where SetDisplayConfig is refused with error 5 for every identity.
+    /// Asked of Windows directly: at boot the desktop-switch monitor may not
+    /// have made its first observation yet.
+    fn input_desktop_is_secure() -> bool {
+        use crate::capture::desktop_switch::{probe_input_desktop, InputDesktop};
+        matches!(probe_input_desktop(), InputDesktop::Secure | InputDesktop::ScreenSaver)
+    }
+
+    /// Disable the devnode, retrying while the driver finishes starting.
+    ///
+    /// A disable issued straight after an enable failed with
+    /// `ERROR_INVALID_DATA` on every error-5 boot (2026-10-16 → 2026-11-09)
+    /// — the device was still starting — while the same disable on a device
+    /// that had been running for hours succeeded even on the shutdown
+    /// desktop. So: a few attempts, half a second apart. Returns whether the
+    /// devnode ended up disabled.
+    fn park_devnode(&mut self, why: &str) -> bool {
+        const ATTEMPTS: u32 = 6;
+        for attempt in 1..=ATTEMPTS {
+            match self.set_enabled(false) {
+                Ok(()) => return true,
+                Err(e) if attempt < ATTEMPTS => {
+                    println!("⏳ VDD park ({why}) attempt {attempt}/{ATTEMPTS} failed: {e} — retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => println!("⚠️  VDD park ({why}) gave up after {ATTEMPTS} attempts: {e}"),
+            }
+        }
+        !self.is_enabled()
+    }
+
+    /// Put the desktop back the way a clean teardown would have left it, for a
+    /// devnode some earlier host left enabled with no stream on it: physical
+    /// path re-lit and saved to the CCD database as "VDD inactive", devnode
+    /// parked, phantom monitors swept, physical mode re-asserted. Needs the
+    /// interactive desktop (the CCD half is error 5 anywhere else).
+    fn heal_orphaned_devnode(&mut self, why: &str) {
+        let orphan = Self::wait_for_virtual_display_device_name();
+        Self::isolate_virtual_display_at_boot(orphan.as_deref());
+        self.park_devnode(why);
+        match Self::cleanup_phantom_monitors() {
+            Ok(0) => {}
+            Ok(n) => println!("🧹 Removed {n} phantom virtual-monitor devnode(s)"),
+            Err(e) => println!("⚠️  Phantom-monitor sweep: {e}"),
+        }
+        // The heal re-lights the physical output with SDC_TOPOLOGY_EXTEND,
+        // which picks its own mode — the same "Windows guesses" path as the
+        // teardown — so the persisted baseline gets the last word.
+        self.reassert_physical_baseline(why);
+    }
+
+    /// See [`Self::boot_heal_pending`]. Cheap enough to poll every loop pass.
+    pub fn boot_heal_pending(&self) -> bool {
+        self.boot_heal_pending
+    }
+
+    /// Finish what the sign-in-screen boot could not: call once the
+    /// interactive desktop is back and no stream owns the display.
+    pub fn finish_deferred_boot_heal(&mut self) {
+        if !self.boot_heal_pending || self.active {
+            return;
+        }
+        self.boot_heal_pending = false;
+        println!("🖥️  Signed in — finishing the display repair the sign-in screen blocked");
+        if self.is_enabled() {
+            self.heal_orphaned_devnode("deferred boot heal");
+        } else {
+            // Parked successfully at boot; Windows chose the physical mode
+            // on its own, so only the mode needs putting back.
+            self.reassert_physical_baseline("deferred boot heal");
+        }
     }
 
     // -------------------------------------------------------------

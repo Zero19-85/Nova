@@ -125,6 +125,15 @@ pub fn switch_generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
+/// Ask Windows NOW which desktop has input, without waiting for the monitor.
+///
+/// [`current_input_desktop`] reads `Unknown` until the monitor thread's first
+/// query lands, which makes it the wrong source for a decision taken at
+/// process start (the VDD boot cycle). This is the same query, done inline.
+pub fn probe_input_desktop() -> InputDesktop {
+    query_input_desktop().0
+}
+
 // ── Query + classification ────────────────────────────────────────────────────
 
 /// Opens the current input desktop and classifies it by name. `Err` from

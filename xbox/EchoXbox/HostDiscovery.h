@@ -36,9 +36,15 @@ struct DiscoveredHost {
     std::wstring relayUrl;    // TXT "relay"      — absent means LAN-only host
     std::wstring relayPin;    // TXT "relaypin"
     std::wstring fingerprintHint;  // TXT "fp" — A LABEL. Read the header.
+    // TXT "mac" — the host's LAN adapter, for Wake-on-LAN. Only as trustworthy
+    // as mDNS, which is fine: the worst a forged one does is wake nothing.
+    std::wstring mac;
+    // Not a live record: a paired host from hosts.json that mDNS cannot see
+    // right now (asleep, off, or elsewhere). A press on it WAKES it.
+    bool offline = false;
 
     bool Usable() const noexcept {
-        return !address.empty() && !relayUrl.empty() && !relayPin.empty();
+        return !offline && !address.empty() && !relayUrl.empty() && !relayPin.empty();
     }
 };
 

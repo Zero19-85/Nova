@@ -324,8 +324,17 @@ pub(crate) fn spawn(mdns: &ServiceDaemon, cfg: &EchoConfig) {
         };
 
         let label = host_label();
-        let records =
+        let mut records =
             txt_records(&fingerprint, &label, &relay_url, &relay_pin, &ip, public.as_deref(), &advertise_override);
+        // `mac` — the LAN adapter's, for Wake-on-LAN (crate::wol). Clients
+        // store it with the host card, because the only time they can learn it
+        // is while the PC is awake to answer. Absent rather than a placeholder
+        // when unknown: a client that stored a fake MAC would "wake" nothing
+        // and never say why. Resolved here, not read from the `_nvstream`
+        // task, so the two registrations cannot race.
+        if let Some(adapter) = crate::wol::resolve_for_ip(&ip) {
+            records.push(("mac".to_string(), adapter.mac));
+        }
         // Say so when the advertised URL is not the configured one, so the log
         // explains an address the operator never typed.
         if let Some((_, advertised)) = records.iter().find(|(k, _)| k == "relay") {

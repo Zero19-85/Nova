@@ -220,6 +220,17 @@ namespace winrt::EchoXbox::implementation
         bool CanStream() const;               // UI thread
         bool CanPair() const;                 // UI thread
 
+        // Wake-on-LAN. An OFFLINE card is a paired host from hosts.json that
+        // mDNS cannot see; A on it sends the magic packet and watches for the
+        // PC to reappear. See the note in the .cpp.
+        bool SelectedHostOffline() const;     // UI thread
+        std::wstring SavedMacFor(std::wstring const& address) const;
+        void WakeSelectedHost();              // UI thread
+        void SendWakePacket(std::wstring const& mac, std::wstring const& address);   // any thread; sends on a pool thread
+        void OnWakeTick();                    // UI thread, 1 Hz while waking
+        void OnWakeTargetAppeared();          // UI thread, from RefreshHostList
+        void WakeAfterFailedConnect();        // UI thread
+
         std::wstring m_log;
         std::string  m_stateDir;
 
@@ -379,6 +390,19 @@ namespace winrt::EchoXbox::implementation
         std::wstring m_statsLine;
 
         Windows::UI::Xaml::DispatcherTimer m_statsTimer{ nullptr };
+
+        // The host being woken (empty = none), and the clock on it.
+        std::wstring m_wakeAddress;
+        std::wstring m_wakeName;
+        std::wstring m_wakeMac;
+        std::chrono::steady_clock::time_point m_wakeStarted{};
+        bool m_wakeResent = false;
+        Windows::UI::Xaml::DispatcherTimer m_wakeTimer{ nullptr };
+        // The host the last stream attempt went to, so a connect that never
+        // reached a grant can try waking it (a PC asleep behind a cached
+        // mDNS record still reads ONLINE).
+        std::wstring m_connectMac;
+        std::wstring m_connectAddress;
         // Built on first use and restarted rather than replaced, so toggling
         // mouse mode twice quickly cannot have the first toast's expiry hide
         // the second one.

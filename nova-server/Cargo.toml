@@ -110,6 +110,12 @@ windows = { version = "0.58", features = [
     #   Local, not UTC: the person looking for the file is the one who pressed
     #   the button. Bindings only — no new library is linked (developer rule #1).
     "Win32_System_SystemInformation",
+    #   GetAdaptersAddresses — the LAN adapter's MAC for Wake-on-LAN (wol.rs).
+    #   IP_ADAPTER_ADDRESSES_LH is cfg-gated on Ndis + WinSock together.
+    #   Bindings only — iphlpapi.dll is a system DLL (developer rule #1).
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 # System tray icon + native right-click context menu (handles all Win32 quirks
 # — message pump, SetForegroundWindow, NOTIFYICON_VERSION_4 — internally).

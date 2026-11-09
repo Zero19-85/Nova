@@ -62,6 +62,12 @@ data class KnownHost(
     val paired: Boolean,
     /** Wall clock of the last mDNS sighting, for the "last seen" line. */
     val lastSeenMs: Long,
+    /**
+     * The MAC that wakes this host (Wake-on-LAN), from its `_echo._tcp` record.
+     * Kept across sightings because the only time it can be learned is while
+     * the PC is awake, and the only time it is needed is while it is not.
+     */
+    val macAddress: String? = null,
 ) {
     /** What to draw. */
     val displayName: String get() = alias?.takeIf { it.isNotBlank() } ?: name
@@ -96,6 +102,7 @@ data class KnownHost(
         .put("wan", wanEndpoint ?: JSONObject.NULL)
         .put("paired", paired)
         .put("seen", lastSeenMs)
+        .put("mac", macAddress ?: JSONObject.NULL)
 
     companion object {
         const val DEFAULT_PORT = 48011
@@ -114,6 +121,7 @@ data class KnownHost(
                 wanEndpoint = o.optStringOrNull("wan"),
                 paired = o.optBoolean("paired", false),
                 lastSeenMs = o.optLong("seen", 0L),
+                macAddress = o.optStringOrNull("mac"),
             )
         }
     }
@@ -267,6 +275,9 @@ class HostStore private constructor(context: Context) {
                 // endpoint that stopped answering.
                 relayUrl = if (found.hasRelay) found.relayUrl else existing.relayUrl,
                 relayPin = if (found.hasRelay) found.relayPin else existing.relayPin,
+                // Refreshed when advertised (a new NIC), kept when not: an
+                // older Nova that publishes no MAC must not erase a known one.
+                macAddress = found.mac ?: existing.macAddress,
                 lastSeenMs = now,
             )
             // A re-announcement that says nothing new is not worth a disk write
@@ -295,6 +306,7 @@ class HostStore private constructor(context: Context) {
                         wanEndpoint = null,
                         paired = false,
                         lastSeenMs = now,
+                        macAddress = found.mac,
                     )
                 )
             }
@@ -358,6 +370,7 @@ class HostStore private constructor(context: Context) {
                 relayUrl = host.relayUrl ?: other.relayUrl,
                 relayPin = host.relayPin ?: other.relayPin,
                 wanEndpoint = host.wanEndpoint ?: other.wanEndpoint,
+                macAddress = host.macAddress ?: other.macAddress,
             )
         }
         list[index] = host

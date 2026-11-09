@@ -104,6 +104,50 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
+## 2026-11-09: **BLACK MONITOR AT BOOT — the VDD was enabled on the sign-in screen** (fixed + deployed) and **Wake-on-LAN**
+
+**Symptom:** after a shutdown, the PC booted with the physical monitor black;
+connecting from Echo "released" it. **Measured cause (nova.log, every error-5
+boot since 2026-10-16):** `ensure_enabled_at_boot`'s once-per-boot devnode
+cycle enabled the VDD **pre-login**. Enabling it makes Windows re-apply the CCD
+database entry for the {physical + VDD} display set — headless whenever a
+stream's teardown could not overwrite it (a shutdown mid-stream reaches
+teardown on the secure shutdown desktop: `restore_topology failed (error 5)`).
+On the sign-in screen the repair is impossible: `SetDisplayConfig` is error 5
+there for every identity, and the follow-up disable failed with
+`ERROR_INVALID_DATA` (issued while the driver was still starting) while the log
+still claimed `hardware-disabled at boot`. Logon screen on an invisible 4K
+monitor, nobody able to sign in locally. Invisible on boots where someone
+signed in fast — the post-login Worker's orphan heal fixed it.
+
+**Fix (`virtual_display.rs`):** (1) on the secure desktop the boot cycle is
+**not done** — it only refreshes MttVDD's mode table, which every stream's cold
+enable does anyway; (2) a devnode found enabled there (power cut mid-stream) is
+**parked** — PnP disable IS allowed on the secure desktop (the shutdown-time
+disable always worked) — with `park_devnode` retrying 6x500 ms; (3)
+`boot_heal_pending` makes both loops finish the CCD/mode repair the moment the
+input desktop is positively `Default` (`interactive_desktop_confirmed`, not
+merely "not secure"). Logs: `🕶️ Sign-in screen is up — skipping the boot VDD
+cycle`, `🩹 … parking it`, `🖥️ Signed in — finishing the display repair`.
+**Rule: never touch the VDD devnode's enable state, or SetDisplayConfig, on the
+secure desktop except to PARK it.** PRESHUTDOWN was considered and rejected:
+the user session is logged off before services get PRESHUTDOWN, so the
+desktop is already the secure one by then; the teardown's devnode disable is
+what makes the next boot safe, and it works there.
+
+**Wake-on-LAN (`wol.rs`, `echo-client/src/wol.rs`):** the host publishes its
+LAN adapter's real MAC — Echo `_echo._tcp` TXT `mac=`, and `_nvstream` TXT +
+`/serverinfo <mac>` (both carried the placeholder `00:11:22:33:44:55` until
+now, so Moonlight's own WoL never worked either) — resolved via
+`GetAdaptersAddresses` for the adapter carrying `usable_local_ip` (dev box:
+Ethernet, Realtek 2.5GbE, `30:56:0F:44:51:E5`). The Master arms the NIC once per
+start (`Set-NetAdapterPowerManagement -WakeOnMagicPacket Enabled -NoRestart`,
+`powercfg /deviceenablewake`), reports the vendor shut-down WoL property and
+Fast Startup, and changes neither. Log: `⏰ Wake-on-LAN: …`. Clients persist the
+MAC with the host card and send the magic packet (limited + /24 subnet
+broadcast, UDP 9 and 7, 3 bursts) from an OFFLINE card — Xbox
+`HANDOFF_ECHO_XBOX.md` §23.
+
 ## 2026-10-28: **SILENT XBOX DRIFT — LTR off for Echo; still-screen keyframe built** (deployed, test RUNNING)
 
 A 4K120 HDR10 Echo/Xbox session showed grey/white/tan blocks and minutes-old

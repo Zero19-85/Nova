@@ -979,7 +979,9 @@ async fn handle_request(
                     r#"<uniqueid>{}</uniqueid>"#,
                     r#"<HttpsPort>47984</HttpsPort>"#,
                     r#"<ExternalPort>47989</ExternalPort>"#,
-                    r#"<mac>00:11:22:33:44:55</mac>"#,
+                    // The LAN adapter's real MAC once known (wol.rs) —
+                    // what Moonlight's own Wake-on-LAN stores and uses.
+                    r#"<mac>{}</mac>"#,
                     r#"<LocalIP>{}</LocalIP>"#,
                     r#"<ExternalIP>{}</ExternalIP>"#,
                     // SCM bits (moonlight-common-c Limelight.h): H264=0x1,
@@ -1015,7 +1017,8 @@ async fn handle_request(
                     r#"</SupportedDisplayModeList>"#,
                     r#"</root>"#,
                 ),
-                server_id, _host_ip, _host_ip, codec_mode_support, pair_status, current_game, server_state,
+                server_id, crate::wol::host_mac(), _host_ip, _host_ip, codec_mode_support,
+                pair_status, current_game, server_state,
             );
             Ok(make_xml_response(&body))
         }

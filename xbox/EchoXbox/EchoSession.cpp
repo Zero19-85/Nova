@@ -122,7 +122,10 @@ void SaveHostFingerprint(std::string const& stateDir, std::wstring const& addres
             root = JsonObject();
         }
 
+        // Updated in place, not rebuilt: a re-pair must not throw away the
+        // wake MAC learned while the host was awake.
         JsonObject entry;
+        if (root.HasKey(hstring(address))) entry = root.GetNamedObject(hstring(address));
         entry.SetNamedValue(L"name", JsonValue::CreateStringValue(hstring(name)));
         entry.SetNamedValue(L"fingerprint",
                             JsonValue::CreateStringValue(to_hstring(fingerprint)));
@@ -133,6 +136,49 @@ void SaveHostFingerprint(std::string const& stateDir, std::wstring const& addres
         if (out) out.write(text.data(), static_cast<std::streamsize>(text.size()));
     } catch (...) {
         // A failure here costs one re-pair, never a broken session.
+    }
+}
+
+std::vector<SavedHost> LoadSavedHosts(std::string const& stateDir) noexcept {
+    std::vector<SavedHost> out;
+    try {
+        const auto raw = ReadFile(HostsPath(stateDir));
+        if (raw.empty()) return out;
+        JsonObject root{ nullptr };
+        if (!JsonObject::TryParse(to_hstring(raw), root)) return out;
+        for (auto const& pair : root) {
+            if (pair.Value().ValueType() != JsonValueType::Object) continue;
+            auto entry = pair.Value().GetObject();
+            SavedHost host;
+            host.address = std::wstring(pair.Key());
+            host.name = std::wstring(entry.GetNamedString(L"name", L""));
+            host.fingerprint = to_string(entry.GetNamedString(L"fingerprint", L""));
+            host.mac = std::wstring(entry.GetNamedString(L"mac", L""));
+            if (!host.fingerprint.empty()) out.push_back(std::move(host));
+        }
+    } catch (...) {
+    }
+    return out;
+}
+
+void SaveHostMac(std::string const& stateDir, std::wstring const& address,
+                 std::wstring const& mac) noexcept {
+    try {
+        if (address.empty() || mac.empty()) return;
+        JsonObject root{ nullptr };
+        const auto raw = ReadFile(HostsPath(stateDir));
+        if (raw.empty() || !JsonObject::TryParse(to_hstring(raw), root)) return;
+        // Paired hosts only: an unpaired advertisement has no card to wake.
+        if (!root.HasKey(hstring(address))) return;
+        auto entry = root.GetNamedObject(hstring(address));
+        if (entry.GetNamedString(L"mac", L"") == mac) return;   // the common case: no write
+        entry.SetNamedValue(L"mac", JsonValue::CreateStringValue(hstring(mac)));
+        root.SetNamedValue(hstring(address), entry);
+        const auto text = to_string(root.Stringify());
+        std::ofstream out(HostsPath(stateDir), std::ios::binary | std::ios::trunc);
+        if (out) out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    } catch (...) {
+        // Costs the wake MAC until the next sighting, never a session.
     }
 }
 

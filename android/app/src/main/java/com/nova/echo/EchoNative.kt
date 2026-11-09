@@ -346,4 +346,16 @@ object EchoNative {
      * session it had just started and needed several presses to land.
      */
     external fun nativeRelease(configJson: String): String
+
+    /**
+     * Wake a sleeping host: send the Wake-on-LAN magic packet for [mac] to the
+     * limited broadcast and, from [lastIp] (may be blank), the host's subnet
+     * broadcast — `echo_client::wol`, shared with the Xbox.
+     *
+     * **Blocking** (~0.5 s across three bursts) — call off the main thread.
+     * Returns the datagrams sent; throws for an unusable MAC or a socket that
+     * refused every send. Sent is not woken: only the host reappearing on the
+     * network says that.
+     */
+    external fun nativeWake(mac: String, lastIp: String): Int
 }

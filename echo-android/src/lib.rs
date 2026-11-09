@@ -1504,6 +1504,35 @@ pub extern "system" fn Java_com_nova_echo_EchoNative_nativeRelease<'local>(
     }
 }
 
+/// Wake a sleeping host: send the Wake-on-LAN magic packet for `mac`.
+///
+/// **Blocking** (~0.5 s), like [`Java_com_nova_echo_EchoNative_nativeRelease`]:
+/// call from `Dispatchers.IO`. `last_ip` may be empty; it only aims a subnet
+/// broadcast beside the limited one (see `echo_client::wol`). Returns the
+/// datagrams sent; an unusable MAC or a socket that refused every send throws,
+/// like every other failure on this bridge that the caller must explain.
+#[no_mangle]
+pub extern "system" fn Java_com_nova_echo_EchoNative_nativeWake<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    mac: JString<'local>,
+    last_ip: JString<'local>,
+) -> jni::sys::jint {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mac: String = env.get_string(&mac).map_err(|e| format!("read mac argument: {e}"))?.into();
+        let ip: String = env.get_string(&last_ip).map_err(|e| format!("read ip argument: {e}"))?.into();
+        let ip = Some(ip.trim()).filter(|s| !s.is_empty());
+        echo_client::wol::wake(&mac, ip)
+    }));
+    match flatten(result) {
+        Ok(sent) => sent as jni::sys::jint,
+        Err(msg) => {
+            throw(&mut env, &msg);
+            0
+        }
+    }
+}
+
 /// Ask the relay whether it currently knows how to reach this host.
 ///
 /// **Blocking**, like [`Java_com_nova_echo_EchoNative_nativeRelease`], and for

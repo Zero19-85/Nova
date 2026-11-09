@@ -33,7 +33,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Where a host is answering from *right now*.
@@ -119,6 +122,14 @@ enum class LaunchMode(val label: String, val appId: Int) {
  * button for the mode whose whole point is that it needs no button.
  */
 const val QUICK_START_APP_ID = 5
+
+/** How long a wake watches for the PC to come back. Nova advertises within
+ *  seconds of boot; a full cold start plus sign-in screen fits well inside. */
+private const val WAKE_WINDOW_MS = 60_000L
+/** How often the wake re-browses and re-probes while it waits. */
+private const val WAKE_POLL_MS = 5_000L
+/** A second burst of magic packets, for a radio that dropped the first. */
+private const val WAKE_RESEND_MS = 20_000L
 
 /**
  * The dashboard: what Echo shows when nothing is streaming.
@@ -280,6 +291,66 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
      */
     fun quickStart(host: KnownHost) = activate(host, QUICK_START_APP_ID)
 
+    // ── Wake-on-LAN ─────────────────────────────────────────────────────────
+    //
+    // A paired OFFLINE card with a known MAC wakes its PC instead of trying a
+    // session that cannot answer. Success is the host REAPPEARING (on the LAN,
+    // or registered with its relay) — never "the packet was sent", which only
+    // proves this phone has a radio. The same flow as the Xbox client.
+    var wakingIds by remember { mutableStateOf(setOf<String>()) }
+    val currentOnLan by rememberUpdatedState(onLan)
+    val currentWan by rememberUpdatedState(wan)
+
+    fun canWake(host: KnownHost): Boolean =
+        presence(host) == Presence.Cached && host.paired && !host.macAddress.isNullOrBlank()
+
+    fun sendWake(host: KnownHost) = scope.launch {
+        val mac = host.macAddress ?: return@launch
+        val result = withContext(Dispatchers.IO) {
+            runCatching { EchoNative.nativeWake(mac, host.lanAddress.orEmpty()) }
+        }
+        result.exceptionOrNull()?.let { say("Could not send the wake packet: ${it.message}") }
+    }
+
+    fun wake(host: KnownHost) {
+        if (host.id in wakingIds) {
+            // A second tap while waiting asks for another burst, not a new clock.
+            sendWake(host)
+            say("Still waking ${host.displayName} — sent again")
+            return
+        }
+        wakingIds = wakingIds + host.id
+        say("Waking ${host.displayName}…")
+        scope.launch {
+            sendWake(host).join()
+            val start = System.currentTimeMillis()
+            var resent = false
+            var awake = false
+            while (System.currentTimeMillis() - start < WAKE_WINDOW_MS) {
+                delay(WAKE_POLL_MS)
+                if (host.id in currentOnLan || currentWan[host.id]?.registered == true) {
+                    awake = true
+                    break
+                }
+                // A fresh browse and a fresh relay probe: Nova advertises within
+                // seconds of booting, but a long-running browse reports a NEW
+                // service on its own schedule.
+                discovery.restart()
+                probeNonce++
+                if (!resent && System.currentTimeMillis() - start >= WAKE_RESEND_MS) {
+                    resent = true
+                    sendWake(host)
+                }
+            }
+            wakingIds = wakingIds - host.id
+            say(
+                if (awake) "${host.displayName} is awake"
+                else "${host.displayName} did not wake — check the PC's BIOS wake-on-LAN setting, " +
+                    "and that this phone is on the same network"
+            )
+        }
+    }
+
     Scaffold(
         containerColor = Void,
         snackbarHost = { SnackbarHost(snackbar) },
@@ -351,14 +422,19 @@ fun EchoDashboard(controller: EchoController, state: UiState) {
                         busy = state.connected && !state.streaming,
                         expandable = expandable,
                         expanded = expandable && expandedHostId == host.id,
+                        waking = host.id in wakingIds,
+                        wakeable = canWake(host),
                         onTap = {
-                            if (expandable) {
-                                expandedHostId = if (expandedHostId == host.id) null else host.id
-                            } else {
-                                activate(host)
+                            when {
+                                // Asleep or off: there is nothing to launch on
+                                // yet, so a tap wakes it.
+                                canWake(host) -> wake(host)
+                                expandable ->
+                                    expandedHostId = if (expandedHostId == host.id) null else host.id
+                                else -> activate(host)
                             }
                         },
-                        onDoubleTap = { quickStart(host) },
+                        onDoubleTap = { if (canWake(host)) wake(host) else quickStart(host) },
                         onLongPress = { sheetHostId = host.id },
                         onLaunch = { mode -> launch(host, mode) },
                     )
@@ -529,12 +605,18 @@ private fun HostCard(
     busy: Boolean,
     expandable: Boolean,
     expanded: Boolean,
+    /** A wake is in flight for this host. */
+    waking: Boolean,
+    /** A tap would wake this host (paired, offline, MAC known). */
+    wakeable: Boolean,
     onTap: () -> Unit,
     onDoubleTap: () -> Unit,
     onLongPress: () -> Unit,
     onLaunch: (LaunchMode) -> Unit,
 ) {
-    val accent = presence.accent()
+    // Amber while waking: neither the dim of OFFLINE nor the green that only
+    // "the network answered" may wear.
+    val accent = if (waking) Amber else presence.accent()
 
     // The gesture detector is keyed on Unit so a recomposition never restarts it
     // mid-gesture — which means it captures the FIRST callbacks it is given, and
@@ -604,7 +686,7 @@ private fun HostCard(
                         fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Badge(presence.label(), accent)
+                    Badge(if (waking) "WAKING…" else presence.label(), accent)
                 }
 
                 Text(
@@ -624,6 +706,8 @@ private fun HostCard(
                 // worse than a card that says so.
                 val hint = when {
                     busy -> "session starting…"
+                    waking -> "MAGIC PACKET SENT — WATCHING FOR THE PC TO COME ONLINE"
+                    wakeable -> "ASLEEP OR OFF — TAP TO WAKE THIS PC"
                     !host.paired -> "TAP TO PAIR — Nova shows a PIN on the PC"
                     !host.streamable -> "HOLD TO SET AN ADDRESS OR A RELAY — no route to try"
                     // Reachable here and nowhere else. Worth saying plainly rather

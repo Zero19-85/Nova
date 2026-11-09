@@ -33,6 +33,20 @@ std::string LoadHostFingerprint(std::string const& stateDir,
 void SaveHostFingerprint(std::string const& stateDir, std::wstring const& address,
                          std::wstring const& name, std::string const& fingerprint) noexcept;
 
+// Every paired host on record — what the dashboard shows as an OFFLINE card
+// when mDNS cannot see it, with the MAC that wakes it.
+struct SavedHost {
+    std::wstring address;
+    std::wstring name;
+    std::string  fingerprint;
+    std::wstring mac;        // empty until a live record has advertised one
+};
+std::vector<SavedHost> LoadSavedHosts(std::string const& stateDir) noexcept;
+// Record a paired host's wake MAC (from its TXT `mac`). No-op for an unpaired
+// address, and no write when unchanged — this runs on every list refresh.
+void SaveHostMac(std::string const& stateDir, std::wstring const& address,
+                 std::wstring const& mac) noexcept;
+
 // Build the JSON `echo_pair` / `echo_connect` take. `identityDir` is
 // LocalState — it holds this console's private key.
 std::string BuildPairConfig(std::string const& identityDir,

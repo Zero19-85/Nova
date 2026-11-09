@@ -47,6 +47,13 @@ data class DiscoveredHost(
     val relayUrl: String?,
     /** TXT `relaypin`, present exactly when [relayUrl] is. */
     val relayPin: String?,
+    /**
+     * TXT `mac` — the host's LAN adapter, for Wake-on-LAN. Learned only while
+     * the host is awake, which is why [HostStore] keeps it with the card. As
+     * unauthenticated as the rest of the record, and harmlessly so: a forged
+     * one wakes nothing.
+     */
+    val mac: String? = null,
 ) {
     /** True when this host advertises a usable relay. */
     val hasRelay: Boolean get() = !relayUrl.isNullOrBlank() && !relayPin.isNullOrBlank()
@@ -416,6 +423,7 @@ private fun NsdServiceInfo.toDiscoveredHost(): DiscoveredHost? {
         // its pin is not usable — the pin is what authenticates the relay.
         relayUrl = if (relayUrl != null && relayPin != null) relayUrl.reachableFrom(address) else null,
         relayPin = if (relayUrl != null && relayPin != null) relayPin else null,
+        mac = str("mac"),
     )
 }
 

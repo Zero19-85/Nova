@@ -147,4 +147,12 @@ void echo_detach(uint64_t handle);
 // deliberately: ending a session never needed a session. Worker thread only.
 int32_t echo_release(const char* config_json, char* out, int32_t cap);
 
+// ── Wake-on-LAN ─────────────────────────────────────────────────────────────
+
+// Send the magic packet for `mac` (AA:BB:CC:DD:EE:FF) to the limited broadcast
+// and, from `last_ip` (nullable), the host's subnet broadcast. Returns the
+// datagrams sent, or ECHO_FAILED (reason via echo_last_error). BLOCKING
+// (~0.5 s) — worker thread only.
+int32_t echo_wake(const char* mac, const char* last_ip);
+
 }  // extern "C"

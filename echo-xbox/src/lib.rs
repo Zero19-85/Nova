@@ -1142,6 +1142,31 @@ pub unsafe extern "C" fn echo_release(config_json: *const c_char, out: *mut c_ch
     }
 }
 
+/// Wake a sleeping host: send the Wake-on-LAN magic packet for `mac`.
+///
+/// `last_ip` is the host's last known LAN address (may be null or empty),
+/// used only to aim a subnet broadcast as well as the limited one — see
+/// `echo_client::wol`. Returns the number of datagrams sent, or
+/// [`ECHO_FAILED`] with the reason in [`echo_last_error`] (an unusable MAC,
+/// or a socket that refused every send). **Blocking** for ~0.5 s: worker
+/// thread only. A positive return means the packets left this console, not
+/// that the PC woke — only its reappearance on the network says that.
+///
+/// # Safety
+/// `mac` must be a NUL-terminated UTF-8 string; `last_ip` must be null or one.
+#[no_mangle]
+pub unsafe extern "C" fn echo_wake(mac: *const c_char, last_ip: *const c_char) -> i32 {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mac = read_str(mac)?;
+        let ip = if last_ip.is_null() { None } else { Some(read_str(last_ip)?) };
+        echo_client::wol::wake(&mac, ip.as_deref().filter(|s| !s.is_empty()))
+    }));
+    match flatten(result) {
+        Ok(sent) => sent as i32,
+        Err(_) => ECHO_FAILED,
+    }
+}
+
 // ── Plumbing ────────────────────────────────────────────────────────────────
 
 /// Build the runtime, spawn the session, and hand back a boxed handle.

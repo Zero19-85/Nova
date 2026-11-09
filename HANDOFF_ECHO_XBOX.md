@@ -2087,3 +2087,39 @@ headset and anything above reopens it, live.
 version until the next submission. Packages:
 `dist\EchoXbox-sideload-EchoXbox_0.1.3.1_x64.zip`,
 `AppPackages\EchoXbox\EchoXbox_0.1.3.1_x64_bundle.msixupload`.
+
+## 23. Wake-on-LAN from an OFFLINE card (2026-11-09, 0.1.3.1, console test OWED)
+
+**What.** A sleeping or shut-down PC used to vanish from the host list —
+nothing to press. Now every paired host in `hosts.json` that mDNS cannot see
+is shown as an OFFLINE card (`DiscoveredHost::offline`, id `saved:<address>`),
+and A (single or double tap), or Start → Stream, on it wakes the PC.
+
+- **The MAC** comes from the host's `_echo._tcp` TXT `mac=` (host side in
+  CLAUDE.md, 2026-11-09). `RefreshHostList` writes it beside the pairing on
+  every sighting (`SaveHostMac`: paired hosts only, no write when unchanged);
+  `SaveHostFingerprint` now updates entries in place so a re-pair keeps it.
+  A host seen only before this build has no MAC yet: its card says
+  `OFFLINE // no wake address yet` until it is seen awake once.
+- **The packet** is `echo_wake(mac, last_ip)` → `echo_client::wol` (shared
+  with Android): 6xFF + 16xMAC to 255.255.255.255 and the /24 subnet
+  broadcast, UDP 9 and 7, three bursts 200 ms apart, on a pool thread.
+- **Success is the host reappearing in mDNS**, never "sent". A 1 Hz timer
+  counts down 60 s on the status line (not the card — rebuilding the list
+  every second would drop the focus rect), re-sends at 20 s, and restarts the
+  DNS-SD watcher every 15 s as a backstop (`Stop` keeps the list, so nothing
+  moves). `OnWakeTargetAppeared` toasts `<NAME> IS AWAKE`; the selection is
+  carried from the `saved:` card to the live one by address.
+- **A stale ONLINE card** (PC asleep, mDNS record still cached): a stream that
+  errors before any grant sends a wake packet to the host's known MAC and
+  toasts `NO ANSWER :: sent a wake packet - try again in ~30 s`.
+
+**Limits, said on screen when it times out:** the BIOS/UEFI wake setting must
+be on, and the PC must be wired (most Wi-Fi cards cannot wake a PC). The
+console and the PC must share the LAN segment — a broadcast does not cross a
+router.
+
+**Test.** Sleep the PC (then, separately, shut it down). Card turns OFFLINE //
+PRESS A TO WAKE. Press A: amber WAKING..., countdown on the status line, PC
+wakes, card turns ONLINE with `IS AWAKE` toast. Diagnostics log shows
+`wake        6 magic packets for 30:56:0F:44:51:E5 ...`.

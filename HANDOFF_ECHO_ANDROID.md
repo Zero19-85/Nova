@@ -734,3 +734,18 @@ game content is unaffected — it carries its own nits.
 **Fixed 2026-10-09:** `[hdr] sdr_white_nits` in `nova.toml` (default 280 nits =
 Windows slider 50, picked by eye on this phone and the TV) is applied to the
 virtual display whenever HDR engages. See CLAUDE.md, Current Phase.
+
+## Wake-on-LAN from an OFFLINE card (2026-11-09) — live test OWED
+
+`KnownHost.macAddress` (JSON `mac`) is filled from the host's `_echo._tcp`
+TXT `mac=` by `HostStore.observed` (refreshed when advertised, never erased by
+a record without one; merged on the `paired()` de-duplication). A tap or
+double-tap on a **paired, `Presence.Cached`, MAC-known** card calls
+`EchoNative.nativeWake(mac, lanAddress)` → `echo_client::wol` (shared with the
+Xbox: 6xFF + 16xMAC, limited + /24 subnet broadcast, UDP 9/7, three bursts) on
+`Dispatchers.IO`, badges the card `WAKING…` in amber, and every 5 s restarts
+the browse and the relay probe until the host is `onLan` or relay-registered
+(success) or 60 s pass (snackbar names the BIOS setting and same-network
+requirement). A second burst goes out at 20 s; a second tap re-sends without
+restarting the clock. Hosts seen only before this build have no MAC until they
+are seen awake once, and keep the old tap behaviour until then.

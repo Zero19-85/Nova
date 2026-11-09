@@ -622,6 +622,9 @@ namespace winrt::EchoXbox::implementation
             m_selected = HostList().SelectedIndex();
         }
 
+        // A sleeping host has nothing to launch on yet; A wakes it.
+        if (SelectedHostOffline()) { WakeSelectedHost(); return; }
+
         // Unpaired hosts do not get a drawer. Every entry in it launches
         // something, and launching needs the fingerprint a PIN handshake earns —
         // so the strip would be four buttons that all answer with the same
@@ -671,6 +674,9 @@ namespace winrt::EchoXbox::implementation
             HostList().SelectedIndex(0);
             m_selected = HostList().SelectedIndex();
         }
+
+        // Same answer as a single tap: a sleeping host is woken, not launched.
+        if (SelectedHostOffline()) { WakeSelectedHost(); return; }
 
         // Unpaired is answered the same way a single tap answers it, so the two
         // gestures never disagree about what state the console is in.
@@ -1182,6 +1188,34 @@ namespace winrt::EchoXbox::implementation
         const bool wasEmpty = m_hosts.empty();
 
         m_hosts = m_discovery->Hosts();
+
+        // ── Wake-on-LAN: learn the MAC while the PC is awake ────────────────
+        //
+        // A sleeping PC cannot say what wakes it, so each live record's `mac`
+        // is written beside the pairing now (no-op when unchanged, and for
+        // unpaired hosts), and every paired host mDNS cannot see is shown as
+        // an OFFLINE card that a press wakes. Before this a sleeping PC simply
+        // vanished from the list, leaving nothing to press.
+        size_t liveCount = m_hosts.size();
+        bool wakeTargetLive = false;
+        for (auto const& host : m_hosts) {
+            if (!host.mac.empty()) echo::SaveHostMac(m_stateDir, host.address, host.mac);
+            if (!m_wakeAddress.empty() && host.address == m_wakeAddress) wakeTargetLive = true;
+        }
+        for (auto const& saved : echo::LoadSavedHosts(m_stateDir)) {
+            const bool live = std::any_of(m_hosts.begin(), m_hosts.begin() + liveCount,
+                [&](echo::DiscoveredHost const& h) { return h.address == saved.address; });
+            if (live) continue;
+            echo::DiscoveredHost offline;
+            offline.id = L"saved:" + saved.address;
+            offline.name = saved.name.empty() ? saved.address : saved.name;
+            offline.address = saved.address;
+            offline.mac = saved.mac;
+            offline.offline = true;
+            m_hosts.push_back(std::move(offline));
+        }
+        if (wakeTargetLive) OnWakeTargetAppeared();
+
         HostList().Items().Clear();
 
         int restore = -1;
@@ -1201,9 +1235,17 @@ namespace winrt::EchoXbox::implementation
             // host is `ONLINE // LAN` - which is exactly what a live mDNS
             // record means - and the third state waits for a real probe.
             const bool paired = !stored.empty();
+            const bool waking = host.offline && host.address == m_wakeAddress;
             std::wstring badge = paired ? L"PAIRED" : L"NOT PAIRED";
-            badge += L"   ONLINE // LAN";
-            if (host.relayUrl.empty()) badge += L"   no relay advertised";
+            if (waking) {
+                badge += L"   WAKING...";
+            } else if (host.offline) {
+                badge += host.mac.empty() ? L"   OFFLINE // no wake address yet"
+                                          : L"   OFFLINE // PRESS A TO WAKE";
+            } else {
+                badge += L"   ONLINE // LAN";
+                if (host.relayUrl.empty()) badge += L"   no relay advertised";
+            }
 
             StackPanel row;
             row.Margin(ThicknessHelper::FromLengths(6, 16, 6, 16));
@@ -1232,7 +1274,9 @@ namespace winrt::EchoXbox::implementation
             dot.Width(13);
             dot.Height(13);
             dot.VerticalAlignment(VerticalAlignment::Center);
-            dot.Fill(IonBrush(L"IonMatrix"));
+            // Green stays "the network answered" — an offline card is dim, a
+            // card being woken is amber until the PC actually appears.
+            dot.Fill(IonBrush(waking ? L"IonAmber" : host.offline ? L"IonTextDim" : L"IonMatrix"));
 
             TextBlock state;
             state.Text(hstring(badge));
@@ -1250,13 +1294,21 @@ namespace winrt::EchoXbox::implementation
             row.Children().Append(badgeRow);
             HostList().Items().Append(row);
 
-            if (!selectedId.empty() && host.id == selectedId) restore = static_cast<int>(i);
+            // A woken host changes id (saved:<address> -> its live record);
+            // keep the selection on it so the next A streams to the PC that
+            // was just woken rather than whatever now sits at that index.
+            if (!selectedId.empty() &&
+                (host.id == selectedId || (!host.offline && selectedId == L"saved:" + host.address))) {
+                restore = static_cast<int>(i);
+            }
         }
 
         HostsHeader().Text(m_hosts.empty()
             ? hstring(L"SEARCHING THE NETWORK...")
-            : hstring(std::to_wstring(m_hosts.size()) +
-                      (m_hosts.size() == 1 ? L" HOST FOUND" : L" HOSTS FOUND")));
+            : liveCount == 0
+                ? hstring(L"NO HOST AWAKE   ::   PRESS A ON ONE TO WAKE IT")
+                : hstring(std::to_wstring(liveCount) +
+                          (liveCount == 1 ? L" HOST FOUND" : L" HOSTS FOUND")));
 
         if (restore >= 0) {
             HostList().SelectedIndex(restore);
@@ -1322,6 +1374,13 @@ namespace winrt::EchoXbox::implementation
         }
 
         auto const& host = m_hosts[m_selected];
+        if (!m_wakeAddress.empty() && host.address == m_wakeAddress) return;   // the wake timer owns it
+        if (host.offline) {
+            SetStatus(host.mac.empty()
+                ? hstring(host.name + L"  -  asleep or off. Echo learns how to wake it the next time it sees this PC awake.")
+                : hstring(host.name + L"  -  asleep or off. Press A to wake it."));
+            return;
+        }
         const auto stored = echo::LoadHostFingerprint(m_stateDir, host.address);
         if (stored.empty()) {
             SetStatus(hstring(host.name + L"  -  not paired yet. Press A twice to pair and stream."));
@@ -1348,7 +1407,156 @@ namespace winrt::EchoXbox::implementation
     {
         if (m_streaming) return false;
         if (m_selected < 0 || m_selected >= static_cast<int>(m_hosts.size())) return false;
-        return !m_hosts[m_selected].address.empty();
+        // An offline card is a memory of a host, not a host that can answer.
+        return !m_hosts[m_selected].offline && !m_hosts[m_selected].address.empty();
+    }
+
+    // ── Wake-on-LAN ─────────────────────────────────────────────────────────
+    //
+    // A press on an OFFLINE card sends the magic packet (echo_wake, from the
+    // MAC the host published while awake), then watches for the PC to come
+    // back for kWakeWindow. Success is the host REAPPEARING in mDNS — Nova's
+    // service advertises within seconds of boot — never "the packet was
+    // sent", which only proves this console has a network card.
+    //
+    // The countdown lives on the status line, not on the card: rebuilding the
+    // list every second would drop the focus rect, and on a console the focus
+    // rect is the only cursor there is.
+    namespace
+    {
+        constexpr int64_t kWakeWindowSecs = 60;
+        constexpr int64_t kWakeResendAt = 20;          // a second burst for Wi-Fi
+        constexpr int64_t kWakeRediscoverEvery = 15;   // backstop for a slow watcher
+    }
+
+    bool MainPage::SelectedHostOffline() const
+    {
+        return m_selected >= 0 && m_selected < static_cast<int>(m_hosts.size()) &&
+               m_hosts[m_selected].offline;
+    }
+
+    std::wstring MainPage::SavedMacFor(std::wstring const& address) const
+    {
+        for (auto const& saved : echo::LoadSavedHosts(m_stateDir)) {
+            if (saved.address == address) return saved.mac;
+        }
+        return {};
+    }
+
+    void MainPage::WakeSelectedHost()
+    {
+        if (!SelectedHostOffline()) return;
+        auto const host = m_hosts[m_selected];
+        if (host.mac.empty()) {
+            ShowToast(L"CAN'T WAKE YET   ::   no wake address for this PC", L"IonAmber");
+            SetStatus(hstring(host.name + L"  -  Echo learns how to wake a PC the next time it sees "
+                                          L"it awake (Nova from 2026-11-09 on publishes it)."));
+            return;
+        }
+        if (host.address == m_wakeAddress) {
+            // Pressing again while waiting is a request to try harder, not to
+            // restart the clock the user is watching.
+            SendWakePacket(host.mac, host.address);
+            ShowToast(L"STILL WAKING " + host.name + L"   ::   sent again", L"IonBlue");
+            return;
+        }
+
+        m_wakeAddress = host.address;
+        m_wakeName = host.name;
+        m_wakeMac = host.mac;
+        m_wakeStarted = std::chrono::steady_clock::now();
+        m_wakeResent = false;
+        SendWakePacket(host.mac, host.address);
+        ShowToast(L"WAKING " + host.name + L"   ::   magic packet sent", L"IonBlue");
+        SetStatus(hstring(L"waking " + host.name + L"... (" + std::to_wstring(kWakeWindowSecs) + L" s)"));
+
+        if (!m_wakeTimer) {
+            m_wakeTimer = DispatcherTimer();
+            m_wakeTimer.Interval(std::chrono::seconds(1));
+            m_wakeTimer.Tick([this](auto&&...) { OnWakeTick(); });
+        }
+        m_wakeTimer.Start();
+        RefreshHostList();   // the badge says WAKING; selection is kept by id
+    }
+
+    void MainPage::SendWakePacket(std::wstring const& mac, std::wstring const& address)
+    {
+        // echo_wake blocks ~0.5 s across its three bursts: never the UI thread.
+        auto lifetime = get_strong();
+        Windows::System::Threading::ThreadPool::RunAsync(
+            [this, lifetime, mac, address](auto&&) {
+                const std::string m = to_string(mac);
+                const std::string a = to_string(address);
+                const int32_t sent = echo_wake(m.c_str(), a.c_str());
+                if (sent > 0) {
+                    Append(hstring(L"wake        " + std::to_wstring(sent) + L" magic packets for " +
+                                   mac + L" (broadcast + " + address + L"'s subnet, UDP 9 and 7)"));
+                } else {
+                    std::array<char, kTextBuffer> reason{};
+                    echo_last_error(reason.data(), kTextBuffer);
+                    Append(hstring(L"wake        FAILED: ") + to_hstring(std::string(reason.data())));
+                }
+            });
+    }
+
+    void MainPage::OnWakeTick()
+    {
+        if (m_wakeAddress.empty()) { m_wakeTimer.Stop(); return; }
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_wakeStarted).count();
+
+        if (secs >= kWakeWindowSecs) {
+            m_wakeTimer.Stop();
+            const auto name = m_wakeName;
+            m_wakeAddress.clear();
+            ShowToast(L"NO ANSWER FROM " + name + L"   ::   see the status line", L"IonAmber");
+            SetStatus(hstring(name + L" did not wake. Check the PC's BIOS/UEFI wake-on-LAN setting, "
+                                     L"and that it is wired - most Wi-Fi cards cannot wake a PC."));
+            RefreshHostList();
+            return;
+        }
+        if (secs >= kWakeResendAt && !m_wakeResent) {
+            m_wakeResent = true;
+            SendWakePacket(m_wakeMac, m_wakeAddress);
+        }
+        // DNS-SD watchers report a new service on their own schedule; a fresh
+        // watcher queries at once. Restarting keeps the list (Stop does not
+        // clear it), so nothing on screen moves.
+        if (secs > 0 && secs % kWakeRediscoverEvery == 0 && m_discovery) {
+            m_discovery->Stop();
+            std::wstring error;
+            m_discovery->Start(
+                [this] {
+                    Dispatcher().RunAsync(CoreDispatcherPriority::Normal,
+                                          [this] { RefreshHostList(); });
+                },
+                error);
+        }
+        if (!m_streaming) {
+            SetStatus(hstring(L"waking " + m_wakeName + L"... (" +
+                              std::to_wstring(kWakeWindowSecs - secs) + L" s)"));
+        }
+    }
+
+    // Called from RefreshHostList the moment the woken host is live again.
+    // Must not call RefreshHostList itself: it runs in the middle of one.
+    void MainPage::OnWakeTargetAppeared()
+    {
+        if (m_wakeAddress.empty()) return;
+        if (m_wakeTimer) m_wakeTimer.Stop();
+        const auto name = m_wakeName;
+        m_wakeAddress.clear();
+        ShowToast(name + L" IS AWAKE   ::   press A", L"IonMatrix");
+        if (!m_streaming) SetStatus(hstring(name + L"  -  awake and ready"));
+    }
+
+    void MainPage::WakeAfterFailedConnect()
+    {
+        if (m_connectAddress.empty()) return;
+        const auto mac = m_connectMac.empty() ? SavedMacFor(m_connectAddress) : m_connectMac;
+        if (mac.empty()) return;
+        SendWakePacket(mac, m_connectAddress);
+        ShowToast(L"NO ANSWER   ::   sent a wake packet - try again in ~30 s", L"IonAmber");
     }
 
     // ── The app strip: one tap of A ─────────────────────────────────────────
@@ -1960,6 +2168,12 @@ namespace winrt::EchoXbox::implementation
             }
             auto const& host = m_hosts[m_selected];
             hostName = host.name;
+            // Start -> Stream on a sleeping host means "get me onto that PC",
+            // and the first step of that is waking it.
+            if (host.offline) { WakeSelectedHost(); return; }
+            // Remembered so a connect that never answers can try a wake.
+            m_connectMac = host.mac;
+            m_connectAddress = host.address;
 
             const auto fingerprint = echo::LoadHostFingerprint(m_stateDir, host.address);
             if (fingerprint.empty()) { SetStatus(L"pair with this host first"); return; }
@@ -2805,9 +3019,15 @@ namespace winrt::EchoXbox::implementation
         }
 
         if (type == "error") {
+            const bool wasPairing = m_pairing;
+            const bool everStreamed = m_streaming;
             m_pairing = false;
             SetStatus(L"error: " + to_hstring(echo::JsonField(json, "message")));
-            Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this]() {
+            Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this, wasPairing, everStreamed]() {
+                // A stream that never reached a grant may be a PC that went to
+                // sleep while its mDNS record was still cached — the card said
+                // ONLINE, so nothing offered to wake it. Try once, and say so.
+                if (!wasPairing && !everStreamed) WakeAfterFailedConnect();
                 PinPanel().Visibility(Visibility::Collapsed);
                 // An error ends this session whether or not it ever streamed,
                 // so the HDR it engaged is owed back even before `granted`.

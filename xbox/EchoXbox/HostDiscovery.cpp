@@ -90,6 +90,7 @@ DiscoveredHost FromDevice(IMapView<hstring, IInspectable> const& props,
         host.relayUrl        = TxtValue(attrs, L"relay");
         host.relayPin        = TxtValue(attrs, L"relaypin");
         host.fingerprintHint = TxtValue(attrs, L"fp");
+        host.mac             = TxtValue(attrs, L"mac");
     }
 
     if (host.name.empty()) {
@@ -145,6 +146,7 @@ bool HostDiscovery::Start(Changed onChanged, std::wstring& error) noexcept {
                 if (!merged.relayUrl.empty())        host.relayUrl = merged.relayUrl;
                 if (!merged.relayPin.empty())        host.relayPin = merged.relayPin;
                 if (!merged.fingerprintHint.empty()) host.fingerprintHint = merged.fingerprintHint;
+                if (!merged.mac.empty())             host.mac = merged.mac;
                 break;
             }
             if (m_onChanged) m_onChanged();
