@@ -999,14 +999,52 @@ enum Drift {
 ///     is the same rule that keeps VB-CABLE out of `kGhostSinkNames`; following
 ///     the operator onto it would be that bug by another route.
 ///   * anything else that predates the stream -> a deliberate choice; follow it.
-fn judge_drift(cur: &[u16], known_at_start: &[Vec<u16>], is_cable: bool) -> Drift {
+///
+/// ...and a pre-existing device is only a choice if a PERSON was there to make
+/// it. Measured 2026-11-13: the default flipped to "Speakers (Realtek(R) Audio)"
+/// 30 s into a stream started right after sign-in, with zero mouse movement in
+/// those 30 s — a startup program or Windows itself re-applying the user's
+/// default. Nova followed it as a choice and game audio played out of the PC.
+/// Picking an output takes a click or a key, so `person_present` (keyboard or
+/// mouse input in the last [`CHOICE_INPUT_WINDOW`], physical or injected —
+/// see [`person_used_input_within`]) is now required to follow.
+fn judge_drift(cur: &[u16], known_at_start: &[Vec<u16>], is_cable: bool, person_present: bool) -> Drift {
     if is_cable {
         Drift::Reassert("a virtual cable carries the Echo microphone, so game audio there would come back as the host's microphone")
     } else if !known_at_start.iter().any(|k| k.as_slice() == cur) {
         Drift::Reassert("it appeared after the stream started, so Windows chose it, not you")
+    } else if !person_present {
+        Drift::Reassert("no keyboard or mouse was used just before it, so Windows or a program changed it, not you")
     } else {
         Drift::Follow
     }
+}
+
+/// How recent a keyboard/mouse input must be for a change of default output
+/// to count as somebody choosing it. A click in Sound settings or the quick
+/// settings flyout moves the default within a second; the watchdog looks once
+/// a second. Ten seconds is generous for that and still far shorter than the
+/// stretches of controller-only play in which programs re-apply defaults.
+const CHOICE_INPUT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Did anyone use a keyboard or mouse in this session within `window`?
+///
+/// `GetLastInputInfo` covers physical devices (including VirtualHere's, which
+/// are local USB devices to Windows) AND input Nova injects for a client, and
+/// it does NOT count gamepads — exactly the line between "someone clicked
+/// something" and "someone is playing". Unknown reads as no: a failed query
+/// must keep the sink rather than let anything pass for a choice.
+fn person_used_input_within(window: Duration) -> bool {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return false;
+    }
+    // Both are 32-bit millisecond tick counts; wrapping_sub survives the
+    // 49.7-day rollover.
+    let idle_ms = unsafe { GetTickCount() }.wrapping_sub(info.dwTime);
+    u64::from(idle_ms) <= window.as_millis() as u64
 }
 
 /// Where this capture is bound, for the once-per-second routing watchdog.
@@ -1164,7 +1202,12 @@ fn send_pcm_loop(
                     CaptureRoute::PinnedSink { sink, known_at_start } if cur_id != *sink => {
                         // Default moved off the sink mid-stream. Whose move was
                         // it? See judge_drift.
-                        let why = match judge_drift(&cur_id, known_at_start, endpoint_is_virtual_cable(&cur_id)) {
+                        let why = match judge_drift(
+                            &cur_id,
+                            known_at_start,
+                            endpoint_is_virtual_cable(&cur_id),
+                            person_used_input_within(CHOICE_INPUT_WINDOW),
+                        ) {
                             Drift::Follow => return SendExit::OperatorChoseOutput(cur_id),
                             Drift::Reassert(why) => why,
                         };
@@ -1261,7 +1304,25 @@ mod tests {
     #[test]
     fn choosing_an_output_that_already_existed_is_followed() {
         let known = vec![id("speakers"), id("steam"), id("lg-hdmi")];
-        assert_eq!(judge_drift(&id("speakers"), &known, false), Drift::Follow);
+        assert_eq!(judge_drift(&id("speakers"), &known, false, true), Drift::Follow);
+    }
+
+    /// The 2026-11-13 report: the default flipped to the host speakers 30 s
+    /// into a stream with nobody touching a mouse or keyboard (controller
+    /// only), and game audio played out loud at the PC. A device that already
+    /// existed is still not a choice when no person could have made it.
+    #[test]
+    fn a_switch_nobody_made_is_overridden_even_to_a_known_device() {
+        let known = vec![id("speakers"), id("steam")];
+        assert!(matches!(judge_drift(&id("speakers"), &known, false, false), Drift::Reassert(_)));
+    }
+
+    /// The live session's own input clock: this test process just ran, so the
+    /// answer is only checked for not panicking and for honouring a zero window.
+    #[test]
+    fn input_clock_query_runs() {
+        let _ = person_used_input_within(CHOICE_INPUT_WINDOW);
+        let _ = person_used_input_within(Duration::ZERO);
     }
 
     /// What the re-assert was built for: an endpoint enumerating mid-stream that
@@ -1269,7 +1330,7 @@ mod tests {
     #[test]
     fn an_endpoint_that_appeared_mid_stream_is_overridden() {
         let known = vec![id("speakers"), id("steam")];
-        assert!(matches!(judge_drift(&id("vdd-hdmi"), &known, false), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("vdd-hdmi"), &known, false, true), Drift::Reassert(_)));
     }
 
     /// The two-list rule: VB-CABLE carries the Echo microphone, so it is never
@@ -1277,12 +1338,12 @@ mod tests {
     #[test]
     fn a_virtual_cable_is_never_followed_even_when_it_predates_the_stream() {
         let known = vec![id("speakers"), id("cable-input")];
-        assert!(matches!(judge_drift(&id("cable-input"), &known, true), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("cable-input"), &known, true, true), Drift::Reassert(_)));
     }
 
     /// A failed snapshot must keep the sink rather than follow everything.
     #[test]
     fn with_no_snapshot_nothing_is_treated_as_a_choice() {
-        assert!(matches!(judge_drift(&id("speakers"), &[], false), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("speakers"), &[], false, true), Drift::Reassert(_)));
     }
 }
