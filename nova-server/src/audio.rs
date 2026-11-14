@@ -1008,16 +1008,46 @@ enum Drift {
 /// Picking an output takes a click or a key, so `person_present` (keyboard or
 /// mouse input in the last [`CHOICE_INPUT_WINDOW`], physical or injected —
 /// see [`person_used_input_within`]) is now required to follow.
-fn judge_drift(cur: &[u16], known_at_start: &[Vec<u16>], is_cable: bool, person_present: bool) -> Drift {
+///
+/// ...and input alone does not prove it either, because someone playing a
+/// mouse-and-keyboard game is "present" every second. The 2026-11-13 culprit
+/// turned out to be STEAM (`streaming_log.txt`: `Restoring default audio
+/// device: Speakers (Realtek(R) Audio)` at exactly the switch, twice): on every
+/// launch it finds its own Steam Streaming Speakers as the default, takes that
+/// for a Remote Play leftover, and puts back the device it saved — the output
+/// that was default BEFORE the stream. Windows re-applying a user's default at
+/// sign-in lands on the same device. So a move back to the pre-stream output
+/// (`back_to_pre_stream`) is reverted the first time, and only followed when
+/// it happens again within [`INSIST_WINDOW`] (`insisted`): Steam restores once
+/// per launch; a person who really wants the PC speakers picks them twice.
+fn judge_drift(
+    cur: &[u16],
+    known_at_start: &[Vec<u16>],
+    is_cable: bool,
+    person_present: bool,
+    back_to_pre_stream: bool,
+    insisted: bool,
+) -> Drift {
     if is_cable {
         Drift::Reassert("a virtual cable carries the Echo microphone, so game audio there would come back as the host's microphone")
     } else if !known_at_start.iter().any(|k| k.as_slice() == cur) {
         Drift::Reassert("it appeared after the stream started, so Windows chose it, not you")
+    } else if back_to_pre_stream && !insisted {
+        Drift::Reassert("it is the output from before the stream, which Steam (each time it starts) and Windows (at sign-in) restore on their own — choose it again within 2 minutes to keep it")
     } else if !person_present {
         Drift::Reassert("no keyboard or mouse was used just before it, so Windows or a program changed it, not you")
     } else {
         Drift::Follow
     }
+}
+
+/// How long after Nova reverts a move to the pre-stream output a second move
+/// to it counts as a person insisting. See [`judge_drift`].
+const INSIST_WINDOW: Duration = Duration::from_secs(120);
+
+/// The armed pre-stream output, without claiming it (the restore still owns it).
+fn pre_stream_endpoint() -> Option<Vec<u16>> {
+    lock_original().clone()
 }
 
 /// How recent a keyboard/mouse input must be for a change of default output
@@ -1188,6 +1218,8 @@ fn send_pcm_loop(
     // Routing watchdog bookkeeping — checked once per second.
     let mut last_route_check = Instant::now();
     let mut reasserts: u32 = 0;
+    // When Nova last reverted a move to the pre-stream output — see judge_drift.
+    let mut pre_stream_reverted_at: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // ── Routing watchdog (1 Hz) — the "ghost" enforcement ────────────────
@@ -1202,21 +1234,32 @@ fn send_pcm_loop(
                     CaptureRoute::PinnedSink { sink, known_at_start } if cur_id != *sink => {
                         // Default moved off the sink mid-stream. Whose move was
                         // it? See judge_drift.
+                        let back_to_pre_stream =
+                            pre_stream_endpoint().is_some_and(|pre| pre == cur_id);
+                        let insisted = back_to_pre_stream
+                            && pre_stream_reverted_at.is_some_and(|t| t.elapsed() <= INSIST_WINDOW);
                         let why = match judge_drift(
                             &cur_id,
                             known_at_start,
                             endpoint_is_virtual_cable(&cur_id),
                             person_used_input_within(CHOICE_INPUT_WINDOW),
+                            back_to_pre_stream,
+                            insisted,
                         ) {
                             Drift::Follow => return SendExit::OperatorChoseOutput(cur_id),
                             Drift::Reassert(why) => why,
                         };
+                        if back_to_pre_stream {
+                            pre_stream_reverted_at = Some(Instant::now());
+                        }
                         // Application audio would fall back to wherever the
                         // default went and vanish from the stream. Re-assert the
                         // sink; capture (pinned by id) stays valid throughout.
                         reasserts += 1;
                         if unsafe { SetDefaultAudioDevice(sink.as_ptr()) } == 0 {
-                            if reasserts == 1 || reasserts % 10 == 0 {
+                            // A revert to the pre-stream output is always worth a
+                            // line: it is the one a person may want to undo.
+                            if reasserts == 1 || reasserts % 10 == 0 || back_to_pre_stream {
                                 println!(
                                     "🎧 Audio: default output moved to \"{}\" — put the streaming sink back \
                                      because {why} ({reasserts} time(s))",
@@ -1304,7 +1347,7 @@ mod tests {
     #[test]
     fn choosing_an_output_that_already_existed_is_followed() {
         let known = vec![id("speakers"), id("steam"), id("lg-hdmi")];
-        assert_eq!(judge_drift(&id("speakers"), &known, false, true), Drift::Follow);
+        assert_eq!(judge_drift(&id("speakers"), &known, false, true, false, false), Drift::Follow);
     }
 
     /// The 2026-11-13 report: the default flipped to the host speakers 30 s
@@ -1314,7 +1357,27 @@ mod tests {
     #[test]
     fn a_switch_nobody_made_is_overridden_even_to_a_known_device() {
         let known = vec![id("speakers"), id("steam")];
-        assert!(matches!(judge_drift(&id("speakers"), &known, false, false), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("speakers"), &known, false, false, false, false), Drift::Reassert(_)));
+    }
+
+    /// The second 2026-11-13 report, with the culprit named: Steam, on start,
+    /// "restored" the pre-stream speakers while the player was busy on mouse
+    /// and keyboard — so input alone said "a person did it". A move back to the
+    /// pre-stream output is reverted the first time, input or not.
+    #[test]
+    fn steam_restoring_the_pre_stream_output_is_reverted_even_mid_game() {
+        let known = vec![id("speakers"), id("steam")];
+        assert!(matches!(
+            judge_drift(&id("speakers"), &known, false, true, true, false),
+            Drift::Reassert(_)
+        ));
+    }
+
+    /// ...and a person who really wants the PC speakers picks them again.
+    #[test]
+    fn choosing_the_pre_stream_output_twice_is_followed() {
+        let known = vec![id("speakers"), id("steam")];
+        assert_eq!(judge_drift(&id("speakers"), &known, false, true, true, true), Drift::Follow);
     }
 
     /// The live session's own input clock: this test process just ran, so the
@@ -1330,7 +1393,7 @@ mod tests {
     #[test]
     fn an_endpoint_that_appeared_mid_stream_is_overridden() {
         let known = vec![id("speakers"), id("steam")];
-        assert!(matches!(judge_drift(&id("vdd-hdmi"), &known, false, true), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("vdd-hdmi"), &known, false, true, false, false), Drift::Reassert(_)));
     }
 
     /// The two-list rule: VB-CABLE carries the Echo microphone, so it is never
@@ -1338,12 +1401,12 @@ mod tests {
     #[test]
     fn a_virtual_cable_is_never_followed_even_when_it_predates_the_stream() {
         let known = vec![id("speakers"), id("cable-input")];
-        assert!(matches!(judge_drift(&id("cable-input"), &known, true, true), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("cable-input"), &known, true, true, false, false), Drift::Reassert(_)));
     }
 
     /// A failed snapshot must keep the sink rather than follow everything.
     #[test]
     fn with_no_snapshot_nothing_is_treated_as_a_choice() {
-        assert!(matches!(judge_drift(&id("speakers"), &[], false, true), Drift::Reassert(_)));
+        assert!(matches!(judge_drift(&id("speakers"), &[], false, true, false, false), Drift::Reassert(_)));
     }
 }
