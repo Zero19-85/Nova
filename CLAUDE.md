@@ -121,12 +121,21 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
   had been masking it with `[WARN] … still alive - force-terminating`). The stop
   path now shuts the tokio runtime down with a bound (`shutdown_timeout(3s)`),
   logs each stage (`🛑 Service stop: …`), and ends the process with
-  `debug::exit_hard` (TerminateProcess, no DLL detach). **The old process still
-  outlives even that** — cause unknown; an external kill ends it in ~130 ms — so
-  the load-bearing fix is the net: **a starting Master ends every other
-  nova-server.exe before binding anything** (`🧹 Service start: ended leftover
-  Nova process(es)`). Verified: two back-to-back restarts, one Master + one
-  Worker each, new Master owns 47998/47999/48000.
+  `debug::exit_hard` (TerminateProcess, no DLL detach). A starting Master also
+  ends every other nova-server.exe before binding anything (`🧹 Service start:
+  ended leftover Nova process(es)`) — but that net never runs after a tray
+  **Quit**, which left a Master running in the background until reboot.
+  **The real cause (found the same day): `flush_log` hung forever.** It
+  `PeekNamedPipe`d the log pipe's read end while `nova-log-drain` sat in a
+  synchronous `ReadFile` on the same handle; Windows serialises synchronous
+  I/O per handle, so the peek waited for a read that only returns when
+  something else is logged — and on the way out nothing is. TerminateProcess
+  was never reached (no line after `ending the Master process` ever appeared).
+  `flush_log` now reads counters the drain thread publishes
+  (`drain_parked`, `drain_reads`) and never touches the pipe. Verified: stop →
+  zero nova-server processes within ms. **Rule: never issue I/O on a handle
+  another thread is blocked reading synchronously.** `exit_hard` additionally
+  logs and falls back to `taskkill /PID self` should TerminateProcess ever return.
 
 ## 2026-11-09: **BLACK MONITOR AT BOOT — the VDD was enabled on the sign-in screen** (fixed + deployed) and **Wake-on-LAN**
 

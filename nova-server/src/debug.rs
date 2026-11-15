@@ -36,7 +36,7 @@ use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -47,7 +47,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Console::{
     SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows::Win32::System::Pipes::CreatePipe;
 
 // ── Log path ─────────────────────────────────────────────────────────────────
 
@@ -240,6 +240,11 @@ struct LogSink {
     /// Both threads are running. Until then nothing may be told to write into
     /// the pipe — an undrained pipe blocks its writers once full.
     active:     AtomicBool,
+    /// `nova-log-drain` is in (or about to enter) its blocking `ReadFile`.
+    drain_parked: AtomicBool,
+    /// Reads `nova-log-drain` has completed. With `drain_parked`, lets
+    /// `flush_log` see an empty pipe without touching it.
+    drain_reads:  AtomicU64,
 }
 
 static SINK: OnceLock<LogSink> = OnceLock::new();
@@ -286,6 +291,8 @@ fn start_sink(path: PathBuf, file: std::fs::File) -> bool {
         backlog:    Mutex::new(Backlog { chunks: VecDeque::new(), bytes: 0, dropped: 0, writing: false }),
         ready:      Condvar::new(),
         active:     AtomicBool::new(false),
+        drain_parked: AtomicBool::new(false),
+        drain_reads:  AtomicU64::new(0),
     };
     if SINK.set(sink).is_err() {
         unsafe {
@@ -329,8 +336,14 @@ fn drain_loop(sink: &'static LogSink) {
     });
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = match pipe.read(&mut buf) {
-            Ok(0) => continue, // a zero-length write, not end of stream
+        sink.drain_parked.store(true, Ordering::Release);
+        let result = pipe.read(&mut buf);
+        sink.drain_parked.store(false, Ordering::Release);
+        let n = match result {
+            Ok(0) => {
+                sink.drain_reads.fetch_add(1, Ordering::AcqRel);
+                continue; // a zero-length write, not end of stream
+            }
             Ok(n) => n,
             Err(_) => return,  // every write end is gone — the process is exiting
         };
@@ -343,6 +356,9 @@ fn drain_loop(sink: &'static LogSink) {
                 b.chunks.push_back(buf[..n].to_vec());
             }
         }
+        // Counted only once the chunk is in the backlog, so a flush that sees
+        // this count also sees the chunk (or the writer busy with it).
+        sink.drain_reads.fetch_add(1, Ordering::AcqRel);
         sink.ready.notify_one();
     }
 }
@@ -400,23 +416,31 @@ fn writer_loop(sink: &'static LogSink, path: PathBuf, mut file: std::fs::File) {
 ///
 /// Needed on the way OUT of the process: `process::exit` kills the logger
 /// threads where they stand, and the last lines before an exit or a panic are
-/// precisely the ones worth keeping. Two consecutive idle readings, because the
-/// drain thread can hold a chunk it has read but not yet queued.
+/// precisely the ones worth keeping.
+///
+/// **Never touches the pipe.** It used to `PeekNamedPipe` the read end — but
+/// `nova-log-drain` sits in a synchronous `ReadFile` on that same handle, and
+/// Windows serialises synchronous I/O per handle, so the peek queued behind a
+/// read that only returns when something else is logged. On the way out
+/// nothing else is, so the "bounded" flush blocked for ever — that was the
+/// Master which outlived every Quit and service stop (2026-11-15). Instead the
+/// drain thread publishes whether it is parked in `ReadFile` and how many reads
+/// it has completed: parked + no new reads across two readings means the pipe
+/// is empty (data in the pipe completes that read at once), and an idle backlog
+/// means the writer has put everything in the file.
 pub fn flush_log(timeout: Duration) {
     let Some(sink) = active_sink() else { return };
-    let read = HANDLE(sink.pipe_read as *mut core::ffi::c_void);
     let deadline = Instant::now() + timeout;
     let mut idle_readings = 0;
+    let mut last_reads = u64::MAX;
     while Instant::now() < deadline {
-        let mut in_pipe = 0u32;
-        if unsafe { PeekNamedPipe(read, None, 0, None, Some(&mut in_pipe), None) }.is_err() {
-            return;
-        }
+        let parked = sink.drain_parked.load(Ordering::Acquire);
+        let reads = sink.drain_reads.load(Ordering::Acquire);
         let idle = {
             let b = sink.lock();
             b.chunks.is_empty() && b.dropped == 0 && !b.writing
         };
-        if in_pipe == 0 && idle {
+        if parked && idle && reads == last_reads {
             idle_readings += 1;
             if idle_readings >= 2 {
                 return;
@@ -424,6 +448,7 @@ pub fn flush_log(timeout: Duration) {
         } else {
             idle_readings = 0;
         }
+        last_reads = reads;
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -444,15 +469,44 @@ pub fn exit(code: i32) -> ! {
 /// service Master hit exactly that after reporting SERVICE_STOPPED (live
 /// 2026-11-15): the SCM started its replacement while the old process lived on
 /// holding UDP 47999, so the new Master could not bind Moonlight's control port.
+///
+/// (The Master that outlived this on 2026-11-15 never reached TerminateProcess
+/// at all — it was stuck in `flush_log`'s pipe peek; see there.) Should
+/// TerminateProcess ever return regardless, log why and have `taskkill` end us
+/// from outside, which has always worked.
 pub fn exit_hard(code: i32) -> ! {
     flush_log(Duration::from_secs(2));
-    unsafe {
+    let outcome = unsafe {
         use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-        let _ = TerminateProcess(GetCurrentProcess(), code as u32);
+        TerminateProcess(GetCurrentProcess(), code as u32)
+    };
+    let pid = std::process::id();
+    match outcome {
+        Err(e) => println!("⚠️ TerminateProcess(self) failed: {e} — asking taskkill to end PID {pid}"),
+        Ok(()) => println!("⚠️ TerminateProcess(self) returned and PID {pid} is still running — asking taskkill to end it"),
     }
-    // TerminateProcess on the current process does not return; this only
-    // satisfies the type checker if it somehow did.
+    flush_log(Duration::from_secs(1));
+    kill_self_externally(pid);
+    // taskkill lands well inside this; the exit below is only the last resort.
+    std::thread::sleep(Duration::from_secs(10));
+    println!("❌ PID {pid} survived taskkill too — falling back to a normal exit");
+    flush_log(Duration::from_secs(1));
     std::process::exit(code)
+}
+
+/// `taskkill /F /PID <pid>` with no window and no inherited stdio. `.status()`
+/// rather than `.output()`: no pipes for anything to hold open.
+fn kill_self_externally(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 }
 
 /// A panic message goes to stderr — the pipe — and the process may be gone

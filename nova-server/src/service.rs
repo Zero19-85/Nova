@@ -395,8 +395,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     // The dispatcher thread's own exit path is the fallback if this is never
     // reached.
     println!("🛑 Service stopped — ending the Master process");
-    crate::debug::flush_log(std::time::Duration::from_secs(2));
-    let _ = windows::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), 0);
+    crate::debug::exit_hard(0);
 }
 
 /// Controls the service accepts while RUNNING.
