@@ -1,12 +1,35 @@
 use std::os::windows::ffi::OsStrExt;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 // ── Congestion-control state ─────────────────────────────────────────────────
 // STREAM_BITRATE_KBPS: the active CBR target for the current session.
 // Written by lib.rs on session start / reconfigure; read by control.rs when
 // computing a congestion-triggered reduction.
+// ── The NVIDIA driver replaced under a running process ──────────────────────
+//
+// An NVIDIA driver install swaps the kernel driver while this process keeps the
+// OLD user-mode NVENC library loaded; from then on every encoder open fails
+// with NV_ENC_ERR_NO_ENCODE_DEVICE, and nothing short of a new process loads
+// the new library. Live 2026-11-15: driver 32.0.16.2124 installed at 03:30
+// under a Worker started at 03:14; every Echo session after that was "up" with
+// zero frames. The status alone is not proof (a PC whose NVENC is genuinely
+// unusable says the same thing) — it is only treated as a driver swap when
+// this same process opened NVENC successfully earlier, which also means a fresh
+// process that hits it cannot restart itself in a loop.
+const NV_ENC_ERR_NO_ENCODE_DEVICE: i32 = 1;
+static NVENC_EVER_OPENED: AtomicBool = AtomicBool::new(false);
+static NVENC_DRIVER_REPLACED: AtomicBool = AtomicBool::new(false);
+
+/// True once NVENC has refused to open with "no encode device" in a process
+/// where it opened fine before: the driver changed under us, and only a fresh
+/// process can encode again. The Worker polls this and exits so the service
+/// respawns it (the Master replays the session into the new one).
+pub fn nvenc_driver_replaced() -> bool {
+    NVENC_DRIVER_REPLACED.load(Ordering::Relaxed)
+}
+
 static STREAM_BITRATE_KBPS: AtomicI32 = AtomicI32::new(0);
 
 // CONGESTION_BITRATE_KBPS: pending bitrate set by the control thread on
@@ -85,6 +108,8 @@ extern "C" {
     fn SetSdrWhiteLevel(scrgb_units: f32);
 
     fn OpenNvEncSession(d3d11_device: *mut c_void, out_encoder: *mut *mut c_void) -> i32;
+    /// NVENCSTATUS of the last failed InitEncoder; 0 after a success.
+    fn LastInitEncoderStatus() -> i32;
     fn InitEncoder(
         encoder: *mut c_void,
         width: i32,
@@ -492,8 +517,13 @@ impl Encoder {
                 config.is_hdr as i32,
             );
             if ret != 0 {
-                return Err(format!("InitEncoder returned {}", ret));
+                let status = LastInitEncoderStatus();
+                if status == NV_ENC_ERR_NO_ENCODE_DEVICE && NVENC_EVER_OPENED.load(Ordering::Relaxed) {
+                    NVENC_DRIVER_REPLACED.store(true, Ordering::Relaxed);
+                }
+                return Err(format!("InitEncoder returned {ret} (NVENCSTATUS {status})"));
             }
+            NVENC_EVER_OPENED.store(true, Ordering::Relaxed);
 
             let ret = InitColorConversion(device_ptr, config.width, config.height, config.is_hdr as i32, config.fps);
             if ret != 0 {

@@ -384,6 +384,19 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     report_status(SERVICE_STOPPED, 0, 0);
     let _ = CloseHandle(stop);
     let _ = CloseHandle(wake);
+
+    // Everything that needed to run on the way out has run: the Worker's
+    // display/audio teardown (stop_host), the router mappings, the runtime.
+    // So end the process HERE, and end it hard. A normal exit runs every
+    // loaded DLL's detach code and static destructors — the Master holds
+    // WASAPI/COM objects through nova_shim.dll for the microphone — and a
+    // deadlock in any of them kept the old Master alive after the SCM had
+    // already started its replacement (the stale process held UDP 47999).
+    // The dispatcher thread's own exit path is the fallback if this is never
+    // reached.
+    println!("🛑 Service stopped — ending the Master process");
+    crate::debug::flush_log(std::time::Duration::from_secs(2));
+    let _ = windows::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), 0);
 }
 
 /// Controls the service accepts while RUNNING.
@@ -806,6 +819,19 @@ fn service_worker(stop: HANDLE, wake: HANDLE) {
     if let Some(h) = host.take() {
         stop_host(&h);
     }
+    println!("🛑 Service stop: Worker stopped — shutting down the Master's network stack");
+
+    // Bounded, never a plain drop. Dropping a tokio Runtime waits WITHOUT
+    // LIMIT for every blocking task still running, and a stop that never
+    // finishes leaves the old Master holding its sockets after the SCM has
+    // started a new one (live 2026-11-15: the stale Master kept UDP 47999, so
+    // the new one could not bind Moonlight's control port). Anything still
+    // running after this is abandoned to the process exit in `service_main`.
+    drop(master);
+    if let Some(rt) = ipc_runtime {
+        rt.shutdown_timeout(std::time::Duration::from_secs(3));
+    }
+    println!("🛑 Service stop: network stack down");
 }
 
 /// Grace period the service gives the host to exit on its own (finishing its

@@ -156,11 +156,27 @@ fn main() {
             // the spawned host owns; a shared file would leave the host unable to
             // open its log (sharing) and its startup errors invisible.
             nova_server::debug::init_service_logger();
+            // A starting Master owns the machine's Nova processes, so anything
+            // still running is a leftover from the previous run — and a
+            // leftover Master holding UDP 47999 made this one's Moonlight
+            // control port fail to bind (live 2026-11-15, repeatedly: the old
+            // process outlived even its own TerminateProcess). Killing it from
+            // outside works at once, so do it here, before any port is bound.
+            // No Worker of THIS service exists yet; the SCM starts us first.
+            match kill_other_nova_instances() {
+                Some(0) => println!("🧹 Service start: ended leftover Nova process(es) from the previous run"),
+                Some(_) | None => {} // taskkill: 128 = nothing to end
+            }
             if let Err(e) = nova_server::service::run_service_dispatcher() {
                 println!("❌ Service dispatcher failed: {e}");
-                nova_server::debug::exit(1);
+                nova_server::debug::exit_hard(1);
             }
-            nova_server::debug::exit(0);
+            // The dispatcher returns once the service reported STOPPED, i.e.
+            // after every teardown already ran. A normal exit can hang in DLL
+            // detach code and leave this Master holding its ports while the
+            // SCM starts the next one — see debug::exit_hard.
+            println!("🛑 Service dispatcher returned — ending the Master process");
+            nova_server::debug::exit_hard(0);
         }
 
         Some("--install-service") => {
@@ -522,9 +538,13 @@ fn uninstall_task() -> Result<(), String> {
 /// a `nova-server.exe`, so a blanket `taskkill /F /IM nova-server.exe` would
 /// terminate the very process doing the install (observed: the install self-
 /// killed before `CreateServiceW`). The `PID ne <self>` filter excludes us.
-fn kill_other_nova_instances() {
+/// End every other `nova-server.exe`. Returns taskkill's exit code (0 = it
+/// ended something; 128 = none were running), or `None` if it could not run.
+fn kill_other_nova_instances() -> Option<i32> {
     let filter = format!("PID ne {}", std::process::id());
-    let _ = run_hidden("taskkill", &["/F", "/IM", "nova-server.exe", "/FI", &filter]);
+    run_hidden("taskkill", &["/F", "/IM", "nova-server.exe", "/FI", &filter])
+        .ok()
+        .and_then(|status| status.code())
 }
 
 /// Run a command without creating a visible console window.

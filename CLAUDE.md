@@ -104,6 +104,30 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
 4. **Consistency:** Ensure pairing logic (port 47989) and discovery (mDNS) stay compliant with the GameStream protocol.
 5. **Build output:** `cargo build --release` produces two files that must be deployed together: `nova-server.exe` and `nova_shim.dll` (both in `target/release/`). The DLL is built by `build.rs` via `cl.exe` + `link.exe /DLL` and copied automatically.
 
+## 2026-11-15: **NVIDIA driver installed mid-run + the Master that would not die** (fixed + deployed)
+
+- **Driver swap under a running Worker.** Installing NVIDIA 32.0.16.2124 while
+  a Worker ran left it holding the OLD user-mode NVENC library: every later
+  `nvEncOpenEncodeSessionEx` failed `NV_ENC_ERR_NO_ENCODE_DEVICE` (1), so
+  every Echo session was "up" with zero frames (Xbox: `fed 0`, no `📊 RTP/s`).
+  The shim now records the status (`LastInitEncoderStatus`); `encoder.rs`
+  sets `nvenc_driver_replaced()` only for status 1 **in a process that opened
+  NVENC successfully before** (so a box with genuinely broken NVENC cannot
+  restart-loop), and the Worker loop exits on it (`🔁 NVENC reports no encode
+  device …`) so the service spawns a fresh Worker and the Master replays the
+  session. **Not yet seen live** — it needs a driver install to trigger.
+- **Stopping the service left the old Master alive**, still holding UDP 47999,
+  so the next Master's Moonlight control port silently failed to bind (deploy.ps1
+  had been masking it with `[WARN] … still alive - force-terminating`). The stop
+  path now shuts the tokio runtime down with a bound (`shutdown_timeout(3s)`),
+  logs each stage (`🛑 Service stop: …`), and ends the process with
+  `debug::exit_hard` (TerminateProcess, no DLL detach). **The old process still
+  outlives even that** — cause unknown; an external kill ends it in ~130 ms — so
+  the load-bearing fix is the net: **a starting Master ends every other
+  nova-server.exe before binding anything** (`🧹 Service start: ended leftover
+  Nova process(es)`). Verified: two back-to-back restarts, one Master + one
+  Worker each, new Master owns 47998/47999/48000.
+
 ## 2026-11-09: **BLACK MONITOR AT BOOT — the VDD was enabled on the sign-in screen** (fixed + deployed) and **Wake-on-LAN**
 
 **Symptom:** after a shutdown, the PC booted with the physical monitor black;

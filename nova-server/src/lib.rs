@@ -3954,6 +3954,19 @@ pub async fn run_worker() -> Result<()> {
             vd.finish_deferred_boot_heal();
         }
 
+        // The NVIDIA driver was replaced under this process (see
+        // encoder::nvenc_driver_replaced): no encoder can open here again. Exit
+        // so the service spawns a fresh Worker that loads the new driver; the
+        // Master keeps the client's session and replays it into that Worker.
+        // Before this, every session after a driver install was "up" and
+        // carried no video until someone restarted the service by hand.
+        if encoder::nvenc_driver_replaced() {
+            println!("🔁 NVENC reports no encode device although it opened earlier in this \
+                Worker — the NVIDIA driver was replaced or reset under it. Exiting so the \
+                service starts a fresh Worker on the new driver (the session is replayed).");
+            crate::debug::exit(3);
+        }
+
         // HIGH CPU priority while a client is connected (priority.rs).
         priority::set_streaming(client_connected);
         let mut texture_to_encode: Option<ID3D11Texture2D> = None;

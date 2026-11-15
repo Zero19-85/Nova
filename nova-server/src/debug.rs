@@ -435,6 +435,26 @@ pub fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// [`flush_log`], then end the process WITHOUT running DLL detach code or
+/// static destructors — for exits where all cleanup has already run.
+///
+/// `std::process::exit` is `ExitProcess`, which first kills every other thread
+/// and then calls each loaded DLL's detach routine; one that waits on a lock or
+/// a COM object whose owning thread was just killed hangs there for ever. The
+/// service Master hit exactly that after reporting SERVICE_STOPPED (live
+/// 2026-11-15): the SCM started its replacement while the old process lived on
+/// holding UDP 47999, so the new Master could not bind Moonlight's control port.
+pub fn exit_hard(code: i32) -> ! {
+    flush_log(Duration::from_secs(2));
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    // TerminateProcess on the current process does not return; this only
+    // satisfies the type checker if it somehow did.
+    std::process::exit(code)
+}
+
 /// A panic message goes to stderr — the pipe — and the process may be gone
 /// before the writer gets to it. Flush after the default hook has printed.
 fn install_panic_flush() {

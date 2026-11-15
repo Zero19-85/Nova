@@ -1683,10 +1683,23 @@ extern "C" __declspec(dllexport) int OpenNvEncSession(void* d3d11_device, void**
     return 0;
 }
 
+// The NVENCSTATUS of the last failed InitEncoder (0 = the last one succeeded,
+// or failed outside NVENC). Read by Rust (LastInitEncoderStatus) to tell "this
+// configuration was refused" apart from "the driver behind this process is
+// gone": NV_ENC_ERR_NO_ENCODE_DEVICE (1) from a process that opened NVENC fine
+// earlier means the NVIDIA driver was replaced under it (live 2026-11-15), and
+// only a fresh process loads the new one.
+static int g_lastInitStatus = 0;
+
+extern "C" __declspec(dllexport) int LastInitEncoderStatus() {
+    return g_lastInitStatus;
+}
+
 extern "C" __declspec(dllexport) int InitEncoder(
     void* encoder, int width, int height, const char* codec,
     int bitrate_kbps, int fps, bool is_hdr)
 {
+    g_lastInitStatus = 0;
     if (!g_device) return -1;
     g_hdrMetadataReady = false;
 
@@ -2065,6 +2078,11 @@ extern "C" __declspec(dllexport) int InitEncoder(
                                                "H.264 - 8-bit SDR";
         ShimLog("[NVENC] Initialized Codec: %s\n", codec_label);
         return 0;
+    }
+    catch (const NVENCException& e) {
+        g_lastInitStatus = static_cast<int>(e.getErrorCode());
+        ShimLog("❌ InitEncoder failed (NVENCSTATUS %d): %s\n", g_lastInitStatus, e.what());
+        return -1;
     }
     catch (const std::exception& e) {
         ShimLog("❌ InitEncoder failed: %s\n", e.what());
