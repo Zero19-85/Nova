@@ -136,6 +136,14 @@ Anything below describing Nova as "ONE interactive elevated process" is pre-Phas
   zero nova-server processes within ms. **Rule: never issue I/O on a handle
   another thread is blocked reading synchronously.** `exit_hard` additionally
   logs and falls back to `taskkill /PID self` should TerminateProcess ever return.
+- **The shortcut after a Quit (`de3b3d8`).** The desktop/Start-menu shortcut is a
+  BARE launch (no flags), which ran the legacy monolithic host: UDP stream ports
+  bound, pairing/RTSP/Echo RPC never opened — clients saw the PC and could not
+  connect, re-pairing changed nothing. A bare launch now starts `NovaService`
+  when installed and exits (`service::request_service_start`); only a box
+  without the service runs standalone. The one formerly-flagless service spawn
+  carries `--from-service` (stripped before clap) so it cannot loop.
+  **Rule: every service-spawned command line must carry a flag.**
 
 ## 2026-11-09: **BLACK MONITOR AT BOOT — the VDD was enabled on the sign-in screen** (fixed + deployed) and **Wake-on-LAN**
 

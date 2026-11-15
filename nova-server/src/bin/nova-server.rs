@@ -233,10 +233,28 @@ fn main() {
         _ if is_worker => run_worker(),
 
         _ => {
+            // A BARE launch (no flags at all) is the desktop / Start-menu
+            // shortcut or a double-click. When NovaService is installed, that
+            // means "turn Nova on": start the service and leave. Running the
+            // monolithic host here instead — e.g. after a tray Quit stopped
+            // the service — produced a Nova that clients could see but not
+            // connect to (2026-11-15). Service-spawned hosts always carry a
+            // flag, so they never take this branch.
+            if args.len() == 1 {
+                use nova_server::service::{request_service_start, ServiceStartRequest};
+                match request_service_start() {
+                    ServiceStartRequest::Started | ServiceStartRequest::AlreadyRunning => {
+                        std::process::exit(0)
+                    }
+                    ServiceStartRequest::NotInstalled => {}
+                    // Fall back to the standalone host rather than nothing.
+                    ServiceStartRequest::Failed(_) => {}
+                }
+            }
             // Normal run — launched by the scheduled task on logon, spawned
-            // by the service as a non-split host, or manually. Any
-            // `--system-token`/`--system-fallback` flags were already
-            // consumed above.
+            // by the service as a non-split host, or manually on a box with
+            // no service. Any `--system-token`/`--system-fallback` flags were
+            // already consumed above.
             run_host();
         }
     }

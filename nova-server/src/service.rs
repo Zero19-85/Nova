@@ -73,10 +73,10 @@ use windows::Win32::System::RemoteDesktop::{
     WTSSessionInfoEx, WTSINFOEXW, WTS_SESSIONSTATE_UNLOCK,
 };
 use windows::Win32::System::Services::{
-    ChangeServiceConfigW, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
+    ChangeServiceConfigW, CreateServiceW, StartServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, ControlService,
     ENUM_SERVICE_TYPE, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
-    SERVICE_QUERY_STATUS, SERVICE_STOP, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_QUERY_STATUS, SERVICE_STOP, SERVICE_START, SERVICE_ACCEPT_SHUTDOWN,
     SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
     SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_ERROR, SERVICE_ERROR_NORMAL,
     SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_TABLE_ENTRYW,
@@ -922,6 +922,60 @@ impl ServiceStopRequest {
     }
 }
 
+/// What [`request_service_start`] found.
+#[derive(Debug)]
+pub enum ServiceStartRequest {
+    /// `NovaService` was stopped and the SCM accepted the start.
+    Started,
+    /// It was already running (or starting) — nothing to do.
+    AlreadyRunning,
+    /// No `NovaService` on this machine (task-based or portable install).
+    NotInstalled,
+    /// It exists but would not start, with why.
+    Failed(String),
+}
+
+/// Start `NovaService` if it is installed. Used by a bare launch (the desktop /
+/// Start-menu shortcut): after a tray Quit the service is stopped, and a bare
+/// launch used to run the legacy monolithic host instead — which never opened
+/// the pairing/RTSP/Echo ports while a service install's state was around, so
+/// every client saw the PC (mDNS) and could not connect (live 2026-11-15).
+pub fn request_service_start() -> ServiceStartRequest {
+    unsafe {
+        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) {
+            Ok(h) => h,
+            Err(e) => return ServiceStartRequest::Failed(format!("no SCM access: {e:?}")),
+        };
+        let _scm_guard = ScHandleGuard(scm);
+
+        let name_w = wide(SERVICE_NAME);
+        let svc = match OpenServiceW(scm, PCWSTR(name_w.as_ptr()), SERVICE_START | SERVICE_QUERY_STATUS) {
+            Ok(h) => h,
+            Err(e) => {
+                const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+                return if e.code().0 as u32 & 0xFFFF == ERROR_SERVICE_DOES_NOT_EXIST {
+                    ServiceStartRequest::NotInstalled
+                } else {
+                    ServiceStartRequest::Failed(format!("OpenServiceW: {e:?}"))
+                };
+            }
+        };
+        let _svc_guard = ScHandleGuard(svc);
+
+        match StartServiceW(svc, None) {
+            Ok(()) => ServiceStartRequest::Started,
+            Err(e) => {
+                const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
+                if e.code().0 as u32 & 0xFFFF == ERROR_SERVICE_ALREADY_RUNNING {
+                    ServiceStartRequest::AlreadyRunning
+                } else {
+                    ServiceStartRequest::Failed(format!("StartServiceW: {e:?}"))
+                }
+            }
+        }
+    }
+}
+
 // ── Cross-process graceful stop (service → host) ─────────────────────────────
 //
 // TerminateProcess skips every Rust destructor and console handler in the
@@ -1145,7 +1199,10 @@ fn spawn_host_in_session(exe: &str, session_id: u32, worker_mode: bool) -> Resul
         let worker_flag = if worker_mode { " --worker" } else { "" };
         let cmdline = match sys_token {
             Some(h) => format!("\"{exe}\" --system-token {}{skip_cycle}{worker_flag}", h.0 as isize),
-            None => format!("\"{exe}\"{skip_cycle}{worker_flag}"),
+            // `--from-service` marks this as service-spawned: a launch with no
+            // flags at all is read as "start the service" (bin/nova-server.rs),
+            // which here would exit, be respawned, and loop.
+            None => format!("\"{exe}\" --from-service{skip_cycle}{worker_flag}"),
         };
         let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
         let inherit_handles = sys_token.is_some();

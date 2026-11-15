@@ -4369,7 +4369,7 @@ pub async fn run() -> Result<()> {
         while let Some(a) = it.next() {
             if a == "--system-token" {
                 let _ = it.next(); // skip its value
-            } else if a == "--system-fallback" || a == "--skip-vdd-cycle" {
+            } else if a == "--system-fallback" || a == "--skip-vdd-cycle" || a == "--from-service" {
                 // bare flags, no value to skip
             } else {
                 out.push(a);
