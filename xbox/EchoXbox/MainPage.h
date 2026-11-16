@@ -250,6 +250,11 @@ namespace winrt::EchoXbox::implementation
         uint32_t m_backBufferHeight = 0;
         std::unique_ptr<echo::EchoSession>   m_session;
         std::unique_ptr<echo::HostDiscovery> m_discovery;
+        // Whether the mDNS watcher has reported anything yet. Saved hosts are
+        // drawn as OFFLINE cards the moment discovery starts, before the
+        // network has said a word, so "no host awake" is only claimed once it
+        // has (UI thread).
+        bool m_discoveryAnswered = false;
         std::unique_ptr<echo::InputBridge>   m_input;
 
         std::vector<echo::DiscoveredHost> m_hosts;   // parallel to HostList items

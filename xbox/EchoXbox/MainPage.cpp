@@ -1168,10 +1168,11 @@ namespace winrt::EchoXbox::implementation
 
         // The watcher's callbacks arrive on a platform thread, so everything
         // they touch has to hop to the dispatcher first.
+        m_discoveryAnswered = false;
         const bool started = m_discovery->Start(
             [this] {
                 Dispatcher().RunAsync(CoreDispatcherPriority::Normal,
-                                      [this] { RefreshHostList(); });
+                                      [this] { m_discoveryAnswered = true; RefreshHostList(); });
             },
             error);
 
@@ -1182,6 +1183,14 @@ namespace winrt::EchoXbox::implementation
             return;
         }
         SetStatus(L"searching for Nova on the network...");
+
+        // Draw the paired hosts NOW, as OFFLINE cards, rather than waiting for
+        // the watcher. A host that is on announces itself within a second or
+        // two and its card flips to ONLINE in place; a host that is off adds
+        // nothing, so the first callback would be EnumerationCompleted — which
+        // the DNS-SD watcher sends on its own schedule, 30-60 s after start.
+        // Until then a powered-off PC had no card at all, so nothing to wake.
+        RefreshHostList();
     }
 
     void MainPage::OnRescanClick(IInspectable const&, RoutedEventArgs const&)
@@ -1331,7 +1340,9 @@ namespace winrt::EchoXbox::implementation
         HostsHeader().Text(m_hosts.empty()
             ? hstring(L"SEARCHING THE NETWORK...")
             : liveCount == 0
-                ? hstring(L"NO HOST AWAKE   ::   PRESS A ON ONE TO WAKE IT")
+                ? (m_discoveryAnswered
+                       ? hstring(L"NO HOST AWAKE   ::   PRESS A ON ONE TO WAKE IT")
+                       : hstring(L"SEARCHING THE NETWORK...   ::   PRESS A ON ONE TO WAKE IT"))
                 : hstring(std::to_wstring(liveCount) +
                           (liveCount == 1 ? L" HOST FOUND" : L" HOSTS FOUND")));
 
@@ -1553,7 +1564,7 @@ namespace winrt::EchoXbox::implementation
             m_discovery->Start(
                 [this] {
                     Dispatcher().RunAsync(CoreDispatcherPriority::Normal,
-                                          [this] { RefreshHostList(); });
+                                          [this] { m_discoveryAnswered = true; RefreshHostList(); });
                 },
                 error);
         }
