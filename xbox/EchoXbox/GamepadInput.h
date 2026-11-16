@@ -22,8 +22,23 @@
 
 #include <cstdint>
 #include <winrt/Windows.Gaming.Input.h>
+#include <winrt/Windows.System.h>
 
 namespace echo {
+
+// Whether a key event was raised by a CONTROLLER rather than a keyboard.
+//
+// On Xbox a pad press also arrives as a key event: NavigationView..
+// NavigationCancel (0x88-0x8F) and GamepadA..GamepadRightThumbstickLeft
+// (0xC3-0xDA). No keyboard produces either range. The pad reaches the host
+// only as `NV_MULTI_CONTROLLER_PACKET` frames from the poll loop; a key packet
+// carrying one of these is a duplicate that the host would inject as a real
+// keyboard event (see InputBridge::Start). Nova's `input.rs` refuses the same
+// ranges, so a client that forgets this check still cannot leak them.
+inline bool IsControllerKey(winrt::Windows::System::VirtualKey key) {
+    const auto vk = static_cast<int32_t>(key);
+    return (vk >= 0x88 && vk <= 0x8F) || (vk >= 0xC3 && vk <= 0xDA);
+}
 
 // XINPUT_GAMEPAD_* — GameStream's low 16 buttonFlags are bit-for-bit these.
 enum XInputBits : uint16_t {

@@ -4,6 +4,7 @@
 
 #include "App.h"
 #include "EchoBridge.h"
+#include "GamepadInput.h"
 
 #include <algorithm>
 #include <array>
@@ -452,9 +453,28 @@ namespace winrt::EchoXbox::implementation
                PinPanel().Visibility() == Visibility::Collapsed;
     }
 
+    // While a stream owns the controller, XAML gets none of it. Every button
+    // already reaches the game through the pad poll; left unhandled here the
+    // same press also moved XAML's focus rect (D-pad, sticks) or invoked
+    // whatever held focus (A). Any panel on top of the stream — overlay, End
+    // Stream, diagnostics, settings, the menu, the PIN screen — parks
+    // forwarding and gets normal navigation back.
+    bool MainPage::PadOwnedByStream()
+    {
+        return m_streaming && !m_overlayOpen && !m_actionMenuOpen &&
+               !m_settingsOpen && !m_diagnosticsOpen && !m_endStreamOpen &&
+               PinPanel().Visibility() == Visibility::Collapsed;
+    }
+
     void MainPage::OnChromeKeyDown(IInspectable const&, KeyRoutedEventArgs const& args)
     {
         const auto key = args.Key();
+
+        if (PadOwnedByStream() &&
+            (echo::IsControllerKey(key) || echo::IsControllerKey(args.OriginalKey()))) {
+            args.Handled(true);
+            return;
+        }
 
         // ── Start: the menu ─────────────────────────────────────────────────
         //
@@ -561,6 +581,11 @@ namespace winrt::EchoXbox::implementation
     // that menu buttons fire on release.
     void MainPage::OnChromeKeyUp(IInspectable const&, KeyRoutedEventArgs const& args)
     {
+        if (PadOwnedByStream() &&
+            (echo::IsControllerKey(args.Key()) || echo::IsControllerKey(args.OriginalKey()))) {
+            args.Handled(true);
+            return;
+        }
         if (args.Key() == VirtualKey::GamepadA) ++m_aXamlUpEdges;
     }
 

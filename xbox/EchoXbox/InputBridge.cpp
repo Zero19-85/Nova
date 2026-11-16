@@ -290,11 +290,24 @@ bool InputBridge::Start(SwapChainPanel const& panel, CoreWindow const& window,
         // whose latency nobody can feel — a keystroke is a discrete event that
         // has already waited on a human — and `CoreWindow` is the only place
         // UWP reports key state at all.
+        //
+        // ── The controller is NOT a keyboard ────────────────────────────────
+        //
+        // On Xbox the pad also raises CoreWindow key events — GamepadA,
+        // GamepadDPadUp, the thumbstick directions, and the Navigation* keys —
+        // auto-repeat included. Forwarding them sent every button press TWICE:
+        // once as the pad frame (PadLoop) and once as a key packet, which the
+        // host injects with SendInput because those VKs have no scan code. A
+        // game then saw a keyboard event beside every XInput press and flipped
+        // its prompts to keyboard/mouse (Crimson Desert). The pad's only route
+        // to the host is PadLoop; these are dropped here.
         if (window) {
             window.KeyDown([this](auto&&, KeyEventArgs const& args) {
+                if (IsControllerKey(args.VirtualKey())) return;
                 Emit(InputEvent{ kKey, static_cast<int32_t>(args.VirtualKey()), 1, 0, 0 });
             });
             window.KeyUp([this](auto&&, KeyEventArgs const& args) {
+                if (IsControllerKey(args.VirtualKey())) return;
                 Emit(InputEvent{ kKey, static_cast<int32_t>(args.VirtualKey()), 0, 0, 0 });
             });
         }

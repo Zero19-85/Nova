@@ -85,6 +85,7 @@ namespace winrt::EchoXbox::implementation
         //          all — see the notes on OnChromeKeyDown and on
         //          InputBridge::SetSinks.
         void HookGestures();                  // UI thread, once
+        bool PadOwnedByStream();              // UI thread: stream live, no panel open
         void OnChromeKeyDown(IInspectable const&, Windows::UI::Xaml::Input::KeyRoutedEventArgs const&);
         void OnChromeKeyUp(IInspectable const&, Windows::UI::Xaml::Input::KeyRoutedEventArgs const&);
         // The A button, from InputBridge's 250 Hz poll. Called on the PAD

@@ -1525,6 +1525,14 @@ fn download_and_run_vigem_setup() {
     }
 }
 
+/// The virtual-key ranges Windows assigns to controllers, not keyboards:
+/// `VK_NAVIGATION_VIEW..VK_NAVIGATION_CANCEL` (0x88-0x8F) and
+/// `VK_GAMEPAD_A..VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT` (0xC3-0xDA). No keyboard
+/// produces either, so refusing them costs no real key.
+fn is_controller_vk(vk: u16) -> bool {
+    (0x88..=0x8F).contains(&vk) || (0xC3..=0xDA).contains(&vk)
+}
+
 /// NV_KEYBOARD_PACKET body (after the 8-byte NV_INPUT_HEADER):
 ///   keyAction : u8     @8   unused — press/release is already determined by
 ///                            the NV_INPUT_HEADER magic (KEY_DOWN/UP_EVENT_MAGIC)
@@ -1540,6 +1548,25 @@ fn inject_keyboard(payload: &[u8], release: bool) {
     let key_code = u16::from_le_bytes([payload[9], payload[10]]);
     let vk = VIRTUAL_KEY(key_code & 0x00FF);
     let modifiers = payload[11];
+
+    // A controller is not a keyboard. A client whose platform reports pad
+    // presses as key events (Xbox UWP: GamepadA, GamepadDPadUp, Navigation*)
+    // and forwards them sends each press twice — the pad frame to ViGEm, and
+    // this. These VKs have no scan code, so `send_key_event` would inject them
+    // as raw-VK keyboard events, and a game seeing a keyboard event beside every
+    // XInput press flips its prompts to keyboard/mouse (Crimson Desert,
+    // 2026-11-16). The pad's only legitimate route is NV_MULTI_CONTROLLER_PACKET.
+    if is_controller_vk(vk.0) {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            println!(
+                "⌨️  Input: dropped controller key 0x{:02X} sent as a keyboard packet \
+                 (the pad reaches the game via ViGEm; logged once)",
+                vk.0
+            );
+        }
+        return;
+    }
 
     if let Some(bit) = modifier_bit_for_vk(vk) {
         // Real modifier key: track held/released state so the synthetic
@@ -1586,6 +1613,19 @@ fn inject_keyboard(payload: &[u8], release: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Controller VKs are refused as keyboard input; every real key passes,
+    /// including the neighbours either side of both ranges.
+    #[test]
+    fn controller_vks_are_not_keyboard_keys() {
+        for vk in [0x88u16, 0x8A, 0x8F, 0xC3, 0xCB, 0xD3, 0xDA] {
+            assert!(is_controller_vk(vk), "0x{vk:02X} should be refused");
+        }
+        // Arrows, Enter, Space, A, Esc, F24, OEM_1, OEM_3, OEM_4.
+        for vk in [0x25u16, 0x26, 0x0D, 0x20, 0x41, 0x1B, 0x87, 0x90, 0xBA, 0xC0, 0xDB] {
+            assert!(!is_controller_vk(vk), "0x{vk:02X} is a real key");
+        }
+    }
 
     /// Locks the Master-side routing predicate that keeps gamepad traffic on
     /// the Worker while mouse/keyboard detours to the SYSTEM input helper (see
